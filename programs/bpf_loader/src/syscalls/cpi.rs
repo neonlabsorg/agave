@@ -927,7 +927,7 @@ where
             // account (caller_account). We need to update the corresponding
             // BorrowedAccount (callee_account) so the callee can see the
             // changes.
-            update_callee_account(
+            let update_caller = update_callee_account(
                 invoke_context,
                 memory_mapping,
                 is_loader_deprecated,
@@ -936,7 +936,7 @@ where
                 direct_mapping,
             )?;
 
-            let caller_account = if instruction_account.is_writable {
+            let caller_account = if instruction_account.is_writable || update_caller {
                 Some(caller_account)
             } else {
                 None
@@ -1170,6 +1170,9 @@ fn cpi_common<S: SyscallInvokeSigned>(
 //
 // This method updates callee_account so the CPI callee can see the caller's
 // changes.
+//
+// When true is returned, the caller account must be updated after CPI. This
+// is only set for direct mapping when the pointer may have changed.
 fn update_callee_account(
     invoke_context: &InvokeContext,
     memory_mapping: &MemoryMapping,
@@ -1177,7 +1180,9 @@ fn update_callee_account(
     caller_account: &CallerAccount,
     mut callee_account: BorrowedAccount<'_>,
     direct_mapping: bool,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
+    let mut must_update_caller = false;
+
     if callee_account.get_lamports() != *caller_account.lamports {
         callee_account.set_lamports(*caller_account.lamports)?;
     }
@@ -1195,7 +1200,11 @@ fn update_callee_account(
                 if is_loader_deprecated && realloc_bytes_used > 0 {
                     return Err(InstructionError::InvalidRealloc.into());
                 }
-                callee_account.set_data_length(post_len)?;
+                if prev_len != post_len {
+                    callee_account.set_data_length(post_len)?;
+                    // pointer to data may have changed, so caller must be updated
+                    must_update_caller = true;
+                }
                 if realloc_bytes_used > 0 {
                     let serialized_data = translate_slice::<u8>(
                         memory_mapping,
@@ -1236,7 +1245,7 @@ fn update_callee_account(
         callee_account.set_owner(caller_account.owner.as_ref())?;
     }
 
-    Ok(())
+    Ok(must_update_caller)
 }
 
 fn update_caller_account_perms(
