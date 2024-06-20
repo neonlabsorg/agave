@@ -14,9 +14,9 @@ use {
 /// Roughly 0.5us/page, where page is 32K; given roughly 15CU/us, the
 /// default heap page cost = 0.5 * 15 ~= 8CU/page
 pub const DEFAULT_HEAP_COST: u64 = 8;
-pub const DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT: u32 = 200_000;
-pub const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
-pub const MAX_HEAP_FRAME_BYTES: u32 = 256 * 1024;
+pub const DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT: u32 = 10_000_000;
+pub const MAX_COMPUTE_UNIT_LIMIT: u32 = 30_000_000;
+pub const MAX_HEAP_FRAME_BYTES: u32 = 1024 * 1024;
 pub const MIN_HEAP_FRAME_BYTES: u32 = HEAP_LENGTH as u32;
 
 /// The total accounts data a transaction can load is limited to 64MiB to not break

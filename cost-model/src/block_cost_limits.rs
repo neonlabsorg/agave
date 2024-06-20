@@ -13,9 +13,11 @@ use {
 ///
 /// Number of microseconds replaying a block should take, 400 millisecond block times
 /// is currently publicly communicated on solana.com
-pub const MAX_BLOCK_REPLAY_TIME_US: u64 = 400_000;
+/// N.B. Adjusted for the rollup.
+pub const MAX_BLOCK_REPLAY_TIME_US: u64 = 1_000_000;
 /// number of concurrent processes,
-pub const MAX_CONCURRENCY: u64 = 4;
+/// N.B. Adjusted for the rollup.
+pub const MAX_CONCURRENCY: u64 = 16;
 
 // Cluster data, method of collecting at https://github.com/solana-labs/solana/issues/19627
 // Dashboard: https://metrics.solana.com/d/monitor-edge/cluster-telemetry?orgId=1
@@ -65,7 +67,7 @@ pub const MAX_BLOCK_UNITS: u64 =
     MAX_BLOCK_REPLAY_TIME_US * COMPUTE_UNIT_TO_US_RATIO * MAX_CONCURRENCY;
 
 #[cfg(test)]
-static_assertions::const_assert_eq!(MAX_BLOCK_UNITS, 48_000_000);
+static_assertions::const_assert_eq!(MAX_BLOCK_UNITS, 480_000_000);
 
 /// Number of compute units that a writable account in a block is allowed. The
 /// limit is to prevent too many transactions write to same account, therefore
@@ -73,14 +75,14 @@ static_assertions::const_assert_eq!(MAX_BLOCK_UNITS, 48_000_000);
 pub const MAX_WRITABLE_ACCOUNT_UNITS: u64 = MAX_BLOCK_REPLAY_TIME_US * COMPUTE_UNIT_TO_US_RATIO;
 
 #[cfg(test)]
-static_assertions::const_assert_eq!(MAX_WRITABLE_ACCOUNT_UNITS, 12_000_000);
+static_assertions::const_assert_eq!(MAX_WRITABLE_ACCOUNT_UNITS, 30_000_000);
 
 /// Number of compute units that a block can have for vote transactions,
 /// sets at ~75% of MAX_BLOCK_UNITS to leave room for non-vote transactions
 pub const MAX_VOTE_UNITS: u64 = (MAX_BLOCK_UNITS as f64 * 0.75_f64) as u64;
 
 #[cfg(test)]
-static_assertions::const_assert_eq!(MAX_VOTE_UNITS, 36_000_000);
+static_assertions::const_assert_eq!(MAX_VOTE_UNITS, 360_000_000);
 
 /// The maximum allowed size, in bytes, that accounts data can grow, per block.
 /// This can also be thought of as the maximum size of new allocations per block.
