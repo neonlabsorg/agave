@@ -91,8 +91,10 @@ trait ThreadArg {
     }
     /// The maximum allowed number of threads (inclusive)
     fn max() -> usize {
-        // By default, no thread pool should scale over the number of the machine's threads
-        get_max_thread_count()
+        // Some CPU overcommitment should be fine.
+        // We may shift between different hardware setups, so setting larger value here is safe
+        // (to not bother changing this value for every hardware possible).
+        32
     }
     /// The range of allowed number of threads (inclusive on both ends)
     fn range() -> RangeInclusive<usize> {
@@ -123,11 +125,6 @@ impl ThreadArg for ReplayForksThreadsArg {
     fn default() -> usize {
         // Default to single threaded fork execution
         1
-    }
-    fn max() -> usize {
-        // Choose a value that is small enough to limit the overhead of having a large thread pool
-        // while also being large enough to allow replay of all active forks in most scenarios
-        4
     }
 }
 
