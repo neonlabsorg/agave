@@ -15,7 +15,10 @@ use {
         },
         connection_cache_stats::ConnectionCacheStats,
     },
-    solana_sdk::signature::Keypair,
+    solana_keypair::Keypair,
+    solana_net_utils::sockets::{
+        bind_with_any_port_with_config, SocketConfiguration as SocketConfig,
+    },
     std::{
         net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
         sync::Arc,
@@ -62,8 +65,11 @@ pub struct UdpConfig {
 
 impl NewConnectionConfig for UdpConfig {
     fn new() -> Result<Self, ClientError> {
-        let socket = solana_net_utils::bind_with_any_port(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-            .map_err(Into::<ClientError>::into)?;
+        let socket = bind_with_any_port_with_config(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketConfig::default(),
+        )
+        .map_err(Into::<ClientError>::into)?;
         Ok(Self {
             udp_socket: Arc::new(socket),
         })

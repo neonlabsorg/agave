@@ -1,13 +1,12 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
     solana_cli::cli::{process_command, CliCommand, CliConfig},
+    solana_commitment_config::CommitmentConfig,
     solana_faucet::faucet::run_local_faucet,
+    solana_keypair::Keypair,
+    solana_native_token::sol_to_lamports,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        commitment_config::CommitmentConfig,
-        native_token::sol_to_lamports,
-        signature::{Keypair, Signer},
-    },
+    solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
     solana_test_validator::TestValidator,
 };

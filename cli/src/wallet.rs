@@ -4,7 +4,7 @@ use {
             log_instruction_custom_error, request_and_confirm_airdrop, CliCommand, CliCommandInfo,
             CliConfig, CliError, ProcessResult,
         },
-        compute_budget::WithComputeUnitPrice,
+        compute_budget::{ComputeUnitConfig, WithComputeUnitConfig},
         memo::WithMemo,
         nonce::check_nonce_account,
         spend_utils::{resolve_spend_tx_and_check_account_balances, SpendAmount},
@@ -12,7 +12,7 @@ use {
     clap::{value_t_or_exit, App, Arg, ArgMatches, SubCommand},
     hex::FromHex,
     solana_clap_utils::{
-        compute_unit_price::{compute_unit_price_arg, COMPUTE_UNIT_PRICE_ARG},
+        compute_budget::{compute_unit_price_arg, ComputeUnitLimit, COMPUTE_UNIT_PRICE_ARG},
         fee_payer::*,
         hidden_unless_forced,
         input_parsers::*,
@@ -28,21 +28,18 @@ use {
         CliSignatureVerificationStatus, CliTransaction, CliTransactionConfirmation, OutputFormat,
         ReturnSignersConfig,
     },
+    solana_commitment_config::CommitmentConfig,
+    solana_message::Message,
+    solana_offchain_message::OffchainMessage,
+    solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::config::RpcTransactionConfig,
     solana_rpc_client_nonce_utils::blockhash_query::BlockhashQuery,
-    solana_sdk::{
-        commitment_config::CommitmentConfig,
-        message::Message,
-        offchain_message::OffchainMessage,
-        pubkey::Pubkey,
-        signature::Signature,
-        stake,
-        system_instruction::{self, SystemError},
-        system_program,
-        transaction::{Transaction, VersionedTransaction},
-    },
+    solana_sdk_ids::{stake, system_program},
+    solana_signature::Signature,
+    solana_system_interface::{error::SystemError, instruction as system_instruction},
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
     solana_transaction_status::{
         EncodableWithMeta, EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
         TransactionBinaryEncoding, UiTransactionEncoding,
@@ -393,7 +390,7 @@ fn resolve_derived_address_program_id(matches: &ArgMatches<'_>, arg_name: &str) 
         let upper = v.to_ascii_uppercase();
         match upper.as_str() {
             "NONCE" | "SYSTEM" => Some(system_program::id()),
-            "STAKE" => Some(stake::program::id()),
+            "STAKE" => Some(stake::id()),
             "VOTE" => Some(solana_vote_program::id()),
             _ => pubkey_of(matches, arg_name),
         }
@@ -796,7 +793,7 @@ pub fn process_confirm(
                     confirmation_status: Some(transaction_status.confirmation_status()),
                     transaction,
                     get_transaction_error,
-                    err: transaction_status.err.clone(),
+                    err: transaction_status.err.clone().map(Into::into),
                 }
             } else {
                 CliTransactionConfirmation {
@@ -879,7 +876,7 @@ pub fn process_transfer(
     fee_payer: SignerIndex,
     derived_address_seed: Option<String>,
     derived_address_program_id: Option<&Pubkey>,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     let from = config.signers[from];
     let mut from_pubkey = from.pubkey();
@@ -911,6 +908,11 @@ pub fn process_transfer(
         None
     };
 
+    let compute_unit_limit = if nonce_account.is_some() {
+        ComputeUnitLimit::Default
+    } else {
+        ComputeUnitLimit::Simulated
+    };
     let build_message = |lamports| {
         let ixs = if let Some((base_pubkey, seed, program_id, from_pubkey)) = with_seed.as_ref() {
             vec![system_instruction::transfer_with_seed(
@@ -922,11 +924,17 @@ pub fn process_transfer(
                 lamports,
             )]
             .with_memo(memo)
-            .with_compute_unit_price(compute_unit_price)
+            .with_compute_unit_config(&ComputeUnitConfig {
+                compute_unit_price,
+                compute_unit_limit,
+            })
         } else {
             vec![system_instruction::transfer(&from_pubkey, to, lamports)]
                 .with_memo(memo)
-                .with_compute_unit_price(compute_unit_price)
+                .with_compute_unit_config(&ComputeUnitConfig {
+                    compute_unit_price,
+                    compute_unit_limit,
+                })
         };
 
         if let Some(nonce_account) = &nonce_account {
@@ -948,6 +956,7 @@ pub fn process_transfer(
         &recent_blockhash,
         &from_pubkey,
         &fee_payer.pubkey(),
+        compute_unit_limit,
         build_message,
         config.commitment,
     )?;
@@ -974,9 +983,13 @@ pub fn process_transfer(
 
         tx.try_sign(&config.signers, recent_blockhash)?;
         let result = if no_wait {
-            rpc_client.send_transaction(&tx)
+            rpc_client.send_transaction_with_config(&tx, config.send_transaction_config)
         } else {
-            rpc_client.send_and_confirm_transaction_with_spinner(&tx)
+            rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+                &tx,
+                config.commitment,
+                config.send_transaction_config,
+            )
         };
         log_instruction_custom_error::<SystemError>(result, config)
     }

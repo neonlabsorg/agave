@@ -1,7 +1,9 @@
 use {
     crate::{
         cli::{CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult},
-        compute_budget::WithComputeUnitPrice,
+        compute_budget::{
+            simulate_for_compute_unit_limit, ComputeUnitConfig, WithComputeUnitConfig,
+        },
         feature::get_feature_activation_epoch,
         spend_utils::{resolve_spend_tx_and_check_account_balance, SpendAmount},
     },
@@ -9,8 +11,9 @@ use {
     console::style,
     crossbeam_channel::unbounded,
     serde::{Deserialize, Serialize},
+    solana_account::{from_account, state_traits::StateMut},
     solana_clap_utils::{
-        compute_unit_price::{compute_unit_price_arg, COMPUTE_UNIT_PRICE_ARG},
+        compute_budget::{compute_unit_price_arg, ComputeUnitLimit, COMPUTE_UNIT_PRICE_ARG},
         input_parsers::*,
         input_validators::*,
         keypair::DefaultSigner,
@@ -24,8 +27,16 @@ use {
         },
         *,
     },
+    solana_clock::{self as clock, Clock, Epoch, Slot},
+    solana_commitment_config::CommitmentConfig,
+    solana_hash::Hash,
+    solana_message::Message,
+    solana_native_token::lamports_to_sol,
+    solana_nonce::state::State as NonceState,
+    solana_pubkey::Pubkey,
     solana_pubsub_client::pubsub_client::PubsubClient,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
+    solana_rent::Rent,
     solana_rpc_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient},
     solana_rpc_client_api::{
         client_error::ErrorKind as ClientErrorKind,
@@ -38,32 +49,17 @@ use {
         request::DELINQUENT_VALIDATOR_SLOT_DISTANCE,
         response::{RpcPerfSample, RpcPrioritizationFee, SlotInfo},
     },
-    solana_sdk::{
-        account::from_account,
-        account_utils::StateMut,
-        clock::{self, Clock, Slot},
-        commitment_config::CommitmentConfig,
-        epoch_schedule::Epoch,
-        feature_set,
-        hash::Hash,
-        message::Message,
-        native_token::lamports_to_sol,
-        nonce::State as NonceState,
-        pubkey::Pubkey,
-        rent::Rent,
-        rpc_port::DEFAULT_RPC_PORT_STR,
-        signature::Signature,
-        slot_history,
-        stake::{self, state::StakeStateV2},
-        system_instruction::{self, MAX_PERMITTED_DATA_LENGTH},
-        sysvar::{self, slot_history::SlotHistory, stake_history},
-        transaction::Transaction,
-    },
+    solana_sdk_ids::sysvar::{self, stake_history},
+    solana_signature::Signature,
+    solana_slot_history::{self as slot_history, SlotHistory},
+    solana_stake_interface::{self as stake, state::StakeStateV2},
+    solana_system_interface::{instruction as system_instruction, MAX_PERMITTED_DATA_LENGTH},
     solana_tps_client::TpsClient,
+    solana_transaction::Transaction,
     solana_transaction_status::{
         EncodableWithMeta, EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding,
     },
-    solana_vote_program::vote_state::VoteState,
+    solana_vote_program::vote_state::VoteStateV3,
     std::{
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
         fmt,
@@ -79,6 +75,8 @@ use {
     },
     thiserror::Error,
 };
+
+const DEFAULT_RPC_PORT_STR: &str = "8899";
 
 pub trait ClusterQuerySubCommands {
     fn cluster_query_subcommands(self) -> Self;
@@ -170,19 +168,6 @@ impl ClusterQuerySubCommands for App<'_, '_> {
         .subcommand(
             SubCommand::with_name("cluster-version")
                 .about("Get the version of the cluster entrypoint"),
-        )
-        // Deprecated in v1.8.0
-        .subcommand(
-            SubCommand::with_name("fees")
-                .about("Display current cluster fees (Deprecated in v1.8.0)")
-                .arg(
-                    Arg::with_name("blockhash")
-                        .long("blockhash")
-                        .takes_value(true)
-                        .value_name("BLOCKHASH")
-                        .validator(is_hash)
-                        .help("Query fees for BLOCKHASH instead of the most recent blockhash"),
-                ),
         )
         .subcommand(
             SubCommand::with_name("first-available-block")
@@ -751,7 +736,7 @@ pub fn process_catchup(
     our_localhost_port: Option<u16>,
     log: bool,
 ) -> ProcessResult {
-    let sleep_interval = Duration::from_secs(5);
+    let sleep_interval = Duration::from_secs(2);
 
     let progress_bar = new_spinner_progress_bar();
     progress_bar.set_message("Connecting...");
@@ -980,42 +965,6 @@ pub fn process_cluster_version(rpc_client: &RpcClient, config: &CliConfig) -> Pr
     } else {
         Ok(remote_version.to_string())
     }
-}
-
-pub fn process_fees(
-    rpc_client: &RpcClient,
-    config: &CliConfig,
-    blockhash: Option<&Hash>,
-) -> ProcessResult {
-    let fees = if let Some(recent_blockhash) = blockhash {
-        #[allow(deprecated)]
-        let result = rpc_client.get_fee_calculator_for_blockhash_with_commitment(
-            recent_blockhash,
-            config.commitment,
-        )?;
-        if let Some(fee_calculator) = result.value {
-            CliFees::some(
-                result.context.slot,
-                *recent_blockhash,
-                fee_calculator.lamports_per_signature,
-                None,
-                None,
-            )
-        } else {
-            CliFees::none()
-        }
-    } else {
-        #[allow(deprecated)]
-        let result = rpc_client.get_fees_with_commitment(config.commitment)?;
-        CliFees::some(
-            result.context.slot,
-            result.value.blockhash,
-            result.value.fee_calculator.lamports_per_signature,
-            None,
-            Some(result.value.last_valid_block_height),
-        )
-    };
-    Ok(config.output_format.formatted_string(&fees))
 }
 
 pub fn process_first_available_block(rpc_client: &RpcClient) -> ProcessResult {
@@ -1480,14 +1429,19 @@ pub fn process_ping(
     timeout: &Duration,
     fixed_blockhash: &Option<Hash>,
     print_timestamp: bool,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
     rpc_client: &RpcClient,
 ) -> ProcessResult {
     let (signal_sender, signal_receiver) = unbounded();
-    ctrlc::set_handler(move || {
+    let handler = move || {
         let _ = signal_sender.send(());
-    })
-    .expect("Error setting Ctrl-C handler");
+    };
+    match ctrlc::try_set_handler(handler) {
+        // It's possible to set the ctrl-c handler more than once in testing
+        // situations, so let that case through
+        Err(ctrlc::Error::MultipleHandlers) => {}
+        result => result.expect("Error setting Ctrl-C handler"),
+    }
 
     let mut cli_pings = vec![];
 
@@ -1507,6 +1461,23 @@ pub fn process_ping(
         }
     }
 
+    let to = config.signers[0].pubkey();
+    let compute_unit_limit = if compute_unit_price.is_some() {
+        let ixs = vec![system_instruction::transfer(
+            &config.signers[0].pubkey(),
+            &to,
+            lamports,
+        )]
+        .with_compute_unit_config(&ComputeUnitConfig {
+            compute_unit_price,
+            compute_unit_limit: ComputeUnitLimit::Simulated,
+        });
+        let message = Message::new(&ixs, Some(&config.signers[0].pubkey()));
+        ComputeUnitLimit::Static(simulate_for_compute_unit_limit(rpc_client, &message)?)
+    } else {
+        ComputeUnitLimit::Default
+    };
+
     'mainloop: for seq in 0..count.unwrap_or(u64::MAX) {
         let now = Instant::now();
         if fixed_blockhash.is_none() && now.duration_since(blockhash_acquired).as_secs() > 60 {
@@ -1517,7 +1488,6 @@ pub fn process_ping(
             blockhash_acquired = Instant::now();
         }
 
-        let to = config.signers[0].pubkey();
         lamports = lamports.saturating_add(1);
 
         let build_message = |lamports| {
@@ -1526,7 +1496,10 @@ pub fn process_ping(
                 &to,
                 lamports,
             )]
-            .with_compute_unit_price(compute_unit_price);
+            .with_compute_unit_config(&ComputeUnitConfig {
+                compute_unit_price,
+                compute_unit_limit,
+            });
             Message::new(&ixs, Some(&config.signers[0].pubkey()))
         };
         let (message, _) = resolve_spend_tx_and_check_account_balance(
@@ -1535,6 +1508,7 @@ pub fn process_ping(
             SpendAmount::Some(lamports),
             &blockhash,
             &config.signers[0].pubkey(),
+            compute_unit_limit,
             build_message,
             config.commitment,
         )?;
@@ -1921,8 +1895,10 @@ pub fn process_show_stakes(
     let stake_history = from_account(&stake_history_account).ok_or_else(|| {
         CliError::RpcRequestError("Failed to deserialize stake history".to_string())
     })?;
-    let new_rate_activation_epoch =
-        get_feature_activation_epoch(rpc_client, &feature_set::reduce_stake_warmup_cooldown::id())?;
+    let new_rate_activation_epoch = get_feature_activation_epoch(
+        rpc_client,
+        &agave_feature_set::reduce_stake_warmup_cooldown::id(),
+    )?;
     stake_account_progress_bar.finish_and_clear();
 
     let mut stake_accounts: Vec<CliKeyedStakeState> = vec![];
@@ -2286,7 +2262,7 @@ impl RentLengthValue {
             Self::Nonce => NonceState::size(),
             Self::Stake => StakeStateV2::size_of(),
             Self::System => 0,
-            Self::Vote => VoteState::size_of(),
+            Self::Vote => VoteStateV3::size_of(),
             Self::Bytes(l) => *l,
         }
     }
@@ -2339,7 +2315,7 @@ mod tests {
     use {
         super::*,
         crate::{clap_app::get_clap_app, cli::parse_command},
-        solana_sdk::signature::{write_keypair, Keypair},
+        solana_keypair::{write_keypair, Keypair},
         std::str::FromStr,
         tempfile::NamedTempFile,
     };
@@ -2371,26 +2347,6 @@ mod tests {
         assert_eq!(
             parse_command(&test_cluster_version, &default_signer, &mut None).unwrap(),
             CliCommandInfo::without_signers(CliCommand::ClusterVersion)
-        );
-
-        let test_fees = test_commands.clone().get_matches_from(vec!["test", "fees"]);
-        assert_eq!(
-            parse_command(&test_fees, &default_signer, &mut None).unwrap(),
-            CliCommandInfo::without_signers(CliCommand::Fees { blockhash: None })
-        );
-
-        let blockhash = Hash::new_unique();
-        let test_fees = test_commands.clone().get_matches_from(vec![
-            "test",
-            "fees",
-            "--blockhash",
-            &blockhash.to_string(),
-        ]);
-        assert_eq!(
-            parse_command(&test_fees, &default_signer, &mut None).unwrap(),
-            CliCommandInfo::without_signers(CliCommand::Fees {
-                blockhash: Some(blockhash)
-            })
         );
 
         let slot = 100;

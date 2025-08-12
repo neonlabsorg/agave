@@ -1,6 +1,6 @@
 use {
     ahash::AHashMap,
-    solana_sdk::pubkey::Pubkey,
+    solana_pubkey::Pubkey,
     std::{
         collections::hash_map::Entry,
         fmt::{Debug, Display},
@@ -38,6 +38,15 @@ struct AccountReadLocks {
 struct AccountLocks {
     pub write_locks: Option<AccountWriteLocks>,
     pub read_locks: Option<AccountReadLocks>,
+}
+
+/// `try_lock_accounts` may fail for different reasons:
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TryLockError {
+    /// Outstanding conflicts with multiple threads.
+    MultipleConflicts,
+    /// Outstanding conflict (if any) not in `allowed_threads`.
+    ThreadNotAllowed,
 }
 
 /// Thread-aware account locks which allows for scheduling on threads
@@ -80,16 +89,18 @@ impl ThreadAwareAccountLocks {
         read_account_locks: impl Iterator<Item = &'a Pubkey> + Clone,
         allowed_threads: ThreadSet,
         thread_selector: impl FnOnce(ThreadSet) -> ThreadId,
-    ) -> Option<ThreadId> {
-        let schedulable_threads = self.accounts_schedulable_threads(
-            write_account_locks.clone(),
-            read_account_locks.clone(),
-        )? & allowed_threads;
-        (!schedulable_threads.is_empty()).then(|| {
-            let thread_id = thread_selector(schedulable_threads);
-            self.lock_accounts(write_account_locks, read_account_locks, thread_id);
-            thread_id
-        })
+    ) -> Result<ThreadId, TryLockError> {
+        let schedulable_threads = self
+            .accounts_schedulable_threads(write_account_locks.clone(), read_account_locks.clone())
+            .ok_or(TryLockError::MultipleConflicts)?;
+        let schedulable_threads = schedulable_threads & allowed_threads;
+        if schedulable_threads.is_empty() {
+            return Err(TryLockError::ThreadNotAllowed);
+        }
+
+        let thread_id = thread_selector(schedulable_threads);
+        self.lock_accounts(write_account_locks, read_account_locks, thread_id);
+        Ok(thread_id)
     }
 
     /// Unlocks the accounts for the given thread.
@@ -421,12 +432,36 @@ impl ThreadSet {
 
     #[inline(always)]
     pub(crate) fn contained_threads_iter(self) -> impl Iterator<Item = ThreadId> {
-        (0..MAX_THREADS).filter(move |thread_id| self.contains(*thread_id))
+        ThreadSetIterator(self.0)
     }
 
     #[inline(always)]
     const fn as_flag(thread_id: ThreadId) -> u64 {
         0b1 << thread_id
+    }
+}
+
+struct ThreadSetIterator(u64);
+
+impl Iterator for ThreadSetIterator {
+    type Item = ThreadId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.0 == 0 {
+            None
+        } else {
+            // Find the first set bit by counting trailing zeros.
+            // This is guaranteed to be < 64 because self.0 != 0.
+            let thread_id = self.0.trailing_zeros() as ThreadId;
+            // Clear the lowest set bit. The subtraction is safe because
+            // we know that self.0 != 0.
+            // Example (with 4 bits):
+            //  self.0 = 0b1010           // initial value
+            //  self.0 - 1 = 0b1001       // all bits at or after the lowest set bit are flipped
+            //  0b1010 & 0b1001 = 0b1000  // the lowest bit has been cleared
+            self.0 &= self.0 - 1;
+            Some(thread_id)
+        }
     }
 }
 
@@ -468,7 +503,7 @@ mod tests {
                 TEST_ANY_THREADS,
                 test_thread_selector
             ),
-            None
+            Err(TryLockError::MultipleConflicts)
         );
     }
 
@@ -486,7 +521,25 @@ mod tests {
                 TEST_ANY_THREADS,
                 test_thread_selector
             ),
-            Some(3)
+            Ok(3)
+        );
+    }
+
+    #[test]
+    fn test_try_lock_accounts_one_not_allowed() {
+        let pk1 = Pubkey::new_unique();
+        let pk2 = Pubkey::new_unique();
+        let mut locks = ThreadAwareAccountLocks::new(TEST_NUM_THREADS);
+        locks.write_lock_account(&pk2, 3);
+
+        assert_eq!(
+            locks.try_lock_accounts(
+                [&pk1].into_iter(),
+                [&pk2].into_iter(),
+                ThreadSet::none(),
+                test_thread_selector
+            ),
+            Err(TryLockError::ThreadNotAllowed)
         );
     }
 
@@ -505,7 +558,7 @@ mod tests {
                 TEST_ANY_THREADS - ThreadSet::only(0), // exclude 0
                 test_thread_selector
             ),
-            Some(1)
+            Ok(1)
         );
     }
 
@@ -521,7 +574,7 @@ mod tests {
                 TEST_ANY_THREADS,
                 test_thread_selector
             ),
-            Some(0)
+            Ok(0)
         );
     }
 
@@ -738,5 +791,40 @@ mod tests {
     fn test_thread_set_any_max() {
         let any_threads = ThreadSet::any(MAX_THREADS);
         assert_eq!(any_threads.num_threads(), MAX_THREADS as u32);
+    }
+
+    #[test]
+    fn test_thread_set_iter() {
+        let mut thread_set = ThreadSet::none();
+        assert!(thread_set.contained_threads_iter().next().is_none());
+
+        thread_set.insert(4);
+        assert_eq!(
+            thread_set.contained_threads_iter().collect::<Vec<_>>(),
+            vec![4]
+        );
+
+        thread_set.insert(5);
+        assert_eq!(
+            thread_set.contained_threads_iter().collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        thread_set.insert(63);
+        assert_eq!(
+            thread_set.contained_threads_iter().collect::<Vec<_>>(),
+            vec![4, 5, 63]
+        );
+
+        thread_set.remove(5);
+        assert_eq!(
+            thread_set.contained_threads_iter().collect::<Vec<_>>(),
+            vec![4, 63]
+        );
+
+        let thread_set = ThreadSet::any(64);
+        assert_eq!(
+            thread_set.contained_threads_iter().collect::<Vec<_>>(),
+            (0..64).collect::<Vec<_>>()
+        );
     }
 }

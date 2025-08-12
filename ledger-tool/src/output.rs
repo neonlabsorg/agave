@@ -4,27 +4,34 @@ use {
         ledger_utils::get_program_ids,
     },
     chrono::{Local, TimeZone},
+    itertools::Either,
+    pretty_hex::PrettyHex,
     serde::ser::{Impossible, SerializeSeq, SerializeStruct, Serializer},
     serde_derive::{Deserialize, Serialize},
-    solana_account_decoder::{UiAccount, UiAccountData, UiAccountEncoding},
-    solana_accounts_db::accounts_index::ScanConfig,
+    solana_account::{AccountSharedData, ReadableAccount},
+    solana_accounts_db::{
+        accounts_index::{ScanConfig, ScanOrder},
+        is_loadable::IsLoadable as _,
+    },
     solana_cli_output::{
         display::writeln_transaction, CliAccount, CliAccountNewConfig, OutputFormat, QuietDisplay,
         VerboseDisplay,
     },
-    solana_ledger::blockstore::{Blockstore, BlockstoreError},
-    solana_runtime::bank::{Bank, TotalAccountsStats},
-    solana_sdk::{
-        account::{AccountSharedData, ReadableAccount},
-        clock::{Slot, UnixTimestamp},
-        hash::Hash,
-        native_token::lamports_to_sol,
-        pubkey::Pubkey,
+    solana_clock::{Slot, UnixTimestamp},
+    solana_hash::Hash,
+    solana_ledger::{
+        blockstore::{Blockstore, BlockstoreError},
+        blockstore_meta::{DuplicateSlotProof, ErasureMeta},
+        shred::{Shred, ShredType},
     },
+    solana_native_token::lamports_to_sol,
+    solana_pubkey::Pubkey,
+    solana_runtime::bank::Bank,
+    solana_transaction::versioned::VersionedTransaction,
     solana_transaction_status::{
-        BlockEncodingOptions, ConfirmedBlock, EncodeError, EncodedConfirmedBlock,
+        BlockEncodingOptions, ConfirmedBlock, Encodable, EncodedConfirmedBlock,
         EncodedTransactionWithStatusMeta, EntrySummary, Rewards, TransactionDetails,
-        UiTransactionEncoding, VersionedConfirmedBlockWithEntries,
+        UiTransactionEncoding, VersionedConfirmedBlock, VersionedConfirmedBlockWithEntries,
         VersionedTransactionWithStatusMeta,
     },
     std::{
@@ -120,7 +127,8 @@ impl Display for SlotBankHash {
 fn writeln_entry(f: &mut dyn fmt::Write, i: usize, entry: &CliEntry, prefix: &str) -> fmt::Result {
     writeln!(
         f,
-        "{prefix}Entry {} - num_hashes: {}, hash: {}, transactions: {}, starting_transaction_index: {}",
+        "{prefix}Entry {} - num_hashes: {}, hash: {}, transactions: {}, \
+         starting_transaction_index: {}",
         i, entry.num_hashes, entry.hash, entry.num_transactions, entry.starting_transaction_index,
     )
 }
@@ -298,6 +306,117 @@ impl fmt::Display for CliBlockWithEntries {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CliDuplicateSlotProof {
+    shred1: CliDuplicateShred,
+    shred2: CliDuplicateShred,
+    erasure_consistency: Option<bool>,
+}
+
+impl QuietDisplay for CliDuplicateSlotProof {}
+
+impl VerboseDisplay for CliDuplicateSlotProof {
+    fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        write!(w, "    Shred1 ")?;
+        VerboseDisplay::write_str(&self.shred1, w)?;
+        write!(w, "    Shred2 ")?;
+        VerboseDisplay::write_str(&self.shred2, w)?;
+        if let Some(erasure_consistency) = self.erasure_consistency {
+            writeln!(w, "    Erasure consistency {erasure_consistency}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for CliDuplicateSlotProof {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "    Shred1 {}", self.shred1)?;
+        write!(f, "    Shred2 {}", self.shred2)?;
+        if let Some(erasure_consistency) = self.erasure_consistency {
+            writeln!(f, "    Erasure consistency {erasure_consistency}")?;
+        }
+        Ok(())
+    }
+}
+
+impl From<DuplicateSlotProof> for CliDuplicateSlotProof {
+    fn from(proof: DuplicateSlotProof) -> Self {
+        let shred1 = Shred::new_from_serialized_shred(proof.shred1).unwrap();
+        let shred2 = Shred::new_from_serialized_shred(proof.shred2).unwrap();
+        let erasure_consistency = (shred1.shred_type() == ShredType::Code
+            && shred2.shred_type() == ShredType::Code)
+            .then(|| ErasureMeta::check_erasure_consistency(&shred1, &shred2));
+
+        Self {
+            shred1: CliDuplicateShred::from(shred1),
+            shred2: CliDuplicateShred::from(shred2),
+            erasure_consistency,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliDuplicateShred {
+    fec_set_index: u32,
+    index: u32,
+    shred_type: ShredType,
+    version: u16,
+    merkle_root: Option<Hash>,
+    chained_merkle_root: Option<Hash>,
+    last_in_slot: bool,
+    #[serde(with = "serde_bytes")]
+    payload: Vec<u8>,
+}
+
+impl CliDuplicateShred {
+    fn write_common(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        writeln!(
+            w,
+            "fec_set_index {}, index {}, shred_type {:?}\n       version {}, merkle_root {:?}, \
+             chained_merkle_root {:?}, last_in_slot {}",
+            self.fec_set_index,
+            self.index,
+            self.shred_type,
+            self.version,
+            self.merkle_root,
+            self.chained_merkle_root,
+            self.last_in_slot,
+        )
+    }
+}
+
+impl QuietDisplay for CliDuplicateShred {}
+
+impl VerboseDisplay for CliDuplicateShred {
+    fn write_str(&self, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+        self.write_common(w)?;
+        writeln!(w, "       payload: {:?}", self.payload)
+    }
+}
+
+impl fmt::Display for CliDuplicateShred {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        self.write_common(f)
+    }
+}
+
+impl From<Shred> for CliDuplicateShred {
+    fn from(shred: Shred) -> Self {
+        Self {
+            fec_set_index: shred.fec_set_index(),
+            index: shred.index(),
+            shred_type: shred.shred_type(),
+            version: shred.version(),
+            merkle_root: shred.merkle_root().ok(),
+            chained_merkle_root: shred.chained_merkle_root().ok(),
+            last_in_slot: shred.last_in_slot(),
+            payload: Vec::from(shred.into_payload().bytes),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EncodedConfirmedBlockWithEntries {
     pub previous_blockhash: String,
     pub blockhash: String,
@@ -322,8 +441,7 @@ impl EncodedConfirmedBlockWithEntries {
                 .transactions
                 .get(entry.starting_transaction_index..ending_transaction_index)
                 .ok_or(LedgerToolError::Generic(format!(
-                    "Mismatched entry data and transactions: entry {:?}",
-                    i
+                    "Mismatched entry data and transactions: entry {i:?}"
                 )))?;
             entries.push(CliPopulatedEntry {
                 num_hashes: entry.num_hashes,
@@ -348,22 +466,80 @@ impl EncodedConfirmedBlockWithEntries {
 pub(crate) fn encode_confirmed_block(
     confirmed_block: ConfirmedBlock,
 ) -> Result<EncodedConfirmedBlock> {
-    let encoded_block = confirmed_block
-        .encode_with_options(
-            UiTransactionEncoding::Base64,
-            BlockEncodingOptions {
-                transaction_details: TransactionDetails::Full,
-                show_rewards: true,
-                max_supported_transaction_version: Some(0),
-            },
-        )
-        .map_err(|err| match err {
-            EncodeError::UnsupportedTransactionVersion(version) => LedgerToolError::Generic(
-                format!("Failed to process unsupported transaction version ({version}) in block"),
-            ),
-        })?;
+    let encoded_block = confirmed_block.encode_with_options(
+        UiTransactionEncoding::Base64,
+        BlockEncodingOptions {
+            transaction_details: TransactionDetails::Full,
+            show_rewards: true,
+            max_supported_transaction_version: Some(0),
+        },
+    )?;
+
     let encoded_block: EncodedConfirmedBlock = encoded_block.into();
     Ok(encoded_block)
+}
+
+fn encode_versioned_transactions(block: BlockWithoutMetadata) -> EncodedConfirmedBlock {
+    let transactions = block
+        .transactions
+        .into_iter()
+        .map(|transaction| EncodedTransactionWithStatusMeta {
+            transaction: transaction.encode(UiTransactionEncoding::Base64),
+            meta: None,
+            version: None,
+        })
+        .collect();
+
+    EncodedConfirmedBlock {
+        previous_blockhash: Hash::default().to_string(),
+        blockhash: block.blockhash,
+        parent_slot: block.parent_slot,
+        transactions,
+        rewards: Rewards::default(),
+        num_partitions: None,
+        block_time: None,
+        block_height: None,
+    }
+}
+
+pub enum BlockContents {
+    VersionedConfirmedBlock(VersionedConfirmedBlock),
+    BlockWithoutMetadata(BlockWithoutMetadata),
+}
+
+// A VersionedConfirmedBlock analogue for use when the transaction metadata
+// fields are unavailable. Also supports non-full blocks
+pub struct BlockWithoutMetadata {
+    pub blockhash: String,
+    pub parent_slot: Slot,
+    pub transactions: Vec<VersionedTransaction>,
+}
+
+impl BlockContents {
+    pub fn transactions(&self) -> impl Iterator<Item = &VersionedTransaction> {
+        match self {
+            BlockContents::VersionedConfirmedBlock(block) => Either::Left(
+                block
+                    .transactions
+                    .iter()
+                    .map(|VersionedTransactionWithStatusMeta { transaction, .. }| transaction),
+            ),
+            BlockContents::BlockWithoutMetadata(block) => Either::Right(block.transactions.iter()),
+        }
+    }
+}
+
+impl TryFrom<BlockContents> for EncodedConfirmedBlock {
+    type Error = LedgerToolError;
+
+    fn try_from(block_contents: BlockContents) -> Result<Self> {
+        match block_contents {
+            BlockContents::VersionedConfirmedBlock(block) => {
+                encode_confirmed_block(ConfirmedBlock::from(block))
+            }
+            BlockContents::BlockWithoutMetadata(block) => Ok(encode_versioned_transactions(block)),
+        }
+    }
 }
 
 pub fn output_slot(
@@ -374,34 +550,89 @@ pub fn output_slot(
     verbose_level: u64,
     all_program_ids: &mut HashMap<Pubkey, u64>,
 ) -> Result<()> {
-    if blockstore.is_dead(slot) {
-        if allow_dead_slots {
-            if *output_format == OutputFormat::Display {
-                println!(" Slot is dead");
-            }
-        } else {
-            return Err(LedgerToolError::from(BlockstoreError::DeadSlot));
+    let is_root = blockstore.is_root(slot);
+    let is_dead = blockstore.is_dead(slot);
+    if *output_format == OutputFormat::Display && verbose_level <= 1 {
+        if is_root && is_dead {
+            eprintln!("Slot {slot} is marked as both a root and dead, this shouldn't be possible");
         }
+        println!(
+            "Slot {slot}{}",
+            if is_root {
+                " (root)"
+            } else if is_dead {
+                " (dead)"
+            } else {
+                ""
+            }
+        );
+    }
+
+    if is_dead && !allow_dead_slots {
+        return Err(LedgerToolError::from(BlockstoreError::DeadSlot));
     }
 
     let Some(meta) = blockstore.meta(slot)? else {
         return Ok(());
     };
-    let VersionedConfirmedBlockWithEntries { block, entries } = blockstore
-        .get_complete_block_with_entries(
-            slot,
-            /*require_previous_blockhash:*/ false,
-            /*populate_entries:*/ true,
-            allow_dead_slots,
-        )?;
+    let (block_contents, entries) = match blockstore.get_complete_block_with_entries(
+        slot,
+        /*require_previous_blockhash:*/ false,
+        /*populate_entries:*/ true,
+        allow_dead_slots,
+    ) {
+        Ok(VersionedConfirmedBlockWithEntries { block, entries }) => {
+            (BlockContents::VersionedConfirmedBlock(block), entries)
+        }
+        Err(_) => {
+            // Transaction metadata could be missing, try to fetch just the
+            // entries and leave the metadata fields empty
+            let (entries, _, _) = blockstore.get_slot_entries_with_shred_info(
+                slot,
+                /*shred_start_index:*/ 0,
+                allow_dead_slots,
+            )?;
+
+            let blockhash = entries
+                .last()
+                .filter(|_| meta.is_full())
+                .map(|entry| entry.hash)
+                .unwrap_or(Hash::default());
+            let parent_slot = meta.parent_slot.unwrap_or(0);
+
+            let mut entry_summaries = Vec::with_capacity(entries.len());
+            let mut starting_transaction_index = 0;
+            let transactions = entries
+                .into_iter()
+                .flat_map(|entry| {
+                    entry_summaries.push(EntrySummary {
+                        num_hashes: entry.num_hashes,
+                        hash: entry.hash,
+                        num_transactions: entry.transactions.len() as u64,
+                        starting_transaction_index,
+                    });
+                    starting_transaction_index += entry.transactions.len();
+
+                    entry.transactions
+                })
+                .collect();
+
+            let block = BlockWithoutMetadata {
+                blockhash: blockhash.to_string(),
+                parent_slot,
+                transactions,
+            };
+            (BlockContents::BlockWithoutMetadata(block), entry_summaries)
+        }
+    };
 
     if verbose_level == 0 {
         if *output_format == OutputFormat::Display {
             // Given that Blockstore::get_complete_block_with_entries() returned Ok(_), we know
             // that we have a full block so meta.consumed is the number of shreds in the block
             println!(
-                "  num_shreds: {}, parent_slot: {:?}, next_slots: {:?}, num_entries: {}, \
-                 is_full: {}",
+                "  num_shreds: {}, parent_slot: {:?}, next_slots: {:?}, num_entries: {}, is_full: \
+                 {}",
                 meta.consumed,
                 meta.parent_slot,
                 meta.next_slots,
@@ -417,24 +648,23 @@ pub fn output_slot(
             for entry in entries.iter() {
                 num_hashes += entry.num_hashes;
             }
+            let blockhash = entries
+                .last()
+                .filter(|_| meta.is_full())
+                .map(|entry| entry.hash)
+                .unwrap_or(Hash::default());
 
-            let blockhash = if let Some(entry) = entries.last() {
-                entry.hash
-            } else {
-                Hash::default()
-            };
-
-            let transactions = block.transactions.len();
+            let mut num_transactions = 0;
             let mut program_ids = HashMap::new();
-            for VersionedTransactionWithStatusMeta { transaction, .. } in block.transactions.iter()
-            {
+
+            for transaction in block_contents.transactions() {
+                num_transactions += 1;
                 for program_id in get_program_ids(transaction) {
                     *program_ids.entry(*program_id).or_insert(0) += 1;
                 }
             }
-
             println!(
-                "  Transactions: {transactions}, hashes: {num_hashes}, block_hash: {blockhash}",
+                "  Transactions: {num_transactions}, hashes: {num_hashes}, block_hash: {blockhash}",
             );
             for (pubkey, count) in program_ids.iter() {
                 *all_program_ids.entry(*pubkey).or_insert(0) += count;
@@ -443,7 +673,7 @@ pub fn output_slot(
             output_sorted_program_ids(program_ids);
         }
     } else {
-        let encoded_block = encode_confirmed_block(ConfirmedBlock::from(block))?;
+        let encoded_block = EncodedConfirmedBlock::try_from(block_contents)?;
         let cli_block = CliBlockWithEntries {
             encoded_confirmed_block: EncodedConfirmedBlockWithEntries::try_from(
                 encoded_block,
@@ -477,23 +707,12 @@ pub fn output_ledger(
     let num_slots = num_slots.unwrap_or(Slot::MAX);
     let mut num_printed = 0;
     let mut all_program_ids = HashMap::new();
-    for (slot, slot_meta) in slot_iterator {
+    for (slot, _slot_meta) in slot_iterator {
         if only_rooted && !blockstore.is_root(slot) {
             continue;
         }
         if slot > ending_slot {
             break;
-        }
-
-        match output_format {
-            OutputFormat::Display => {
-                println!("Slot {} root?: {}", slot, blockstore.is_root(slot))
-            }
-            OutputFormat::Json => {
-                serde_json::to_writer(stdout(), &slot_meta)?;
-                stdout().write_all(b",\n")?;
-            }
-            _ => unreachable!(),
         }
 
         if let Err(err) = output_slot(
@@ -549,10 +768,8 @@ pub enum AccountsOutputMode {
 
 pub struct AccountsOutputConfig {
     pub mode: AccountsOutputMode,
+    pub output_config: Option<CliAccountNewConfig>,
     pub include_sysvars: bool,
-    pub include_account_contents: bool,
-    pub include_account_data: bool,
-    pub account_data_encoding: UiAccountEncoding,
 }
 
 impl AccountsOutputStreamer {
@@ -603,6 +820,33 @@ impl AccountsOutputStreamer {
     }
 }
 
+/// Struct to collect stats when scanning all accounts for AccountsOutputStreamer
+#[derive(Debug, Default, Copy, Clone, Serialize)]
+pub struct TotalAccountsStats {
+    /// Total number of accounts
+    pub num_accounts: usize,
+    /// Total data size of all accounts
+    pub data_len: usize,
+
+    /// Total number of executable accounts
+    pub num_executable_accounts: usize,
+    /// Total data size of executable accounts
+    pub executable_data_len: usize,
+}
+
+impl TotalAccountsStats {
+    pub fn accumulate_account(&mut self, account: &AccountSharedData) {
+        let data_len = account.data().len();
+        self.num_accounts += 1;
+        self.data_len += data_len;
+
+        if account.executable() {
+            self.num_executable_accounts += 1;
+            self.executable_data_len += data_len;
+        }
+    }
+}
+
 struct AccountsScanner {
     bank: Arc<Bank>,
     total_accounts_stats: Rc<RefCell<TotalAccountsStats>>,
@@ -612,8 +856,8 @@ struct AccountsScanner {
 impl AccountsScanner {
     /// Returns true if this account should be included in the output
     fn should_process_account(&self, account: &AccountSharedData) -> bool {
-        solana_accounts_db::accounts::Accounts::is_loadable(account.lamports())
-            && (self.config.include_sysvars || !solana_sdk::sysvar::check_id(account.owner()))
+        account.is_loadable()
+            && (self.config.include_sysvars || !solana_sdk_ids::sysvar::check_id(account.owner()))
     }
 
     fn maybe_output_account<S>(
@@ -621,24 +865,26 @@ impl AccountsScanner {
         seq_serializer: &mut Option<S>,
         pubkey: &Pubkey,
         account: &AccountSharedData,
-        slot: Option<Slot>,
-        cli_account_new_config: &CliAccountNewConfig,
     ) where
         S: SerializeSeq,
     {
-        if self.config.include_account_contents {
+        if let Some(output_config) = &self.config.output_config {
+            let cli_account = CliAccount::new_with_config(pubkey, account, output_config);
+
             if let Some(serializer) = seq_serializer {
-                let cli_account =
-                    CliAccount::new_with_config(pubkey, account, cli_account_new_config);
                 serializer.serialize_element(&cli_account).unwrap();
             } else {
-                output_account(
-                    pubkey,
-                    account,
-                    slot,
-                    self.config.include_account_data,
-                    self.config.account_data_encoding,
-                );
+                print!("{}", &cli_account);
+                // CliAccount doesn't print the account data payload so handle
+                // that separately. If --no-account-data was specified,
+                // output_config.data_slice_config will have been created to
+                // yield an empty slice which will make data.empty() below true
+                let account_data = cli_account.keyed_account.account.data.decode();
+                if let Some(data) = account_data {
+                    if !data.is_empty() {
+                        println!("{:?}", data.hex_dump());
+                    }
+                }
             }
         }
     }
@@ -648,25 +894,12 @@ impl AccountsScanner {
         S: SerializeSeq,
     {
         let mut total_accounts_stats = self.total_accounts_stats.borrow_mut();
-        let rent_collector = self.bank.rent_collector();
-
-        let cli_account_new_config = CliAccountNewConfig {
-            data_encoding: self.config.account_data_encoding,
-            ..CliAccountNewConfig::default()
-        };
-
         let scan_func = |account_tuple: Option<(&Pubkey, AccountSharedData, Slot)>| {
-            if let Some((pubkey, account, slot)) =
+            if let Some((pubkey, account, _slot)) =
                 account_tuple.filter(|(_, account, _)| self.should_process_account(account))
             {
-                total_accounts_stats.accumulate_account(pubkey, &account, rent_collector);
-                self.maybe_output_account(
-                    seq_serializer,
-                    pubkey,
-                    &account,
-                    Some(slot),
-                    &cli_account_new_config,
-                );
+                total_accounts_stats.accumulate_account(&account);
+                self.maybe_output_account(seq_serializer, pubkey, &account);
             }
         };
 
@@ -675,36 +908,24 @@ impl AccountsScanner {
                 self.bank.scan_all_accounts(scan_func, true).unwrap();
             }
             AccountsOutputMode::Individual(pubkeys) => pubkeys.iter().for_each(|pubkey| {
-                if let Some((account, slot)) = self
+                if let Some((account, _slot)) = self
                     .bank
                     .get_account_modified_slot_with_fixed_root(pubkey)
                     .filter(|(account, _)| self.should_process_account(account))
                 {
-                    total_accounts_stats.accumulate_account(pubkey, &account, rent_collector);
-                    self.maybe_output_account(
-                        seq_serializer,
-                        pubkey,
-                        &account,
-                        Some(slot),
-                        &cli_account_new_config,
-                    );
+                    total_accounts_stats.accumulate_account(&account);
+                    self.maybe_output_account(seq_serializer, pubkey, &account);
                 }
             }),
             AccountsOutputMode::Program(program_pubkey) => self
                 .bank
-                .get_program_accounts(program_pubkey, &ScanConfig::new(false))
+                .get_program_accounts(program_pubkey, &ScanConfig::new(ScanOrder::Sorted))
                 .unwrap()
                 .iter()
                 .filter(|(_, account)| self.should_process_account(account))
                 .for_each(|(pubkey, account)| {
-                    total_accounts_stats.accumulate_account(pubkey, account, rent_collector);
-                    self.maybe_output_account(
-                        seq_serializer,
-                        pubkey,
-                        account,
-                        None,
-                        &cli_account_new_config,
-                    );
+                    total_accounts_stats.accumulate_account(account);
+                    self.maybe_output_account(seq_serializer, pubkey, account);
                 }),
         }
     }
@@ -721,40 +942,24 @@ impl serde::Serialize for AccountsScanner {
     }
 }
 
-pub fn output_account(
-    pubkey: &Pubkey,
-    account: &AccountSharedData,
-    modified_slot: Option<Slot>,
-    print_account_data: bool,
-    encoding: UiAccountEncoding,
-) {
-    println!("{pubkey}:");
-    println!("  balance: {} SOL", lamports_to_sol(account.lamports()));
-    println!("  owner: '{}'", account.owner());
-    println!("  executable: {}", account.executable());
-    if let Some(slot) = modified_slot {
-        println!("  slot: {slot}");
-    }
-    println!("  rent_epoch: {}", account.rent_epoch());
-    println!("  data_len: {}", account.data().len());
-    if print_account_data {
-        let account_data = UiAccount::encode(pubkey, account, encoding, None, None).data;
-        match account_data {
-            UiAccountData::Binary(data, data_encoding) => {
-                println!("  data: '{data}'");
-                println!(
-                    "  encoding: {}",
-                    serde_json::to_string(&data_encoding).unwrap()
-                );
+#[derive(Serialize, Deserialize)]
+pub struct CliAccounts {
+    pub accounts: Vec<CliAccount>,
+}
+
+impl fmt::Display for CliAccounts {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for account in &self.accounts {
+            write!(f, "{account}")?;
+            let account_data = account.keyed_account.account.data.decode();
+            if let Some(data) = account_data {
+                if !data.is_empty() {
+                    writeln!(f, "{:?}", data.hex_dump())?;
+                }
             }
-            UiAccountData::Json(account_data) => {
-                println!(
-                    "  data: '{}'",
-                    serde_json::to_string(&account_data).unwrap()
-                );
-                println!("  encoding: \"jsonParsed\"");
-            }
-            UiAccountData::LegacyBinary(_) => {}
-        };
+        }
+        Ok(())
     }
 }
+impl QuietDisplay for CliAccounts {}
+impl VerboseDisplay for CliAccounts {}

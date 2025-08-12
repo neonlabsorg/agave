@@ -1,19 +1,17 @@
 use {
+    solana_account_info::{next_account_info, AccountInfo},
+    solana_instruction::{AccountMeta, Instruction},
+    solana_keypair::Keypair,
+    solana_msg::msg,
+    solana_program::{instruction::get_stack_height, program::invoke},
+    solana_program_entrypoint::{ProgramResult, MAX_PERMITTED_DATA_INCREASE},
     solana_program_test::{processor, ProgramTest},
-    solana_sdk::{
-        account_info::{next_account_info, AccountInfo},
-        entrypoint::{ProgramResult, MAX_PERMITTED_DATA_INCREASE},
-        instruction::{get_stack_height, AccountMeta, Instruction},
-        msg,
-        program::invoke,
-        pubkey::Pubkey,
-        rent::Rent,
-        signature::Signer,
-        signer::keypair::Keypair,
-        system_instruction, system_program,
-        sysvar::Sysvar,
-        transaction::Transaction,
-    },
+    solana_pubkey::Pubkey,
+    solana_rent::Rent,
+    solana_signer::Signer,
+    solana_system_interface::{instruction as system_instruction, program as system_program},
+    solana_sysvar::Sysvar,
+    solana_transaction::Transaction,
 };
 
 // Process instruction to invoke into another program
@@ -129,7 +127,7 @@ async fn cpi() {
         processor!(invoked_process_instruction),
     );
 
-    let mut context = program_test.start_with_context().await;
+    let context = program_test.start_with_context().await;
     let instructions = vec![Instruction::new_with_bincode(
         invoker_program_id,
         &[0],
@@ -165,7 +163,7 @@ async fn cpi_dupes() {
         processor!(invoked_process_instruction),
     );
 
-    let mut context = program_test.start_with_context().await;
+    let context = program_test.start_with_context().await;
     let instructions = vec![Instruction::new_with_bincode(
         invoker_program_id,
         &[0],
@@ -201,7 +199,7 @@ async fn cpi_create_account() {
     );
 
     let create_account_keypair = Keypair::new();
-    let mut context = program_test.start_with_context().await;
+    let context = program_test.start_with_context().await;
     let instructions = vec![Instruction::new_with_bincode(
         create_account_program_id,
         &[0],
@@ -272,7 +270,7 @@ async fn stack_height() {
         processor!(invoked_stack_height),
     );
 
-    let mut context = program_test.start_with_context().await;
+    let context = program_test.start_with_context().await;
     let instructions = vec![Instruction::new_with_bytes(
         invoker_stack_height_program_id,
         &[],

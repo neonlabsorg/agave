@@ -8,11 +8,10 @@ use {
     },
     solana_cli_output::{CliAddressLookupTable, CliAddressLookupTableCreated, OutputFormat},
     solana_faucet::faucet::run_local_faucet,
-    solana_sdk::{
-        native_token::LAMPORTS_PER_SOL,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-    },
+    solana_keypair::Keypair,
+    solana_native_token::LAMPORTS_PER_SOL,
+    solana_pubkey::Pubkey,
+    solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
     solana_test_validator::TestValidator,
     std::str::FromStr,
@@ -43,7 +42,6 @@ fn test_cli_create_extend_and_freeze_address_lookup_table() {
     config.command =
         CliCommand::AddressLookupTable(AddressLookupTableCliCommand::CreateLookupTable {
             authority_pubkey: keypair.pubkey(),
-            authority_signer_index: None,
             payer_signer_index: 0,
         });
     let response: CliAddressLookupTableCreated =
@@ -158,7 +156,6 @@ fn test_cli_create_and_deactivate_address_lookup_table() {
     config.command =
         CliCommand::AddressLookupTable(AddressLookupTableCliCommand::CreateLookupTable {
             authority_pubkey: keypair.pubkey(),
-            authority_signer_index: Some(0),
             payer_signer_index: 0,
         });
     let response: CliAddressLookupTableCreated =

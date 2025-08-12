@@ -28,22 +28,17 @@ source ci/rust-version.sh nightly
 # as normal (not dev) dependencies, only if you're sure that there's good
 # reason to bend dev-context-only-utils's original intention and that listed
 # package isn't part of released binaries.
-declare tainted_packages=(
-  solana-accounts-bench
-  solana-banking-bench
-  agave-ledger-tool
-  solana-bench-tps
-  agave-store-tool
-  agave-accounts-hash-cache-tool
-)
+source scripts/dcou-tainted-packages.sh
 
 # convert to comma separeted (ref: https://stackoverflow.com/a/53839433)
-printf -v allowed '"%s",' "${tainted_packages[@]}"
+printf -v allowed '"%s",' "${dcou_tainted_packages[@]}"
 allowed="${allowed%,}"
 
 mode=${1:-full}
+# consume the mode, so that other arguments are forwarded to cargo-hack
+shift
 case "$mode" in
-  tree | check-bins | check-all-targets | full)
+  tree | check-bins-and-lib | check-all-targets | full)
     ;;
   *)
     echo "$0: unrecognized mode: $mode";
@@ -156,9 +151,18 @@ fi
 # consistency with other CI steps and for the possibility of new similar lints.
 export RUSTFLAGS="-D warnings -Z threads=8 $RUSTFLAGS"
 
-if [[ $mode = "check-bins" || $mode = "full" ]]; then
-  _ cargo "+${rust_nightly}" hack check --bins
+# As this environment value is used by the rather deep crate of our dep graph
+# (solana-varsion), this could invalidate significant portion of caches when
+# this changes just with a new tiny commit. Technically, it's possible for
+# CI_COMMIT to affect the outcome of compilation via build.rs, but it's
+# extremely unrealistic for such diverting compilation behaviors to be desired
+# as a sane use-case. So, just unset CI_COMMIT unconditionally to increase
+# cache efficiency.
+unset CI_COMMIT
+
+if [[ $mode = "check-bins-and-lib" || $mode = "full" ]]; then
+  _ cargo "+${rust_nightly}" hack "$@" check
 fi
 if [[ $mode = "check-all-targets" || $mode = "full" ]]; then
-  _ cargo "+${rust_nightly}" hack check --all-targets
+  _ cargo "+${rust_nightly}" hack "$@" check --all-targets
 fi

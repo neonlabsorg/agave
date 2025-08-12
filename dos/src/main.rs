@@ -5,6 +5,7 @@
 //!
 //! * `mode` argument defines interface to use (e.g. rpc, tvu, tpu)
 //! * `data-type` argument specifies the type of the request.
+//!
 //! Some request types might be used only with particular `mode` value.
 //! For example, `get-account-info` is valid only with `mode=rpc`.
 //!
@@ -16,27 +17,27 @@
 //! The following configurations are suggested:
 //! Let `COMMON="--mode tpu --data-type transaction --unique-transactions"`
 //! 1. Without blockhash or payer:
-//! 1.1 With invalid signatures
-//! ```bash
-//! solana-dos $COMMON --num-signatures 8
-//! ```
-//! 1.2 With valid signatures
-//! ```bash
-//! solana-dos $COMMON --valid-signatures --num-signatures 8
-//! ```
+//!    1.1 With invalid signatures
+//!    ```bash
+//!    solana-dos $COMMON --num-signatures 8
+//!    ```
+//!    1.2 With valid signatures
+//!    ```bash
+//!    solana-dos $COMMON --valid-signatures --num-signatures 8
+//!    ```
 //! 2. With blockhash and payer:
-//! 2.1 Single-instruction transaction
-//! ```bash
-//! solana-dos $COMMON --valid-blockhash --transaction-type transfer --num-instructions 1
-//! ```
-//! 2.2 Multi-instruction transaction
-//! ```bash
-//! solana-dos $COMMON --valid-blockhash --transaction-type transfer --num-instructions 8
-//! ```
-//! 2.3 Account-creation transaction
-//! ```bash
-//! solana-dos $COMMON --valid-blockhash --transaction-type account-creation
-//! ```
+//!    2.1 Single-instruction transaction
+//!    ```bash
+//!    solana-dos $COMMON --valid-blockhash --transaction-type transfer --num-instructions 1
+//!    ```
+//!    2.2 Multi-instruction transaction
+//!    ```bash
+//!    solana-dos $COMMON --valid-blockhash --transaction-type transfer --num-instructions 8
+//!    ```
+//!    2.3 Account-creation transaction
+//!    ```bash
+//!    solana-dos $COMMON --valid-blockhash --transaction-type account-creation
+//!    ```
 //!
 #![allow(clippy::arithmetic_side_effects)]
 #![allow(deprecated)]
@@ -46,35 +47,35 @@ use {
     log::*,
     rand::{thread_rng, Rng},
     solana_bench_tps::bench::generate_and_fund_keypairs,
-    solana_client::{
-        connection_cache::ConnectionCache, tpu_client::TpuClientWrapper,
-        tpu_connection::TpuConnection,
-    },
+    solana_client::{connection_cache::ConnectionCache, tpu_client::TpuClientWrapper},
+    solana_connection_cache::client_connection::ClientConnection as TpuConnection,
     solana_core::repair::serve_repair::{RepairProtocol, RepairRequestHeader, ServeRepair},
     solana_dos::cli::*,
     solana_gossip::{
         contact_info::{ContactInfo, Protocol},
         gossip_service::{discover, get_client},
     },
+    solana_hash::Hash,
+    solana_keypair::Keypair,
     solana_measure::measure::Measure,
+    solana_message::{compiled_instruction::CompiledInstruction, Message},
+    solana_net_utils::bind_to_unspecified,
+    solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        hash::Hash,
-        instruction::CompiledInstruction,
-        message::Message,
-        pubkey::Pubkey,
-        signature::{Keypair, Signature, Signer},
-        stake,
-        system_instruction::{self, SystemInstruction},
-        system_program,
-        timing::timestamp,
-        transaction::Transaction,
-    },
+    solana_signature::Signature,
+    solana_signer::Signer,
+    solana_stake_interface as stake,
     solana_streamer::socket::SocketAddrSpace,
+    solana_system_interface::{
+        instruction::{self as system_instruction, SystemInstruction},
+        program as system_program,
+    },
+    solana_time_utils::timestamp,
     solana_tps_client::TpsClient,
     solana_tpu_client::tpu_client::DEFAULT_TPU_CONNECTION_POOL_SIZE,
+    solana_transaction::Transaction,
     std::{
-        net::{SocketAddr, UdpSocket},
+        net::SocketAddr,
         process::exit,
         sync::Arc,
         thread,
@@ -91,12 +92,12 @@ fn compute_rate_per_second(count: usize) -> usize {
 /// Provide functionality to generate several types of transactions:
 ///
 /// 1. Without blockhash
-/// 1.1 With valid signatures (number of signatures is configurable)
-/// 1.2 With invalid signatures (number of signatures is configurable)
+///    1.1 With valid signatures (number of signatures is configurable)
+///    1.2 With invalid signatures (number of signatures is configurable)
 ///
 /// 2. With blockhash (but still deliberately invalid):
-/// 2.1 Transfer from 1 payer to multiple destinations (many instructions per transaction)
-/// 2.2 Create an account
+///    2.1 Transfer from 1 payer to multiple destinations (many instructions per transaction)
+///    2.2 Create an account
 ///
 #[derive(Clone)]
 struct TransactionGenerator {
@@ -259,14 +260,13 @@ fn create_sender_thread(
     tpu_use_quic: bool,
 ) -> thread::JoinHandle<()> {
     // ConnectionCache is used instead of client because it gives ~6% higher pps
-    let connection_cache = match tpu_use_quic {
-        true => ConnectionCache::new_quic(
+    let connection_cache = if tpu_use_quic {
+        ConnectionCache::new_quic(
             "connection_cache_dos_quic",
             DEFAULT_TPU_CONNECTION_POOL_SIZE,
-        ),
-        false => {
-            ConnectionCache::with_udp("connection_cache_dos_udp", DEFAULT_TPU_CONNECTION_POOL_SIZE)
-        }
+        )
+    } else {
+        ConnectionCache::with_udp("connection_cache_dos_udp", DEFAULT_TPU_CONNECTION_POOL_SIZE)
     };
     let connection = connection_cache.get_connection(target);
 
@@ -307,7 +307,7 @@ fn create_sender_thread(
                             stats_count += len;
                             total_count += len;
                             if iterations != 0 && total_count >= iterations {
-                                info!("All transactions has been sent");
+                                info!("All transactions have been sent");
                                 // dropping receiver to signal generator threads to stop
                                 drop(tx_receiver);
                                 break;
@@ -361,7 +361,7 @@ fn create_generator_thread<T: 'static + TpsClient + Send + Sync>(
     // and hence this choice of n provides large enough number of permutations
     let mut keypairs_flat: Vec<Keypair> = Vec::new();
     // 1000 is arbitrary number. In case of permutation_size > 1,
-    // this guaranties large enough set of unique permutations
+    // this guarantees large enough set of unique permutations
     let permutation_size = get_permutation_size(
         transaction_params.num_signatures.as_ref(),
         transaction_params.num_instructions.as_ref(),
@@ -434,7 +434,7 @@ fn get_target(
     let mut target = None;
     if nodes.is_empty() {
         // skip-gossip case
-        target = Some((solana_sdk::pubkey::new_rand(), entrypoint_addr));
+        target = Some((solana_pubkey::new_rand(), entrypoint_addr));
     } else {
         info!("************ NODE ***********");
         for node in nodes {
@@ -443,7 +443,7 @@ fn get_target(
         info!("ADDR = {}", entrypoint_addr);
 
         for node in nodes {
-            if node.gossip().ok() == Some(entrypoint_addr) {
+            if node.gossip() == Some(entrypoint_addr) {
                 info!("{:?}", node.gossip());
                 target = match mode {
                     Mode::Gossip => Some((*node.pubkey(), node.gossip().unwrap())),
@@ -476,7 +476,7 @@ fn get_rpc_client(
 
     // find target node
     for node in nodes {
-        if node.gossip().ok() == Some(entrypoint_addr) {
+        if node.gossip() == Some(entrypoint_addr) {
             info!("{:?}", node.gossip());
             return Ok(RpcClient::new_socket(node.rpc().unwrap()));
         }
@@ -551,7 +551,7 @@ fn create_payers<T: 'static + TpsClient + Send + Sync>(
     // Assume that if we use valid blockhash, we also have a payer
     if valid_blockhash {
         // each payer is used to fund transaction
-        // transactions are built to be invalid so the the amount here is arbitrary
+        // transactions are built to be invalid so the amount here is arbitrary
         let funding_key = Keypair::new();
         let funding_key = Arc::new(funding_key);
         let res = generate_and_fund_keypairs(
@@ -726,7 +726,7 @@ fn run_dos<T: 'static + TpsClient + Send + Sync>(
             _ => panic!("Unsupported data_type detected"),
         };
 
-        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let socket = bind_to_unspecified().unwrap();
         let mut last_log = Instant::now();
         let mut total_count: usize = 0;
         let mut count: usize = 0;
@@ -761,7 +761,18 @@ fn run_dos<T: 'static + TpsClient + Send + Sync>(
 
 fn main() {
     solana_logger::setup_with_default_filter();
-    let cmd_params = build_cli_parameters();
+    let mut cmd_params = build_cli_parameters();
+
+    if !cmd_params.skip_gossip && cmd_params.shred_version.is_none() {
+        // Try to get shred version from the entrypoint
+        cmd_params.shred_version = Some(
+            solana_net_utils::get_cluster_shred_version(&cmd_params.entrypoint_addr)
+                .unwrap_or_else(|err| {
+                    eprintln!("Failed to get shred version: {}", err);
+                    exit(1);
+                }),
+        );
+    }
 
     let (nodes, client) = if !cmd_params.skip_gossip {
         info!("Finding cluster entry: {:?}", cmd_params.entrypoint_addr);
@@ -774,7 +785,7 @@ fn main() {
             None,                              // find_nodes_by_pubkey
             Some(&cmd_params.entrypoint_addr), // find_node_by_gossip_addr
             None,                              // my_gossip_addr
-            0,                                 // my_shred_version
+            cmd_params.shred_version.unwrap(), // my_shred_version
             socket_addr_space,
         )
         .unwrap_or_else(|err| {
@@ -828,7 +839,7 @@ pub mod test {
         },
         solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool},
         solana_rpc::rpc::JsonRpcConfig,
-        solana_sdk::timing::timestamp,
+        solana_time_utils::timestamp,
         solana_tpu_client::tpu_client::TpuClient,
     };
 
@@ -845,7 +856,7 @@ pub mod test {
     #[test]
     fn test_dos() {
         let nodes = [ContactInfo::new_localhost(
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             timestamp(),
         )];
         let entrypoint_addr = nodes[0].gossip().unwrap();
@@ -860,6 +871,7 @@ pub mod test {
                 data_type: DataType::Random,
                 data_input: None,
                 skip_gossip: false,
+                shred_version: Some(42),
                 allow_private_addr: false,
                 num_gen_threads: 1,
                 transaction_params: TransactionParams::default(),
@@ -881,6 +893,7 @@ pub mod test {
                 data_type: DataType::RepairHighest,
                 data_input: None,
                 skip_gossip: false,
+                shred_version: Some(42),
                 allow_private_addr: false,
                 num_gen_threads: 1,
                 transaction_params: TransactionParams::default(),
@@ -899,6 +912,7 @@ pub mod test {
                 data_type: DataType::RepairShred,
                 data_input: None,
                 skip_gossip: false,
+                shred_version: Some(42),
                 allow_private_addr: false,
                 num_gen_threads: 1,
                 transaction_params: TransactionParams::default(),
@@ -917,6 +931,7 @@ pub mod test {
                 data_type: DataType::GetAccountInfo,
                 data_input: Some(Pubkey::default()),
                 skip_gossip: false,
+                shred_version: Some(42),
                 allow_private_addr: false,
                 num_gen_threads: 1,
                 transaction_params: TransactionParams::default(),
@@ -950,6 +965,7 @@ pub mod test {
                 data_type: DataType::Random,
                 data_input: None,
                 skip_gossip: false,
+                shred_version: Some(42),
                 allow_private_addr: false,
                 num_gen_threads: 1,
                 transaction_params: TransactionParams::default(),
@@ -971,9 +987,13 @@ pub mod test {
         let node = cluster.get_contact_info(&nodes[0]).unwrap().clone();
         let nodes_slice = [node];
 
-        let client = Arc::new(cluster.build_tpu_quic_client().unwrap_or_else(|err| {
-            panic!("Could not create TpuClient with Quic Cache {err:?}");
-        }));
+        let client = Arc::new(
+            cluster
+                .build_validator_tpu_quic_client(cluster.entry_point_info.pubkey())
+                .unwrap_or_else(|err| {
+                    panic!("Could not create TpuClient with Quic Cache {err:?}");
+                }),
+        );
 
         // creates one transaction with 8 valid signatures and sends it 10 times
         run_dos(
@@ -987,6 +1007,7 @@ pub mod test {
                 data_type: DataType::Transaction,
                 data_input: None,
                 skip_gossip: false,
+                shred_version: Some(42),
                 allow_private_addr: false,
                 num_gen_threads: 1,
                 transaction_params: TransactionParams {
@@ -1014,6 +1035,7 @@ pub mod test {
                 data_type: DataType::Transaction,
                 data_input: None,
                 skip_gossip: false,
+                shred_version: Some(42),
                 allow_private_addr: false,
                 num_gen_threads: 1,
                 transaction_params: TransactionParams {
@@ -1041,6 +1063,7 @@ pub mod test {
                 data_type: DataType::Transaction,
                 data_input: None,
                 skip_gossip: false,
+                shred_version: Some(42),
                 allow_private_addr: false,
                 num_gen_threads: 1,
                 transaction_params: TransactionParams {
@@ -1076,7 +1099,7 @@ pub mod test {
         let cluster = LocalCluster::new(
             &mut ClusterConfig {
                 node_stakes: vec![999_990; num_nodes],
-                cluster_lamports: 200_000_000,
+                mint_lamports: 200_000_000,
                 validator_configs: make_identical_validator_configs(
                     &ValidatorConfig {
                         rpc_config: JsonRpcConfig {
@@ -1101,9 +1124,13 @@ pub mod test {
         let node = cluster.get_contact_info(&nodes[0]).unwrap().clone();
         let nodes_slice = [node];
 
-        let client = Arc::new(cluster.build_tpu_quic_client().unwrap_or_else(|err| {
-            panic!("Could not create TpuClient with Quic Cache {err:?}");
-        }));
+        let client = Arc::new(
+            cluster
+                .build_validator_tpu_quic_client(cluster.entry_point_info.pubkey())
+                .unwrap_or_else(|err| {
+                    panic!("Could not create TpuClient with Quic Cache {err:?}");
+                }),
+        );
 
         // creates one transaction and sends it 10 times
         // this is done in single thread
@@ -1118,6 +1145,7 @@ pub mod test {
                 data_type: DataType::Transaction,
                 data_input: None,
                 skip_gossip: false,
+                shred_version: Some(42),
                 allow_private_addr: false,
                 num_gen_threads: 1,
                 transaction_params: TransactionParams {
@@ -1147,6 +1175,7 @@ pub mod test {
                 data_type: DataType::Transaction,
                 data_input: None,
                 skip_gossip: false,
+                shred_version: Some(42),
                 allow_private_addr: false,
                 num_gen_threads: 1,
                 transaction_params: TransactionParams {
@@ -1175,6 +1204,7 @@ pub mod test {
                 data_type: DataType::Transaction,
                 data_input: None,
                 skip_gossip: false,
+                shred_version: Some(42),
                 allow_private_addr: false,
                 num_gen_threads: 1,
                 transaction_params: TransactionParams {
@@ -1203,6 +1233,7 @@ pub mod test {
                 data_type: DataType::Transaction,
                 data_input: None,
                 skip_gossip: false,
+                shred_version: Some(42),
                 allow_private_addr: false,
                 num_gen_threads: 1,
                 transaction_params: TransactionParams {

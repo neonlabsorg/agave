@@ -1,15 +1,13 @@
 use {
-    crate::crds_value::{new_rand_timestamp, sanitize_wallclock},
+    crate::crds_data::{new_rand_timestamp, sanitize_wallclock},
     bv::BitVec,
     itertools::Itertools,
     rand::Rng,
-    solana_sdk::{
-        clock::Slot,
-        hash::Hash,
-        pubkey::Pubkey,
-        sanitize::{Sanitize, SanitizeError},
-        serde_varint,
-    },
+    solana_clock::Slot,
+    solana_hash::Hash,
+    solana_pubkey::Pubkey,
+    solana_sanitize::{Sanitize, SanitizeError},
+    solana_serde_varint as serde_varint,
     thiserror::Error,
 };
 
@@ -112,7 +110,7 @@ impl RestartLastVotedForkSlots {
 
     /// New random Version for tests and benchmarks.
     pub(crate) fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
-        let pubkey = pubkey.unwrap_or_else(solana_sdk::pubkey::new_rand);
+        let pubkey = pubkey.unwrap_or_else(solana_pubkey::new_rand);
         let num_slots = rng.gen_range(2..20);
         let slots = std::iter::repeat_with(|| 47825632 + rng.gen_range(0..512))
             .take(num_slots)
@@ -148,7 +146,7 @@ impl Sanitize for RestartHeaviestFork {
 
 impl RestartHeaviestFork {
     pub(crate) fn new_rand<R: Rng>(rng: &mut R, from: Option<Pubkey>) -> Self {
-        let from = from.unwrap_or_else(solana_sdk::pubkey::new_rand);
+        let from = from.unwrap_or_else(solana_pubkey::new_rand);
         Self {
             from,
             wallclock: new_rand_timestamp(rng),
@@ -167,7 +165,7 @@ impl RunLengthEncoding {
             .dedup_with_count()
             .map_while(|(count, _)| u16::try_from(count).ok())
             .scan(0, |current_bytes, count| {
-                *current_bytes += ((u16::BITS - count.leading_zeros() + 6) / 7).max(1) as usize;
+                *current_bytes += (u16::BITS - count.leading_zeros()).div_ceil(7).max(1) as usize;
                 (*current_bytes <= RestartLastVotedForkSlots::MAX_BYTES).then_some(U16(count))
             })
             .collect();
@@ -184,7 +182,7 @@ impl RunLengthEncoding {
             .iter()
             .map(|bit_count| usize::from(bit_count.0))
             .zip([1, 0].iter().cycle())
-            .flat_map(|(bit_count, bit)| std::iter::repeat(bit).take(bit_count))
+            .flat_map(|(bit_count, bit)| std::iter::repeat_n(bit, bit_count))
             .enumerate()
             .filter(|(_, bit)| **bit == 1)
             .map_while(|(offset, _)| {
@@ -222,11 +220,14 @@ mod test {
     use {
         super::*,
         crate::{
-            cluster_info::MAX_CRDS_OBJECT_SIZE,
-            crds_value::{CrdsData, CrdsValue, CrdsValueLabel},
+            crds_data::CrdsData,
+            crds_value::{CrdsValue, CrdsValueLabel},
+            protocol::MAX_CRDS_OBJECT_SIZE,
         },
         bincode::serialized_size,
-        solana_sdk::{signature::Signer, signer::keypair::Keypair, timing::timestamp},
+        solana_keypair::Keypair,
+        solana_signer::Signer,
+        solana_time_utils::timestamp,
         std::iter::repeat_with,
     };
 
@@ -287,8 +288,7 @@ mod test {
             shred_version,
         )
         .unwrap();
-        let value =
-            CrdsValue::new_signed(CrdsData::RestartLastVotedForkSlots(slots.clone()), &keypair);
+        let value = CrdsValue::new(CrdsData::RestartLastVotedForkSlots(slots.clone()), &keypair);
         assert_eq!(value.sanitize(), Ok(()));
         let label = value.label();
         assert_eq!(
@@ -370,7 +370,7 @@ mod test {
         };
         assert_eq!(fork.sanitize(), Ok(()));
         assert_eq!(fork.observed_stake, 800_000);
-        fork.wallclock = crate::crds_value::MAX_WALLCLOCK;
+        fork.wallclock = crate::crds_data::MAX_WALLCLOCK;
         assert_eq!(fork.sanitize(), Err(SanitizeError::ValueOutOfBounds));
     }
 }

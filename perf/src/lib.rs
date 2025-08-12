@@ -1,4 +1,4 @@
-#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(min_specialization))]
+#![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 pub mod cuda_runtime;
 pub mod data_budget;
 pub mod deduper;
@@ -8,11 +8,9 @@ pub mod perf_libs;
 pub mod recycler;
 pub mod recycler_cache;
 pub mod sigverify;
+#[cfg(feature = "dev-context-only-utils")]
 pub mod test_tx;
 pub mod thread;
-
-#[macro_use]
-extern crate lazy_static;
 
 #[macro_use]
 extern crate log;
@@ -70,8 +68,9 @@ pub fn report_target_features() {
                 info!("AVX detected");
             } else {
                 error!(
-                "Incompatible CPU detected: missing AVX support. Please build from source on the target"
-            );
+                    "Incompatible CPU detected: missing AVX support. Please build from source on \
+                     the target"
+                );
                 std::process::abort();
             }
         }
@@ -85,7 +84,8 @@ pub fn report_target_features() {
                 info!("AVX2 detected");
             } else {
                 error!(
-                    "Incompatible CPU detected: missing AVX2 support. Please build from source on the target"
+                    "Incompatible CPU detected: missing AVX2 support. Please build from source on \
+                     the target"
                 );
                 std::process::abort();
             }

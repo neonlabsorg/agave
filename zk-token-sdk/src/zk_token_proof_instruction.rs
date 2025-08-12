@@ -12,7 +12,7 @@
 //! In step 1, the zero-knowledge proof can be included directly as the instruction data or
 //! pre-written to an account. The program determines whether the proof is provided as instruction
 //! data or pre-written to an account by inspecting the length of the data. If the instruction data
-//! is exactly 5 bytes (instruction disciminator + unsigned 32-bit integer), then the program
+//! is exactly 5 bytes (instruction discriminator + unsigned 32-bit integer), then the program
 //! assumes that the first account provided with the instruction contains the zero-knowledge proof
 //! and verifies the account data at the offset specified in the instruction data. Otherwise, the
 //! program assumes that the zero-knowledge proof is provided as part of the instruction data.
@@ -37,10 +37,8 @@ use {
     bytemuck::bytes_of,
     num_derive::{FromPrimitive, ToPrimitive},
     num_traits::{FromPrimitive, ToPrimitive},
-    solana_program::{
-        instruction::{AccountMeta, Instruction},
-        pubkey::Pubkey,
-    },
+    solana_instruction::{AccountMeta, Instruction},
+    solana_pubkey::Pubkey,
 };
 
 #[derive(Clone, Copy, Debug, FromPrimitive, ToPrimitive, PartialEq, Eq)]
@@ -321,7 +319,7 @@ pub enum ProofInstruction {
     ///   2. `[]` The proof context account owner
     ///
     ///   * Otherwise
-    ///   None
+    ///     None
     ///
     /// The instruction expects either:
     ///   i. `GroupedCiphertext3HandlesValidityProofData` if proof is provided as instruction data
@@ -344,7 +342,7 @@ pub enum ProofInstruction {
     ///   2. `[]` The proof context account owner
     ///
     ///   * Otherwise
-    ///   None
+    ///     None
     ///
     /// The instruction expects either:
     ///   i. `BatchedGroupedCiphertext3HandlesValidityProofData` if proof is provided as instruction data

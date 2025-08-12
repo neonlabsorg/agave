@@ -1,10 +1,9 @@
 use {
     super::Bank,
+    crate::inflation_rewards::points::PointValue,
     log::info,
-    solana_sdk::{
-        account::{create_account_shared_data_with_fields as create_account, from_account},
-        sysvar,
-    },
+    solana_account::{create_account_shared_data_with_fields as create_account, from_account},
+    solana_sysvar as sysvar,
 };
 
 impl Bank {
@@ -13,7 +12,7 @@ impl Bank {
         if let Some(account) = self.get_account(&sysvar::epoch_rewards::id()) {
             let epoch_rewards: sysvar::epoch_rewards::EpochRewards =
                 from_account(&account).unwrap();
-            info!("{prefix} epoch_rewards sysvar: {:?}", epoch_rewards);
+            info!("{prefix} epoch_rewards sysvar: {epoch_rewards:?}");
         } else {
             info!("{prefix} epoch_rewards sysvar: none");
         }
@@ -24,15 +23,12 @@ impl Bank {
     /// last_blockhash.
     pub(in crate::bank) fn create_epoch_rewards_sysvar(
         &self,
-        total_rewards: u64,
         distributed_rewards: u64,
         distribution_starting_block_height: u64,
         num_partitions: u64,
-        total_points: u128,
+        point_value: PointValue,
     ) {
-        assert!(self.is_partitioned_rewards_code_enabled());
-
-        assert!(total_rewards >= distributed_rewards);
+        assert!(point_value.rewards >= distributed_rewards);
 
         let parent_blockhash = self.last_blockhash();
 
@@ -40,8 +36,8 @@ impl Bank {
             distribution_starting_block_height,
             num_partitions,
             parent_blockhash,
-            total_points,
-            total_rewards,
+            total_points: point_value.points,
+            total_rewards: point_value.rewards,
             distributed_rewards,
             active: true,
         };
@@ -61,8 +57,6 @@ impl Bank {
         &self,
         distributed: u64,
     ) {
-        assert!(self.is_partitioned_rewards_code_enabled());
-
         let mut epoch_rewards = self.get_epoch_rewards_sysvar();
         assert!(epoch_rewards.active);
 
@@ -81,10 +75,7 @@ impl Bank {
     /// Update EpochRewards sysvar with distributed rewards
     pub(in crate::bank::partitioned_epoch_rewards) fn set_epoch_rewards_sysvar_to_inactive(&self) {
         let mut epoch_rewards = self.get_epoch_rewards_sysvar();
-        assert_eq!(
-            epoch_rewards.distributed_rewards,
-            epoch_rewards.total_rewards
-        );
+        assert!(epoch_rewards.total_rewards >= epoch_rewards.distributed_rewards);
         epoch_rewards.active = false;
 
         self.update_sysvar_account(&sysvar::epoch_rewards::id(), |account| {
@@ -114,13 +105,9 @@ impl Bank {
 #[cfg(test)]
 mod tests {
     use {
-        super::*,
-        crate::bank::tests::create_genesis_config,
-        solana_sdk::{
-            account::ReadableAccount, epoch_schedule::EpochSchedule, feature_set,
-            native_token::LAMPORTS_PER_SOL, pubkey::Pubkey,
-        },
-        std::sync::Arc,
+        super::*, crate::bank::tests::create_genesis_config, solana_account::ReadableAccount,
+        solana_epoch_schedule::EpochSchedule, solana_native_token::LAMPORTS_PER_SOL,
+        solana_pubkey::Pubkey, std::sync::Arc,
     };
 
     /// Test `EpochRewards` sysvar creation, distribution, and burning.
@@ -131,12 +118,15 @@ mod tests {
         let (mut genesis_config, _mint_keypair) =
             create_genesis_config(1_000_000 * LAMPORTS_PER_SOL);
         genesis_config.epoch_schedule = EpochSchedule::custom(432000, 432000, false);
-        let mut bank = Bank::new_for_tests(&genesis_config);
-        bank.activate_feature(&feature_set::enable_partitioned_epoch_reward::id());
+        let bank = Bank::new_for_tests(&genesis_config);
 
-        let total_rewards = 1_000_000_000; // a large rewards so that the sysvar account is rent-exempted.
+        let total_rewards = 1_000_000_000;
         let num_partitions = 2; // num_partitions is arbitrary and unimportant for this test
         let total_points = (total_rewards * 42) as u128; // total_points is arbitrary for the purposes of this test
+        let point_value = PointValue {
+            rewards: total_rewards,
+            points: total_points,
+        };
 
         // create epoch rewards sysvar
         let expected_epoch_rewards = sysvar::epoch_rewards::EpochRewards {
@@ -155,7 +145,7 @@ mod tests {
             sysvar::epoch_rewards::EpochRewards::default()
         );
 
-        bank.create_epoch_rewards_sysvar(total_rewards, 10, 42, num_partitions, total_points);
+        bank.create_epoch_rewards_sysvar(10, 42, num_partitions, point_value.clone());
         let account = bank.get_account(&sysvar::epoch_rewards::id()).unwrap();
         let expected_balance = bank.get_minimum_balance_for_rent_exemption(account.data().len());
         // Expected balance is the sysvar rent-exempt balance
@@ -169,7 +159,7 @@ mod tests {
         let bank = Bank::new_from_parent(Arc::new(bank), &Pubkey::default(), parent_slot + 1);
         // Also note that running `create_epoch_rewards_sysvar()` against a bank
         // with an existing EpochRewards sysvar clobbers the previous values
-        bank.create_epoch_rewards_sysvar(total_rewards, 10, 42, num_partitions, total_points);
+        bank.create_epoch_rewards_sysvar(10, 42, num_partitions, point_value.clone());
 
         let expected_epoch_rewards = sysvar::epoch_rewards::EpochRewards {
             distribution_starting_block_height: 42,

@@ -13,11 +13,10 @@ on:
       - "**.rs"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "cargo-build-bpf"
-      - "cargo-test-bpf"
       - "cargo-build-sbf"
       - "cargo-test-sbf"
       - "scripts/build-downstream-anchor-projects.sh"
+      - "scripts/patch-spl-crates-for-anchor.sh"
       - ".github/scripts/purge-ubuntu-runner.sh"
       - ".github/scripts/downstream-project-spl-install-deps.sh"
       - ".github/workflows/downstream-project-anchor.yml"
@@ -39,10 +38,12 @@ env:
 
 jobs:
   test:
+    #if: github.repository == 'anza-xyz/agave'
+    if: false # restore once all program-specific repos are ready
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        version: ["v0.29.0", "v0.30.0"]
+        version: ["master"]
     steps:
       - uses: actions/checkout@v4
 
@@ -50,9 +51,9 @@ jobs:
         run: |
           .github/scripts/purge-ubuntu-runner.sh
 
-      - uses: mozilla-actions/sccache-action@v0.0.4
+      - uses: mozilla-actions/sccache-action@v0.0.9
         with:
-          version: "v0.8.1"
+          version: "v0.10.0"
 
       - shell: bash
         run: |

@@ -1,7 +1,8 @@
 use {
-    crate::stakes::{Stakes, StakesEnum},
+    crate::stakes::SerdeStakesToStakeFormat,
     serde::{Deserialize, Serialize},
-    solana_sdk::{clock::Epoch, pubkey::Pubkey, stake::state::Stake},
+    solana_clock::Epoch,
+    solana_pubkey::Pubkey,
     solana_vote::vote_account::VoteAccountsHashMap,
     std::{collections::HashMap, sync::Arc},
 };
@@ -17,22 +18,23 @@ pub struct NodeVoteAccounts {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample, AbiEnumVisitor))]
 #[cfg_attr(feature = "dev-context-only-utils", derive(PartialEq))]
-pub struct EpochStakes {
-    #[serde(with = "crate::stakes::serde_stakes_enum_compat")]
-    stakes: Arc<StakesEnum>,
-    total_stake: u64,
-    node_id_to_vote_accounts: Arc<NodeIdToVoteAccounts>,
-    epoch_authorized_voters: Arc<EpochAuthorizedVoters>,
+pub enum VersionedEpochStakes {
+    Current {
+        stakes: SerdeStakesToStakeFormat,
+        total_stake: u64,
+        node_id_to_vote_accounts: Arc<NodeIdToVoteAccounts>,
+        epoch_authorized_voters: Arc<EpochAuthorizedVoters>,
+    },
 }
 
-impl EpochStakes {
-    pub(crate) fn new(stakes: Arc<StakesEnum>, leader_schedule_epoch: Epoch) -> Self {
+impl VersionedEpochStakes {
+    pub(crate) fn new(stakes: SerdeStakesToStakeFormat, leader_schedule_epoch: Epoch) -> Self {
         let epoch_vote_accounts = stakes.vote_accounts();
         let (total_stake, node_id_to_vote_accounts, epoch_authorized_voters) =
             Self::parse_epoch_vote_accounts(epoch_vote_accounts.as_ref(), leader_schedule_epoch);
-        Self {
+        Self::Current {
             stakes,
             total_stake,
             node_id_to_vote_accounts: Arc::new(node_id_to_vote_accounts),
@@ -40,29 +42,71 @@ impl EpochStakes {
         }
     }
 
-    pub fn stakes(&self) -> &StakesEnum {
-        &self.stakes
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn new_for_tests(
+        vote_accounts_hash_map: VoteAccountsHashMap,
+        leader_schedule_epoch: Epoch,
+    ) -> Self {
+        Self::new(
+            SerdeStakesToStakeFormat::Account(crate::stakes::Stakes::new_for_tests(
+                0,
+                solana_vote::vote_account::VoteAccounts::from(Arc::new(vote_accounts_hash_map)),
+                im::HashMap::default(),
+            )),
+            leader_schedule_epoch,
+        )
+    }
+
+    pub fn stakes(&self) -> &SerdeStakesToStakeFormat {
+        match self {
+            Self::Current { stakes, .. } => stakes,
+        }
     }
 
     pub fn total_stake(&self) -> u64 {
-        self.total_stake
+        match self {
+            Self::Current { total_stake, .. } => *total_stake,
+        }
     }
 
-    /// For tests
+    #[cfg(feature = "dev-context-only-utils")]
     pub fn set_total_stake(&mut self, total_stake: u64) {
-        self.total_stake = total_stake;
+        match self {
+            Self::Current {
+                total_stake: total_stake_field,
+                ..
+            } => {
+                *total_stake_field = total_stake;
+            }
+        }
     }
 
     pub fn node_id_to_vote_accounts(&self) -> &Arc<NodeIdToVoteAccounts> {
-        &self.node_id_to_vote_accounts
+        match self {
+            Self::Current {
+                node_id_to_vote_accounts,
+                ..
+            } => node_id_to_vote_accounts,
+        }
+    }
+
+    pub fn node_id_to_stake(&self, node_id: &Pubkey) -> Option<u64> {
+        self.node_id_to_vote_accounts()
+            .get(node_id)
+            .map(|x| x.total_stake)
     }
 
     pub fn epoch_authorized_voters(&self) -> &Arc<EpochAuthorizedVoters> {
-        &self.epoch_authorized_voters
+        match self {
+            Self::Current {
+                epoch_authorized_voters,
+                ..
+            } => epoch_authorized_voters,
+        }
     }
 
     pub fn vote_account_stake(&self, vote_account: &Pubkey) -> u64 {
-        self.stakes
+        self.stakes()
             .vote_accounts()
             .get_delegated_stake(vote_account)
     }
@@ -79,35 +123,20 @@ impl EpochStakes {
         let epoch_authorized_voters = epoch_vote_accounts
             .iter()
             .filter_map(|(key, (stake, account))| {
-                let vote_state = account.vote_state();
-                let vote_state = match vote_state.as_ref() {
-                    Err(_) => {
-                        datapoint_warn!(
-                            "parse_epoch_vote_accounts",
-                            (
-                                "warn",
-                                format!("Unable to get vote_state from account {key}"),
-                                String
-                            ),
-                        );
-                        return None;
-                    }
-                    Ok(vote_state) => vote_state,
-                };
+                let vote_state = account.vote_state_view();
 
                 if *stake > 0 {
-                    if let Some(authorized_voter) = vote_state
-                        .authorized_voters()
-                        .get_authorized_voter(leader_schedule_epoch)
+                    if let Some(authorized_voter) =
+                        vote_state.get_authorized_voter(leader_schedule_epoch)
                     {
                         let node_vote_accounts = node_id_to_vote_accounts
-                            .entry(vote_state.node_pubkey)
+                            .entry(*vote_state.node_pubkey())
                             .or_default();
 
                         node_vote_accounts.total_stake += stake;
                         node_vote_accounts.vote_accounts.push(*key);
 
-                        Some((*key, authorized_voter))
+                        Some((*key, *authorized_voter))
                     } else {
                         None
                     }
@@ -124,38 +153,10 @@ impl EpochStakes {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) enum VersionedEpochStakes {
-    Current {
-        stakes: Stakes<Stake>,
-        total_stake: u64,
-        node_id_to_vote_accounts: Arc<NodeIdToVoteAccounts>,
-        epoch_authorized_voters: Arc<EpochAuthorizedVoters>,
-    },
-}
-
-impl From<VersionedEpochStakes> for EpochStakes {
-    fn from(versioned: VersionedEpochStakes) -> Self {
-        let VersionedEpochStakes::Current {
-            stakes,
-            total_stake,
-            node_id_to_vote_accounts,
-            epoch_authorized_voters,
-        } = versioned;
-
-        Self {
-            stakes: Arc::new(StakesEnum::Stakes(stakes)),
-            total_stake,
-            node_id_to_vote_accounts,
-            epoch_authorized_voters,
-        }
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use {
-        super::*, solana_sdk::account::AccountSharedData, solana_vote::vote_account::VoteAccount,
+        super::*, solana_account::AccountSharedData, solana_vote::vote_account::VoteAccount,
         solana_vote_program::vote_state::create_account_with_authorized, std::iter,
     };
 
@@ -165,20 +166,20 @@ pub(crate) mod tests {
         authorized_voter: Pubkey,
     }
 
-    #[test]
-    fn test_parse_epoch_vote_accounts() {
-        let stake_per_account = 100;
-        let num_vote_accounts_per_node = 2;
+    fn new_vote_accounts(
+        num_nodes: usize,
+        num_vote_accounts_per_node: usize,
+    ) -> HashMap<Pubkey, Vec<VoteAccountInfo>> {
         // Create some vote accounts for each pubkey
-        let vote_accounts_map: HashMap<Pubkey, Vec<VoteAccountInfo>> = (0..10)
+        (0..num_nodes)
             .map(|_| {
-                let node_id = solana_sdk::pubkey::new_rand();
+                let node_id = solana_pubkey::new_rand();
                 (
                     node_id,
                     iter::repeat_with(|| {
-                        let authorized_voter = solana_sdk::pubkey::new_rand();
+                        let authorized_voter = solana_pubkey::new_rand();
                         VoteAccountInfo {
-                            vote_account: solana_sdk::pubkey::new_rand(),
+                            vote_account: solana_pubkey::new_rand(),
                             account: create_account_with_authorized(
                                 &node_id,
                                 &authorized_voter,
@@ -193,7 +194,32 @@ pub(crate) mod tests {
                     .collect(),
                 )
             })
-            .collect();
+            .collect()
+    }
+
+    fn new_epoch_vote_accounts(
+        vote_accounts_map: &HashMap<Pubkey, Vec<VoteAccountInfo>>,
+        node_id_to_stake_fn: impl Fn(&Pubkey) -> u64,
+    ) -> VoteAccountsHashMap {
+        // Create and process the vote accounts
+        vote_accounts_map
+            .iter()
+            .flat_map(|(node_id, vote_accounts)| {
+                vote_accounts.iter().map(|v| {
+                    let vote_account = VoteAccount::try_from(v.account.clone()).unwrap();
+                    (v.vote_account, (node_id_to_stake_fn(node_id), vote_account))
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_epoch_vote_accounts() {
+        let stake_per_account = 100;
+        let num_vote_accounts_per_node = 2;
+        let num_nodes = 10;
+
+        let vote_accounts_map = new_vote_accounts(num_nodes, num_vote_accounts_per_node);
 
         let expected_authorized_voters: HashMap<_, _> = vote_accounts_map
             .iter()
@@ -220,19 +246,11 @@ pub(crate) mod tests {
             })
             .collect();
 
-        // Create and process the vote accounts
-        let epoch_vote_accounts: HashMap<_, _> = vote_accounts_map
-            .iter()
-            .flat_map(|(_, vote_accounts)| {
-                vote_accounts.iter().map(|v| {
-                    let vote_account = VoteAccount::try_from(v.account.clone()).unwrap();
-                    (v.vote_account, (stake_per_account, vote_account))
-                })
-            })
-            .collect();
+        let epoch_vote_accounts =
+            new_epoch_vote_accounts(&vote_accounts_map, |_| stake_per_account);
 
         let (total_stake, mut node_id_to_vote_accounts, epoch_authorized_voters) =
-            EpochStakes::parse_epoch_vote_accounts(&epoch_vote_accounts, 0);
+            VersionedEpochStakes::parse_epoch_vote_accounts(&epoch_vote_accounts, 0);
 
         // Verify the results
         node_id_to_vote_accounts
@@ -253,7 +271,32 @@ pub(crate) mod tests {
         );
         assert_eq!(
             total_stake,
-            vote_accounts_map.len() as u64 * num_vote_accounts_per_node as u64 * 100
+            num_nodes as u64 * num_vote_accounts_per_node as u64 * 100
         );
+    }
+
+    #[test]
+    fn test_node_id_to_stake() {
+        let num_nodes = 10;
+        let num_vote_accounts_per_node = 2;
+
+        let vote_accounts_map = new_vote_accounts(num_nodes, num_vote_accounts_per_node);
+        let node_id_to_stake_map = vote_accounts_map
+            .keys()
+            .enumerate()
+            .map(|(index, node_id)| (*node_id, ((index + 1) * 100) as u64))
+            .collect::<HashMap<_, _>>();
+        let epoch_vote_accounts = new_epoch_vote_accounts(&vote_accounts_map, |node_id| {
+            *node_id_to_stake_map.get(node_id).unwrap()
+        });
+        let epoch_stakes = VersionedEpochStakes::new_for_tests(epoch_vote_accounts, 0);
+
+        assert_eq!(epoch_stakes.total_stake(), 11000);
+        for (node_id, stake) in node_id_to_stake_map.iter() {
+            assert_eq!(
+                epoch_stakes.node_id_to_stake(node_id),
+                Some(*stake * num_vote_accounts_per_node as u64)
+            );
+        }
     }
 }

@@ -1,21 +1,25 @@
 use {
-    super::packet_filter::PacketFilterFailure,
-    solana_perf::packet::Packet,
-    solana_runtime::compute_budget_details::{ComputeBudgetDetails, GetComputeBudgetDetails},
-    solana_sdk::{
-        feature_set,
-        hash::Hash,
-        message::Message,
-        pubkey::Pubkey,
-        sanitize::SanitizeError,
-        short_vec::decode_shortu16_len,
-        signature::Signature,
-        transaction::{
-            AddressLoader, SanitizedTransaction, SanitizedVersionedTransaction,
-            VersionedTransaction,
-        },
+    agave_feature_set::FeatureSet,
+    solana_clock::Slot,
+    solana_compute_budget::compute_budget_limits::ComputeBudgetLimits,
+    solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions,
+    solana_hash::Hash,
+    solana_message::{v0::LoadedAddresses, AddressLoaderError, Message, SimpleAddressLoader},
+    solana_perf::packet::PacketRef,
+    solana_pubkey::Pubkey,
+    solana_runtime::bank::Bank,
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+    solana_sanitize::SanitizeError,
+    solana_short_vec::decode_shortu16_len,
+    solana_signature::Signature,
+    solana_svm_transaction::{
+        instruction::SVMInstruction, message_address_table_lookup::SVMMessageAddressTableLookup,
     },
-    std::{cmp::Ordering, collections::HashSet, mem::size_of, sync::Arc},
+    solana_transaction::{
+        sanitized::{MessageHash, SanitizedTransaction},
+        versioned::{sanitized::SanitizedVersionedTransaction, VersionedTransaction},
+    },
+    std::{cmp::Ordering, collections::HashSet, mem::size_of},
     thiserror::Error,
 };
 
@@ -34,48 +38,64 @@ pub enum DeserializedPacketError {
     PrioritizationFailure,
     #[error("vote transaction failure")]
     VoteTransactionError,
-    #[error("Packet filter failure: {0}")]
-    FailedFilter(#[from] PacketFilterFailure),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+// Make a dummy feature_set with all features enabled to
+// fetch compute_unit_price and compute_unit_limit for legacy leader.
+static FEATURE_SET: std::sync::LazyLock<FeatureSet> =
+    std::sync::LazyLock::new(FeatureSet::all_enabled);
+
+#[derive(Debug)]
+#[cfg_attr(test, derive(Clone))]
 pub struct ImmutableDeserializedPacket {
-    original_packet: Packet,
     transaction: SanitizedVersionedTransaction,
+    forwarded: bool,
     message_hash: Hash,
     is_simple_vote: bool,
-    compute_budget_details: ComputeBudgetDetails,
+    compute_unit_price: u64,
+    compute_unit_limit: u32,
 }
 
 impl ImmutableDeserializedPacket {
-    pub fn new(packet: Packet) -> Result<Self, DeserializedPacketError> {
+    pub fn new(packet: PacketRef) -> Result<Self, DeserializedPacketError> {
         let versioned_transaction: VersionedTransaction = packet.deserialize_slice(..)?;
         let sanitized_transaction = SanitizedVersionedTransaction::try_from(versioned_transaction)?;
-        let message_bytes = packet_message(&packet)?;
+        let message_bytes = packet_message(packet)?;
         let message_hash = Message::hash_raw_message(message_bytes);
         let is_simple_vote = packet.meta().is_simple_vote_tx();
+        let forwarded = packet.meta().forwarded();
 
         // drop transaction if prioritization fails.
-        let mut compute_budget_details = sanitized_transaction
-            .get_compute_budget_details(packet.meta().round_compute_unit_price())
-            .ok_or(DeserializedPacketError::PrioritizationFailure)?;
+        let ComputeBudgetLimits {
+            mut compute_unit_price,
+            compute_unit_limit,
+            ..
+        } = process_compute_budget_instructions(
+            sanitized_transaction
+                .get_message()
+                .program_instructions_iter()
+                .map(|(pubkey, ix)| (pubkey, SVMInstruction::from(ix))),
+            &FEATURE_SET,
+        )
+        .map_err(|_| DeserializedPacketError::PrioritizationFailure)?;
 
         // set compute unit price to zero for vote transactions
         if is_simple_vote {
-            compute_budget_details.compute_unit_price = 0;
+            compute_unit_price = 0;
         };
 
         Ok(Self {
-            original_packet: packet,
             transaction: sanitized_transaction,
+            forwarded,
             message_hash,
             is_simple_vote,
-            compute_budget_details,
+            compute_unit_price,
+            compute_unit_limit,
         })
     }
 
-    pub fn original_packet(&self) -> &Packet {
-        &self.original_packet
+    pub fn forwarded(&self) -> bool {
+        self.forwarded
     }
 
     pub fn transaction(&self) -> &SanitizedVersionedTransaction {
@@ -91,38 +111,68 @@ impl ImmutableDeserializedPacket {
     }
 
     pub fn compute_unit_price(&self) -> u64 {
-        self.compute_budget_details.compute_unit_price
+        self.compute_unit_price
     }
 
     pub fn compute_unit_limit(&self) -> u64 {
-        self.compute_budget_details.compute_unit_limit
-    }
-
-    pub fn compute_budget_details(&self) -> ComputeBudgetDetails {
-        self.compute_budget_details.clone()
+        u64::from(self.compute_unit_limit)
     }
 
     // This function deserializes packets into transactions, computes the blake3 hash of transaction
     // messages.
+    // Additionally, this returns the minimum deactivation slot of the resolved addresses.
     pub fn build_sanitized_transaction(
         &self,
-        _feature_set: &Arc<feature_set::FeatureSet>,
         votes_only: bool,
-        address_loader: impl AddressLoader,
+        bank: &Bank,
         reserved_account_keys: &HashSet<Pubkey>,
-    ) -> Option<SanitizedTransaction> {
+    ) -> Option<(RuntimeTransaction<SanitizedTransaction>, Slot)> {
         if votes_only && !self.is_simple_vote() {
             return None;
         }
-        let tx = SanitizedTransaction::try_new(
-            self.transaction().clone(),
-            *self.message_hash(),
-            self.is_simple_vote(),
-            address_loader,
-            reserved_account_keys,
+
+        // Resolve the lookup addresses and retrieve the min deactivation slot
+        let (loaded_addresses, deactivation_slot) =
+            Self::resolve_addresses_with_deactivation(self.transaction(), bank).ok()?;
+        let address_loader = SimpleAddressLoader::Enabled(loaded_addresses);
+        let tx = RuntimeTransaction::<SanitizedVersionedTransaction>::try_from(
+            self.transaction.clone(),
+            MessageHash::Precomputed(self.message_hash),
+            Some(self.is_simple_vote),
         )
+        .and_then(|tx| {
+            RuntimeTransaction::<SanitizedTransaction>::try_from(
+                tx,
+                address_loader,
+                reserved_account_keys,
+            )
+        })
         .ok()?;
-        Some(tx)
+        Some((tx, deactivation_slot))
+    }
+
+    fn resolve_addresses_with_deactivation(
+        transaction: &SanitizedVersionedTransaction,
+        bank: &Bank,
+    ) -> Result<(LoadedAddresses, Slot), AddressLoaderError> {
+        let Some(address_table_lookups) = transaction.get_message().message.address_table_lookups()
+        else {
+            return Ok((LoadedAddresses::default(), Slot::MAX));
+        };
+
+        bank.load_addresses_from_ref(
+            address_table_lookups
+                .iter()
+                .map(SVMMessageAddressTableLookup::from),
+        )
+    }
+}
+
+// Eq and PartialEq MUST be consistent with PartialOrd and Ord
+impl Eq for ImmutableDeserializedPacket {}
+impl PartialEq for ImmutableDeserializedPacket {
+    fn eq(&self, other: &Self) -> bool {
+        self.compute_unit_price() == other.compute_unit_price()
     }
 }
 
@@ -139,7 +189,7 @@ impl Ord for ImmutableDeserializedPacket {
 }
 
 /// Read the transaction message from packet data
-fn packet_message(packet: &Packet) -> Result<&[u8], DeserializedPacketError> {
+fn packet_message(packet: PacketRef) -> Result<&[u8], DeserializedPacketError> {
     let (sig_len, sig_size) = packet
         .data(..)
         .and_then(|bytes| decode_shortu16_len(bytes).ok())
@@ -154,57 +204,21 @@ fn packet_message(packet: &Packet) -> Result<&[u8], DeserializedPacketError> {
 #[cfg(test)]
 mod tests {
     use {
-        super::*,
-        solana_sdk::{
-            compute_budget, instruction::Instruction, pubkey::Pubkey, signature::Keypair,
-            signer::Signer, system_instruction, system_transaction, transaction::Transaction,
-        },
+        super::*, solana_keypair::Keypair, solana_perf::packet::BytesPacket,
+        solana_system_transaction as system_transaction,
     };
 
     #[test]
     fn simple_deserialized_packet() {
         let tx = system_transaction::transfer(
             &Keypair::new(),
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             1,
             Hash::new_unique(),
         );
-        let packet = Packet::from_data(None, tx).unwrap();
-        let deserialized_packet = ImmutableDeserializedPacket::new(packet);
+        let packet = BytesPacket::from_data(None, tx).unwrap();
+        let deserialized_packet = ImmutableDeserializedPacket::new(packet.as_ref());
 
         assert!(deserialized_packet.is_ok());
-    }
-
-    #[test]
-    fn compute_unit_limit_above_static_builtins() {
-        // Cases:
-        // 1. compute_unit_limit under static builtins
-        // 2. compute_unit_limit equal to static builtins
-        // 3. compute_unit_limit above static builtins
-        for (cu_limit, expectation) in [
-            (250, Err(PacketFilterFailure::InsufficientComputeLimit)),
-            (300, Ok(())),
-            (350, Ok(())),
-        ] {
-            let keypair = Keypair::new();
-            let bpf_program_id = Pubkey::new_unique();
-            let ixs = vec![
-                system_instruction::transfer(&keypair.pubkey(), &Pubkey::new_unique(), 1),
-                compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
-                Instruction::new_with_bytes(bpf_program_id, &[], vec![]), // non-builtin - not counted in filter
-            ];
-            let tx = Transaction::new_signed_with_payer(
-                &ixs,
-                Some(&keypair.pubkey()),
-                &[&keypair],
-                Hash::new_unique(),
-            );
-            let packet = Packet::from_data(None, tx).unwrap();
-            let deserialized_packet = ImmutableDeserializedPacket::new(packet).unwrap();
-            assert_eq!(
-                deserialized_packet.check_insufficent_compute_unit_limit(),
-                expectation
-            );
-        }
     }
 }

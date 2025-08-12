@@ -2,20 +2,21 @@
 
 use {
     serde_derive::{Deserialize, Serialize},
-    solana_sdk::{
-        account::Account,
-        clock::Slot,
-        commitment_config::CommitmentLevel,
-        fee_calculator::FeeCalculator,
-        hash::Hash,
-        inner_instruction::InnerInstructions,
-        message::Message,
-        pubkey::Pubkey,
-        signature::Signature,
-        transaction::{self, TransactionError, VersionedTransaction},
-        transaction_context::TransactionReturnData,
-    },
+    solana_account::Account,
+    solana_clock::Slot,
+    solana_commitment_config::CommitmentLevel,
+    solana_hash::Hash,
+    solana_message::{inner_instruction::InnerInstructions, Message},
+    solana_pubkey::Pubkey,
+    solana_signature::Signature,
+    solana_transaction::versioned::VersionedTransaction,
+    solana_transaction_context::TransactionReturnData,
+    solana_transaction_error::TransactionError,
 };
+
+mod transaction {
+    pub use solana_transaction_error::TransactionResult as Result;
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransactionConfirmationStatus {
@@ -37,6 +38,7 @@ pub struct TransactionStatus {
 pub struct TransactionSimulationDetails {
     pub logs: Vec<String>,
     pub units_consumed: u64,
+    pub loaded_accounts_data_size: u32,
     pub return_data: Option<TransactionReturnData>,
     pub inner_instructions: Option<Vec<InnerInstructions>>,
 }
@@ -64,13 +66,6 @@ pub struct BanksTransactionResultWithMetadata {
 #[tarpc::service]
 pub trait Banks {
     async fn send_transaction_with_context(transaction: VersionedTransaction);
-    #[deprecated(
-        since = "1.9.0",
-        note = "Please use `get_fee_for_message_with_commitment_and_context` instead"
-    )]
-    async fn get_fees_with_commitment_and_context(
-        commitment: CommitmentLevel,
-    ) -> (FeeCalculator, Hash, Slot);
     async fn get_transaction_status_with_context(signature: Signature)
         -> Option<TransactionStatus>;
     async fn get_slot_with_context(commitment: CommitmentLevel) -> Slot;

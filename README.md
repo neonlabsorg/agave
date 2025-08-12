@@ -1,6 +1,6 @@
 <p align="center">
-  <a href="https://solana.com">
-    <img alt="Solana" src="https://i.imgur.com/0vfIMHo.png" width="250" />
+  <a href="https://anza.xyz">
+    <img alt="Anza" src="https://i.postimg.cc/VkKTnMM9/agave-logo-talc-1.png" width="250" />
   </a>
 </p>
 
@@ -36,12 +36,12 @@ On Linux systems you may need to install libssl-dev, pkg-config, zlib1g-dev, pro
 On Ubuntu:
 ```bash
 $ sudo apt-get update
-$ sudo apt-get install libssl-dev libudev-dev pkg-config zlib1g-dev llvm clang cmake make libprotobuf-dev protobuf-compiler
+$ sudo apt-get install libssl-dev libudev-dev pkg-config zlib1g-dev llvm clang cmake make libprotobuf-dev protobuf-compiler libclang-dev
 ```
 
 On Fedora:
 ```bash
-$ sudo dnf install openssl-devel systemd-devel pkg-config zlib-devel llvm clang cmake make protobuf-devel protobuf-compiler perl-core
+$ sudo dnf install openssl-devel systemd-devel pkg-config zlib-devel llvm clang cmake make protobuf-devel protobuf-compiler perl-core libclang-dev
 ```
 
 ## **2. Download the source code.**
@@ -56,6 +56,9 @@ $ cd agave
 ```bash
 $ ./cargo build
 ```
+
+> [!NOTE]
+> Note that this builds a debug version that is **not suitable for running a testnet or mainnet validator**. Please read [`docs/src/cli/install.md`](docs/src/cli/install.md#build-from-source) for instructions to build a release version for test and production uses.
 
 # Testing
 

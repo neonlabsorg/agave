@@ -5,33 +5,39 @@
 
 #[deprecated(
     since = "1.8.0",
-    note = "Please use `solana_sdk::stake::state` or `solana_program::stake::state` instead"
+    note = "Please use `solana_stake_interface::state` instead"
 )]
-pub use solana_sdk::stake::state::*;
+pub use solana_stake_interface::state::*;
 use {
-    solana_program_runtime::{ic_msg, invoke_context::InvokeContext},
-    solana_sdk::{
-        account::{AccountSharedData, ReadableAccount},
-        account_utils::StateMut,
-        clock::{Clock, Epoch},
-        feature_set::{self, FeatureSet},
-        instruction::{checked_add, InstructionError},
-        pubkey::Pubkey,
-        rent::Rent,
-        stake::{
-            instruction::{LockupArgs, StakeError},
-            program::id,
-            stake_flags::StakeFlags,
-            tools::{acceptable_reference_epoch_credits, eligible_for_deactivate_delinquent},
-        },
-        stake_history::{StakeHistory, StakeHistoryEntry},
-        transaction_context::{
-            BorrowedAccount, IndexOfAccount, InstructionContext, TransactionContext,
-        },
+    solana_account::{state_traits::StateMut, AccountSharedData, ReadableAccount},
+    solana_clock::{Clock, Epoch},
+    solana_instruction::error::InstructionError,
+    solana_program_runtime::invoke_context::InvokeContext,
+    solana_pubkey::Pubkey,
+    solana_rent::Rent,
+    solana_sdk_ids::stake::id,
+    solana_stake_interface::{
+        error::StakeError,
+        instruction::LockupArgs,
+        stake_flags::StakeFlags,
+        tools::{acceptable_reference_epoch_credits, eligible_for_deactivate_delinquent},
     },
-    solana_vote_program::vote_state::{self, VoteState, VoteStateVersions},
+    solana_svm_log_collector::ic_msg,
+    solana_sysvar::stake_history::{StakeHistory, StakeHistoryEntry},
+    solana_transaction_context::{
+        BorrowedAccount, IndexOfAccount, InstructionContext, TransactionContext,
+    },
+    solana_vote_interface::state::{VoteState, VoteStateVersions},
     std::{collections::HashSet, convert::TryFrom},
 };
+
+// feature_set::reduce_stake_warmup_cooldown changed the warmup/cooldown from
+// 25% to 9%. this number is necessary to calculate historical effective stake from
+// stake history, but we only care that stake we are dealing with in the present
+// epoch has been fully (de)activated. this means, as long as one epoch has
+// passed since activation where all prior stake had escaped warmup/cooldown,
+// we can pretend the rate has always beein 9% without issue. so we do that
+const PERPETUAL_NEW_WARMUP_COOLDOWN_RATE_EPOCH: Option<u64> = Some(0);
 
 // utility function, used by Stakes, tests
 pub fn from<T: ReadableAccount + StateMut<StakeStateV2>>(account: &T) -> Option<StakeStateV2> {
@@ -58,14 +64,12 @@ pub fn meta_from(account: &AccountSharedData) -> Option<Meta> {
     from(account).and_then(|state: StakeStateV2| state.meta())
 }
 
-pub(crate) fn new_warmup_cooldown_rate_epoch(invoke_context: &InvokeContext) -> Option<Epoch> {
-    let epoch_schedule = invoke_context
-        .get_sysvar_cache()
-        .get_epoch_schedule()
-        .unwrap();
-    invoke_context
-        .get_feature_set()
-        .new_warmup_cooldown_rate_epoch(epoch_schedule.as_ref())
+pub(crate) fn new_warmup_cooldown_rate_epoch() -> Option<Epoch> {
+    PERPETUAL_NEW_WARMUP_COOLDOWN_RATE_EPOCH
+}
+
+fn checked_add(a: u64, b: u64) -> Result<u64, InstructionError> {
+    a.checked_add(b).ok_or(InstructionError::InsufficientFunds)
 }
 
 fn get_stake_status(
@@ -76,13 +80,12 @@ fn get_stake_status(
     let stake_history = invoke_context.get_sysvar_cache().get_stake_history()?;
     Ok(stake.delegation.stake_activating_and_deactivating(
         clock.epoch,
-        &stake_history,
-        new_warmup_cooldown_rate_epoch(invoke_context),
+        stake_history.as_ref(),
+        new_warmup_cooldown_rate_epoch(),
     ))
 }
 
 fn redelegate_stake(
-    invoke_context: &InvokeContext,
     stake: &mut Stake,
     stake_lamports: u64,
     voter_pubkey: &Pubkey,
@@ -90,28 +93,14 @@ fn redelegate_stake(
     clock: &Clock,
     stake_history: &StakeHistory,
 ) -> Result<(), StakeError> {
-    let new_rate_activation_epoch = new_warmup_cooldown_rate_epoch(invoke_context);
+    let new_rate_activation_epoch = new_warmup_cooldown_rate_epoch();
     // If stake is currently active:
     if stake.stake(clock.epoch, stake_history, new_rate_activation_epoch) != 0 {
-        let stake_lamports_ok = if invoke_context
-            .get_feature_set()
-            .is_active(&feature_set::stake_redelegate_instruction::id())
-        {
-            // When a stake account is redelegated, the delegated lamports from the source stake
-            // account are transferred to a new stake account. Do not permit the deactivation of
-            // the source stake account to be rescinded, by more generally requiring the delegation
-            // be configured with the expected amount of stake lamports before rescinding.
-            stake_lamports >= stake.delegation.stake
-        } else {
-            true
-        };
-
         // If pubkey of new voter is the same as current,
         // and we are scheduled to start deactivating this epoch,
         // we rescind deactivation
         if stake.delegation.voter_pubkey == *voter_pubkey
             && clock.epoch == stake.delegation.deactivation_epoch
-            && stake_lamports_ok
         {
             stake.delegation.deactivation_epoch = u64::MAX;
             return Ok(());
@@ -130,6 +119,86 @@ fn redelegate_stake(
     stake.delegation.voter_pubkey = *voter_pubkey;
     stake.credits_observed = vote_state.credits();
     Ok(())
+}
+
+fn move_stake_or_lamports_shared_checks(
+    invoke_context: &InvokeContext,
+    transaction_context: &TransactionContext,
+    instruction_context: &InstructionContext,
+    source_account: &BorrowedAccount,
+    lamports: u64,
+    destination_account: &BorrowedAccount,
+    stake_authority_index: IndexOfAccount,
+) -> Result<(MergeKind, MergeKind), InstructionError> {
+    // authority must sign
+    let stake_authority_pubkey = transaction_context.get_key_of_account_at_index(
+        instruction_context
+            .get_index_of_instruction_account_in_transaction(stake_authority_index)?,
+    )?;
+    if !instruction_context.is_instruction_account_signer(stake_authority_index)? {
+        return Err(InstructionError::MissingRequiredSignature);
+    }
+
+    let mut signers = HashSet::new();
+    signers.insert(*stake_authority_pubkey);
+
+    // check owners
+    if *source_account.get_owner() != id() || *destination_account.get_owner() != id() {
+        return Err(InstructionError::IncorrectProgramId);
+    }
+
+    // confirm not the same account
+    if *source_account.get_key() == *destination_account.get_key() {
+        return Err(InstructionError::InvalidInstructionData);
+    }
+
+    // source and destination must be writable
+    if !source_account.is_writable() || !destination_account.is_writable() {
+        return Err(InstructionError::InvalidInstructionData);
+    }
+
+    // must move something
+    if lamports == 0 {
+        return Err(InstructionError::InvalidArgument);
+    }
+
+    let clock = invoke_context.get_sysvar_cache().get_clock()?;
+    let stake_history = invoke_context.get_sysvar_cache().get_stake_history()?;
+
+    // get_if_mergeable ensures accounts are not partly activated or in any form of deactivating
+    // we still need to exclude activating state ourselves
+    let source_merge_kind = MergeKind::get_if_mergeable(
+        invoke_context,
+        &source_account.get_state()?,
+        source_account.get_lamports(),
+        &clock,
+        &stake_history,
+    )?;
+
+    // Authorized staker is allowed to move stake
+    source_merge_kind
+        .meta()
+        .authorized
+        .check(&signers, StakeAuthorize::Staker)?;
+
+    // same transient assurance as with source
+    let destination_merge_kind = MergeKind::get_if_mergeable(
+        invoke_context,
+        &destination_account.get_state()?,
+        destination_account.get_lamports(),
+        &clock,
+        &stake_history,
+    )?;
+
+    // ensure all authorities match and lockups match if lockup is in force
+    MergeKind::metas_can_merge(
+        invoke_context,
+        source_merge_kind.meta(),
+        destination_merge_kind.meta(),
+        &clock,
+    )?;
+
+    Ok((source_merge_kind, destination_merge_kind))
 }
 
 pub(crate) fn new_stake(
@@ -241,7 +310,6 @@ pub fn authorize_with_seed(
 
 #[allow(clippy::too_many_arguments)]
 pub fn delegate(
-    invoke_context: &InvokeContext,
     transaction_context: &TransactionContext,
     instruction_context: &InstructionContext,
     stake_account_index: IndexOfAccount,
@@ -249,11 +317,11 @@ pub fn delegate(
     clock: &Clock,
     stake_history: &StakeHistory,
     signers: &HashSet<Pubkey>,
-    feature_set: &FeatureSet,
+    invoke_context: &InvokeContext,
 ) -> Result<(), InstructionError> {
     let vote_account = instruction_context
         .try_borrow_instruction_account(transaction_context, vote_account_index)?;
-    if *vote_account.get_owner() != solana_vote_program::id() {
+    if *vote_account.get_owner() != solana_sdk_ids::vote::id() {
         return Err(InstructionError::IncorrectProgramId);
     }
     let vote_pubkey = *vote_account.get_key();
@@ -266,7 +334,7 @@ pub fn delegate(
         StakeStateV2::Initialized(meta) => {
             meta.authorized.check(signers, StakeAuthorize::Staker)?;
             let ValidatedDelegatedInfo { stake_amount } =
-                validate_delegated_amount(&stake_account, &meta, feature_set)?;
+                validate_delegated_amount(&stake_account, &meta, invoke_context)?;
             let stake = new_stake(
                 stake_amount,
                 &vote_pubkey,
@@ -278,9 +346,8 @@ pub fn delegate(
         StakeStateV2::Stake(meta, mut stake, stake_flags) => {
             meta.authorized.check(signers, StakeAuthorize::Staker)?;
             let ValidatedDelegatedInfo { stake_amount } =
-                validate_delegated_amount(&stake_account, &meta, feature_set)?;
+                validate_delegated_amount(&stake_account, &meta, invoke_context)?;
             redelegate_stake(
-                invoke_context,
                 &mut stake,
                 stake_amount,
                 &vote_pubkey,
@@ -294,56 +361,14 @@ pub fn delegate(
     }
 }
 
-fn deactivate_stake(
-    invoke_context: &InvokeContext,
-    stake: &mut Stake,
-    stake_flags: &mut StakeFlags,
-    epoch: Epoch,
-) -> Result<(), InstructionError> {
-    if invoke_context
-        .get_feature_set()
-        .is_active(&feature_set::stake_redelegate_instruction::id())
-    {
-        if stake_flags.contains(StakeFlags::MUST_FULLY_ACTIVATE_BEFORE_DEACTIVATION_IS_PERMITTED) {
-            let stake_history = invoke_context.get_sysvar_cache().get_stake_history()?;
-            // when MUST_FULLY_ACTIVATE_BEFORE_DEACTIVATION_IS_PERMITTED flag is set on stake_flags,
-            // deactivation is only permitted when the stake delegation activating amount is zero.
-            let status = stake.delegation.stake_activating_and_deactivating(
-                epoch,
-                &stake_history,
-                new_warmup_cooldown_rate_epoch(invoke_context),
-            );
-            if status.activating != 0 {
-                Err(InstructionError::from(
-                    StakeError::RedelegatedStakeMustFullyActivateBeforeDeactivationIsPermitted,
-                ))
-            } else {
-                stake.deactivate(epoch)?;
-                // After deactivation, need to clear `MustFullyActivateBeforeDeactivationIsPermitted` flag if any.
-                // So that future activation and deactivation are not subject to that restriction.
-                stake_flags
-                    .remove(StakeFlags::MUST_FULLY_ACTIVATE_BEFORE_DEACTIVATION_IS_PERMITTED);
-                Ok(())
-            }
-        } else {
-            stake.deactivate(epoch)?;
-            Ok(())
-        }
-    } else {
-        stake.deactivate(epoch)?;
-        Ok(())
-    }
-}
-
 pub fn deactivate(
-    invoke_context: &InvokeContext,
     stake_account: &mut BorrowedAccount,
     clock: &Clock,
     signers: &HashSet<Pubkey>,
 ) -> Result<(), InstructionError> {
-    if let StakeStateV2::Stake(meta, mut stake, mut stake_flags) = stake_account.get_state()? {
+    if let StakeStateV2::Stake(meta, mut stake, stake_flags) = stake_account.get_state()? {
         meta.authorized.check(signers, StakeAuthorize::Staker)?;
-        deactivate_stake(invoke_context, &mut stake, &mut stake_flags, clock.epoch)?;
+        stake.deactivate(clock.epoch)?;
         stake_account.set_state(&StakeStateV2::Stake(meta, stake, stake_flags))
     } else {
         Err(InstructionError::InvalidAccountData)
@@ -402,8 +427,9 @@ pub fn split(
     match stake_state {
         StakeStateV2::Stake(meta, mut stake, stake_flags) => {
             meta.authorized.check(signers, StakeAuthorize::Staker)?;
-            let minimum_delegation =
-                crate::get_minimum_delegation(invoke_context.get_feature_set());
+            let minimum_delegation = crate::get_minimum_delegation(
+                invoke_context.is_stake_raise_minimum_delegation_to_1_sol_active(),
+            );
             let is_active = {
                 let clock = invoke_context.get_sysvar_cache().get_clock()?;
                 let status = get_stake_status(invoke_context, &stake, &clock)?;
@@ -588,119 +614,183 @@ pub fn merge(
     Ok(())
 }
 
-pub fn redelegate(
+pub fn move_stake(
     invoke_context: &InvokeContext,
     transaction_context: &TransactionContext,
     instruction_context: &InstructionContext,
-    stake_account: &mut BorrowedAccount,
-    uninitialized_stake_account_index: IndexOfAccount,
-    vote_account_index: IndexOfAccount,
-    signers: &HashSet<Pubkey>,
+    source_account_index: IndexOfAccount,
+    lamports: u64,
+    destination_account_index: IndexOfAccount,
+    stake_authority_index: IndexOfAccount,
 ) -> Result<(), InstructionError> {
-    let clock = invoke_context.get_sysvar_cache().get_clock()?;
+    let mut source_account = instruction_context
+        .try_borrow_instruction_account(transaction_context, source_account_index)?;
 
-    // ensure `uninitialized_stake_account_index` is in the uninitialized state
-    let mut uninitialized_stake_account = instruction_context
-        .try_borrow_instruction_account(transaction_context, uninitialized_stake_account_index)?;
-    if *uninitialized_stake_account.get_owner() != id() {
-        ic_msg!(
-            invoke_context,
-            "expected uninitialized stake account owner to be {}, not {}",
-            id(),
-            *uninitialized_stake_account.get_owner()
-        );
-        return Err(InstructionError::IncorrectProgramId);
-    }
-    if uninitialized_stake_account.get_data().len() != StakeStateV2::size_of() {
-        ic_msg!(
-            invoke_context,
-            "expected uninitialized stake account data len to be {}, not {}",
-            StakeStateV2::size_of(),
-            uninitialized_stake_account.get_data().len()
-        );
+    let mut destination_account = instruction_context
+        .try_borrow_instruction_account(transaction_context, destination_account_index)?;
+
+    let (source_merge_kind, destination_merge_kind) = move_stake_or_lamports_shared_checks(
+        invoke_context,
+        transaction_context,
+        instruction_context,
+        &source_account,
+        lamports,
+        &destination_account,
+        stake_authority_index,
+    )?;
+
+    // ensure source and destination are the right size for the current version of StakeState
+    // this a safeguard in case there is a new version of the struct that cannot fit into an old account
+    if source_account.get_data().len() != StakeStateV2::size_of()
+        || destination_account.get_data().len() != StakeStateV2::size_of()
+    {
         return Err(InstructionError::InvalidAccountData);
     }
-    if !matches!(
-        uninitialized_stake_account.get_state()?,
-        StakeStateV2::Uninitialized
-    ) {
-        ic_msg!(
-            invoke_context,
-            "expected uninitialized stake account to be uninitialized",
-        );
-        return Err(InstructionError::AccountAlreadyInitialized);
+
+    // source must be fully active
+    let MergeKind::FullyActive(source_meta, mut source_stake) = source_merge_kind else {
+        return Err(InstructionError::InvalidAccountData);
+    };
+
+    let minimum_delegation = crate::get_minimum_delegation(
+        invoke_context.is_stake_raise_minimum_delegation_to_1_sol_active(),
+    );
+    let source_effective_stake = source_stake.delegation.stake;
+
+    // source cannot move more stake than it has, regardless of how many lamports it has
+    let source_final_stake = source_effective_stake
+        .checked_sub(lamports)
+        .ok_or(InstructionError::InvalidArgument)?;
+
+    // unless all stake is being moved, source must retain at least the minimum delegation
+    if source_final_stake != 0 && source_final_stake < minimum_delegation {
+        return Err(InstructionError::InvalidArgument);
     }
 
-    // validate the provided vote account
-    let vote_account = instruction_context
-        .try_borrow_instruction_account(transaction_context, vote_account_index)?;
-    if *vote_account.get_owner() != solana_vote_program::id() {
+    // destination must be fully active or fully inactive
+    let destination_meta = match destination_merge_kind {
+        MergeKind::FullyActive(destination_meta, mut destination_stake) => {
+            // if active, destination must be delegated to the same vote account as source
+            if source_stake.delegation.voter_pubkey != destination_stake.delegation.voter_pubkey {
+                return Err(StakeError::VoteAddressMismatch.into());
+            }
+
+            let destination_effective_stake = destination_stake.delegation.stake;
+            let destination_final_stake = destination_effective_stake
+                .checked_add(lamports)
+                .ok_or(InstructionError::ArithmeticOverflow)?;
+
+            // ensure destination meets miniumum delegation
+            // since it is already active, this only really applies if the minimum is raised
+            if destination_final_stake < minimum_delegation {
+                return Err(InstructionError::InvalidArgument);
+            }
+
+            merge_delegation_stake_and_credits_observed(
+                &mut destination_stake,
+                lamports,
+                source_stake.credits_observed,
+            )?;
+
+            destination_account.set_state(&StakeStateV2::Stake(
+                destination_meta,
+                destination_stake,
+                StakeFlags::empty(),
+            ))?;
+
+            destination_meta
+        }
+        MergeKind::Inactive(destination_meta, _, _) => {
+            // if destination is inactive, it must be given at least the minimum delegation
+            if lamports < minimum_delegation {
+                return Err(InstructionError::InvalidArgument);
+            }
+
+            let mut destination_stake = source_stake;
+            destination_stake.delegation.stake = lamports;
+
+            destination_account.set_state(&StakeStateV2::Stake(
+                destination_meta,
+                destination_stake,
+                StakeFlags::empty(),
+            ))?;
+
+            destination_meta
+        }
+        _ => return Err(InstructionError::InvalidAccountData),
+    };
+
+    if source_final_stake == 0 {
+        source_account.set_state(&StakeStateV2::Initialized(source_meta))?;
+    } else {
+        source_stake.delegation.stake = source_final_stake;
+
+        source_account.set_state(&StakeStateV2::Stake(
+            source_meta,
+            source_stake,
+            StakeFlags::empty(),
+        ))?;
+    }
+
+    source_account.checked_sub_lamports(lamports)?;
+    destination_account.checked_add_lamports(lamports)?;
+
+    // this should be impossible, but because we do all our math with delegations, best to guard it
+    if source_account.get_lamports() < source_meta.rent_exempt_reserve
+        || destination_account.get_lamports() < destination_meta.rent_exempt_reserve
+    {
         ic_msg!(
             invoke_context,
-            "expected vote account owner to be {}, not {}",
-            solana_vote_program::id(),
-            *vote_account.get_owner()
+            "Delegation calculations violated lamport balance assumptions"
         );
-        return Err(InstructionError::IncorrectProgramId);
+        return Err(InstructionError::InvalidArgument);
     }
-    let vote_pubkey = *vote_account.get_key();
-    let vote_state = vote_account.get_state::<VoteStateVersions>()?;
 
-    let (stake_meta, effective_stake) =
-        if let StakeStateV2::Stake(meta, stake, _stake_flags) = stake_account.get_state()? {
-            let status = get_stake_status(invoke_context, &stake, &clock)?;
-            if status.effective == 0 || status.activating != 0 || status.deactivating != 0 {
-                ic_msg!(invoke_context, "stake is not active");
-                return Err(StakeError::RedelegateTransientOrInactiveStake.into());
-            }
+    Ok(())
+}
 
-            // Deny redelegating to the same vote account. This is nonsensical and could be used to
-            // grief the global stake warm-up/cool-down rate
-            if stake.delegation.voter_pubkey == vote_pubkey {
-                ic_msg!(
-                    invoke_context,
-                    "redelegating to the same vote account not permitted"
-                );
-                return Err(StakeError::RedelegateToSameVoteAccount.into());
-            }
+pub fn move_lamports(
+    invoke_context: &InvokeContext,
+    transaction_context: &TransactionContext,
+    instruction_context: &InstructionContext,
+    source_account_index: IndexOfAccount,
+    lamports: u64,
+    destination_account_index: IndexOfAccount,
+    stake_authority_index: IndexOfAccount,
+) -> Result<(), InstructionError> {
+    let mut source_account = instruction_context
+        .try_borrow_instruction_account(transaction_context, source_account_index)?;
 
-            (meta, status.effective)
-        } else {
-            ic_msg!(invoke_context, "invalid stake account data",);
-            return Err(InstructionError::InvalidAccountData);
-        };
+    let mut destination_account = instruction_context
+        .try_borrow_instruction_account(transaction_context, destination_account_index)?;
 
-    // deactivate `stake_account`
-    //
-    // Note: This function also ensures `signers` contains the `StakeAuthorize::Staker`
-    deactivate(invoke_context, stake_account, &clock, signers)?;
-
-    // transfer the effective stake to the uninitialized stake account
-    stake_account.checked_sub_lamports(effective_stake)?;
-    uninitialized_stake_account.checked_add_lamports(effective_stake)?;
-
-    // initialize and schedule `uninitialized_stake_account` for activation
-    let sysvar_cache = invoke_context.get_sysvar_cache();
-    let rent = sysvar_cache.get_rent()?;
-    let mut uninitialized_stake_meta = stake_meta;
-    uninitialized_stake_meta.rent_exempt_reserve =
-        rent.minimum_balance(uninitialized_stake_account.get_data().len());
-
-    let ValidatedDelegatedInfo { stake_amount } = validate_delegated_amount(
-        &uninitialized_stake_account,
-        &uninitialized_stake_meta,
-        invoke_context.get_feature_set(),
+    let (source_merge_kind, _) = move_stake_or_lamports_shared_checks(
+        invoke_context,
+        transaction_context,
+        instruction_context,
+        &source_account,
+        lamports,
+        &destination_account,
+        stake_authority_index,
     )?;
-    uninitialized_stake_account.set_state(&StakeStateV2::Stake(
-        uninitialized_stake_meta,
-        new_stake(
-            stake_amount,
-            &vote_pubkey,
-            &vote_state.convert_to_current(),
-            clock.epoch,
-        ),
-        StakeFlags::MUST_FULLY_ACTIVATE_BEFORE_DEACTIVATION_IS_PERMITTED,
-    ))?;
+
+    let source_free_lamports = match source_merge_kind {
+        MergeKind::FullyActive(source_meta, source_stake) => source_account
+            .get_lamports()
+            .saturating_sub(source_stake.delegation.stake)
+            .saturating_sub(source_meta.rent_exempt_reserve),
+        MergeKind::Inactive(source_meta, source_lamports, _) => {
+            source_lamports.saturating_sub(source_meta.rent_exempt_reserve)
+        }
+        _ => return Err(InstructionError::InvalidAccountData),
+    };
+
+    if lamports > source_free_lamports {
+        return Err(InstructionError::InvalidArgument);
+    }
+
+    source_account.checked_sub_lamports(lamports)?;
+    destination_account.checked_add_lamports(lamports)?;
 
     Ok(())
 }
@@ -784,24 +874,20 @@ pub fn withdraw(
         return Err(StakeError::LockupInForce.into());
     }
 
-    let lamports_and_reserve = checked_add(lamports, reserve)?;
-    // if the stake is active, we mustn't allow the account to go away
-    if is_staked // line coverage for branch coverage
-            && lamports_and_reserve > stake_account.get_lamports()
-    {
-        return Err(InstructionError::InsufficientFunds);
-    }
-
-    if lamports != stake_account.get_lamports() // not a full withdrawal
-            && lamports_and_reserve > stake_account.get_lamports()
-    {
-        assert!(!is_staked);
-        return Err(InstructionError::InsufficientFunds);
-    }
-
-    // Deinitialize state upon zero balance
     if lamports == stake_account.get_lamports() {
+        // if the stake is active, we mustn't allow the account to go away
+        if is_staked {
+            return Err(InstructionError::InsufficientFunds);
+        }
+
+        // Deinitialize state upon zero balance
         stake_account.set_state(&StakeStateV2::Uninitialized)?;
+    } else {
+        // Don't allow withdrawing the reserved rent balance or active stake
+        let lamports_and_reserve = checked_add(lamports, reserve)?;
+        if lamports_and_reserve > stake_account.get_lamports() {
+            return Err(InstructionError::InsufficientFunds);
+        }
     }
 
     stake_account.checked_sub_lamports(lamports)?;
@@ -813,7 +899,6 @@ pub fn withdraw(
 }
 
 pub(crate) fn deactivate_delinquent(
-    invoke_context: &InvokeContext,
     transaction_context: &TransactionContext,
     instruction_context: &InstructionContext,
     stake_account: &mut BorrowedAccount,
@@ -827,7 +912,7 @@ pub(crate) fn deactivate_delinquent(
     )?;
     let delinquent_vote_account = instruction_context
         .try_borrow_instruction_account(transaction_context, delinquent_vote_account_index)?;
-    if *delinquent_vote_account.get_owner() != solana_vote_program::id() {
+    if *delinquent_vote_account.get_owner() != solana_sdk_ids::vote::id() {
         return Err(InstructionError::IncorrectProgramId);
     }
     let delinquent_vote_state = delinquent_vote_account
@@ -836,7 +921,7 @@ pub(crate) fn deactivate_delinquent(
 
     let reference_vote_account = instruction_context
         .try_borrow_instruction_account(transaction_context, reference_vote_account_index)?;
-    if *reference_vote_account.get_owner() != solana_vote_program::id() {
+    if *reference_vote_account.get_owner() != solana_sdk_ids::vote::id() {
         return Err(InstructionError::IncorrectProgramId);
     }
     let reference_vote_state = reference_vote_account
@@ -847,7 +932,7 @@ pub(crate) fn deactivate_delinquent(
         return Err(StakeError::InsufficientReferenceVotes.into());
     }
 
-    if let StakeStateV2::Stake(meta, mut stake, mut stake_flags) = stake_account.get_state()? {
+    if let StakeStateV2::Stake(meta, mut stake, stake_flags) = stake_account.get_state()? {
         if stake.delegation.voter_pubkey != *delinquent_vote_account_pubkey {
             return Err(StakeError::VoteAddressMismatch.into());
         }
@@ -855,7 +940,7 @@ pub(crate) fn deactivate_delinquent(
         // Deactivate the stake account if its delegated vote account has never voted or has not
         // voted in the last `MINIMUM_DELINQUENT_EPOCHS_FOR_DEACTIVATION`
         if eligible_for_deactivate_delinquent(&delinquent_vote_state.epoch_credits, current_epoch) {
-            deactivate_stake(invoke_context, &mut stake, &mut stake_flags, current_epoch)?;
+            stake.deactivate(current_epoch)?;
             stake_account.set_state(&StakeStateV2::Stake(meta, stake, stake_flags))
         } else {
             Err(StakeError::MinimumDelinquentEpochsForDeactivationNotMet.into())
@@ -876,7 +961,7 @@ struct ValidatedDelegatedInfo {
 fn validate_delegated_amount(
     account: &BorrowedAccount,
     meta: &Meta,
-    feature_set: &FeatureSet,
+    invoke_context: &InvokeContext,
 ) -> Result<ValidatedDelegatedInfo, InstructionError> {
     let stake_amount = account
         .get_lamports()
@@ -884,7 +969,11 @@ fn validate_delegated_amount(
 
     // Stake accounts may be initialized with a stake amount below the minimum delegation so check
     // that the minimum is met before delegation.
-    if stake_amount < crate::get_minimum_delegation(feature_set) {
+    if stake_amount
+        < crate::get_minimum_delegation(
+            invoke_context.is_stake_raise_minimum_delegation_to_1_sol_active(),
+        )
+    {
         return Err(StakeError::InsufficientDelegation.into());
     }
     Ok(ValidatedDelegatedInfo { stake_amount })
@@ -1021,7 +1110,7 @@ impl MergeKind {
                 let status = stake.delegation.stake_activating_and_deactivating(
                     clock.epoch,
                     stake_history,
-                    new_warmup_cooldown_rate_epoch(invoke_context),
+                    new_warmup_cooldown_rate_epoch(),
                 );
 
                 match (status.effective, status.activating, status.deactivating) {
@@ -1331,7 +1420,7 @@ fn do_create_account(
 ) -> AccountSharedData {
     let mut stake_account = AccountSharedData::new(lamports, StakeStateV2::size_of(), &id());
 
-    let vote_state = vote_state::from(vote_account).expect("vote_state");
+    let vote_state = VoteState::deserialize(vote_account.data()).expect("vote_state");
 
     let rent_exempt_reserve = rent.minimum_balance(stake_account.data().len());
 
@@ -1360,20 +1449,19 @@ mod tests {
     use {
         super::*,
         proptest::prelude::*,
+        solana_account::{create_account_shared_data_for_test, AccountSharedData},
+        solana_epoch_schedule::EpochSchedule,
         solana_program_runtime::with_mock_invoke_context,
-        solana_sdk::{
-            account::{create_account_shared_data_for_test, AccountSharedData},
-            epoch_schedule::EpochSchedule,
-            pubkey::Pubkey,
-            stake::state::warmup_cooldown_rate,
-            sysvar::{epoch_schedule, SysvarId},
-        },
+        solana_pubkey::Pubkey,
+        solana_sdk_ids::sysvar::epoch_schedule,
+        solana_stake_interface::state::warmup_cooldown_rate,
+        solana_sysvar_id::SysvarId,
         test_case::test_case,
     };
 
     #[test]
     fn test_authorized_authorize() {
-        let staker = solana_sdk::pubkey::new_rand();
+        let staker = solana_pubkey::new_rand();
         let mut authorized = Authorized::auto(&staker);
         let mut signers = HashSet::new();
         assert_eq!(
@@ -1389,9 +1477,9 @@ mod tests {
 
     #[test]
     fn test_authorized_authorize_with_custodian() {
-        let staker = solana_sdk::pubkey::new_rand();
-        let custodian = solana_sdk::pubkey::new_rand();
-        let invalid_custodian = solana_sdk::pubkey::new_rand();
+        let staker = solana_pubkey::new_rand();
+        let custodian = solana_pubkey::new_rand();
+        let invalid_custodian = solana_pubkey::new_rand();
         let mut authorized = Authorized::auto(&staker);
         let mut signers = HashSet::new();
         signers.insert(staker);
@@ -2062,11 +2150,7 @@ mod tests {
                 })
                 .sum::<u64>();
 
-            let delta = if total_effective_stake > prev_total_effective_stake {
-                total_effective_stake - prev_total_effective_stake
-            } else {
-                prev_total_effective_stake - total_effective_stake
-            };
+            let delta = total_effective_stake.abs_diff(prev_total_effective_stake);
 
             // uncomment and add ! for fun with graphing
             // eprint("{:8} {:8} {:8} ", epoch, total_effective_stake, delta);
@@ -2087,7 +2171,7 @@ mod tests {
 
     #[test]
     fn test_lockup_is_expired() {
-        let custodian = solana_sdk::pubkey::new_rand();
+        let custodian = solana_pubkey::new_rand();
         let lockup = Lockup {
             epoch: 1,
             unix_timestamp: 1,
@@ -2148,7 +2232,7 @@ mod tests {
         panic!(
             "stake minimum_balance: {} lamports, {} SOL",
             minimum_balance,
-            minimum_balance as f64 / solana_sdk::native_token::LAMPORTS_PER_SOL as f64
+            minimum_balance as f64 / solana_native_token::LAMPORTS_PER_SOL as f64
         );
     }
 

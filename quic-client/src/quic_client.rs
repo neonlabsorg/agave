@@ -5,14 +5,13 @@ use {
     crate::nonblocking::quic_client::{
         QuicClient, QuicClientConnection as NonblockingQuicConnection, QuicLazyInitializedEndpoint,
     },
-    lazy_static::lazy_static,
     log::*,
     solana_connection_cache::{
         client_connection::{ClientConnection, ClientStats},
         connection_cache_stats::ConnectionCacheStats,
         nonblocking::client_connection::ClientConnection as NonblockingClientConnection,
     },
-    solana_sdk::transport::{Result as TransportResult, TransportError},
+    solana_transaction_error::{TransportError, TransportResult},
     std::{
         net::SocketAddr,
         sync::{atomic::Ordering, Arc, Condvar, Mutex, MutexGuard},
@@ -65,14 +64,18 @@ impl AsyncTaskSemaphore {
     }
 }
 
-lazy_static! {
-    static ref ASYNC_TASK_SEMAPHORE: AsyncTaskSemaphore =
-        AsyncTaskSemaphore::new(MAX_OUTSTANDING_TASK);
-    static ref RUNTIME: Runtime = tokio::runtime::Builder::new_multi_thread()
+static ASYNC_TASK_SEMAPHORE: std::sync::LazyLock<AsyncTaskSemaphore> =
+    std::sync::LazyLock::new(|| AsyncTaskSemaphore::new(MAX_OUTSTANDING_TASK));
+static RUNTIME: std::sync::LazyLock<Runtime> = std::sync::LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
         .thread_name("solQuicClientRt")
         .enable_all()
         .build()
-        .unwrap();
+        .unwrap()
+});
+
+pub fn get_runtime() -> &'static Runtime {
+    &RUNTIME
 }
 
 async fn send_data_async(
@@ -176,4 +179,10 @@ impl ClientConnection for QuicClientConnection {
         RUNTIME.block_on(self.inner.send_data(buffer))?;
         Ok(())
     }
+}
+
+pub(crate) fn close_quic_connection(connection: Arc<QuicClient>) {
+    // Close the connection and release resources
+    trace!("Closing QUIC connection to {}", connection.server_addr());
+    RUNTIME.block_on(connection.close());
 }

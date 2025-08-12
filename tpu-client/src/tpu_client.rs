@@ -2,6 +2,8 @@ pub use crate::nonblocking::tpu_client::TpuSenderError;
 use {
     crate::nonblocking::tpu_client::TpuClient as NonblockingTpuClient,
     rayon::iter::{IntoParallelIterator, ParallelIterator},
+    solana_client_traits::AsyncClient,
+    solana_clock::Slot,
     solana_connection_cache::{
         client_connection::ClientConnection,
         connection_cache::{
@@ -9,27 +11,23 @@ use {
         },
     },
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        client::AsyncClient,
-        clock::Slot,
-        signature::Signature,
-        transaction::{Transaction, VersionedTransaction},
-        transport::Result as TransportResult,
-    },
+    solana_signature::Signature,
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
+    solana_transaction_error::{TransportError, TransportResult},
     std::{
         collections::VecDeque,
-        net::UdpSocket,
         sync::{Arc, RwLock},
     },
 };
 #[cfg(feature = "spinner")]
 use {
-    solana_sdk::{message::Message, signers::Signers, transaction::TransactionError},
-    tokio::time::Duration,
+    solana_message::Message, solana_signer::signers::Signers,
+    solana_transaction_error::TransactionError, tokio::time::Duration,
 };
 
 pub const DEFAULT_TPU_ENABLE_UDP: bool = false;
 pub const DEFAULT_TPU_USE_QUIC: bool = true;
+pub const DEFAULT_VOTE_USE_QUIC: bool = false;
 
 /// The default connection count is set to 1 -- it should
 /// be sufficient for most use cases. Validators can use
@@ -74,8 +72,6 @@ pub struct TpuClient<
     M, // ConnectionManager
     C, // NewConnectionConfig
 > {
-    _deprecated: UdpSocket, // TpuClient now uses the connection_cache to choose a send_socket
-    //todo: get rid of this field
     rpc_client: Arc<RpcClient>,
     tpu_client: Arc<NonblockingTpuClient<P, M, C>>,
 }
@@ -104,11 +100,11 @@ where
         self.invoke(self.tpu_client.try_send_transaction(transaction))
     }
 
-    /// Serialize and send transaction to the current and upcoming leader TPUs according to fanout
-    /// NOTE: send_wire_transaction() and try_send_transaction() above both fail in a specific case when used in LocalCluster
-    /// They both invoke the nonblocking TPUClient and both fail when calling "transfer_with_client()" multiple times
-    /// I do not full understand WHY the nonblocking TPUClient fails in this specific case. But the method defined below
-    /// does work although it has only been tested in LocalCluster integration tests
+    /// Serialize and send transaction to the current and upcoming leader TPUs according to fanout.
+    ///
+    /// Returns an error if:
+    /// 1. there are no known tpu sockets to send to
+    /// 2. any of the sends fail, even if other sends succeeded.
     pub fn send_transaction_to_upcoming_leaders(
         &self,
         transaction: &Transaction,
@@ -119,15 +115,27 @@ where
         let leaders = self
             .tpu_client
             .get_leader_tpu_service()
-            .leader_tpu_sockets(self.tpu_client.get_fanout_slots());
+            .unique_leader_tpu_sockets(self.tpu_client.get_fanout_slots());
 
+        let mut last_error: Option<TransportError> = None;
+        let mut some_success = false;
         for tpu_address in &leaders {
             let cache = self.tpu_client.get_connection_cache();
             let conn = cache.get_connection(tpu_address);
-            conn.send_data_async(wire_transaction.clone())?;
+            if let Err(err) = conn.send_data_async(wire_transaction.clone()) {
+                last_error = Some(err);
+            } else {
+                some_success = true;
+            }
         }
 
-        Ok(())
+        if let Some(err) = last_error {
+            Err(err)
+        } else if !some_success {
+            Err(std::io::Error::other("No sends attempted").into())
+        } else {
+            Ok(())
+        }
     }
 
     /// Serialize and send a batch of transactions to the current and upcoming leader TPUs according
@@ -179,7 +187,6 @@ where
             tokio::task::block_in_place(|| rpc_client.runtime().block_on(create_tpu_client))?;
 
         Ok(Self {
-            _deprecated: UdpSocket::bind("0.0.0.0:0").unwrap(),
             rpc_client,
             tpu_client: Arc::new(tpu_client),
         })
@@ -202,7 +209,6 @@ where
             tokio::task::block_in_place(|| rpc_client.runtime().block_on(create_tpu_client))?;
 
         Ok(Self {
-            _deprecated: UdpSocket::bind("0.0.0.0:0").unwrap(),
             rpc_client,
             tpu_client: Arc::new(tpu_client),
         })

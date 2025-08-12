@@ -87,6 +87,9 @@ Operate a configured testnet
                                         in genesis config for external nodes
    --no-snapshot-fetch
                                       - If set, disables booting validators from a snapshot
+   --copy-program URL_OR_MONIKER PUBKEY
+                                      - Copies a program PUBKEY from URL_OR_MONIKER.
+                                      For example, --copy-program t recr1L3PCGKLbckBqMNcJhuuyU1zgo8nBhfLVsJNwr5
    --skip-poh-verify
                                       - If set, validators will skip verifying
                                         the ledger they already have saved to disk at
@@ -145,6 +148,9 @@ Operate a configured testnet
  startnode/stopnode-specific options:
    -i [ip address]                    - IP Address of the node to start or stop
 
+ startnode specific option:
+   --wen-restart [coordinator_pubkey]      - Use given coordinator pubkey and apply wen_restat
+
  startclients-specific options:
    $CLIENT_OPTIONS
 
@@ -186,12 +192,11 @@ annotateBlockexplorerUrl() {
 }
 
 build() {
-  supported=("20.04")
   declare MAYBE_DOCKER=
-  if [[ $(uname) != Linux || ! " ${supported[*]} " =~ $(lsb_release -sr) ]]; then
-    # shellcheck source=ci/rust-version.sh
-    source "$SOLANA_ROOT"/ci/rust-version.sh
-    MAYBE_DOCKER="ci/docker-run.sh ${ci_docker_image:?}"
+  if [[ $(uname) != Linux ]]; then
+    # shellcheck source=ci/docker/env.sh
+    source "$SOLANA_ROOT"/ci/docker/env.sh
+    MAYBE_DOCKER="ci/docker-run.sh ${CI_DOCKER_IMAGE:?}"
   fi
   SECONDS=0
   (
@@ -279,7 +284,7 @@ syncScripts() {
   local remoteSolanaHome="${remoteHome}/solana"
   rsync -vPrc -e "ssh ${sshOptions[*]}" \
     --exclude 'net/log*' \
-    "$SOLANA_ROOT"/{fetch-perf-libs.sh,fetch-spl.sh,scripts,net,multinode-demo} \
+    "$SOLANA_ROOT"/{fetch-perf-libs.sh,fetch-programs.sh,fetch-core-bpf.sh,fetch-spl.sh,scripts,net,multinode-demo} \
     "$ipAddress":"$remoteSolanaHome"/ > /dev/null
 }
 
@@ -350,6 +355,7 @@ startBootstrapLeader() {
          \"$TMPFS_ACCOUNTS\" \
          \"$disableQuic\" \
          \"$enableUdp\" \
+         \"$maybeWenRestart\" \
       "
 
   ) >> "$logFile" 2>&1 || {
@@ -424,6 +430,7 @@ startNode() {
          \"$TMPFS_ACCOUNTS\" \
          \"$disableQuic\" \
          \"$enableUdp\" \
+         \"$maybeWenRestart\" \
       "
   ) >> "$logFile" 2>&1 &
   declare pid=$!
@@ -620,6 +627,13 @@ deploy() {
   echo "Deployment started at $(date)"
   $metricsWriteDatapoint "testnet-deploy net-start-begin=1"
 
+  if [[ -n "$copyProgramPubkey" ]]; then
+      echo "Copying program from ${copyProgramUrl}"
+      solana -u "${copyProgramUrl}" program dump "${copyProgramPubkey}" "${copyProgramPubkey}".so || exit 1
+
+      genesisOptions="${genesisOptions} --bpf-program ${copyProgramPubkey} BPFLoader2111111111111111111111111111111111 /home/solana/solana/net/${copyProgramPubkey}.so"
+  fi
+
   declare bootstrapLeader=true
   for nodeAddress in "${validatorIpList[@]}" "${blockstreamerIpList[@]}"; do
     nodeType=
@@ -811,6 +825,8 @@ externalPrimordialAccountsFile=
 remoteExternalPrimordialAccountsFile=
 internalNodesStakeLamports=
 internalNodesLamports=
+copyProgramUrl=""
+copyProgramPubkey=""
 maybeNoSnapshot=""
 maybeLimitLedgerSize=""
 maybeSkipLedgerVerify=""
@@ -836,6 +852,7 @@ disableQuic=false
 enableUdp=false
 clientType=tpu-client
 maybeUseUnstakedConnection=""
+maybeWenRestart=""
 
 command=$1
 [[ -n $command ]] || usage
@@ -900,6 +917,10 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --internal-nodes-lamports ]]; then
       internalNodesLamports="$2"
       shift 2
+    elif [[ $1 = --copy-program ]]; then
+      copyProgramUrl="$2"
+      copyProgramPubkey="$3"
+      shift 3
     elif [[ $1 = --external-accounts-file ]]; then
       externalPrimordialAccountsFile="$2"
       remoteExternalPrimordialAccountsFile=/tmp/external-primordial-accounts.yml
@@ -983,6 +1004,12 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --use-unstaked-connection ]]; then
       maybeUseUnstakedConnection="$1"
       shift 1
+    elif [[ $1 = --wen-restart ]]; then
+      # wen_restart needs tower storage to be there, so set skipSetup to true
+      # to avoid erasing the tower storage on disk.
+      skipSetup=true
+      maybeWenRestart="$2"
+      shift 2
     else
       usage "Unknown long option: $1"
     fi

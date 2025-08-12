@@ -8,7 +8,7 @@
 //! [`::schedule_task()`](SchedulingStateMachine::schedule_task) while maintaining the account
 //! readonly/writable lock rules. Those returned runnable tasks are guaranteed to be safe to
 //! execute in parallel. Lastly, `SchedulingStateMachine` should be notified about the completion
-//! of the exeuction via [`::deschedule_task()`](SchedulingStateMachine::deschedule_task), so that
+//! of the execution via [`::deschedule_task()`](SchedulingStateMachine::deschedule_task), so that
 //! conflicting tasks can be returned from
 //! [`::schedule_next_unblocked_task()`](SchedulingStateMachine::schedule_next_unblocked_task) as
 //! newly-unblocked runnable ones.
@@ -16,7 +16,7 @@
 //! The design principle of this crate (`solana-unified-scheduler-logic`) is simplicity for the
 //! separation of concern. It is interacted only with a few of its public API by
 //! `solana-unified-scheduler-pool`. This crate doesn't know about banks, slots, solana-runtime,
-//! threads, crossbeam-channel at all. Becasue of this, it's deterministic, easy-to-unit-test, and
+//! threads, crossbeam-channel at all. Because of this, it's deterministic, easy-to-unit-test, and
 //! its perf footprint is well understood. It really focuses on its single job: sorting
 //! transactions in executable order.
 //!
@@ -50,7 +50,7 @@
 //! Put differently, this algorithm tries to gradually lock all of addresses of tasks at different
 //! timings while not deviating the execution order from the original task ingestion order. This
 //! implies there's no locking retries in general, which is the primary source of non-linear perf.
-//! degration.
+//! degradation.
 //!
 //! As a ballpark number from a synthesized micro benchmark on usual CPU for `mainnet-beta`
 //! validators, it takes roughly 100ns to schedule and deschedule a transaction with 10 accounts.
@@ -67,7 +67,7 @@
 //! the job to other threads from the scheduler thread. This preloading is done inside
 //! [`create_task()`](SchedulingStateMachine::create_task). In this way, task scheduling
 //! computational complexity is basically reduced to several word-sized loads and stores in the
-//! schduler thread (i.e.  constant; no allocations nor syscalls), while being proportional to the
+//! scheduler thread (i.e.  constant; no allocations nor syscalls), while being proportional to the
 //! number of addresses in a given transaction. Note that this statement is held true, regardless
 //! of conflicts. This is because the preloading also pre-allocates some scratch-pad area
 //! ([`blocked_usages_from_tasks`](UsageQueueInner::blocked_usages_from_tasks)) to stash blocked
@@ -98,26 +98,46 @@
 use {
     crate::utils::{ShortCounter, Token, TokenCell},
     assert_matches::assert_matches,
-    solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction},
+    solana_pubkey::Pubkey,
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+    solana_transaction::sanitized::SanitizedTransaction,
     static_assertions::const_assert_eq,
     std::{collections::VecDeque, mem, sync::Arc},
+    unwrap_none::UnwrapNone,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SchedulingMode {
+    BlockVerification,
+    BlockProduction,
+}
+
+/// This type alias is intentionally not exposed to public API with `pub`. The choice of explicit
+/// `u32`, rather than more neutral `usize`, is an implementation detail to squeeze out CPU-cache
+/// footprint as much as possible.
+/// Note that usage of `u32` is safe because it's expected `SchedulingStateMachine` to be
+/// `reinitialize()`-d rather quickly after short period: 1 slot for block verification, 4 (or up to
+/// 8) consecutive slots for block production.
+type CounterInner = u32;
 
 /// Internal utilities. Namely this contains [`ShortCounter`] and [`TokenCell`].
 mod utils {
-    use std::{
-        any::{self, TypeId},
-        cell::{RefCell, UnsafeCell},
-        collections::BTreeSet,
-        marker::PhantomData,
-        thread,
+    use {
+        crate::CounterInner,
+        std::{
+            any::{self, TypeId},
+            cell::{RefCell, UnsafeCell},
+            collections::BTreeSet,
+            marker::PhantomData,
+            thread,
+        },
     };
 
     /// A really tiny counter to hide `.checked_{add,sub}` all over the place.
     ///
-    /// It's caller's reponsibility to ensure this (backed by [`u32`]) never overflow.
+    /// It's caller's responsibility to ensure this (backed by [`CounterInner`]) never overflow.
     #[derive(Debug, Clone, Copy)]
-    pub(super) struct ShortCounter(u32);
+    pub(super) struct ShortCounter(CounterInner);
 
     impl ShortCounter {
         pub(super) fn zero() -> Self {
@@ -136,7 +156,7 @@ mod utils {
             self.0 == 0
         }
 
-        pub(super) fn current(&self) -> u32 {
+        pub(super) fn current(&self) -> CounterInner {
             self.0
         }
 
@@ -402,6 +422,9 @@ const_assert_eq!(mem::size_of::<LockResult>(), 1);
 pub type Task = Arc<TaskInner>;
 const_assert_eq!(mem::size_of::<Task>(), 8);
 
+pub type BlockSize = usize;
+pub const NO_CONSUMED_BLOCK_SIZE: BlockSize = 0;
+
 /// [`Token`] for [`UsageQueue`].
 type UsageQueueToken = Token<UsageQueueInner>;
 const_assert_eq!(mem::size_of::<UsageQueueToken>(), 0);
@@ -413,13 +436,14 @@ const_assert_eq!(mem::size_of::<BlockedUsageCountToken>(), 0);
 /// Internal scheduling data about a particular task.
 #[derive(Debug)]
 pub struct TaskInner {
-    transaction: SanitizedTransaction,
+    transaction: RuntimeTransaction<SanitizedTransaction>,
     /// The index of a transaction in ledger entries; not used by SchedulingStateMachine by itself.
     /// Carrying this along with the transaction is needed to properly record the execution result
     /// of it.
     index: usize,
     lock_contexts: Vec<LockContext>,
     blocked_usage_count: TokenCell<ShortCounter>,
+    consumed_block_size: BlockSize,
 }
 
 impl TaskInner {
@@ -427,7 +451,11 @@ impl TaskInner {
         self.index
     }
 
-    pub fn transaction(&self) -> &SanitizedTransaction {
+    pub fn consumed_block_size(&self) -> BlockSize {
+        self.consumed_block_size
+    }
+
+    pub fn transaction(&self) -> &RuntimeTransaction<SanitizedTransaction> {
         &self.transaction
     }
 
@@ -448,6 +476,10 @@ impl TaskInner {
             .blocked_usage_count
             .with_borrow_mut(token, |usage_count| usage_count.decrement_self().is_zero());
         did_unblock.then_some(self)
+    }
+
+    pub fn into_transaction(self: Task) -> RuntimeTransaction<SanitizedTransaction> {
+        Task::into_inner(self).unwrap().transaction
     }
 }
 
@@ -605,9 +637,12 @@ impl UsageQueueInner {
 
 const_assert_eq!(mem::size_of::<TokenCell<UsageQueueInner>>(), 40);
 
-/// Scheduler's internal data for each address ([`Pubkey`](`solana_sdk::pubkey::Pubkey`)). Very
+/// Scheduler's internal data for each address ([`Pubkey`](`solana_pubkey::Pubkey`)). Very
 /// opaque wrapper type; no methods just with [`::clone()`](Clone::clone) and
 /// [`::default()`](Default::default).
+///
+/// It's the higher layer's responsibility to ensure to associate the same instance of UsageQueue
+/// for given Pubkey at the time of [task](Task) creation.
 #[derive(Debug, Clone, Default)]
 pub struct UsageQueue(Arc<TokenCell<UsageQueueInner>>);
 const_assert_eq!(mem::size_of::<UsageQueue>(), 8);
@@ -616,16 +651,31 @@ const_assert_eq!(mem::size_of::<UsageQueue>(), 8);
 /// `solana-unified-scheduler-pool`.
 pub struct SchedulingStateMachine {
     unblocked_task_queue: VecDeque<Task>,
+    /// The number of all tasks which aren't `deschedule_task()`-ed yet while their ownership has
+    /// already been transferred to SchedulingStateMachine by `schedule_or_buffer_task()`. In other
+    /// words, they are running right now or buffered by explicit request or by implicit blocking
+    /// due to one of other _active_ (= running or buffered) conflicting tasks.
     active_task_count: ShortCounter,
+    /// The number of tasks which are running right now.
+    running_task_count: ShortCounter,
+    /// The maximum number of running tasks at any given moment. While this could be tightly
+    /// related to the number of threads, terminology here is intentionally abstracted away to make
+    /// this struct purely logic only. As a hypothetical counter-example, tasks could be IO-bound,
+    /// in that case max_running_task_count will be coupled with the IO queue depth instead.
+    max_running_task_count: CounterInner,
     handled_task_count: ShortCounter,
     unblocked_task_count: ShortCounter,
     total_task_count: ShortCounter,
     count_token: BlockedUsageCountToken,
     usage_queue_token: UsageQueueToken,
 }
-const_assert_eq!(mem::size_of::<SchedulingStateMachine>(), 48);
+const_assert_eq!(mem::size_of::<SchedulingStateMachine>(), 56);
 
 impl SchedulingStateMachine {
+    pub fn has_no_running_task(&self) -> bool {
+        self.running_task_count.is_zero()
+    }
+
     pub fn has_no_active_task(&self) -> bool {
         self.active_task_count.is_zero()
     }
@@ -634,23 +684,35 @@ impl SchedulingStateMachine {
         !self.unblocked_task_queue.is_empty()
     }
 
+    pub fn has_runnable_task(&self) -> bool {
+        self.has_unblocked_task() && self.is_task_runnable()
+    }
+
+    fn is_task_runnable(&self) -> bool {
+        self.running_task_count.current() < self.max_running_task_count
+    }
+
     pub fn unblocked_task_queue_count(&self) -> usize {
         self.unblocked_task_queue.len()
     }
 
-    pub fn active_task_count(&self) -> u32 {
+    #[cfg(test)]
+    fn active_task_count(&self) -> CounterInner {
         self.active_task_count.current()
     }
 
-    pub fn handled_task_count(&self) -> u32 {
+    #[cfg(test)]
+    fn handled_task_count(&self) -> CounterInner {
         self.handled_task_count.current()
     }
 
-    pub fn unblocked_task_count(&self) -> u32 {
+    #[cfg(test)]
+    fn unblocked_task_count(&self) -> CounterInner {
         self.unblocked_task_count.current()
     }
 
-    pub fn total_task_count(&self) -> u32 {
+    #[cfg(test)]
+    fn total_task_count(&self) -> CounterInner {
         self.total_task_count.current()
     }
 
@@ -660,16 +722,60 @@ impl SchedulingStateMachine {
     /// indicating the scheduled task is blocked currently.
     ///
     /// Note that this function takes ownership of the task to allow for future optimizations.
+    #[cfg(any(test, doc))]
     #[must_use]
     pub fn schedule_task(&mut self, task: Task) -> Option<Task> {
+        self.schedule_or_buffer_task(task, false)
+    }
+
+    /// Adds given `task` to internal buffer, even if it's immediately schedulable otherwise.
+    ///
+    /// Put differently, buffering means to force the task to be blocked unconditionally after
+    /// normal scheduling processing.
+    ///
+    /// Thus, the task is internally retained inside this [`SchedulingStateMachine`], whether the
+    /// task is blocked or not. Eventually, the buffered task will be returned by one of later
+    /// invocations [`schedule_next_unblocked_task()`](Self::schedule_next_unblocked_task).
+    ///
+    /// Note that this function takes ownership of the task to allow for future optimizations.
+    pub fn buffer_task(&mut self, task: Task) {
+        self.schedule_or_buffer_task(task, true).unwrap_none();
+    }
+
+    /// Schedules or buffers given `task`, returning successful one unless buffering is forced.
+    ///
+    /// Refer to [`schedule_task()`](Self::schedule_task) and
+    /// [`buffer_task()`](Self::buffer_task) for the difference between _scheduling_ and
+    /// _buffering_ respectively.
+    ///
+    /// Note that this function takes ownership of the task to allow for future optimizations.
+    #[must_use]
+    pub fn schedule_or_buffer_task(&mut self, task: Task, force_buffering: bool) -> Option<Task> {
         self.total_task_count.increment_self();
         self.active_task_count.increment_self();
-        self.try_lock_usage_queues(task)
+        self.try_lock_usage_queues(task).and_then(|task| {
+            // locking succeeded, and then ...
+            if !self.is_task_runnable() || force_buffering {
+                // ... push to unblocked_task_queue, if buffering is forced.
+                self.unblocked_task_count.increment_self();
+                self.unblocked_task_queue.push_back(task);
+                None
+            } else {
+                // ... return the task back as schedulable to the caller as-is otherwise.
+                self.running_task_count.increment_self();
+                Some(task)
+            }
+        })
     }
 
     #[must_use]
     pub fn schedule_next_unblocked_task(&mut self) -> Option<Task> {
+        if !self.is_task_runnable() {
+            return None;
+        }
+
         self.unblocked_task_queue.pop_front().inspect(|_| {
+            self.running_task_count.increment_self();
             self.unblocked_task_count.increment_self();
         })
     }
@@ -685,6 +791,7 @@ impl SchedulingStateMachine {
     /// tasks inside `SchedulingStateMachine` to provide an offloading-based optimization
     /// opportunity for callers.
     pub fn deschedule_task(&mut self, task: &Task) {
+        self.running_task_count.decrement_self();
         self.active_task_count.decrement_self();
         self.handled_task_count.increment_self();
         self.unlock_usage_queues(task);
@@ -754,8 +861,8 @@ impl SchedulingStateMachine {
         }
     }
 
-    /// Creates a new task with [`SanitizedTransaction`] with all of its corresponding
-    /// [`UsageQueue`]s preloaded.
+    /// Creates a new task with [`RuntimeTransaction<SanitizedTransaction>`] with all of
+    /// its corresponding [`UsageQueue`]s preloaded.
     ///
     /// Closure (`usage_queue_loader`) is used to delegate the (possibly multi-threaded)
     /// implementation of [`UsageQueue`] look-up by [`pubkey`](Pubkey) to callers. It's the
@@ -768,39 +875,78 @@ impl SchedulingStateMachine {
     /// after created, if `has_no_active_task()` is `true`. Also note that this is desired for
     /// separation of concern.
     pub fn create_task(
-        transaction: SanitizedTransaction,
+        transaction: RuntimeTransaction<SanitizedTransaction>,
         index: usize,
         usage_queue_loader: &mut impl FnMut(Pubkey) -> UsageQueue,
     ) -> Task {
-        // Calling the _unchecked() version here is safe for faster operation, because
-        // `get_account_locks()` (the safe variant) is ensured to be called in
-        // DefaultTransactionHandler::handle() via Bank::prepare_unlocked_batch_from_single_tx().
-        //
-        // The safe variant has additional account-locking related verifications, which is crucial.
-        //
-        // Currently the replaying stage is redundantly calling `get_account_locks()` when unified
-        // scheduler is enabled on the given transaction at the blockstore. This will be relaxed
-        // for optimization in the future. As for banking stage with unified scheduler, it will
-        // need to run .get_account_locks() at least once somewhere in the code path. In the
-        // distant future, this function `create_task()` should be adjusted so that both stages do
-        // the checks before calling this (say, with some ad-hoc type like
-        // `SanitizedTransactionWithCheckedAccountLocks`) or do the checks here, resulting in
-        // eliminating the redundant one in the replaying stage and in the handler.
-        let locks = transaction.get_account_locks_unchecked();
+        Self::do_create_task(
+            transaction,
+            index,
+            NO_CONSUMED_BLOCK_SIZE,
+            usage_queue_loader,
+        )
+    }
 
-        let writable_locks = locks
-            .writable
-            .iter()
-            .map(|address| (address, RequestedUsage::Writable));
-        let readonly_locks = locks
-            .readonly
-            .iter()
-            .map(|address| (address, RequestedUsage::Readonly));
+    pub fn create_block_production_task(
+        transaction: RuntimeTransaction<SanitizedTransaction>,
+        index: usize,
+        consumed_block_size: BlockSize,
+        usage_queue_loader: &mut impl FnMut(Pubkey) -> UsageQueue,
+    ) -> Task {
+        Self::do_create_task(transaction, index, consumed_block_size, usage_queue_loader)
+    }
 
-        let lock_contexts = writable_locks
-            .chain(readonly_locks)
-            .map(|(address, requested_usage)| {
-                LockContext::new(usage_queue_loader(**address), requested_usage)
+    fn do_create_task(
+        transaction: RuntimeTransaction<SanitizedTransaction>,
+        index: usize,
+        consumed_block_size: BlockSize,
+        usage_queue_loader: &mut impl FnMut(Pubkey) -> UsageQueue,
+    ) -> Task {
+        // It's crucial for tasks to be validated with
+        // `account_locks::validate_account_locks()` prior to the creation.
+        // That's because it's part of protocol consensus regarding the
+        // rejection of blocks containing malformed transactions
+        // (`AccountLoadedTwice` and `TooManyAccountLocks`). Even more,
+        // `SchedulingStateMachine` can't properly handle transactions with
+        // duplicate addresses (those falling under `AccountLoadedTwice`).
+        //
+        // However, it's okay for now not to call `::validate_account_locks()`
+        // here.
+        //
+        // Currently `replay_stage` is always calling
+        //`::validate_account_locks()` regardless of whether unified-scheduler
+        // is enabled or not at the blockstore
+        // (`Bank::prepare_sanitized_batch()` is called in
+        // `process_entries()`). This verification will be hoisted for
+        // optimization when removing
+        // `--block-verification-method=blockstore-processor`.
+        //
+        // As for `banking_stage` with unified scheduler, it will need to run
+        // `validate_account_locks()` at least once somewhere in the code path.
+        // In the distant future, this function (`create_task()`) should be
+        // adjusted so that both stages do the checks before calling this or do
+        // the checks here, to simplify the two code paths regarding the
+        // essential `validate_account_locks` validation.
+        //
+        // Lastly, `validate_account_locks()` is currently called in
+        // `DefaultTransactionHandler::handle()` via
+        // `Bank::prepare_unlocked_batch_from_single_tx()` as well.
+        // This redundancy is known. It was just left as-is out of abundance
+        // of caution.
+        let lock_contexts = transaction
+            .message()
+            .account_keys()
+            .iter()
+            .enumerate()
+            .map(|(index, address)| {
+                LockContext::new(
+                    usage_queue_loader(*address),
+                    if transaction.message().is_writable(index) {
+                        RequestedUsage::Writable
+                    } else {
+                        RequestedUsage::Readonly
+                    },
+                )
             })
             .collect();
 
@@ -809,26 +955,32 @@ impl SchedulingStateMachine {
             index,
             lock_contexts,
             blocked_usage_count: TokenCell::new(ShortCounter::zero()),
+            consumed_block_size,
         })
     }
 
     /// Rewind the inactive state machine to be initialized
     ///
     /// This isn't called _reset_ to indicate this isn't safe to call this at any given moment.
-    /// This panics if the state machine hasn't properly been finished (i.e.  there should be no
+    /// This panics if the state machine hasn't properly been finished (i.e. there should be no
     /// active task) to uphold invariants of [`UsageQueue`]s.
     ///
     /// This method is intended to reuse SchedulingStateMachine instance (to avoid its `unsafe`
     /// [constructor](SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling)
     /// as much as possible) and its (possibly cached) associated [`UsageQueue`]s for processing
     /// other slots.
+    ///
+    /// There's a related method called [`clear_and_reinitialize()`](Self::clear_and_reinitialize).
     pub fn reinitialize(&mut self) {
         assert!(self.has_no_active_task());
+        assert_eq!(self.running_task_count.current(), 0);
         assert_eq!(self.unblocked_task_queue.len(), 0);
         // nice trick to ensure all fields are handled here if new one is added.
         let Self {
             unblocked_task_queue: _,
             active_task_count,
+            running_task_count: _,
+            max_running_task_count: _,
             handled_task_count,
             unblocked_task_count,
             total_task_count,
@@ -842,18 +994,63 @@ impl SchedulingStateMachine {
         total_task_count.reset_to_zero();
     }
 
+    /// Clear all buffered tasks and immediately rewind the state machine to be initialized
+    ///
+    /// This method _may_ panic if there are tasks which has been scheduled but hasn't been
+    /// descheduled yet (called active tasks). This is due to the invocation of
+    /// [`reinitialize()`](Self::reinitialize) at last. On the other hand, it's guaranteed not to
+    /// panic otherwise. That's because the first clearing step effectively relaxes the runtime
+    /// invariant of `reinitialize()` by making the state machine _inactive_ beforehand. After a
+    /// successful operation, this method returns the number of cleared tasks.
+    ///
+    /// Somewhat surprisingly, the clearing logic is same as the normal (de-)scheduling operation
+    /// because it is still the fastest way to just clear all tasks, under the consideration of
+    /// potential later use of [`UsageQueue`]s. That's because `state_machine` doesn't maintain _the
+    /// global list_ of tasks. Maintaining such one would incur a needless overhead on scheduling,
+    /// which isn't strictly needed otherwise.
+    ///
+    /// Moreover, the descheduling operation is rather heavily optimized to begin with. All
+    /// collection ops are just O(1) over total N of addresses accessed by all active tasks with
+    /// no amortized mem ops.
+    ///
+    /// Whatever the algorithm is chosen, the ultimate goal of this operation is to clear all usage
+    /// queues. Toward to that end, one may create a temporary hash set over [`UsageQueue`]s on the
+    /// fly alternatively. However, that would be costlier than the above usual descheduling
+    /// approach due to extra mem ops and many lookups/insertions.
+    pub fn clear_and_reinitialize(&mut self) -> usize {
+        let mut count = ShortCounter::zero();
+        while let Some(task) = self.schedule_next_unblocked_task() {
+            self.deschedule_task(&task);
+            count.increment_self();
+        }
+        self.reinitialize();
+        count.current().try_into().unwrap()
+    }
+
     /// Creates a new instance of [`SchedulingStateMachine`] with its `unsafe` fields created as
     /// well, thus carrying over `unsafe`.
     ///
     /// # Safety
     /// Call this exactly once for each thread. See [`TokenCell`] for details.
     #[must_use]
-    pub unsafe fn exclusively_initialize_current_thread_for_scheduling() -> Self {
+    pub unsafe fn exclusively_initialize_current_thread_for_scheduling(
+        max_running_task_count: Option<usize>,
+    ) -> Self {
+        // As documented at `CounterInner`, don't expose rather opinionated choice of unsigned
+        // integer type (`u32`) to outer world. So, take more conventional `usize` and convert it
+        // to `CounterInner` here while uncontroversially treating `None` as no limit effectively.
+        let max_running_task_count = max_running_task_count
+            .unwrap_or(CounterInner::MAX as usize)
+            .try_into()
+            .unwrap();
+
         Self {
             // It's very unlikely this is desired to be configurable, like
             // `UsageQueueInner::blocked_usages_from_tasks`'s cap.
             unblocked_task_queue: VecDeque::with_capacity(1024),
             active_task_count: ShortCounter::zero(),
+            running_task_count: ShortCounter::zero(),
+            max_running_task_count,
             handled_task_count: ShortCounter::zero(),
             unblocked_task_count: ShortCounter::zero(),
             total_task_count: ShortCounter::zero(),
@@ -861,31 +1058,33 @@ impl SchedulingStateMachine {
             usage_queue_token: unsafe { UsageQueueToken::assume_exclusive_mutating_thread() },
         }
     }
+
+    #[cfg(test)]
+    unsafe fn exclusively_initialize_current_thread_for_scheduling_for_test() -> Self {
+        Self::exclusively_initialize_current_thread_for_scheduling(None)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use {
         super::*,
-        solana_sdk::{
-            instruction::{AccountMeta, Instruction},
-            message::Message,
-            pubkey::Pubkey,
-            signature::Signer,
-            signer::keypair::Keypair,
-            transaction::{SanitizedTransaction, Transaction},
-        },
+        solana_instruction::{AccountMeta, Instruction},
+        solana_message::Message,
+        solana_pubkey::Pubkey,
+        solana_transaction::{sanitized::SanitizedTransaction, Transaction},
         std::{cell::RefCell, collections::HashMap, rc::Rc},
     };
 
-    fn simplest_transaction() -> SanitizedTransaction {
-        let payer = Keypair::new();
-        let message = Message::new(&[], Some(&payer.pubkey()));
+    fn simplest_transaction() -> RuntimeTransaction<SanitizedTransaction> {
+        let message = Message::new(&[], Some(&Pubkey::new_unique()));
         let unsigned = Transaction::new_unsigned(message);
-        SanitizedTransaction::from_transaction_for_tests(unsigned)
+        RuntimeTransaction::from_transaction_for_tests(unsigned)
     }
 
-    fn transaction_with_readonly_address(address: Pubkey) -> SanitizedTransaction {
+    fn transaction_with_readonly_address(
+        address: Pubkey,
+    ) -> RuntimeTransaction<SanitizedTransaction> {
         let instruction = Instruction {
             program_id: Pubkey::default(),
             accounts: vec![AccountMeta::new_readonly(address, false)],
@@ -893,10 +1092,12 @@ mod tests {
         };
         let message = Message::new(&[instruction], Some(&Pubkey::new_unique()));
         let unsigned = Transaction::new_unsigned(message);
-        SanitizedTransaction::from_transaction_for_tests(unsigned)
+        RuntimeTransaction::from_transaction_for_tests(unsigned)
     }
 
-    fn transaction_with_writable_address(address: Pubkey) -> SanitizedTransaction {
+    fn transaction_with_writable_address(
+        address: Pubkey,
+    ) -> RuntimeTransaction<SanitizedTransaction> {
         let instruction = Instruction {
             program_id: Pubkey::default(),
             accounts: vec![AccountMeta::new(address, false)],
@@ -904,7 +1105,7 @@ mod tests {
         };
         let message = Message::new(&[instruction], Some(&Pubkey::new_unique()));
         let unsigned = Transaction::new_unsigned(message);
-        SanitizedTransaction::from_transaction_for_tests(unsigned)
+        RuntimeTransaction::from_transaction_for_tests(unsigned)
     }
 
     fn create_address_loader(
@@ -923,7 +1124,7 @@ mod tests {
     #[test]
     fn test_scheduling_state_machine_creation() {
         let state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         assert_eq!(state_machine.active_task_count(), 0);
         assert_eq!(state_machine.total_task_count(), 0);
@@ -933,7 +1134,7 @@ mod tests {
     #[test]
     fn test_scheduling_state_machine_good_reinitialization() {
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         state_machine.total_task_count.increment_self();
         assert_eq!(state_machine.total_task_count(), 1);
@@ -945,7 +1146,7 @@ mod tests {
     #[should_panic(expected = "assertion failed: self.has_no_active_task()")]
     fn test_scheduling_state_machine_bad_reinitialization() {
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         let address_loader = &mut create_address_loader(None);
         let task = SchedulingStateMachine::create_task(simplest_transaction(), 3, address_loader);
@@ -956,21 +1157,21 @@ mod tests {
     #[test]
     fn test_create_task() {
         let sanitized = simplest_transaction();
-        let task = SchedulingStateMachine::create_task(sanitized.clone(), 3, &mut |_| {
-            UsageQueue::default()
-        });
+        let signature = *sanitized.signature();
+        let task =
+            SchedulingStateMachine::create_task(sanitized, 3, &mut |_| UsageQueue::default());
         assert_eq!(task.task_index(), 3);
-        assert_eq!(task.transaction(), &sanitized);
+        assert_eq!(task.transaction().signature(), &signature);
     }
 
     #[test]
     fn test_non_conflicting_task_related_counts() {
         let sanitized = simplest_transaction();
         let address_loader = &mut create_address_loader(None);
-        let task = SchedulingStateMachine::create_task(sanitized.clone(), 3, address_loader);
+        let task = SchedulingStateMachine::create_task(sanitized, 3, address_loader);
 
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         let task = state_machine.schedule_task(task).unwrap();
         assert_eq!(state_machine.active_task_count(), 1);
@@ -990,7 +1191,7 @@ mod tests {
         let task3 = SchedulingStateMachine::create_task(sanitized.clone(), 103, address_loader);
 
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         assert_matches!(
             state_machine
@@ -1042,7 +1243,7 @@ mod tests {
         let task3 = SchedulingStateMachine::create_task(sanitized.clone(), 103, address_loader);
 
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         assert_matches!(
             state_machine
@@ -1092,7 +1293,7 @@ mod tests {
         let task2 = SchedulingStateMachine::create_task(sanitized2, 102, address_loader);
 
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         // both of read-only tasks should be immediately runnable
         assert_matches!(
@@ -1133,7 +1334,7 @@ mod tests {
         let task3 = SchedulingStateMachine::create_task(sanitized3, 103, address_loader);
 
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         assert_matches!(
             state_machine
@@ -1184,7 +1385,7 @@ mod tests {
         let task3 = SchedulingStateMachine::create_task(sanitized3, 103, address_loader);
 
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         assert_matches!(
             state_machine
@@ -1226,7 +1427,7 @@ mod tests {
         let task2 = SchedulingStateMachine::create_task(sanitized2, 102, address_loader);
 
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         assert_matches!(
             state_machine
@@ -1262,7 +1463,7 @@ mod tests {
         let task4 = SchedulingStateMachine::create_task(sanitized4, 104, address_loader);
 
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         assert_matches!(
             state_machine
@@ -1318,7 +1519,7 @@ mod tests {
         let task2 = SchedulingStateMachine::create_task(sanitized2, 102, address_loader);
 
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         assert_matches!(
             state_machine
@@ -1358,7 +1559,7 @@ mod tests {
     #[should_panic(expected = "internal error: entered unreachable code")]
     fn test_unreachable_unlock_conditions1() {
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         let usage_queue = UsageQueue::default();
         usage_queue
@@ -1372,7 +1573,7 @@ mod tests {
     #[should_panic(expected = "internal error: entered unreachable code")]
     fn test_unreachable_unlock_conditions2() {
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         let usage_queue = UsageQueue::default();
         usage_queue
@@ -1387,7 +1588,7 @@ mod tests {
     #[should_panic(expected = "internal error: entered unreachable code")]
     fn test_unreachable_unlock_conditions3() {
         let mut state_machine = unsafe {
-            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling()
+            SchedulingStateMachine::exclusively_initialize_current_thread_for_scheduling_for_test()
         };
         let usage_queue = UsageQueue::default();
         usage_queue

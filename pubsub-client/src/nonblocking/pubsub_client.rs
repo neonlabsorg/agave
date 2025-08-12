@@ -175,26 +175,27 @@ use {
     log::*,
     serde::de::DeserializeOwned,
     serde_json::{json, Map, Value},
-    solana_account_decoder::UiAccount,
-    solana_rpc_client_api::{
+    solana_account_decoder_client_types::UiAccount,
+    solana_clock::Slot,
+    solana_pubkey::Pubkey,
+    solana_rpc_client_types::{
         config::{
             RpcAccountInfoConfig, RpcBlockSubscribeConfig, RpcBlockSubscribeFilter,
             RpcProgramAccountsConfig, RpcSignatureSubscribeConfig, RpcTransactionLogsConfig,
             RpcTransactionLogsFilter,
         },
         error_object::RpcErrorObject,
-        filter::maybe_map_filters,
         response::{
             Response as RpcResponse, RpcBlockUpdate, RpcKeyedAccount, RpcLogsResponse,
-            RpcSignatureResult, RpcVersionInfo, RpcVote, SlotInfo, SlotUpdate,
+            RpcSignatureResult, RpcVote, SlotInfo, SlotUpdate,
         },
     },
-    solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Signature},
+    solana_signature::Signature,
     std::collections::BTreeMap,
     thiserror::Error,
     tokio::{
         net::TcpStream,
-        sync::{mpsc, oneshot, RwLock},
+        sync::{mpsc, oneshot},
         task::JoinHandle,
         time::{sleep, Duration},
     },
@@ -218,10 +219,10 @@ pub enum PubsubClientError {
     UrlParseError(#[from] url::ParseError),
 
     #[error("unable to connect to server")]
-    ConnectionError(tokio_tungstenite::tungstenite::Error),
+    ConnectionError(Box<tokio_tungstenite::tungstenite::Error>),
 
     #[error("websocket error")]
-    WsError(#[from] tokio_tungstenite::tungstenite::Error),
+    WsError(#[from] Box<tokio_tungstenite::tungstenite::Error>),
 
     #[error("connection closed (({0})")]
     ConnectionClosed(String),
@@ -265,9 +266,8 @@ type RequestMsg = (
 #[derive(Debug)]
 pub struct PubsubClient {
     subscribe_sender: mpsc::UnboundedSender<SubscribeRequestMsg>,
-    request_sender: mpsc::UnboundedSender<RequestMsg>,
+    _request_sender: mpsc::UnboundedSender<RequestMsg>,
     shutdown_sender: oneshot::Sender<()>,
-    node_version: RwLock<Option<semver::Version>>,
     ws: JoinHandle<PubsubClientResult>,
 }
 
@@ -276,17 +276,18 @@ impl PubsubClient {
         let url = Url::parse(url)?;
         let (ws, _response) = connect_async(url)
             .await
+            .map_err(Box::new)
             .map_err(PubsubClientError::ConnectionError)?;
 
         let (subscribe_sender, subscribe_receiver) = mpsc::unbounded_channel();
-        let (request_sender, request_receiver) = mpsc::unbounded_channel();
+        let (_request_sender, request_receiver) = mpsc::unbounded_channel();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
 
+        #[allow(clippy::used_underscore_binding)]
         Ok(Self {
             subscribe_sender,
-            request_sender,
+            _request_sender,
             shutdown_sender,
-            node_version: RwLock::new(None),
             ws: tokio::spawn(PubsubClient::run_ws(
                 ws,
                 subscribe_receiver,
@@ -299,43 +300,6 @@ impl PubsubClient {
     pub async fn shutdown(self) -> PubsubClientResult {
         let _ = self.shutdown_sender.send(());
         self.ws.await.unwrap() // WS future should not be cancelled or panicked
-    }
-
-    pub async fn set_node_version(&self, version: semver::Version) -> Result<(), ()> {
-        let mut w_node_version = self.node_version.write().await;
-        *w_node_version = Some(version);
-        Ok(())
-    }
-
-    async fn get_node_version(&self) -> PubsubClientResult<semver::Version> {
-        let r_node_version = self.node_version.read().await;
-        if let Some(version) = &*r_node_version {
-            Ok(version.clone())
-        } else {
-            drop(r_node_version);
-            let mut w_node_version = self.node_version.write().await;
-            let node_version = self.get_version().await?;
-            *w_node_version = Some(node_version.clone());
-            Ok(node_version)
-        }
-    }
-
-    async fn get_version(&self) -> PubsubClientResult<semver::Version> {
-        let (response_sender, response_receiver) = oneshot::channel();
-        self.request_sender
-            .send(("getVersion".to_string(), Value::Null, response_sender))
-            .map_err(|err| PubsubClientError::ConnectionClosed(err.to_string()))?;
-        let result = response_receiver
-            .await
-            .map_err(|err| PubsubClientError::ConnectionClosed(err.to_string()))??;
-        let node_version: RpcVersionInfo = serde_json::from_value(result)?;
-        let node_version = semver::Version::parse(&node_version.solana_core).map_err(|e| {
-            PubsubClientError::RequestFailed {
-                reason: format!("failed to parse cluster version: {e}"),
-                message: "getVersion".to_string(),
-            }
-        })?;
-        Ok(node_version)
     }
 
     async fn subscribe<'a, T>(&self, operation: &str, params: Value) -> SubscribeResult<'a, T>
@@ -426,22 +390,8 @@ impl PubsubClient {
     pub async fn program_subscribe(
         &self,
         pubkey: &Pubkey,
-        mut config: Option<RpcProgramAccountsConfig>,
+        config: Option<RpcProgramAccountsConfig>,
     ) -> SubscribeResult<'_, RpcResponse<RpcKeyedAccount>> {
-        if let Some(ref mut config) = config {
-            if let Some(ref mut filters) = config.filters {
-                let node_version = self.get_node_version().await.ok();
-                // If node does not support the pubsub `getVersion` method, assume version is old
-                // and filters should be mapped (node_version.is_none()).
-                maybe_map_filters(node_version, filters).map_err(|e| {
-                    PubsubClientError::RequestFailed {
-                        reason: e,
-                        message: "maybe_map_filters".to_string(),
-                    }
-                })?;
-            }
-        }
-
         let params = json!([pubkey.to_string(), config]);
         self.subscribe("program", params).await
     }
@@ -551,20 +501,20 @@ impl PubsubClient {
                 // Send close on shutdown signal
                 _ = (&mut shutdown_receiver) => {
                     let frame = CloseFrame { code: CloseCode::Normal, reason: "".into() };
-                    ws.send(Message::Close(Some(frame))).await?;
-                    ws.flush().await?;
+                    ws.send(Message::Close(Some(frame))).await.map_err(Box::new)?;
+                    ws.flush().await.map_err(Box::new)?;
                     break;
                 },
                 // Send `Message::Ping` each 10s if no any other communication
                 () = sleep(Duration::from_secs(10)) => {
-                    ws.send(Message::Ping(Vec::new())).await?;
+                    ws.send(Message::Ping(Vec::new())).await.map_err(Box::new)?;
                 },
                 // Read message for subscribe
                 Some((operation, params, response_sender)) = subscribe_receiver.recv() => {
                     request_id += 1;
                     let method = format!("{operation}Subscribe");
                     let text = json!({"jsonrpc":"2.0","id":request_id,"method":method,"params":params}).to_string();
-                    ws.send(Message::Text(text)).await?;
+                    ws.send(Message::Text(text)).await.map_err(Box::new)?;
                     requests_subscribe.insert(request_id, (operation, response_sender));
                 },
                 // Read message for unsubscribe
@@ -573,20 +523,20 @@ impl PubsubClient {
                     request_id += 1;
                     let method = format!("{operation}Unsubscribe");
                     let text = json!({"jsonrpc":"2.0","id":request_id,"method":method,"params":[sid]}).to_string();
-                    ws.send(Message::Text(text)).await?;
+                    ws.send(Message::Text(text)).await.map_err(Box::new)?;
                     requests_unsubscribe.insert(request_id, response_sender);
                 },
                 // Read message for other requests
                 Some((method, params, response_sender)) = request_receiver.recv() => {
                     request_id += 1;
                     let text = json!({"jsonrpc":"2.0","id":request_id,"method":method,"params":params}).to_string();
-                    ws.send(Message::Text(text)).await?;
+                    ws.send(Message::Text(text)).await.map_err(Box::new)?;
                     other_requests.insert(request_id, response_sender);
                 }
                 // Read incoming WebSocket message
                 next_msg = ws.next() => {
                     let msg = match next_msg {
-                        Some(msg) => msg?,
+                        Some(msg) => msg.map_err(Box::new)?,
                         None => break,
                     };
                     trace!("ws.next(): {:?}", &msg);
@@ -596,7 +546,7 @@ impl PubsubClient {
                         Message::Text(text) => text,
                         Message::Binary(_data) => continue, // Ignore
                         Message::Ping(data) => {
-                            ws.send(Message::Pong(data)).await?;
+                            ws.send(Message::Pong(data)).await.map_err(Box::new)?;
                             continue
                         },
                         Message::Pong(_data) => continue,
@@ -672,7 +622,7 @@ impl PubsubClient {
                                 }
                             }
                         } else {
-                            error!("Unknown request id: {}", id);
+                            error!("Unknown request id: {id}");
                             break;
                         }
                         continue;

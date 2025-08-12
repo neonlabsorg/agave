@@ -1,19 +1,19 @@
 use {
-    crate::{StoredExtendedRewards, StoredTransactionStatusMeta},
+    crate::{StoredExtendedRewards, StoredTransactionError, StoredTransactionStatusMeta},
     solana_account_decoder::parse_token::{real_number_string_trimmed, UiTokenAmount},
-    solana_sdk::{
-        hash::Hash,
-        instruction::{CompiledInstruction, InstructionError},
-        message::{
-            legacy::Message as LegacyMessage,
-            v0::{self, LoadedAddresses, MessageAddressTableLookup},
-            MessageHeader, VersionedMessage,
-        },
-        pubkey::Pubkey,
-        signature::Signature,
-        transaction::{Transaction, TransactionError, VersionedTransaction},
-        transaction_context::TransactionReturnData,
+    solana_hash::{Hash, HASH_BYTES},
+    solana_instruction::error::InstructionError,
+    solana_message::{
+        compiled_instruction::CompiledInstruction,
+        legacy::Message as LegacyMessage,
+        v0::{self, LoadedAddresses, MessageAddressTableLookup},
+        MessageHeader, VersionedMessage,
     },
+    solana_pubkey::Pubkey,
+    solana_signature::Signature,
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
+    solana_transaction_context::TransactionReturnData,
+    solana_transaction_error::TransactionError,
     solana_transaction_status::{
         ConfirmedBlock, EntrySummary, InnerInstruction, InnerInstructions, Reward, RewardType,
         RewardsAndNumPartitions, TransactionByAddrInfo, TransactionStatusMeta,
@@ -286,6 +286,20 @@ impl From<generated::Transaction> for VersionedTransaction {
     }
 }
 
+impl From<TransactionError> for generated::TransactionError {
+    fn from(value: TransactionError) -> Self {
+        let stored_error = StoredTransactionError::from(value).0;
+        Self { err: stored_error }
+    }
+}
+
+impl From<generated::TransactionError> for TransactionError {
+    fn from(value: generated::TransactionError) -> Self {
+        let stored_error = StoredTransactionError(value.err);
+        stored_error.into()
+    }
+}
+
 impl From<LegacyMessage> for generated::Message {
     fn from(message: LegacyMessage) -> Self {
         Self {
@@ -343,7 +357,9 @@ impl From<generated::Message> for VersionedMessage {
             .into_iter()
             .map(|key| Pubkey::try_from(key).unwrap())
             .collect();
-        let recent_blockhash = Hash::new(&value.recent_blockhash);
+        let recent_blockhash = <[u8; HASH_BYTES]>::try_from(value.recent_blockhash)
+            .map(Hash::new_from_array)
+            .unwrap();
         let instructions = value.instructions.into_iter().map(|ix| ix.into()).collect();
         let address_table_lookups = value
             .address_table_lookups
@@ -405,6 +421,7 @@ impl From<TransactionStatusMeta> for generated::TransactionStatusMeta {
             loaded_addresses,
             return_data,
             compute_units_consumed,
+            cost_units,
         } = value;
         let err = match status {
             Ok(()) => None,
@@ -465,6 +482,7 @@ impl From<TransactionStatusMeta> for generated::TransactionStatusMeta {
             return_data,
             return_data_none,
             compute_units_consumed,
+            cost_units,
         }
     }
 }
@@ -497,6 +515,7 @@ impl TryFrom<generated::TransactionStatusMeta> for TransactionStatusMeta {
             return_data,
             return_data_none,
             compute_units_consumed,
+            cost_units,
         } = value;
         let status = match &err {
             None => Ok(()),
@@ -566,6 +585,7 @@ impl TryFrom<generated::TransactionStatusMeta> for TransactionStatusMeta {
             loaded_addresses,
             return_data,
             compute_units_consumed,
+            cost_units,
         })
     }
 }
@@ -850,6 +870,7 @@ impl TryFrom<tx_by_addr::TransactionError> for TransactionError {
             34 => TransactionError::ResanitizationNeeded,
             36 => TransactionError::UnbalancedTransaction,
             37 => TransactionError::ProgramCacheHitMaxLimit,
+            38 => TransactionError::CommitCancelled,
             _ => return Err("Invalid TransactionError"),
         })
     }
@@ -970,6 +991,9 @@ impl From<TransactionError> for tx_by_addr::TransactionError {
                 }
                 TransactionError::ProgramCacheHitMaxLimit => {
                     tx_by_addr::TransactionErrorType::ProgramCacheHitMaxLimit
+                }
+                TransactionError::CommitCancelled => {
+                    tx_by_addr::TransactionErrorType::CommitCancelled
                 }
             } as i32,
             instruction_error: match transaction_error {
@@ -1245,7 +1269,9 @@ impl From<entries::Entry> for EntrySummary {
     fn from(entry: entries::Entry) -> Self {
         EntrySummary {
             num_hashes: entry.num_hashes,
-            hash: Hash::new(&entry.hash),
+            hash: <[u8; HASH_BYTES]>::try_from(entry.hash)
+                .map(Hash::new_from_array)
+                .unwrap(),
             num_transactions: entry.num_transactions,
             starting_transaction_index: entry.starting_transaction_index as usize,
         }

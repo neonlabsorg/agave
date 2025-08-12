@@ -1,5 +1,5 @@
 #[allow(deprecated)]
-use solana_sdk::sysvar::{fees::Fees, recent_blockhashes::RecentBlockhashes};
+use solana_sysvar::{fees::Fees, recent_blockhashes::RecentBlockhashes};
 use {
     crate::{
         parse_account_data::{ParsableAccount, ParseAccountError},
@@ -7,17 +7,18 @@ use {
     },
     bincode::deserialize,
     bv::BitVec,
-    solana_sdk::{
-        clock::{Clock, Epoch, Slot, UnixTimestamp},
-        epoch_schedule::EpochSchedule,
-        pubkey::Pubkey,
-        rent::Rent,
-        slot_hashes::SlotHashes,
-        slot_history::{self, SlotHistory},
+    solana_clock::{Clock, Epoch, Slot, UnixTimestamp},
+    solana_epoch_schedule::EpochSchedule,
+    solana_pubkey::Pubkey,
+    solana_rent::Rent,
+    solana_sdk_ids::sysvar,
+    solana_slot_hashes::SlotHashes,
+    solana_slot_history::{self as slot_history, SlotHistory},
+    solana_sysvar::{
+        epoch_rewards::EpochRewards,
+        last_restart_slot::LastRestartSlot,
+        rewards::Rewards,
         stake_history::{StakeHistory, StakeHistoryEntry},
-        sysvar::{
-            self, epoch_rewards::EpochRewards, last_restart_slot::LastRestartSlot, rewards::Rewards,
-        },
     },
 };
 
@@ -245,9 +246,9 @@ pub struct UiEpochRewards {
     pub distribution_starting_block_height: u64,
     pub num_partitions: u64,
     pub parent_blockhash: String,
-    pub total_points: u128,
-    pub total_rewards: u64,
-    pub distributed_rewards: u64,
+    pub total_points: String,
+    pub total_rewards: String,
+    pub distributed_rewards: String,
     pub active: bool,
 }
 
@@ -257,9 +258,9 @@ impl From<EpochRewards> for UiEpochRewards {
             distribution_starting_block_height: epoch_rewards.distribution_starting_block_height,
             num_partitions: epoch_rewards.num_partitions,
             parent_blockhash: epoch_rewards.parent_blockhash.to_string(),
-            total_points: epoch_rewards.total_points,
-            total_rewards: epoch_rewards.total_rewards,
-            distributed_rewards: epoch_rewards.distributed_rewards,
+            total_points: epoch_rewards.total_points.to_string(),
+            total_rewards: epoch_rewards.total_rewards.to_string(),
+            distributed_rewards: epoch_rewards.distributed_rewards.to_string(),
             active: epoch_rewards.active,
         }
     }
@@ -268,15 +269,15 @@ impl From<EpochRewards> for UiEpochRewards {
 #[cfg(test)]
 mod test {
     #[allow(deprecated)]
-    use solana_sdk::sysvar::recent_blockhashes::IterItem;
+    use solana_sysvar::recent_blockhashes::IterItem;
     use {
-        super::*,
-        solana_sdk::{account::create_account_for_test, fee_calculator::FeeCalculator, hash::Hash},
+        super::*, solana_account::create_account_for_test, solana_fee_calculator::FeeCalculator,
+        solana_hash::Hash,
     };
 
     #[test]
     fn test_parse_sysvars() {
-        let hash = Hash::new(&[1; 32]);
+        let hash = Hash::new_from_array([1; 32]);
 
         let clock_sysvar = create_account_for_test(&Clock::default());
         assert_eq!(
@@ -376,7 +377,7 @@ mod test {
             }]),
         );
 
-        let bad_pubkey = solana_sdk::pubkey::new_rand();
+        let bad_pubkey = solana_pubkey::new_rand();
         assert!(parse_sysvar(&stake_history_sysvar.data, &bad_pubkey).is_err());
 
         let bad_data = vec![0; 4];

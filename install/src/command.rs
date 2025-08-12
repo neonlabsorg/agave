@@ -9,15 +9,16 @@ use {
     crossbeam_channel::unbounded,
     indicatif::{ProgressBar, ProgressStyle},
     serde_derive::{Deserialize, Serialize},
-    solana_config_program::{config_instruction, get_config_data, ConfigState},
+    solana_config_interface::instruction::{self as config_instruction},
+    solana_config_program_client::get_config_data,
+    solana_hash::Hash,
+    solana_keypair::{read_keypair_file, signable::Signable, Keypair},
+    solana_message::Message,
+    solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        hash::{Hash, Hasher},
-        message::Message,
-        pubkey::Pubkey,
-        signature::{read_keypair_file, Keypair, Signable, Signer},
-        transaction::Transaction,
-    },
+    solana_sha256_hasher::Hasher,
+    solana_signer::Signer,
+    solana_transaction::Transaction,
     std::{
         fs::{self, File},
         io::{self, BufReader, Read},
@@ -130,9 +131,8 @@ fn download_to_temp(
 
     impl<R: Read> Read for DownloadProgress<R> {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.response.read(buf).map(|n| {
+            self.response.read(buf).inspect(|&n| {
                 self.progress_bar.inc(n as u64);
-                n
             })
         }
     }
@@ -149,7 +149,7 @@ fn download_to_temp(
         .map_err(|err| format!("Unable to hash {temp_file:?}: {err}"))?;
 
     if expected_sha256.is_some() && expected_sha256 != Some(&temp_file_sha256) {
-        return Err(io::Error::new(io::ErrorKind::Other, "Incorrect hash").into());
+        return Err(io::Error::other("Incorrect hash").into());
     }
 
     source.progress_bar.finish_and_clear();
@@ -227,14 +227,16 @@ fn new_update_manifest(
         let recent_blockhash = rpc_client.get_latest_blockhash()?;
 
         let lamports = rpc_client
-            .get_minimum_balance_for_rent_exemption(SignedUpdateManifest::max_space() as usize)?;
+            .get_minimum_balance_for_rent_exemption(SignedUpdateManifest::MAX_SPACE as usize)?;
 
-        let instructions = config_instruction::create_account::<SignedUpdateManifest>(
-            &from_keypair.pubkey(),
-            &update_manifest_keypair.pubkey(),
-            lamports,
-            vec![], // additional keys
-        );
+        let instructions =
+            config_instruction::create_account_with_max_config_space::<SignedUpdateManifest>(
+                &from_keypair.pubkey(),
+                &update_manifest_keypair.pubkey(),
+                lamports,
+                SignedUpdateManifest::MAX_SPACE,
+                vec![], // additional keys
+            );
         let message = Message::new(&instructions, Some(&from_keypair.pubkey()));
         let signers = [from_keypair, update_manifest_keypair];
         let transaction = Transaction::new(&signers, message, recent_blockhash);
@@ -425,7 +427,7 @@ fn add_to_path(new_path: &str) -> bool {
                 HWND_BROADCAST,
                 WM_SETTINGCHANGE,
                 0_usize,
-                "Environment\0".as_ptr() as LPARAM,
+                c"Environment".as_ptr() as LPARAM,
                 SMTO_ABORTIFHUNG,
                 5000,
                 ptr::null_mut(),
@@ -508,7 +510,7 @@ fn add_to_path(new_path: &str) -> bool {
                         Ok(())
                     }
                     append_file(&rcfile, &shell_export_string).unwrap_or_else(|err| {
-                        format!("Unable to append to {rcfile:?}: {err}");
+                        println!("Unable to append to {rcfile:?}: {err}");
                     });
                     modified_rcfiles = true;
                 }
@@ -926,7 +928,7 @@ fn check_for_newer_github_release(
                             if (prerelease_allowed || !prerelease)
                                 && version_filter
                                     .as_ref()
-                                    .map_or(true, |version_filter| version_filter.matches(&version))
+                                    .is_none_or(|version_filter| version_filter.matches(&version))
                             {
                                 return Some(version);
                             }

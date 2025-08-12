@@ -1,4 +1,4 @@
-pub use bytemuck::{Pod, Zeroable};
+pub use bytemuck_derive::{Pod, Zeroable};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 #[repr(transparent)]
@@ -18,7 +18,9 @@ mod target_arch {
         type Error = Curve25519Error;
 
         fn try_from(pod: &PodScalar) -> Result<Self, Self::Error> {
-            Scalar::from_canonical_bytes(pod.0).ok_or(Curve25519Error::PodConversion)
+            Scalar::from_canonical_bytes(pod.0)
+                .into_option()
+                .ok_or(Curve25519Error::PodConversion)
         }
     }
 
@@ -32,7 +34,9 @@ mod target_arch {
         type Error = Curve25519Error;
 
         fn try_from(pod: PodScalar) -> Result<Self, Self::Error> {
-            Scalar::from_canonical_bytes(pod.0).ok_or(Curve25519Error::PodConversion)
+            Scalar::from_canonical_bytes(pod.0)
+                .into_option()
+                .ok_or(Curve25519Error::PodConversion)
         }
     }
 }

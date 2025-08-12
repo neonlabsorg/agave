@@ -6,25 +6,26 @@ use {
         iter::IndexedParallelIterator,
         prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
     },
+    solana_account::{Account, ReadableAccount},
+    solana_clock::Epoch,
+    solana_keypair::Keypair,
     solana_ledger::{
         blockstore_processor::{execute_batch, TransactionBatchWithIndexes},
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
     },
-    solana_program_runtime::timings::ExecuteTimings,
     solana_runtime::{
-        bank::Bank, prioritization_fee_cache::PrioritizationFeeCache,
-        transaction_batch::TransactionBatch,
+        bank::Bank,
+        bank_forks::BankForks,
+        prioritization_fee_cache::PrioritizationFeeCache,
+        transaction_batch::{OwnedOrBorrowed, TransactionBatch},
     },
-    solana_sdk::{
-        account::{Account, ReadableAccount},
-        feature_set::apply_cost_tracker_during_replay,
-        signature::Keypair,
-        signer::Signer,
-        stake_history::Epoch,
-        system_program, system_transaction,
-        transaction::SanitizedTransaction,
-    },
-    std::{borrow::Cow, sync::Arc},
+    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+    solana_signer::Signer,
+    solana_svm_timings::ExecuteTimings,
+    solana_system_interface::program as system_program,
+    solana_system_transaction as system_transaction,
+    solana_transaction::sanitized::SanitizedTransaction,
+    std::sync::{Arc, RwLock},
     test::Bencher,
 };
 
@@ -58,7 +59,7 @@ fn create_funded_accounts(bank: &Bank, num: usize) -> Vec<Keypair> {
     accounts
 }
 
-fn create_transactions(bank: &Bank, num: usize) -> Vec<SanitizedTransaction> {
+fn create_transactions(bank: &Bank, num: usize) -> Vec<RuntimeTransaction<SanitizedTransaction>> {
     let funded_accounts = create_funded_accounts(bank, 2 * num);
     funded_accounts
         .into_par_iter()
@@ -68,16 +69,17 @@ fn create_transactions(bank: &Bank, num: usize) -> Vec<SanitizedTransaction> {
             let to = &chunk[1];
             system_transaction::transfer(from, &to.pubkey(), 1, bank.last_blockhash())
         })
-        .map(SanitizedTransaction::from_transaction_for_tests)
+        .map(RuntimeTransaction::from_transaction_for_tests)
         .collect()
 }
 
 struct BenchFrame {
     bank: Arc<Bank>,
+    _bank_forks: Arc<RwLock<BankForks>>,
     prioritization_fee_cache: PrioritizationFeeCache,
 }
 
-fn setup(apply_cost_tracker_during_replay: bool) -> BenchFrame {
+fn setup() -> BenchFrame {
     let mint_total = u64::MAX;
     let GenesisConfigInfo {
         mut genesis_config, ..
@@ -89,10 +91,6 @@ fn setup(apply_cost_tracker_during_replay: bool) -> BenchFrame {
 
     let mut bank = Bank::new_for_benches(&genesis_config);
 
-    if !apply_cost_tracker_during_replay {
-        bank.deactivate_feature(&apply_cost_tracker_during_replay::id());
-    }
-
     // Allow arbitrary transaction processing time for the purposes of this bench
     bank.ns_per_slot = u128::MAX;
 
@@ -100,19 +98,16 @@ fn setup(apply_cost_tracker_during_replay: bool) -> BenchFrame {
     bank.write_cost_tracker()
         .unwrap()
         .set_limits(u64::MAX, u64::MAX, u64::MAX);
-    let bank = bank.wrap_with_bank_forks_for_tests().0;
+    let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
     let prioritization_fee_cache = PrioritizationFeeCache::default();
     BenchFrame {
         bank,
+        _bank_forks: bank_forks,
         prioritization_fee_cache,
     }
 }
 
-fn bench_execute_batch(
-    bencher: &mut Bencher,
-    batch_size: usize,
-    apply_cost_tracker_during_replay: bool,
-) {
+fn bench_execute_batch(bencher: &mut Bencher, batch_size: usize) {
     const TRANSACTIONS_PER_ITERATION: usize = 64;
     assert_eq!(
         TRANSACTIONS_PER_ITERATION % batch_size,
@@ -124,14 +119,18 @@ fn bench_execute_batch(
 
     let BenchFrame {
         bank,
+        _bank_forks,
         prioritization_fee_cache,
-    } = setup(apply_cost_tracker_during_replay);
+    } = setup();
     let transactions = create_transactions(&bank, 2_usize.pow(20));
     let batches: Vec<_> = transactions
         .chunks(batch_size)
         .map(|txs| {
-            let mut batch =
-                TransactionBatch::new(vec![Ok(()); txs.len()], &bank, Cow::Borrowed(txs));
+            let mut batch = TransactionBatch::new(
+                vec![Ok(()); txs.len()],
+                &bank,
+                OwnedOrBorrowed::Borrowed(txs),
+            );
             batch.set_needs_unlock(false);
             TransactionBatchWithIndexes {
                 batch,
@@ -153,6 +152,7 @@ fn bench_execute_batch(
                 &mut timing,
                 None,
                 &prioritization_fee_cache,
+                None::<fn(&_) -> _>,
             );
         }
     });
@@ -162,30 +162,15 @@ fn bench_execute_batch(
 
 #[bench]
 fn bench_execute_batch_unbatched(bencher: &mut Bencher) {
-    bench_execute_batch(bencher, 1, true);
+    bench_execute_batch(bencher, 1);
 }
 
 #[bench]
 fn bench_execute_batch_half_batch(bencher: &mut Bencher) {
-    bench_execute_batch(bencher, 32, true);
+    bench_execute_batch(bencher, 32);
 }
 
 #[bench]
 fn bench_execute_batch_full_batch(bencher: &mut Bencher) {
-    bench_execute_batch(bencher, 64, true);
-}
-
-#[bench]
-fn bench_execute_batch_unbatched_disable_tx_cost_update(bencher: &mut Bencher) {
-    bench_execute_batch(bencher, 1, false);
-}
-
-#[bench]
-fn bench_execute_batch_half_batch_disable_tx_cost_update(bencher: &mut Bencher) {
-    bench_execute_batch(bencher, 32, false);
-}
-
-#[bench]
-fn bench_execute_batch_full_batch_disable_tx_cost_update(bencher: &mut Bencher) {
-    bench_execute_batch(bencher, 64, false);
+    bench_execute_batch(bencher, 64);
 }

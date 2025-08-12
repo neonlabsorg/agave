@@ -1,22 +1,24 @@
 #[allow(deprecated)]
-use solana_sdk::sysvar::{fees::Fees, recent_blockhashes::RecentBlockhashes};
+use solana_sysvar::{fees::Fees, recent_blockhashes::RecentBlockhashes};
 use {
     crate::invoke_context::InvokeContext,
     serde::de::DeserializeOwned,
-    solana_sdk::{
-        instruction::InstructionError,
-        pubkey::Pubkey,
-        sysvar::{
-            clock::Clock, epoch_rewards::EpochRewards, epoch_schedule::EpochSchedule,
-            last_restart_slot::LastRestartSlot, rent::Rent, slot_hashes::SlotHashes,
-            stake_history::StakeHistory, Sysvar, SysvarId,
-        },
-        transaction_context::{IndexOfAccount, InstructionContext, TransactionContext},
-    },
-    solana_type_overrides::sync::Arc,
+    solana_clock::Clock,
+    solana_epoch_rewards::EpochRewards,
+    solana_epoch_schedule::EpochSchedule,
+    solana_instruction::error::InstructionError,
+    solana_last_restart_slot::LastRestartSlot,
+    solana_pubkey::Pubkey,
+    solana_rent::Rent,
+    solana_sdk_ids::sysvar,
+    solana_slot_hashes::SlotHashes,
+    solana_svm_type_overrides::sync::Arc,
+    solana_sysvar::{stake_history::StakeHistory, Sysvar},
+    solana_sysvar_id::SysvarId,
+    solana_transaction_context::{IndexOfAccount, InstructionContext, TransactionContext},
 };
 
-#[cfg(all(RUSTC_WITH_SPECIALIZATION, feature = "frozen-abi"))]
+#[cfg(feature = "frozen-abi")]
 impl ::solana_frozen_abi::abi_example::AbiExample for SysvarCache {
     fn example() -> Self {
         // SysvarCache is not Serialize so just rely on Default.
@@ -48,7 +50,60 @@ pub struct SysvarCache {
     recent_blockhashes: Option<RecentBlockhashes>,
 }
 
+// declare_deprecated_sysvar_id doesn't support const.
+// These sysvars are going away anyway.
+const FEES_ID: Pubkey = Pubkey::from_str_const("SysvarFees111111111111111111111111111111111");
+const RECENT_BLOCKHASHES_ID: Pubkey =
+    Pubkey::from_str_const("SysvarRecentB1ockHashes11111111111111111111");
+
 impl SysvarCache {
+    /// Overwrite a sysvar. For testing purposes only.
+    #[allow(deprecated)]
+    pub fn set_sysvar_for_tests<T: Sysvar + SysvarId>(&mut self, sysvar: &T) {
+        let data = bincode::serialize(sysvar).expect("Failed to serialize sysvar.");
+        let sysvar_id = T::id();
+        match sysvar_id {
+            sysvar::clock::ID => {
+                self.clock = Some(data);
+            }
+            sysvar::epoch_rewards::ID => {
+                self.epoch_rewards = Some(data);
+            }
+            sysvar::epoch_schedule::ID => {
+                self.epoch_schedule = Some(data);
+            }
+            FEES_ID => {
+                let fees: Fees =
+                    bincode::deserialize(&data).expect("Failed to deserialize Fees sysvar.");
+                self.fees = Some(fees);
+            }
+            sysvar::last_restart_slot::ID => {
+                self.last_restart_slot = Some(data);
+            }
+            RECENT_BLOCKHASHES_ID => {
+                let recent_blockhashes: RecentBlockhashes = bincode::deserialize(&data)
+                    .expect("Failed to deserialize RecentBlockhashes sysvar.");
+                self.recent_blockhashes = Some(recent_blockhashes);
+            }
+            sysvar::rent::ID => {
+                self.rent = Some(data);
+            }
+            sysvar::slot_hashes::ID => {
+                let slot_hashes: SlotHashes =
+                    bincode::deserialize(&data).expect("Failed to deserialize SlotHashes sysvar.");
+                self.slot_hashes = Some(data);
+                self.slot_hashes_obj = Some(Arc::new(slot_hashes));
+            }
+            sysvar::stake_history::ID => {
+                let stake_history: StakeHistory = bincode::deserialize(&data)
+                    .expect("Failed to deserialize StakeHistory sysvar.");
+                self.stake_history = Some(data);
+                self.stake_history_obj = Some(Arc::new(stake_history));
+            }
+            _ => panic!("Unrecognized Sysvar ID: {sysvar_id}"),
+        }
+    }
+
     // this is exposed for SyscallGetSysvar and should not otherwise be used
     pub fn sysvar_id_to_buffer(&self, sysvar_id: &Pubkey) -> &Option<Vec<u8>> {
         if Clock::check_id(sysvar_id) {
@@ -223,9 +278,8 @@ impl SysvarCache {
 
 /// These methods facilitate a transition from fetching sysvars from keyed
 /// accounts to fetching from the sysvar cache without breaking consensus. In
-/// order to keep consistent behavior, they continue to enforce the same checks
-/// as `solana_sdk::keyed_account::from_keyed_account` despite dynamically
-/// loading them instead of deserializing from account data.
+/// order to keep consistent behavior, they continue to enforce legacy checks
+/// despite dynamically loading them instead of deserializing from account data.
 pub mod get_sysvar_with_account_check {
     use super::*;
 

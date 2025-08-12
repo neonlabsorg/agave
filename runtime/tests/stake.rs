@@ -1,34 +1,30 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use {
-    solana_accounts_db::epoch_accounts_hash::EpochAccountsHash,
+    solana_account::{from_account, state_traits::StateMut},
+    solana_client_traits::SyncClient,
+    solana_clock::Slot,
+    solana_epoch_schedule::{EpochSchedule, MINIMUM_SLOTS_PER_EPOCH},
+    solana_keypair::Keypair,
+    solana_message::Message,
+    solana_pubkey::Pubkey,
+    solana_rent::Rent,
     solana_runtime::{
         bank::Bank,
         bank_client::BankClient,
         bank_forks::BankForks,
         genesis_utils::{create_genesis_config_with_leader, GenesisConfigInfo},
     },
-    solana_sdk::{
-        account::from_account,
-        account_utils::StateMut,
-        client::SyncClient,
-        clock::Slot,
-        epoch_schedule::{EpochSchedule, MINIMUM_SLOTS_PER_EPOCH},
-        hash::Hash,
-        message::Message,
-        pubkey::Pubkey,
-        rent::Rent,
-        signature::{Keypair, Signer},
-        stake::{
-            self, instruction as stake_instruction,
-            state::{Authorized, Lockup, StakeStateV2},
-        },
-        sysvar::{self, stake_history::StakeHistory},
+    solana_signer::Signer,
+    solana_stake_interface::{
+        self as stake, instruction as stake_instruction,
+        state::{Authorized, Lockup, StakeStateV2},
     },
     solana_stake_program::stake_state,
+    solana_sysvar::{self as sysvar, stake_history::StakeHistory},
     solana_vote_program::{
         vote_instruction,
-        vote_state::{Vote, VoteInit, VoteState, VoteStateVersions},
+        vote_state::{TowerSync, VoteInit, VoteStateV3, VoteStateVersions, MAX_LOCKOUT_HISTORY},
     },
     std::sync::{Arc, RwLock},
 };
@@ -72,6 +68,7 @@ fn fill_epoch_with_votes(
     bank_forks: &RwLock<BankForks>,
     vote_keypair: &Keypair,
     mint_keypair: &Keypair,
+    start_slot: Slot,
 ) -> Arc<Bank> {
     let mint_pubkey = mint_keypair.pubkey();
     let vote_pubkey = vote_keypair.pubkey();
@@ -83,12 +80,18 @@ fn fill_epoch_with_votes(
 
         let bank_client = BankClient::new_shared(bank.clone());
         let parent = bank.parent().unwrap();
-
+        let lowest_slot = u64::max(
+            (parent.slot() + 1).saturating_sub(MAX_LOCKOUT_HISTORY as u64),
+            start_slot,
+        );
+        let slots: Vec<_> = (lowest_slot..(parent.slot() + 1)).collect();
+        let root = (lowest_slot > start_slot).then(|| lowest_slot - 1);
+        let tower_sync = TowerSync::new_from_slots(slots, parent.hash(), root);
         let message = Message::new(
-            &[vote_instruction::vote(
+            &[vote_instruction::tower_sync(
                 &vote_pubkey,
                 &vote_pubkey,
-                Vote::new(vec![parent.slot()], parent.hash()),
+                tower_sync,
             )],
             Some(&mint_pubkey),
         );
@@ -134,15 +137,11 @@ fn test_stake_create_and_split_single_signature() {
         genesis_config,
         mint_keypair: staker_keypair,
         ..
-    } = create_genesis_config_with_leader(
-        100_000_000_000,
-        &solana_sdk::pubkey::new_rand(),
-        1_000_000,
-    );
+    } = create_genesis_config_with_leader(100_000_000_000, &solana_pubkey::new_rand(), 1_000_000);
 
     let staker_pubkey = staker_keypair.pubkey();
 
-    let bank = Bank::new_with_bank_forks_for_tests(&genesis_config).0;
+    let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
     let bank_client = BankClient::new_shared(bank.clone());
 
     let stake_address =
@@ -153,7 +152,10 @@ fn test_stake_create_and_split_single_signature() {
     let lamports = {
         let rent = &bank.rent_collector().rent;
         let rent_exempt_reserve = rent.minimum_balance(StakeStateV2::size_of());
-        let minimum_delegation = solana_stake_program::get_minimum_delegation(&bank.feature_set);
+        let minimum_delegation = solana_stake_program::get_minimum_delegation(
+            bank.feature_set
+                .is_active(&agave_feature_set::stake_raise_minimum_delegation_to_1_sol::id()),
+        );
         2 * (rent_exempt_reserve + minimum_delegation)
     };
 
@@ -210,15 +212,11 @@ fn test_stake_create_and_split_to_existing_system_account() {
         genesis_config,
         mint_keypair: staker_keypair,
         ..
-    } = create_genesis_config_with_leader(
-        100_000_000_000,
-        &solana_sdk::pubkey::new_rand(),
-        1_000_000,
-    );
+    } = create_genesis_config_with_leader(100_000_000_000, &solana_pubkey::new_rand(), 1_000_000);
 
     let staker_pubkey = staker_keypair.pubkey();
 
-    let bank = Bank::new_with_bank_forks_for_tests(&genesis_config).0;
+    let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
     let bank_client = BankClient::new_shared(bank.clone());
 
     let stake_address =
@@ -229,7 +227,10 @@ fn test_stake_create_and_split_to_existing_system_account() {
     let lamports = {
         let rent = &bank.rent_collector().rent;
         let rent_exempt_reserve = rent.minimum_balance(StakeStateV2::size_of());
-        let minimum_delegation = solana_stake_program::get_minimum_delegation(&bank.feature_set);
+        let minimum_delegation = solana_stake_program::get_minimum_delegation(
+            bank.feature_set
+                .is_active(&agave_feature_set::stake_raise_minimum_delegation_to_1_sol::id()),
+        );
         2 * (rent_exempt_reserve + minimum_delegation)
     };
 
@@ -300,28 +301,24 @@ fn test_stake_account_lifetime() {
         ..
     } = create_genesis_config_with_leader(
         100_000_000_000,
-        &solana_sdk::pubkey::new_rand(),
+        &solana_pubkey::new_rand(),
         2_000_000_000,
     );
     genesis_config.epoch_schedule = EpochSchedule::new(MINIMUM_SLOTS_PER_EPOCH);
     genesis_config.rent = Rent::default();
     let (mut bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
     let mint_pubkey = mint_keypair.pubkey();
-    // Need to set the EAH to Valid so that `Bank::new_from_parent()` doesn't panic during freeze
-    // when parent is in the EAH calculation window.
-    bank.rc
-        .accounts
-        .accounts_db
-        .epoch_accounts_hash_manager
-        .set_valid(EpochAccountsHash::new(Hash::new_unique()), bank.slot());
     let bank_client = BankClient::new_shared(bank.clone());
 
     let (vote_balance, stake_rent_exempt_reserve, stake_minimum_delegation) = {
         let rent = &bank.rent_collector().rent;
         (
-            rent.minimum_balance(VoteState::size_of()),
+            rent.minimum_balance(VoteStateV3::size_of()),
             rent.minimum_balance(StakeStateV2::size_of()),
-            solana_stake_program::get_minimum_delegation(&bank.feature_set),
+            solana_stake_program::get_minimum_delegation(
+                bank.feature_set
+                    .is_active(&agave_feature_set::stake_raise_minimum_delegation_to_1_sol::id()),
+            ),
         )
     };
 
@@ -384,7 +381,7 @@ fn test_stake_account_lifetime() {
         &[stake_instruction::withdraw(
             &stake_pubkey,
             &stake_pubkey,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             1,
             None,
         )],
@@ -413,11 +410,18 @@ fn test_stake_account_lifetime() {
 
     // Reward redemption
     // Submit enough votes to generate rewards
-    bank = fill_epoch_with_votes(bank, bank_forks.as_ref(), &vote_keypair, &mint_keypair);
+    let start_slot = bank.slot();
+    bank = fill_epoch_with_votes(
+        bank,
+        bank_forks.as_ref(),
+        &vote_keypair,
+        &mint_keypair,
+        start_slot,
+    );
 
     // Test that votes and credits are there
     let account = bank.get_account(&vote_pubkey).expect("account not found");
-    let vote_state: VoteState = StateMut::<VoteStateVersions>::state(&account)
+    let vote_state: VoteStateV3 = StateMut::<VoteStateVersions>::state(&account)
         .expect("couldn't unpack account data")
         .convert_to_current();
 
@@ -426,7 +430,13 @@ fn test_stake_account_lifetime() {
     // one vote per slot, might be more slots than 32 in the epoch
     assert!(vote_state.credits() >= 1);
 
-    bank = fill_epoch_with_votes(bank, bank_forks.as_ref(), &vote_keypair, &mint_keypair);
+    bank = fill_epoch_with_votes(
+        bank,
+        bank_forks.as_ref(),
+        &vote_keypair,
+        &mint_keypair,
+        start_slot,
+    );
 
     let pre_staked = get_staked(&bank, &stake_pubkey);
     let pre_balance = bank.get_balance(&stake_pubkey);
@@ -496,7 +506,7 @@ fn test_stake_account_lifetime() {
         &[stake_instruction::withdraw(
             &split_stake_pubkey,
             &stake_pubkey,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             split_starting_delegation + 1,
             None,
         )],
@@ -520,7 +530,7 @@ fn test_stake_account_lifetime() {
         &[stake_instruction::withdraw(
             &split_stake_pubkey,
             &stake_pubkey,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             split_balance,
             None,
         )],
@@ -537,7 +547,7 @@ fn test_stake_account_lifetime() {
         &[stake_instruction::withdraw(
             &split_stake_pubkey,
             &stake_pubkey,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             split_unstaked,
             None,
         )],
@@ -562,7 +572,7 @@ fn test_stake_account_lifetime() {
         &[stake_instruction::withdraw(
             &split_stake_pubkey,
             &stake_pubkey,
-            &solana_sdk::pubkey::new_rand(),
+            &solana_pubkey::new_rand(),
             split_remaining_balance,
             None,
         )],
@@ -588,12 +598,8 @@ fn test_create_stake_account_from_seed() {
         genesis_config,
         mint_keypair,
         ..
-    } = create_genesis_config_with_leader(
-        100_000_000_000,
-        &solana_sdk::pubkey::new_rand(),
-        1_000_000,
-    );
-    let bank = Bank::new_with_bank_forks_for_tests(&genesis_config).0;
+    } = create_genesis_config_with_leader(100_000_000_000, &solana_pubkey::new_rand(), 1_000_000);
+    let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
     let mint_pubkey = mint_keypair.pubkey();
     let bank_client = BankClient::new_shared(bank.clone());
 
@@ -627,7 +633,10 @@ fn test_create_stake_account_from_seed() {
     let (balance, delegation) = {
         let rent = &bank.rent_collector().rent;
         let rent_exempt_reserve = rent.minimum_balance(StakeStateV2::size_of());
-        let minimum_delegation = solana_stake_program::get_minimum_delegation(&bank.feature_set);
+        let minimum_delegation = solana_stake_program::get_minimum_delegation(
+            bank.feature_set
+                .is_active(&agave_feature_set::stake_raise_minimum_delegation_to_1_sol::id()),
+        );
         (rent_exempt_reserve + minimum_delegation, minimum_delegation)
     };
 

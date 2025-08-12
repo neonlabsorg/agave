@@ -1,8 +1,13 @@
 //! This module implements clone-on-write semantics for the SDK's `StakeHistory` to reduce
 //! unnecessary cloning of the underlying vector.
-use std::{
-    ops::{Deref, DerefMut},
-    sync::Arc,
+pub use solana_sysvar::stake_history::StakeHistoryGetEntry;
+use {
+    solana_clock::Epoch,
+    solana_sysvar::stake_history::{self, StakeHistoryEntry},
+    std::{
+        ops::{Deref, DerefMut},
+        sync::Arc,
+    },
 };
 
 /// The SDK's stake history with clone-on-write semantics
@@ -24,11 +29,17 @@ impl DerefMut for StakeHistory {
 }
 
 /// The inner type, which is the SDK's stake history
-type StakeHistoryInner = solana_sdk::stake_history::StakeHistory;
+type StakeHistoryInner = stake_history::StakeHistory;
+
+impl StakeHistoryGetEntry for StakeHistory {
+    fn get_entry(&self, epoch: Epoch) -> Option<StakeHistoryEntry> {
+        self.0.get_entry(epoch)
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use {super::*, solana_sdk::stake_history::StakeHistoryEntry};
+    use {super::*, solana_sysvar::stake_history::StakeHistoryEntry};
 
     fn rand_stake_history_entry() -> StakeHistoryEntry {
         StakeHistoryEntry {

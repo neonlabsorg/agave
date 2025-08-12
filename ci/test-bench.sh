@@ -40,10 +40,6 @@ _ $cargoNightly build --release
 # Remove "BENCH_FILE", if it exists so that the following commands can append
 rm -f "$BENCH_FILE"
 
-# Run sdk benches
-_ $cargoNightly bench --manifest-path sdk/Cargo.toml ${V:+--verbose} \
-  -- -Z unstable-options --format=json | tee -a "$BENCH_FILE"
-
 # Run runtime benches
 _ $cargoNightly bench --manifest-path runtime/Cargo.toml ${V:+--verbose} \
   -- -Z unstable-options --format=json | tee -a "$BENCH_FILE"
@@ -67,7 +63,6 @@ _ $cargoNightly bench --manifest-path programs/sbf/Cargo.toml ${V:+--verbose} --
 
 # Run banking/accounts bench. Doesn't require nightly, but use since it is already built.
 _ $cargoNightly run --release --manifest-path banking-bench/Cargo.toml ${V:+--verbose} | tee -a "$BENCH_FILE"
-_ $cargoNightly run --release --manifest-path accounts-bench/Cargo.toml ${V:+--verbose} -- --num_accounts 10000 --num_slots 4 | tee -a "$BENCH_FILE"
 
 # `solana-upload-perf` disabled as it can take over 30 minutes to complete for some
 # reason

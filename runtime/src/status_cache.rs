@@ -3,10 +3,8 @@ use {
     rand::{thread_rng, Rng},
     serde::Serialize,
     solana_accounts_db::ancestors::Ancestors,
-    solana_sdk::{
-        clock::{Slot, MAX_RECENT_BLOCKHASHES},
-        hash::Hash,
-    },
+    solana_clock::{Slot, MAX_RECENT_BLOCKHASHES},
+    solana_hash::Hash,
     std::{
         collections::{hash_map::Entry, HashMap, HashSet},
         sync::{Arc, Mutex},
@@ -102,7 +100,8 @@ impl<T: Serialize + Clone> StatusCache<T> {
                             }
                         } else {
                             panic!(
-                                "Map for key must exist if key exists in self.slot_deltas, slot: {slot}"
+                                "Map for key must exist if key exists in self.slot_deltas, slot: \
+                                 {slot}"
                             )
                         }
                     }
@@ -154,7 +153,7 @@ impl<T: Serialize + Clone> StatusCache<T> {
         let keys: Vec<_> = self.cache.keys().copied().collect();
 
         for blockhash in keys.iter() {
-            trace!("get_status_any_blockhash: trying {}", blockhash);
+            trace!("get_status_any_blockhash: trying {blockhash}");
             let status = self.get_status(&key, blockhash, ancestors);
             if status.is_some() {
                 return status;
@@ -183,16 +182,28 @@ impl<T: Serialize + Clone> StatusCache<T> {
         res: T,
     ) {
         let max_key_index = key.as_ref().len().saturating_sub(CACHED_KEY_SIZE + 1);
-        let hash_map = self.cache.entry(*transaction_blockhash).or_insert_with(|| {
-            let key_index = thread_rng().gen_range(0..max_key_index + 1);
-            (slot, key_index, HashMap::new())
-        });
 
-        hash_map.0 = std::cmp::max(slot, hash_map.0);
-        let key_index = hash_map.1.min(max_key_index);
+        // Get the cache entry for this blockhash.
+        let (max_slot, key_index, hash_map) =
+            self.cache.entry(*transaction_blockhash).or_insert_with(|| {
+                let key_index = thread_rng().gen_range(0..max_key_index + 1);
+                (slot, key_index, HashMap::new())
+            });
+
+        // Update the max slot observed to contain txs using this blockhash.
+        *max_slot = std::cmp::max(slot, *max_slot);
+
+        // Grab the key slice.
+        let key_index = (*key_index).min(max_key_index);
         let mut key_slice = [0u8; CACHED_KEY_SIZE];
         key_slice.clone_from_slice(&key.as_ref()[key_index..key_index + CACHED_KEY_SIZE]);
-        self.insert_with_slice(transaction_blockhash, slot, key_index, key_slice, res);
+
+        // Insert the slot and tx result into the cache entry associated with
+        // this blockhash and keyslice.
+        let forks = hash_map.entry(key_slice).or_default();
+        forks.push((slot, res.clone()));
+
+        self.add_to_slot_delta(transaction_blockhash, slot, key_index, key_slice, res);
     }
 
     pub fn purge_roots(&mut self) {
@@ -271,9 +282,22 @@ impl<T: Serialize + Clone> StatusCache<T> {
 
         let forks = hash_map.2.entry(key_slice).or_default();
         forks.push((slot, res.clone()));
-        let slot_deltas = self.slot_deltas.entry(slot).or_default();
-        let mut fork_entry = slot_deltas.lock().unwrap();
-        let (_, hash_entry) = fork_entry
+
+        self.add_to_slot_delta(transaction_blockhash, slot, key_index, key_slice, res);
+    }
+
+    // Add this key slice to the list of key slices for this slot and blockhash
+    // combo.
+    fn add_to_slot_delta(
+        &mut self,
+        transaction_blockhash: &Hash,
+        slot: Slot,
+        key_index: usize,
+        key_slice: [u8; CACHED_KEY_SIZE],
+        res: T,
+    ) {
+        let mut fork_entry = self.slot_deltas.entry(slot).or_default().lock().unwrap();
+        let (_key_index, hash_entry) = fork_entry
             .entry(*transaction_blockhash)
             .or_insert((key_index, vec![]));
         hash_entry.push((key_slice, res))
@@ -282,10 +306,7 @@ impl<T: Serialize + Clone> StatusCache<T> {
 
 #[cfg(test)]
 mod tests {
-    use {
-        super::*,
-        solana_sdk::{hash::hash, signature::Signature},
-    };
+    use {super::*, solana_sha256_hasher::hash, solana_signature::Signature};
 
     type BankStatusCache = StatusCache<()>;
 

@@ -6,22 +6,20 @@
 
 use {
     bincode::{deserialize, serialize, serialized_size},
-    byteorder::{ByteOrder, LittleEndian},
     crossbeam_channel::{unbounded, Sender},
     log::*,
     serde_derive::{Deserialize, Serialize},
+    solana_hash::Hash,
+    solana_instruction::Instruction,
+    solana_keypair::Keypair,
+    solana_message::Message,
     solana_metrics::datapoint_info,
-    solana_sdk::{
-        hash::Hash,
-        instruction::Instruction,
-        message::Message,
-        native_token::lamports_to_sol,
-        packet::PACKET_DATA_SIZE,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        system_instruction,
-        transaction::Transaction,
-    },
+    solana_native_token::lamports_to_sol,
+    solana_packet::PACKET_DATA_SIZE,
+    solana_pubkey::Pubkey,
+    solana_signer::Signer,
+    solana_system_interface::instruction::transfer,
+    solana_transaction::Transaction,
     std::{
         collections::{HashMap, HashSet},
         io::{Read, Write},
@@ -202,7 +200,7 @@ impl Faucet {
                             )
                         );
                         let memo_instruction = Instruction {
-                            program_id: Pubkey::from(spl_memo::id().to_bytes()),
+                            program_id: spl_memo_interface::v3::id(),
                             accounts: vec![],
                             data: memo.as_bytes().to_vec(),
                         };
@@ -218,8 +216,7 @@ impl Faucet {
                 }
                 self.check_time_request_limit(lamports, to)?;
 
-                let transfer_instruction =
-                    system_instruction::transfer(&mint_pubkey, &to, lamports);
+                let transfer_instruction = transfer(&mint_pubkey, &to, lamports);
                 let message = Message::new(&[transfer_instruction], Some(&mint_pubkey));
                 Ok(FaucetTransaction::Airdrop(Transaction::new(
                     &[&self.faucet_keypair],
@@ -254,8 +251,8 @@ impl Faucet {
                 };
                 let response_vec = bincode::serialize(&tx)?;
 
-                let mut response_vec_with_length = vec![0; 2];
-                LittleEndian::write_u16(&mut response_vec_with_length, response_vec.len() as u16);
+                let mut response_vec_with_length =
+                    (response_vec.len() as u16).to_le_bytes().to_vec();
                 response_vec_with_length.extend_from_slice(&response_vec);
 
                 Ok(response_vec_with_length)
@@ -304,7 +301,7 @@ pub fn request_airdrop_transaction(
         );
         err
     })?;
-    let transaction_length = LittleEndian::read_u16(&buffer) as usize;
+    let transaction_length = u16::from_le_bytes(buffer) as usize;
     if transaction_length > PACKET_DATA_SIZE {
         return Err(FaucetError::TransactionDataTooLarge(transaction_length));
     } else if transaction_length == 0 {
@@ -492,7 +489,7 @@ impl LimitByTime for Pubkey {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, solana_sdk::system_instruction::SystemInstruction, std::time::Duration};
+    use {super::*, solana_system_interface::instruction::SystemInstruction, std::time::Duration};
 
     #[test]
     fn test_check_time_request_limit() {
@@ -633,7 +630,7 @@ mod tests {
             assert_eq!(tx.signatures.len(), 1);
             assert_eq!(
                 message.account_keys,
-                vec![mint_pubkey, Pubkey::from(spl_memo::id().to_bytes())]
+                vec![mint_pubkey, spl_memo_interface::v3::id()]
             );
             assert_eq!(message.recent_blockhash, blockhash);
 
@@ -649,8 +646,8 @@ mod tests {
 
     #[test]
     fn test_process_faucet_request() {
-        let to = solana_sdk::pubkey::new_rand();
-        let blockhash = Hash::new(to.as_ref());
+        let to = solana_pubkey::new_rand();
+        let blockhash = Hash::new_from_array(to.to_bytes());
         let lamports = 50;
         let req = FaucetRequest::GetAirdrop {
             lamports,
@@ -661,12 +658,11 @@ mod tests {
         let req = serialize(&req).unwrap();
 
         let keypair = Keypair::new();
-        let expected_instruction = system_instruction::transfer(&keypair.pubkey(), &to, lamports);
+        let expected_instruction = transfer(&keypair.pubkey(), &to, lamports);
         let message = Message::new(&[expected_instruction], Some(&keypair.pubkey()));
         let expected_tx = Transaction::new(&[&keypair], message, blockhash);
         let expected_bytes = serialize(&expected_tx).unwrap();
-        let mut expected_vec_with_length = vec![0; 2];
-        LittleEndian::write_u16(&mut expected_vec_with_length, expected_bytes.len() as u16);
+        let mut expected_vec_with_length = (expected_bytes.len() as u16).to_le_bytes().to_vec();
         expected_vec_with_length.extend_from_slice(&expected_bytes);
 
         let mut faucet = Faucet::new(keypair, None, None, None);

@@ -98,7 +98,7 @@ impl GroupedCiphertext3HandlesValidityProof {
         let mut y_r = Scalar::random(&mut OsRng);
         let mut y_x = Scalar::random(&mut OsRng);
 
-        let Y_0 = RistrettoPoint::multiscalar_mul(vec![&y_r, &y_x], vec![&(*H), &(*G)]).compress();
+        let Y_0 = RistrettoPoint::multiscalar_mul(vec![&y_r, &y_x], vec![&(*H), &G]).compress();
         let Y_1 = (&y_r * P_source).compress();
         let Y_2 = (&y_r * P_destination).compress();
         let Y_3 = (&y_r * P_auditor).compress();
@@ -201,7 +201,7 @@ impl GroupedCiphertext3HandlesValidityProof {
                 &self.z_r,            // z_r
                 &self.z_x,            // z_x
                 &(-&c),               // -c
-                &-(&Scalar::one()),   // -identity
+                &-(&Scalar::ONE),     // -identity
                 &(&w * &self.z_r),    // w * z_r
                 &(&w_negated * &c),   // -w * c
                 &w_negated,           // -w
@@ -214,18 +214,18 @@ impl GroupedCiphertext3HandlesValidityProof {
             ],
             vec![
                 &(*H),         // H
-                &(*G),         // G
+                &G,            // G
                 C,             // C
                 &Y_0,          // Y_0
-                P_source,      // P_destination
-                D_source,      // D_destination
+                P_source,      // P_source
+                D_source,      // D_source
                 &Y_1,          // Y_1
                 P_destination, // P_destination
                 D_destination, // D_destination
-                &Y_2,          // Y_1
+                &Y_2,          // Y_2
                 P_auditor,     // P_auditor
                 D_auditor,     // D_auditor
-                &Y_3,          // Y_2
+                &Y_3,          // Y_3
             ],
         );
 

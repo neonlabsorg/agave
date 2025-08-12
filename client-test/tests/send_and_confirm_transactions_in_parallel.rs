@@ -1,16 +1,20 @@
 use {
     solana_client::{
         nonblocking::tpu_client::TpuClient,
+        rpc_config::RpcSendTransactionConfig,
         send_and_confirm_transactions_in_parallel::{
-            send_and_confirm_transactions_in_parallel_blocking, SendAndConfirmConfig,
+            send_and_confirm_transactions_in_parallel_blocking_v2, SendAndConfirmConfigV2,
         },
     },
+    solana_commitment_config::CommitmentConfig,
+    solana_keypair::Keypair,
+    solana_message::Message,
+    solana_native_token::sol_to_lamports,
+    solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        commitment_config::CommitmentConfig, message::Message, native_token::sol_to_lamports,
-        pubkey::Pubkey, signature::Keypair, signer::Signer, system_instruction,
-    },
+    solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
+    solana_system_interface::instruction as system_instruction,
     solana_test_validator::TestValidator,
     std::sync::Arc,
 };
@@ -38,7 +42,7 @@ fn test_send_and_confirm_transactions_in_parallel_without_tpu_client() {
     let test_validator =
         TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
 
-    let bob_pubkey = solana_sdk::pubkey::new_rand();
+    let bob_pubkey = solana_pubkey::new_rand();
     let alice_pubkey = alice.pubkey();
 
     let rpc_client = Arc::new(RpcClient::new(test_validator.rpc_url()));
@@ -51,14 +55,21 @@ fn test_send_and_confirm_transactions_in_parallel_without_tpu_client() {
     let original_alice_balance = rpc_client.get_balance(&alice.pubkey()).unwrap();
     let (messages, sum) = create_messages(alice_pubkey, bob_pubkey);
 
-    let txs_errors = send_and_confirm_transactions_in_parallel_blocking(
+    let txs_errors = send_and_confirm_transactions_in_parallel_blocking_v2(
         rpc_client.clone(),
         None,
         &messages,
         &[&alice],
-        SendAndConfirmConfig {
+        SendAndConfirmConfigV2 {
             with_spinner: false,
             resign_txs_count: Some(5),
+            rpc_send_transaction_config: RpcSendTransactionConfig {
+                skip_preflight: false,
+                preflight_commitment: Some(CommitmentConfig::confirmed().commitment),
+                encoding: None,
+                max_retries: None,
+                min_context_slot: None,
+            },
         },
     );
     assert!(txs_errors.is_ok());
@@ -88,7 +99,7 @@ fn test_send_and_confirm_transactions_in_parallel_with_tpu_client() {
     let test_validator =
         TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
 
-    let bob_pubkey = solana_sdk::pubkey::new_rand();
+    let bob_pubkey = solana_pubkey::new_rand();
     let alice_pubkey = alice.pubkey();
 
     let rpc_client = Arc::new(RpcClient::new(test_validator.rpc_url()));
@@ -109,14 +120,21 @@ fn test_send_and_confirm_transactions_in_parallel_with_tpu_client() {
     );
     let tpu_client = rpc_client.runtime().block_on(tpu_client_fut).unwrap();
 
-    let txs_errors = send_and_confirm_transactions_in_parallel_blocking(
+    let txs_errors = send_and_confirm_transactions_in_parallel_blocking_v2(
         rpc_client.clone(),
         Some(tpu_client),
         &messages,
         &[&alice],
-        SendAndConfirmConfig {
+        SendAndConfirmConfigV2 {
             with_spinner: false,
             resign_txs_count: Some(5),
+            rpc_send_transaction_config: RpcSendTransactionConfig {
+                skip_preflight: false,
+                preflight_commitment: Some(CommitmentConfig::confirmed().commitment),
+                encoding: None,
+                max_retries: None,
+                min_context_slot: None,
+            },
         },
     );
     assert!(txs_errors.is_ok());

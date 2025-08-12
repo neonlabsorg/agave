@@ -5,7 +5,7 @@ use {
         PerfContext,
     },
     solana_metrics::datapoint_info,
-    solana_sdk::timing::timestamp,
+    solana_time_utils::timestamp,
     std::{
         cell::RefCell,
         fmt::Debug,
@@ -30,7 +30,6 @@ pub struct BlockstoreInsertionMetrics {
     pub num_recovered: usize,
     pub num_recovered_blockstore_error: usize,
     pub num_recovered_inserted: usize,
-    pub num_recovered_failed_sig: usize,
     pub num_recovered_failed_invalid: usize,
     pub num_recovered_exists: usize,
     pub num_repaired_data_shreds_exists: usize,
@@ -81,11 +80,6 @@ impl BlockstoreInsertionMetrics {
             (
                 "num_recovered_inserted",
                 self.num_recovered_inserted as i64,
-                i64
-            ),
-            (
-                "num_recovered_failed_sig",
-                self.num_recovered_failed_sig as i64,
                 i64
             ),
             (
@@ -324,7 +318,7 @@ pub struct BlockstoreRocksDbColumnFamilyMetrics {
 
     // FIFO Compaction related
 
-    // returns an estimation of the oldest key timestamp in the DB. Only vailable
+    // returns an estimation of the oldest key timestamp in the DB. Only available
     // for FIFO compaction with compaction_options_fifo.allow_compaction = false.
     // RocksDB's internal property key: "rocksdb.estimate-oldest-key-time"
     pub estimate_oldest_key_time: i64,
@@ -347,7 +341,6 @@ impl BlockstoreRocksDbColumnFamilyMetrics {
             "blockstore_rocksdb_cfs",
             // tags that support group-by operations
             "cf_name" => cf_name,
-            "storage" => column_options.get_storage_type_string(),
             "compression" => column_options.get_compression_type_string(),
             // Size related
             (
@@ -459,7 +452,6 @@ pub(crate) fn report_rocksdb_read_perf(
             // tags that support group-by operations
             "op" => op_name,
             "cf_name" => cf_name,
-            "storage" => column_options.get_storage_type_string(),
             "compression" => column_options.get_compression_type_string(),
             // total nanos spent on the entire operation.
             ("total_op_nanos", total_op_duration.as_nanos() as i64, i64),
@@ -635,7 +627,6 @@ pub(crate) fn report_rocksdb_write_perf(
             // tags that support group-by operations
             "op" => op_name,
             "cf_name" => cf_name,
-            "storage" => column_options.get_storage_type_string(),
             "compression" => column_options.get_compression_type_string(),
             // total nanos spent on the entire operation.
             ("total_op_nanos", total_op_duration.as_nanos() as i64, i64),

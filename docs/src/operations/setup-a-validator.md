@@ -1,6 +1,6 @@
 ---
-title: Setup a Solana Validator
-sidebar_label: Setup a Validator
+title: Setup an Agave Validator
+sidebar_label: Setup an Agave Validator
 sidebar_position: 5
 ---
 
@@ -308,10 +308,8 @@ not start without the settings below.
 
 ```bash
 sudo bash -c "cat >/etc/sysctl.d/21-agave-validator.conf <<EOF
-# Increase UDP buffer sizes
-net.core.rmem_default = 134217728
+# Increase max UDP buffer sizes
 net.core.rmem_max = 134217728
-net.core.wmem_default = 134217728
 net.core.wmem_max = 134217728
 
 # Increase memory mapped files limit
@@ -332,6 +330,7 @@ Add
 
 ```
 LimitNOFILE=1000000
+LimitMEMLOCK=2000000000
 ```
 
 to the `[Service]` section of your systemd service file, if you use one,
@@ -339,6 +338,7 @@ otherwise add
 
 ```
 DefaultLimitNOFILE=1000000
+DefaultLimitMEMLOCK=2000000000
 ```
 
 to the `[Manager]` section of `/etc/systemd/system.conf`.
@@ -351,6 +351,8 @@ sudo systemctl daemon-reload
 sudo bash -c "cat >/etc/security/limits.d/90-solana-nofiles.conf <<EOF
 # Increase process file descriptor count limit
 * - nofile 1000000
+# Increase memory locked limit (kB)
+* - memlock 2000000
 EOF"
 ```
 
@@ -383,7 +385,7 @@ su - sol
 
 ## Install The Solana CLI on Remote Machine
 
-Your remote machine will need the Solana cli installed to run the validator
+Your remote machine will need the Solana CLI installed to run the Agave validator
 software. For simplicity, install the cli with user `sol`. Refer again to
 [Solana's Install Tool](../cli/install.md#use-solanas-install-tool) or
 [build from source](../cli/install.md#build-from-source). It is best for
@@ -435,6 +437,8 @@ Refer to `agave-validator --help` for more information on what each flag is
 doing in this script. Also refer to the section on
 [best practices for operating a validator](./best-practices/general.md).
 
+This startup script is specifically intended for testnet. For more startup script examples intended for other clusters, refer to the
+[clusters section.](./../clusters/available.md).
 ## Verifying Your Validator Is Working
 
 Test that your `validator.sh` file is running properly by executing the
@@ -445,7 +449,7 @@ Test that your `validator.sh` file is running properly by executing the
 ```
 
 The script should execute the `agave-validator` process. In a new terminal
-window, shh into your server, then verify that the process is running:
+window, ssh into your server, then verify that the process is running:
 
 ```
 ps aux | grep agave-validator

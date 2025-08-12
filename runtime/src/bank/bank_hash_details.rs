@@ -8,18 +8,15 @@ use {
         de::{self, Deserialize, Deserializer},
         ser::{Serialize, SerializeSeq, Serializer},
     },
-    solana_accounts_db::{
-        accounts_db::PubkeyHashAccount,
-        accounts_hash::{AccountHash, AccountsDeltaHash},
-    },
-    solana_sdk::{
-        account::{Account, AccountSharedData, ReadableAccount},
-        clock::{Epoch, Slot},
-        hash::Hash,
-        pubkey::Pubkey,
-    },
-    solana_svm::transaction_results::TransactionExecutionDetails,
-    solana_transaction_status::UiInstruction,
+    solana_account::{Account, AccountSharedData, ReadableAccount},
+    solana_clock::Slot,
+    solana_fee_structure::FeeDetails,
+    solana_message::inner_instruction::InnerInstructionsList,
+    solana_pubkey::Pubkey,
+    solana_svm::transaction_commit_result::CommittedTransaction,
+    solana_transaction_context::TransactionReturnData,
+    solana_transaction_error::TransactionResult,
+    solana_transaction_status_client_types::UiInstruction,
     std::str::FromStr,
 };
 
@@ -69,73 +66,59 @@ impl BankHashDetails {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
 pub struct TransactionDetails {
+    pub signature: String,
     pub index: usize,
     pub accounts: Vec<String>,
     pub instructions: Vec<UiInstruction>,
     pub is_simple_vote_tx: bool,
-    pub execution_results: Option<TransactionExecutionDetails>,
+    pub commit_details: Option<TransactionCommitDetails>,
 }
 
-/// The components that go into a bank hash calculation for a single bank/slot.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
-pub struct SlotDetails {
-    pub slot: Slot,
-    pub bank_hash: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    #[serde(default)]
-    pub parent_bank_hash: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    #[serde(default)]
-    pub accounts_delta_hash: String,
-    #[serde(skip_serializing_if = "u64_is_zero")]
-    #[serde(default)]
-    pub signature_count: u64,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    #[serde(default)]
-    pub last_blockhash: String,
-    #[serde(skip_serializing_if = "accounts_is_empty")]
-    #[serde(default)]
-    pub accounts: AccountsDetails,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(default)]
-    pub transactions: Vec<TransactionDetails>,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TransactionCommitDetails {
+    pub status: TransactionResult<()>,
+    pub log_messages: Option<Vec<String>>,
+    pub inner_instructions: Option<InnerInstructionsList>,
+    pub return_data: Option<TransactionReturnData>,
+    pub executed_units: u64,
+    pub fee_details: FeeDetails,
 }
 
-fn u64_is_zero(val: &u64) -> bool {
-    *val == 0
-}
-
-fn accounts_is_empty(accounts: &AccountsDetails) -> bool {
-    accounts.accounts.is_empty()
-}
-
-impl SlotDetails {
-    pub fn new(
-        slot: Slot,
-        bank_hash: Hash,
-        parent_bank_hash: Hash,
-        accounts_delta_hash: Hash,
-        signature_count: u64,
-        last_blockhash: Hash,
-        accounts: AccountsDetails,
-    ) -> Self {
+impl From<CommittedTransaction> for TransactionCommitDetails {
+    fn from(committed_tx: CommittedTransaction) -> Self {
         Self {
-            slot,
-            bank_hash: bank_hash.to_string(),
-            parent_bank_hash: parent_bank_hash.to_string(),
-            accounts_delta_hash: accounts_delta_hash.to_string(),
-            signature_count,
-            last_blockhash: last_blockhash.to_string(),
-            accounts,
-            transactions: Vec::new(),
+            status: committed_tx.status,
+            log_messages: committed_tx.log_messages,
+            inner_instructions: committed_tx.inner_instructions,
+            return_data: committed_tx.return_data,
+            executed_units: committed_tx.executed_units,
+            fee_details: committed_tx.fee_details,
         }
     }
 }
 
-impl TryFrom<&Bank> for SlotDetails {
-    type Error = String;
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
+pub struct SlotDetails {
+    pub slot: Slot,
+    pub bank_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none", default, flatten)]
+    pub bank_hash_components: Option<BankHashComponents>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub transactions: Vec<TransactionDetails>,
+}
 
-    fn try_from(bank: &Bank) -> Result<Self, Self::Error> {
+/// The components that go into a bank hash calculation for a single bank
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, Default)]
+pub struct BankHashComponents {
+    pub parent_bank_hash: String,
+    pub signature_count: u64,
+    pub last_blockhash: String,
+    pub accounts_lt_hash_checksum: String,
+    pub accounts: AccountsDetails,
+}
+
+impl SlotDetails {
+    pub fn new_from_bank(bank: &Bank, include_bank_hash_components: bool) -> Result<Self, String> {
         let slot = bank.slot();
         if !bank.is_frozen() {
             return Err(format!(
@@ -143,26 +126,32 @@ impl TryFrom<&Bank> for SlotDetails {
             ));
         }
 
-        // This bank is frozen; as a result, we know that the state has been
-        // hashed which means the delta hash is Some(). So, .unwrap() is safe
-        let AccountsDeltaHash(accounts_delta_hash) = bank
-            .rc
-            .accounts
-            .accounts_db
-            .get_accounts_delta_hash(slot)
-            .unwrap();
+        let bank_hash_components = if include_bank_hash_components {
+            let accounts = bank.get_accounts_for_bank_hash_details();
 
-        let accounts = bank.get_accounts_for_bank_hash_details();
+            Some(BankHashComponents {
+                parent_bank_hash: bank.parent_hash().to_string(),
+                signature_count: bank.signature_count(),
+                last_blockhash: bank.last_blockhash().to_string(),
+                accounts_lt_hash_checksum: bank
+                    .accounts_lt_hash
+                    .lock()
+                    .unwrap()
+                    .0
+                    .checksum()
+                    .to_string(),
+                accounts: AccountsDetails { accounts },
+            })
+        } else {
+            None
+        };
 
-        Ok(Self::new(
+        Ok(Self {
             slot,
-            bank.hash(),
-            bank.parent_hash(),
-            accounts_delta_hash,
-            bank.signature_count(),
-            bank.last_blockhash(),
-            AccountsDetails { accounts },
-        ))
+            bank_hash: bank.hash().to_string(),
+            bank_hash_components,
+            transactions: Vec::new(),
+        })
     }
 }
 
@@ -170,7 +159,7 @@ impl TryFrom<&Bank> for SlotDetails {
 /// implementations.
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct AccountsDetails {
-    pub accounts: Vec<PubkeyHashAccount>,
+    pub accounts: Vec<(Pubkey, AccountSharedData)>,
 }
 
 /// Used as an intermediate for serializing and deserializing account fields
@@ -178,39 +167,30 @@ pub struct AccountsDetails {
 #[derive(Deserialize, Serialize)]
 struct SerdeAccount {
     pubkey: String,
-    hash: String,
     owner: String,
     lamports: u64,
-    rent_epoch: Epoch,
     executable: bool,
     data: String,
 }
 
-impl From<&PubkeyHashAccount> for SerdeAccount {
-    fn from(pubkey_hash_account: &PubkeyHashAccount) -> Self {
-        let PubkeyHashAccount {
-            pubkey,
-            hash,
-            account,
-        } = pubkey_hash_account;
+impl From<&(Pubkey, AccountSharedData)> for SerdeAccount {
+    fn from(pubkey_account: &(Pubkey, AccountSharedData)) -> Self {
+        let (pubkey, account) = pubkey_account;
         Self {
             pubkey: pubkey.to_string(),
-            hash: hash.0.to_string(),
             owner: account.owner().to_string(),
             lamports: account.lamports(),
-            rent_epoch: account.rent_epoch(),
             executable: account.executable(),
             data: BASE64_STANDARD.encode(account.data()),
         }
     }
 }
 
-impl TryFrom<SerdeAccount> for PubkeyHashAccount {
+impl TryFrom<SerdeAccount> for (Pubkey, AccountSharedData) {
     type Error = String;
 
     fn try_from(temp_account: SerdeAccount) -> Result<Self, Self::Error> {
         let pubkey = Pubkey::from_str(&temp_account.pubkey).map_err(|err| err.to_string())?;
-        let hash = AccountHash(Hash::from_str(&temp_account.hash).map_err(|err| err.to_string())?);
 
         let account = AccountSharedData::from(Account {
             lamports: temp_account.lamports,
@@ -219,14 +199,10 @@ impl TryFrom<SerdeAccount> for PubkeyHashAccount {
                 .map_err(|err| err.to_string())?,
             owner: Pubkey::from_str(&temp_account.owner).map_err(|err| err.to_string())?,
             executable: temp_account.executable,
-            rent_epoch: temp_account.rent_epoch,
+            rent_epoch: u64::MAX, // obsolete, now always set to all ones
         });
 
-        Ok(Self {
-            pubkey,
-            hash,
-            account,
-        })
+        Ok((pubkey, account))
     }
 }
 
@@ -249,21 +225,23 @@ impl<'de> Deserialize<'de> for AccountsDetails {
     where
         D: Deserializer<'de>,
     {
+        type PubkeyAccount = (Pubkey, AccountSharedData);
+
         let temp_accounts: Vec<SerdeAccount> = Deserialize::deserialize(deserializer)?;
-        let pubkey_hash_accounts: Result<Vec<_>, _> = temp_accounts
+        let pubkey_accounts: Result<Vec<_>, _> = temp_accounts
             .into_iter()
-            .map(PubkeyHashAccount::try_from)
+            .map(PubkeyAccount::try_from)
             .collect();
-        let pubkey_hash_accounts = pubkey_hash_accounts.map_err(de::Error::custom)?;
+        let pubkey_accounts = pubkey_accounts.map_err(de::Error::custom)?;
         Ok(AccountsDetails {
-            accounts: pubkey_hash_accounts,
+            accounts: pubkey_accounts,
         })
     }
 }
 
 /// Output the components that comprise the overall bank hash for the supplied `Bank`
 pub fn write_bank_hash_details_file(bank: &Bank) -> std::result::Result<(), String> {
-    let slot_details = SlotDetails::try_from(bank)?;
+    let slot_details = SlotDetails::new_from_bank(bank, /*include_bank_hash_mixins:*/ true)?;
     let details = BankHashDetails::new(vec![slot_details]);
 
     let parent_dir = bank
@@ -300,43 +278,34 @@ pub mod tests {
     use super::*;
 
     fn build_details(num_slots: usize) -> BankHashDetails {
-        use solana_sdk::hash::{hash, hashv};
-
         let slot_details: Vec<_> = (0..num_slots)
             .map(|slot| {
-                let signature_count = 314;
+                let slot = slot as u64;
 
                 let account = AccountSharedData::from(Account {
                     lamports: 123_456_789,
                     data: vec![0, 9, 1, 8, 2, 7, 3, 6, 4, 5],
                     owner: Pubkey::new_unique(),
                     executable: true,
-                    rent_epoch: 123,
+                    rent_epoch: u64::MAX,
                 });
                 let account_pubkey = Pubkey::new_unique();
-                let account_hash = AccountHash(hash("account".as_bytes()));
                 let accounts = AccountsDetails {
-                    accounts: vec![PubkeyHashAccount {
-                        pubkey: account_pubkey,
-                        hash: account_hash,
-                        account,
-                    }],
+                    accounts: vec![(account_pubkey, account)],
                 };
 
-                let bank_hash = hashv(&["bank".as_bytes(), &slot.to_le_bytes()]);
-                let parent_bank_hash = hash("parent_bank".as_bytes());
-                let accounts_delta_hash = hash("accounts_delta".as_bytes());
-                let last_blockhash = hash("last_blockhash".as_bytes());
-
-                SlotDetails::new(
-                    slot as Slot,
-                    bank_hash,
-                    parent_bank_hash,
-                    accounts_delta_hash,
-                    signature_count,
-                    last_blockhash,
-                    accounts,
-                )
+                SlotDetails {
+                    slot,
+                    bank_hash: format!("bank{slot}"),
+                    bank_hash_components: Some(BankHashComponents {
+                        parent_bank_hash: "parent_bank_hash".into(),
+                        signature_count: slot + 10,
+                        last_blockhash: "last_blockhash".into(),
+                        accounts_lt_hash_checksum: "accounts_lt_hash_checksum".into(),
+                        accounts,
+                    }),
+                    transactions: vec![],
+                }
             })
             .collect();
 

@@ -1,34 +1,34 @@
 use {
     crate::{
         cli::{CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult},
-        compute_budget::WithComputeUnitPrice,
+        compute_budget::{ComputeUnitConfig, WithComputeUnitConfig},
         spend_utils::{resolve_spend_tx_and_check_account_balance, SpendAmount},
     },
     bincode::{deserialize, serialized_size},
     clap::{App, AppSettings, Arg, ArgMatches, SubCommand},
     reqwest::blocking::Client,
     serde_json::{Map, Value},
+    solana_account::Account,
     solana_account_decoder::validator_info::{
-        self, ValidatorInfo, MAX_LONG_FIELD_LENGTH, MAX_SHORT_FIELD_LENGTH,
+        self, ValidatorInfo, MAX_LONG_FIELD_LENGTH, MAX_SHORT_FIELD_LENGTH, MAX_VALIDATOR_INFO,
     },
     solana_clap_utils::{
-        compute_unit_price::{compute_unit_price_arg, COMPUTE_UNIT_PRICE_ARG},
+        compute_budget::{compute_unit_price_arg, ComputeUnitLimit, COMPUTE_UNIT_PRICE_ARG},
         hidden_unless_forced,
         input_parsers::{pubkey_of, value_of},
         input_validators::{is_pubkey, is_url},
         keypair::DefaultSigner,
     },
     solana_cli_output::{CliValidatorInfo, CliValidatorInfoVec},
-    solana_config_program::{config_instruction, get_config_data, ConfigKeys, ConfigState},
+    solana_config_interface::instruction::{self as config_instruction},
+    solana_config_program_client::{get_config_data, ConfigKeys},
+    solana_keypair::Keypair,
+    solana_message::Message,
+    solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_sdk::{
-        account::Account,
-        message::Message,
-        pubkey::Pubkey,
-        signature::{Keypair, Signer},
-        transaction::Transaction,
-    },
+    solana_signer::Signer,
+    solana_transaction::Transaction,
     std::{error, rc::Rc},
 };
 
@@ -45,7 +45,7 @@ pub fn check_details_length(string: String) -> Result<(), String> {
 
 pub fn check_total_length(info: &ValidatorInfo) -> Result<(), String> {
     let size = serialized_size(&info).unwrap();
-    let limit = ValidatorInfo::max_space();
+    let limit = MAX_VALIDATOR_INFO;
 
     if size > limit {
         Err(format!(
@@ -130,7 +130,7 @@ fn parse_validator_info(
     pubkey: &Pubkey,
     account: &Account,
 ) -> Result<(Pubkey, Map<String, serde_json::value::Value>), Box<dyn error::Error>> {
-    if account.owner != solana_config_program::id() {
+    if account.owner != solana_config_program_client::ID {
         return Err(format!("{pubkey} is not a validator info account").into());
     }
     let key_list: ConfigKeys = deserialize(&account.data)?;
@@ -275,7 +275,7 @@ pub fn process_set_validator_info(
     validator_info: &Value,
     force_keybase: bool,
     info_pubkey: Option<Pubkey>,
-    compute_unit_price: Option<&u64>,
+    compute_unit_price: Option<u64>,
 ) -> ProcessResult {
     // Validate keybase username
     if let Some(string) = validator_info.get("keybaseUsername") {
@@ -303,7 +303,7 @@ pub fn process_set_validator_info(
     }
 
     // Check for existing validator-info account
-    let all_config = rpc_client.get_program_accounts(&solana_config_program::id())?;
+    let all_config = rpc_client.get_program_accounts(&solana_config_program_client::ID)?;
     let existing_account = all_config
         .iter()
         .filter(
@@ -334,8 +334,8 @@ pub fn process_set_validator_info(
         (validator_info::id(), false),
         (config.signers[0].pubkey(), true),
     ];
-    let data_len = ValidatorInfo::max_space()
-        .checked_add(ConfigKeys::serialized_size(keys.clone()))
+    let data_len = MAX_VALIDATOR_INFO
+        .checked_add(serialized_size(&ConfigKeys { keys: keys.clone() }).unwrap())
         .expect("ValidatorInfo and two keys fit into a u64");
     let lamports = rpc_client.get_minimum_balance_for_rent_exemption(data_len as usize)?;
 
@@ -349,6 +349,7 @@ pub fn process_set_validator_info(
         vec![config.signers[0]]
     };
 
+    let compute_unit_limit = ComputeUnitLimit::Simulated;
     let build_message = |lamports| {
         let keys = keys.clone();
         if balance == 0 {
@@ -356,13 +357,18 @@ pub fn process_set_validator_info(
                 "Publishing info for Validator {:?}",
                 config.signers[0].pubkey()
             );
-            let mut instructions = config_instruction::create_account::<ValidatorInfo>(
-                &config.signers[0].pubkey(),
-                &info_pubkey,
-                lamports,
-                keys.clone(),
-            )
-            .with_compute_unit_price(compute_unit_price);
+            let mut instructions =
+                config_instruction::create_account_with_max_config_space::<ValidatorInfo>(
+                    &config.signers[0].pubkey(),
+                    &info_pubkey,
+                    lamports,
+                    MAX_VALIDATOR_INFO,
+                    keys.clone(),
+                )
+                .with_compute_unit_config(&ComputeUnitConfig {
+                    compute_unit_price,
+                    compute_unit_limit,
+                });
             instructions.extend_from_slice(&[config_instruction::store(
                 &info_pubkey,
                 true,
@@ -382,7 +388,10 @@ pub fn process_set_validator_info(
                 keys,
                 &validator_info,
             )]
-            .with_compute_unit_price(compute_unit_price);
+            .with_compute_unit_config(&ComputeUnitConfig {
+                compute_unit_price,
+                compute_unit_limit,
+            });
             Message::new(&instructions, Some(&config.signers[0].pubkey()))
         }
     };
@@ -395,12 +404,17 @@ pub fn process_set_validator_info(
         SpendAmount::Some(lamports),
         &latest_blockhash,
         &config.signers[0].pubkey(),
+        compute_unit_limit,
         build_message,
         config.commitment,
     )?;
     let mut tx = Transaction::new_unsigned(message);
     tx.try_sign(&signers, latest_blockhash)?;
-    let signature_str = rpc_client.send_and_confirm_transaction_with_spinner(&tx)?;
+    let signature_str = rpc_client.send_and_confirm_transaction_with_spinner_and_config(
+        &tx,
+        config.commitment,
+        config.send_transaction_config,
+    )?;
 
     println!("Success! Validator info published at: {info_pubkey:?}");
     println!("{signature_str}");
@@ -418,7 +432,7 @@ pub fn process_get_validator_info(
             rpc_client.get_account(&validator_info_pubkey)?,
         )]
     } else {
-        let all_config = rpc_client.get_program_accounts(&solana_config_program::id())?;
+        let all_config = rpc_client.get_program_accounts(&solana_config_program_client::ID)?;
         all_config
             .into_iter()
             .filter(|(_, validator_info_account)| {
@@ -493,7 +507,7 @@ mod tests {
 
     #[test]
     fn test_verify_keybase_username_not_string() {
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
         let value = Value::Bool(true);
 
         assert_eq!(
@@ -558,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_parse_validator_info() {
-        let pubkey = solana_sdk::pubkey::new_rand();
+        let pubkey = solana_pubkey::new_rand();
         let keys = vec![(validator_info::id(), false), (pubkey, true)];
         let config = ConfigKeys { keys };
 
@@ -572,7 +586,7 @@ mod tests {
             parse_validator_info(
                 &Pubkey::default(),
                 &Account {
-                    owner: solana_config_program::id(),
+                    owner: solana_config_program_client::ID,
                     data,
                     ..Account::default()
                 }
@@ -587,7 +601,7 @@ mod tests {
         assert!(parse_validator_info(
             &Pubkey::default(),
             &Account {
-                owner: solana_sdk::pubkey::new_rand(),
+                owner: solana_pubkey::new_rand(),
                 ..Account::default()
             }
         )
@@ -607,7 +621,7 @@ mod tests {
         assert!(parse_validator_info(
             &Pubkey::default(),
             &Account {
-                owner: solana_config_program::id(),
+                owner: solana_config_program_client::ID,
                 data,
                 ..Account::default()
             },
@@ -646,7 +660,7 @@ mod tests {
 
         assert_eq!(
             serialized_size(&validator_info).unwrap(),
-            ValidatorInfo::max_space()
+            MAX_VALIDATOR_INFO
         );
     }
 }

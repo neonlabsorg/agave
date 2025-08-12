@@ -8,8 +8,9 @@ use {
     indexmap::map::IndexMap,
     log::*,
     rand::{thread_rng, Rng},
+    solana_keypair::Keypair,
     solana_measure::measure::Measure,
-    solana_sdk::{signature::Keypair, timing::AtomicInterval},
+    solana_time_utils::AtomicInterval,
     std::{
         net::SocketAddr,
         sync::{atomic::Ordering, Arc, RwLock},
@@ -24,7 +25,7 @@ const MAX_CONNECTIONS: usize = 1024;
 /// Default connection pool size per remote address
 pub const DEFAULT_CONNECTION_POOL_SIZE: usize = 2;
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Protocol {
     UDP,
     QUIC,
@@ -513,7 +514,10 @@ mod tests {
         async_trait::async_trait,
         rand::{Rng, SeedableRng},
         rand_chacha::ChaChaRng,
-        solana_sdk::transport::Result as TransportResult,
+        solana_net_utils::sockets::{
+            bind_with_any_port_with_config, SocketConfiguration as SocketConfig,
+        },
+        solana_transaction_error::TransportResult,
         std::{
             net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
             sync::Arc,
@@ -570,8 +574,11 @@ mod tests {
         fn default() -> Self {
             Self {
                 udp_socket: Arc::new(
-                    solana_net_utils::bind_with_any_port(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-                        .expect("Unable to bind to UDP socket"),
+                    bind_with_any_port_with_config(
+                        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        SocketConfig::default(),
+                    )
+                    .expect("Unable to bind to UDP socket"),
                 ),
             }
         }
@@ -581,8 +588,11 @@ mod tests {
         fn new() -> Result<Self, ClientError> {
             Ok(Self {
                 udp_socket: Arc::new(
-                    solana_net_utils::bind_with_any_port(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-                        .map_err(Into::<ClientError>::into)?,
+                    bind_with_any_port_with_config(
+                        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        SocketConfig::default(),
+                    )
+                    .map_err(Into::<ClientError>::into)?,
                 ),
             })
         }

@@ -1,27 +1,25 @@
 use {
     crate::cli_output::CliSignatureVerificationStatus,
+    agave_reserved_account_keys::ReservedAccountKeys,
     base64::{prelude::BASE64_STANDARD, Engine},
     chrono::{DateTime, Local, SecondsFormat, TimeZone, Utc},
     console::style,
     indicatif::{ProgressBar, ProgressStyle},
+    solana_bincode::limited_deserialize,
     solana_cli_config::SettingType,
-    solana_sdk::{
-        clock::UnixTimestamp,
-        hash::Hash,
-        instruction::CompiledInstruction,
-        message::v0::MessageAddressTableLookup,
-        native_token::lamports_to_sol,
-        program_utils::limited_deserialize,
-        pubkey::Pubkey,
-        reserved_account_keys::ReservedAccountKeys,
-        signature::Signature,
-        stake,
-        transaction::{TransactionError, TransactionVersion, VersionedTransaction},
-    },
+    solana_clock::UnixTimestamp,
+    solana_hash::Hash,
+    solana_message::{compiled_instruction::CompiledInstruction, v0::MessageAddressTableLookup},
+    solana_native_token::lamports_to_sol,
+    solana_pubkey::Pubkey,
+    solana_signature::Signature,
+    solana_stake_interface as stake,
+    solana_transaction::versioned::{TransactionVersion, VersionedTransaction},
     solana_transaction_status::{
         Rewards, UiReturnDataEncoding, UiTransactionReturnData, UiTransactionStatusMeta,
     },
-    spl_memo::{id as spl_memo_id, v1::id as spl_memo_v1_id},
+    solana_transaction_status_client_types::UiTransactionError,
+    spl_memo_interface::{v1::id as spl_memo_v1_id, v3::id as spl_memo_v3_id},
     std::{collections::HashMap, fmt, io, time::Duration},
 };
 
@@ -44,7 +42,7 @@ impl Default for BuildBalanceMessageConfig {
 
 fn is_memo_program(k: &Pubkey) -> bool {
     let k_str = k.to_string();
-    (k_str == spl_memo_v1_id().to_string()) || (k_str == spl_memo_id().to_string())
+    (k_str == spl_memo_v1_id().to_string()) || (k_str == spl_memo_v3_id().to_string())
 }
 
 pub fn build_balance_message_with_config(
@@ -440,24 +438,29 @@ fn write_instruction<'a, W: io::Write>(
     let mut raw = true;
     if let AccountKeyType::Known(program_pubkey) = program_pubkey {
         if program_pubkey == &solana_vote_program::id() {
-            if let Ok(vote_instruction) = limited_deserialize::<
-                solana_vote_program::vote_instruction::VoteInstruction,
-            >(&instruction.data)
+            if let Ok(vote_instruction) =
+                limited_deserialize::<solana_vote_program::vote_instruction::VoteInstruction>(
+                    &instruction.data,
+                    solana_packet::PACKET_DATA_SIZE as u64,
+                )
             {
                 writeln!(w, "{prefix}  {vote_instruction:?}")?;
                 raw = false;
             }
         } else if program_pubkey == &stake::program::id() {
-            if let Ok(stake_instruction) =
-                limited_deserialize::<stake::instruction::StakeInstruction>(&instruction.data)
-            {
+            if let Ok(stake_instruction) = limited_deserialize::<stake::instruction::StakeInstruction>(
+                &instruction.data,
+                solana_packet::PACKET_DATA_SIZE as u64,
+            ) {
                 writeln!(w, "{prefix}  {stake_instruction:?}")?;
                 raw = false;
             }
-        } else if program_pubkey == &solana_sdk::system_program::id() {
-            if let Ok(system_instruction) = limited_deserialize::<
-                solana_sdk::system_instruction::SystemInstruction,
-            >(&instruction.data)
+        } else if program_pubkey == &solana_sdk_ids::system_program::id() {
+            if let Ok(system_instruction) =
+                limited_deserialize::<solana_system_interface::instruction::SystemInstruction>(
+                    &instruction.data,
+                    solana_packet::PACKET_DATA_SIZE as u64,
+                )
             {
                 writeln!(w, "{prefix}  {system_instruction:?}")?;
                 raw = false;
@@ -538,7 +541,7 @@ fn write_rewards<W: io::Write>(
 
 fn write_status<W: io::Write>(
     w: &mut W,
-    transaction_status: &Result<(), TransactionError>,
+    transaction_status: &Result<(), UiTransactionError>,
     prefix: &str,
 ) -> io::Result<()> {
     writeln!(
@@ -602,10 +605,7 @@ fn write_return_data<W: io::Write>(
         let (data, encoding) = &return_data.data;
         let raw_return_data = match encoding {
             UiReturnDataEncoding::Base64 => BASE64_STANDARD.decode(data).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("could not parse data as {encoding:?}: {err:?}"),
-                )
+                io::Error::other(format!("could not parse data as {encoding:?}: {err:?}"))
             })?,
         };
         if !raw_return_data.is_empty() {
@@ -723,16 +723,15 @@ pub fn unix_timestamp_to_string(unix_timestamp: UnixTimestamp) -> String {
 mod test {
     use {
         super::*,
-        solana_sdk::{
-            message::{
-                v0::{self, LoadedAddresses},
-                Message as LegacyMessage, MessageHeader, VersionedMessage,
-            },
-            pubkey::Pubkey,
-            signature::{Keypair, Signer},
-            transaction::Transaction,
-            transaction_context::TransactionReturnData,
+        solana_keypair::Keypair,
+        solana_message::{
+            v0::{self, LoadedAddresses},
+            Message as LegacyMessage, MessageHeader, VersionedMessage,
         },
+        solana_pubkey::Pubkey,
+        solana_signer::Signer,
+        solana_transaction::Transaction,
+        solana_transaction_context::TransactionReturnData,
         solana_transaction_status::{Reward, RewardType, TransactionStatusMeta},
         std::io::BufWriter,
     };
@@ -815,6 +814,7 @@ mod test {
                 data: vec![1, 2, 3],
             }),
             compute_units_consumed: Some(1234u64),
+            cost_units: Some(5678),
         };
 
         let output = {
@@ -894,6 +894,7 @@ Rewards:
                 data: vec![1, 2, 3],
             }),
             compute_units_consumed: Some(2345u64),
+            cost_units: Some(5678),
         };
 
         let output = {

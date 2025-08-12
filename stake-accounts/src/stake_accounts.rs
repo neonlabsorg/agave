@@ -1,15 +1,14 @@
-use solana_sdk::{
-    clock::SECONDS_PER_DAY,
-    instruction::Instruction,
-    message::Message,
-    pubkey::Pubkey,
-    stake::{
-        self,
+use {
+    solana_clock::SECONDS_PER_DAY,
+    solana_instruction::Instruction,
+    solana_message::Message,
+    solana_pubkey::Pubkey,
+    solana_stake_interface::{
+        self as stake,
         instruction::{self as stake_instruction, LockupArgs},
         state::{Authorized, Lockup, StakeAuthorize},
     },
 };
-
 const DAYS_PER_YEAR: f64 = 365.25;
 const SECONDS_PER_YEAR: i64 = (SECONDS_PER_DAY as f64 * DAYS_PER_YEAR) as i64;
 
@@ -283,25 +282,24 @@ pub(crate) fn move_stake_accounts(
 mod tests {
     use {
         super::*,
-        solana_runtime::{bank::Bank, bank_client::BankClient},
-        solana_sdk::{
-            account::{AccountSharedData, ReadableAccount},
-            client::SyncClient,
-            genesis_config::create_genesis_config,
-            signature::{Keypair, Signer},
-            stake::state::StakeStateV2,
-        },
+        solana_account::{AccountSharedData, ReadableAccount},
+        solana_client_traits::SyncClient,
+        solana_genesis_config::create_genesis_config,
+        solana_keypair::Keypair,
+        solana_runtime::{bank::Bank, bank_client::BankClient, bank_forks::BankForks},
+        solana_signer::Signer,
+        solana_stake_interface::state::StakeStateV2,
         solana_stake_program::stake_state,
-        std::sync::Arc,
+        std::sync::{Arc, RwLock},
     };
 
-    fn create_bank(lamports: u64) -> (Arc<Bank>, Keypair, u64, u64) {
+    fn create_bank(lamports: u64) -> (Arc<Bank>, Arc<RwLock<BankForks>>, Keypair, u64, u64) {
         let (mut genesis_config, mint_keypair) = create_genesis_config(lamports);
-        genesis_config.fee_rate_governor = solana_sdk::fee_calculator::FeeRateGovernor::new(0, 0);
-        let bank = Bank::new_with_bank_forks_for_tests(&genesis_config).0;
+        genesis_config.fee_rate_governor = solana_fee_calculator::FeeRateGovernor::new(0, 0);
+        let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         let stake_rent = bank.get_minimum_balance_for_rent_exemption(StakeStateV2::size_of());
         let system_rent = bank.get_minimum_balance_for_rent_exemption(0);
-        (bank, mint_keypair, stake_rent, system_rent)
+        (bank, bank_forks, mint_keypair, stake_rent, system_rent)
     }
 
     fn create_account<C: SyncClient>(
@@ -355,7 +353,7 @@ mod tests {
 
     #[test]
     fn test_new_derived_stake_account() {
-        let (bank, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
+        let (bank, _bank_forks, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
         let funding_pubkey = funding_keypair.pubkey();
         let bank_client = BankClient::new_shared(bank);
         let fee_payer_keypair = create_account(&bank_client, &funding_keypair, system_rent);
@@ -364,8 +362,8 @@ mod tests {
         let base_keypair = Keypair::new();
         let base_pubkey = base_keypair.pubkey();
         let lamports = stake_rent + 1;
-        let stake_authority_pubkey = solana_sdk::pubkey::new_rand();
-        let withdraw_authority_pubkey = solana_sdk::pubkey::new_rand();
+        let stake_authority_pubkey = solana_pubkey::new_rand();
+        let withdraw_authority_pubkey = solana_pubkey::new_rand();
 
         let message = new_stake_account(
             &fee_payer_pubkey,
@@ -392,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_authorize_stake_accounts() {
-        let (bank, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
+        let (bank, _bank_forks, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
         let funding_pubkey = funding_keypair.pubkey();
         let bank_client = BankClient::new_shared(bank);
         let fee_payer_keypair = create_account(&bank_client, &funding_keypair, system_rent);
@@ -423,8 +421,8 @@ mod tests {
             .send_and_confirm_message(&signers, message)
             .unwrap();
 
-        let new_stake_authority_pubkey = solana_sdk::pubkey::new_rand();
-        let new_withdraw_authority_pubkey = solana_sdk::pubkey::new_rand();
+        let new_stake_authority_pubkey = solana_pubkey::new_rand();
+        let new_withdraw_authority_pubkey = solana_pubkey::new_rand();
         let messages = authorize_stake_accounts(
             &fee_payer_pubkey,
             &base_pubkey,
@@ -454,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_lockup_stake_accounts() {
-        let (bank, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
+        let (bank, _bank_forks, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
         let funding_pubkey = funding_keypair.pubkey();
         let bank_client = BankClient::new_shared(bank);
         let fee_payer_keypair = create_account(&bank_client, &funding_keypair, system_rent);
@@ -545,7 +543,7 @@ mod tests {
 
     #[test]
     fn test_rebase_stake_accounts() {
-        let (bank, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
+        let (bank, _bank_forks, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
         let funding_pubkey = funding_keypair.pubkey();
         let bank_client = BankClient::new_shared(bank);
         let fee_payer_keypair = create_account(&bank_client, &funding_keypair, system_rent);
@@ -608,7 +606,7 @@ mod tests {
 
     #[test]
     fn test_move_stake_accounts() {
-        let (bank, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
+        let (bank, _bank_forks, funding_keypair, stake_rent, system_rent) = create_bank(10_000_000);
         let funding_pubkey = funding_keypair.pubkey();
         let bank_client = BankClient::new_shared(bank);
         let fee_payer_keypair = create_account(&bank_client, &funding_keypair, system_rent);
@@ -642,8 +640,8 @@ mod tests {
 
         let new_base_keypair = Keypair::new();
         let new_base_pubkey = new_base_keypair.pubkey();
-        let new_stake_authority_pubkey = solana_sdk::pubkey::new_rand();
-        let new_withdraw_authority_pubkey = solana_sdk::pubkey::new_rand();
+        let new_stake_authority_pubkey = solana_pubkey::new_rand();
+        let new_withdraw_authority_pubkey = solana_pubkey::new_rand();
         let balances = get_balances(&bank_client, &base_pubkey, num_accounts);
         let messages = move_stake_accounts(
             &fee_payer_pubkey,

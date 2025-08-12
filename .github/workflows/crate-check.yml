@@ -14,7 +14,9 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-20.04
+    name: crate check
+    if: github.repository == 'anza-xyz/agave'
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:

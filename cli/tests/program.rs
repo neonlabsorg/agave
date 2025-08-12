@@ -3,38 +3,38 @@
 #![allow(clippy::items_after_test_module)]
 
 use {
+    agave_feature_set::enable_alt_bn128_syscall,
     assert_matches::assert_matches,
     serde_json::Value,
+    solana_account::{state_traits::StateMut, ReadableAccount},
+    solana_borsh::v1::try_from_slice_unchecked,
     solana_cli::{
         cli::{process_command, CliCommand, CliConfig},
         program::{ProgramCliCommand, CLOSE_PROGRAM_WARNING},
+        program_v4::{AdditionalCliConfig, ProgramV4CliCommand},
         test_utils::wait_n_slots,
     },
     solana_cli_output::{parse_sign_only_reply_string, OutputFormat},
-    solana_client::{
-        rpc_client::GetConfirmedSignaturesForAddress2Config, rpc_config::RpcTransactionConfig,
-    },
+    solana_client::rpc_config::RpcSendTransactionConfig,
+    solana_commitment_config::CommitmentConfig,
+    solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_faucet::faucet::run_local_faucet,
+    solana_fee_calculator::FeeRateGovernor,
+    solana_keypair::Keypair,
+    solana_loader_v3_interface::state::UpgradeableLoaderState,
+    solana_pubkey::Pubkey,
+    solana_rent::Rent,
     solana_rpc::rpc::JsonRpcConfig,
-    solana_rpc_client::rpc_client::RpcClient,
+    solana_rpc_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient},
+    solana_rpc_client_api::config::RpcTransactionConfig,
     solana_rpc_client_nonce_utils::blockhash_query::BlockhashQuery,
-    solana_sdk::{
-        account::ReadableAccount,
-        account_utils::StateMut,
-        borsh1::try_from_slice_unchecked,
-        bpf_loader_upgradeable::{self, UpgradeableLoaderState},
-        commitment_config::CommitmentConfig,
-        compute_budget::{self, ComputeBudgetInstruction},
-        feature_set::enable_alt_bn128_syscall,
-        fee_calculator::FeeRateGovernor,
-        pubkey::Pubkey,
-        rent::Rent,
-        signature::{Keypair, NullSigner, Signature, Signer},
-        system_program,
-        transaction::Transaction,
-    },
+    solana_sdk_ids::{bpf_loader_upgradeable, compute_budget, loader_v4},
+    solana_signature::Signature,
+    solana_signer::{null_signer::NullSigner, Signer},
     solana_streamer::socket::SocketAddrSpace,
-    solana_test_validator::{TestValidator, TestValidatorGenesis},
+    solana_system_interface::program as system_program,
+    solana_test_validator::TestValidatorGenesis,
+    solana_transaction::Transaction,
     solana_transaction_status::UiTransactionEncoding,
     std::{
         env,
@@ -42,9 +42,34 @@ use {
         io::{Read, Seek, SeekFrom},
         path::{Path, PathBuf},
         str::FromStr,
+        sync::Arc,
     },
     test_case::test_case,
 };
+
+fn test_validator_genesis(mint_keypair: Keypair) -> TestValidatorGenesis {
+    let mut genesis = TestValidatorGenesis::default();
+    genesis
+        .fee_rate_governor(FeeRateGovernor::new(0, 0))
+        .rent(Rent {
+            lamports_per_byte_year: 1,
+            exemption_threshold: 1.0,
+            ..Rent::default()
+        })
+        .faucet_addr(Some(run_local_faucet(mint_keypair, None)));
+    genesis
+}
+
+fn setup_rpc_client(config: &mut CliConfig) -> Arc<RpcClient> {
+    let rpc_client = Arc::new(RpcClient::new_with_timeouts_and_commitment(
+        config.json_rpc_url.to_string(),
+        config.rpc_timeout,
+        config.commitment,
+        config.confirm_transaction_initial_timeout,
+    ));
+    config.rpc_client = Some(rpc_client.clone());
+    rpc_client
+}
 
 #[track_caller]
 fn expect_command_failure(config: &CliConfig, should_fail_because: &str, error_expected: &str) {
@@ -82,12 +107,13 @@ fn test_cli_program_deploy_non_upgradeable() {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -101,9 +127,7 @@ fn test_cli_program_deploy_non_upgradeable() {
         .get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_program())
         .unwrap();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
@@ -287,12 +311,13 @@ fn test_cli_program_deploy_no_authority() {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -308,9 +333,7 @@ fn test_cli_program_deploy_no_authority() {
         .unwrap();
     let upgrade_authority = Keypair::new();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.command = CliCommand::Airdrop {
         pubkey: None,
         lamports: 100 * minimum_balance_for_programdata + minimum_balance_for_program,
@@ -375,9 +398,11 @@ fn test_cli_program_deploy_no_authority() {
     );
 }
 
-#[test_case(true; "Feature enabled")]
-#[test_case(false; "Feature disabled")]
-fn test_cli_program_deploy_feature(enable_feature: bool) {
+#[test_case(true, true; "Feature enabled, skip preflight")]
+#[test_case(true, false; "Feature enabled, don't skip preflight")]
+#[test_case(false, true; "Feature disabled, skip preflight")]
+#[test_case(false, false; "Feature disabled, don't skip preflight")]
+fn test_cli_program_deploy_feature(enable_feature: bool, skip_preflight: bool) {
     solana_logger::setup();
 
     let mut program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -388,29 +413,20 @@ fn test_cli_program_deploy_feature(enable_feature: bool) {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let mut genesis = TestValidatorGenesis::default();
-    let mut test_validator_builder = genesis
-        .fee_rate_governor(FeeRateGovernor::new(0, 0))
-        .rent(Rent {
-            lamports_per_byte_year: 1,
-            exemption_threshold: 1.0,
-            ..Rent::default()
-        })
-        .faucet_addr(Some(faucet_addr));
+    let mut test_validator_builder = test_validator_genesis(mint_keypair);
 
     // Deactivate the enable alt bn128 syscall and try to submit a program with that syscall
     if !enable_feature {
-        test_validator_builder =
-            test_validator_builder.deactivate_features(&[enable_alt_bn128_syscall::id()]);
+        test_validator_builder.deactivate_features(&[enable_alt_bn128_syscall::id()]);
     }
 
     let test_validator = test_validator_builder
         .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
         .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(program_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -426,14 +442,13 @@ fn test_cli_program_deploy_feature(enable_feature: bool) {
         .unwrap();
     let upgrade_authority = Keypair::new();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.command = CliCommand::Airdrop {
         pubkey: None,
         lamports: 100 * minimum_balance_for_programdata + minimum_balance_for_program,
     };
     config.signers = vec![&keypair];
+    config.send_transaction_config.skip_preflight = skip_preflight;
     process_command(&config).unwrap();
 
     config.signers = vec![&keypair, &upgrade_authority];
@@ -461,10 +476,10 @@ fn test_cli_program_deploy_feature(enable_feature: bool) {
         assert!(res.is_ok());
     } else {
         expect_command_failure(
-            &config,
-            "Program contains a syscall from a deactivated feature",
-            "ELF error: ELF error: Unresolved symbol (sol_alt_bn128_group_op) at instruction #49 (ELF file offset 0x188)"
-        );
+                &config,
+                "Program contains a syscall from a deactivated feature",
+                "ELF error: ELF error: Unresolved symbol (sol_alt_bn128_group_op) at instruction #49 (ELF file offset 0x188)"
+            );
 
         // If we bypass the verification, there should be no error
         config.command = CliCommand::Program(ProgramCliCommand::Deploy {
@@ -487,11 +502,19 @@ fn test_cli_program_deploy_feature(enable_feature: bool) {
 
         // When we skip verification, we fail at a later stage
         let response = process_command(&config);
-        assert!(response
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Deploying program failed: RPC response error -32002:"));
+        if skip_preflight {
+            assert!(response
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Deploying program failed"));
+        } else {
+            assert!(response
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Deploying program failed: RPC response error -32002:"));
+        }
     }
 }
 
@@ -514,30 +537,20 @@ fn test_cli_program_upgrade_with_feature(enable_feature: bool) {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-
-    let mut genesis = TestValidatorGenesis::default();
-    let mut test_validator_builder = genesis
-        .fee_rate_governor(FeeRateGovernor::new(0, 0))
-        .rent(Rent {
-            lamports_per_byte_year: 1,
-            exemption_threshold: 1.0,
-            ..Rent::default()
-        })
-        .faucet_addr(Some(faucet_addr));
+    let mut test_validator_builder = test_validator_genesis(mint_keypair);
 
     // Deactivate the enable alt bn128 syscall and try to submit a program with that syscall
     if !enable_feature {
-        test_validator_builder =
-            test_validator_builder.deactivate_features(&[enable_alt_bn128_syscall::id()]);
+        test_validator_builder.deactivate_features(&[enable_alt_bn128_syscall::id()]);
     }
 
     let test_validator = test_validator_builder
         .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
         .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let blockhash = rpc_client.get_latest_blockhash().unwrap();
 
@@ -551,8 +564,7 @@ fn test_cli_program_upgrade_with_feature(enable_feature: bool) {
         ))
         .unwrap();
 
-    let mut config = CliConfig::recent_for_tests();
-    config.json_rpc_url = test_validator.rpc_url();
+    config.send_transaction_config.skip_preflight = false;
 
     let online_signer = Keypair::new();
     let offline_signer = Keypair::new();
@@ -679,12 +691,13 @@ fn test_cli_program_deploy_with_authority() {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -700,9 +713,7 @@ fn test_cli_program_deploy_with_authority() {
         .unwrap();
     let upgrade_authority = Keypair::new();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
@@ -1062,8 +1073,9 @@ fn test_cli_program_deploy_with_authority() {
     assert_eq!("none", authority_pubkey_str);
 }
 
-#[test]
-fn test_cli_program_upgrade_auto_extend() {
+#[test_case(true; "Skip preflight")]
+#[test_case(false; "Dont skip preflight")]
+fn test_cli_program_upgrade_auto_extend(skip_preflight: bool) {
     solana_logger::setup();
 
     let mut noop_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1080,12 +1092,13 @@ fn test_cli_program_upgrade_auto_extend() {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -1107,9 +1120,7 @@ fn test_cli_program_upgrade_auto_extend() {
         .unwrap();
     let upgrade_authority = Keypair::new();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
@@ -1138,6 +1149,7 @@ fn test_cli_program_upgrade_auto_extend() {
         skip_feature_verification: true,
     });
     config.output_format = OutputFormat::JsonCompact;
+    config.send_transaction_config.skip_preflight = skip_preflight;
     process_command(&config).unwrap();
 
     // Attempt to upgrade the program with a larger program, but with the
@@ -1160,18 +1172,26 @@ fn test_cli_program_upgrade_auto_extend() {
         use_rpc: false,
         skip_feature_verification: true,
     });
-    expect_command_failure(
-        &config,
-        "Can not upgrade a program when ELF does not fit into the allocated data account",
-        "Deploying program failed: \
-         RPC response error -32002: \
-         Transaction simulation failed: \
-         Error processing Instruction 0: \
-         account data too small for instruction; 3 log messages:\n  \
-         Program BPFLoaderUpgradeab1e11111111111111111111111 invoke [1]\n  \
-         ProgramData account not large enough\n  \
-         Program BPFLoaderUpgradeab1e11111111111111111111111 failed: account data too small for instruction\n",
-    );
+    if skip_preflight {
+        expect_command_failure(
+            &config,
+            "Cannot upgrade a program when ELF does not fit into the allocated data account",
+            "Deploying program failed: Error processing Instruction 0: account data too small for instruction",
+        );
+    } else {
+        expect_command_failure(
+            &config,
+            "Can not upgrade a program when ELF does not fit into the allocated data account",
+            "Deploying program failed: \
+            RPC response error -32002: \
+            Transaction simulation failed: \
+            Error processing Instruction 0: \
+            account data too small for instruction; 3 log messages:\n  \
+            Program BPFLoaderUpgradeab1e11111111111111111111111 invoke [1]\n  \
+            ProgramData account not large enough\n  \
+            Program BPFLoaderUpgradeab1e11111111111111111111111 failed: account data too small for instruction\n",
+        );
+    }
 
     // Attempt to upgrade the program with a larger program, this time without
     // the --no-auto-extend flag. This should automatically extend the program data.
@@ -1233,12 +1253,13 @@ fn test_cli_program_close_program() {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -1254,9 +1275,7 @@ fn test_cli_program_close_program() {
         .unwrap();
     let upgrade_authority = Keypair::new();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
@@ -1352,12 +1371,13 @@ fn test_cli_program_extend_program() {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -1373,13 +1393,16 @@ fn test_cli_program_extend_program() {
         .unwrap();
     let upgrade_authority = Keypair::new();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
         lamports: 100 * minimum_balance_for_programdata + minimum_balance_for_program,
+    };
+    config.send_transaction_config = RpcSendTransactionConfig {
+        skip_preflight: false,
+        preflight_commitment: Some(CommitmentConfig::processed().commitment),
+        ..RpcSendTransactionConfig::default()
     };
     process_command(&config).unwrap();
 
@@ -1424,9 +1447,10 @@ fn test_cli_program_extend_program() {
     file.read_to_end(&mut new_program_data).unwrap();
     let new_max_len = new_program_data.len();
     let additional_bytes = (new_max_len - max_len) as u32;
-    config.signers = vec![&keypair];
-    config.command = CliCommand::Program(ProgramCliCommand::ExtendProgram {
+    config.signers = vec![&keypair, &upgrade_authority];
+    config.command = CliCommand::Program(ProgramCliCommand::ExtendProgramChecked {
         program_pubkey: program_keypair.pubkey(),
+        authority_signer_index: 1,
         additional_bytes: additional_bytes - 1,
     });
     process_command(&config).unwrap();
@@ -1454,6 +1478,7 @@ fn test_cli_program_extend_program() {
         use_rpc: false,
         skip_feature_verification: true,
     });
+
     expect_command_failure(
         &config,
         "Program upgrade must fail, as the buffer is 1 byte too short",
@@ -1471,9 +1496,10 @@ fn test_cli_program_extend_program() {
     wait_n_slots(&rpc_client, 1);
 
     // Extend 1 last byte
-    config.signers = vec![&keypair];
-    config.command = CliCommand::Program(ProgramCliCommand::ExtendProgram {
+    config.signers = vec![&keypair, &upgrade_authority];
+    config.command = CliCommand::Program(ProgramCliCommand::ExtendProgramChecked {
         program_pubkey: program_keypair.pubkey(),
+        authority_signer_index: 1,
         additional_bytes: 1,
     });
     process_command(&config).unwrap();
@@ -1505,6 +1531,84 @@ fn test_cli_program_extend_program() {
 }
 
 #[test]
+fn test_cli_program_migrate_program() {
+    solana_logger::setup();
+
+    let mut noop_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    noop_path.push("tests");
+    noop_path.push("fixtures");
+    noop_path.push("noop");
+    noop_path.set_extension("so");
+
+    let mint_keypair = Keypair::new();
+    let mint_pubkey = mint_keypair.pubkey();
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
+
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
+
+    let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
+    let mut program_data = Vec::new();
+    file.read_to_end(&mut program_data).unwrap();
+    let max_len = program_data.len();
+    let minimum_balance_for_programdata = rpc_client
+        .get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_programdata(
+            max_len,
+        ))
+        .unwrap();
+    let minimum_balance_for_program = rpc_client
+        .get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_program())
+        .unwrap();
+    let upgrade_authority = Keypair::new();
+
+    let keypair = Keypair::new();
+    config.signers = vec![&keypair];
+    config.command = CliCommand::Airdrop {
+        pubkey: None,
+        lamports: 100 * minimum_balance_for_programdata + minimum_balance_for_program,
+    };
+    process_command(&config).unwrap();
+
+    // Deploy the upgradeable program
+    let program_keypair = Keypair::new();
+    config.signers = vec![&keypair, &upgrade_authority, &program_keypair];
+    config.command = CliCommand::Program(ProgramCliCommand::Deploy {
+        program_location: Some(noop_path.to_str().unwrap().to_string()),
+        fee_payer_signer_index: 0,
+        program_signer_index: Some(2),
+        program_pubkey: Some(program_keypair.pubkey()),
+        buffer_signer_index: None,
+        buffer_pubkey: None,
+        upgrade_authority_signer_index: 1,
+        is_final: false,
+        max_len: Some(max_len),
+        skip_fee_check: false,
+        compute_unit_price: None,
+        max_sign_attempts: 5,
+        auto_extend: true,
+        use_rpc: false,
+        skip_feature_verification: true,
+    });
+    config.output_format = OutputFormat::JsonCompact;
+    process_command(&config).unwrap();
+
+    // Wait one slot to avoid "Program was deployed in this block already" error
+    wait_n_slots(&rpc_client, 1);
+
+    // Migrate program
+    config.signers = vec![&keypair, &upgrade_authority];
+    config.command = CliCommand::Program(ProgramCliCommand::MigrateProgram {
+        program_pubkey: program_keypair.pubkey(),
+        authority_signer_index: 1,
+        compute_unit_price: Some(1),
+    });
+    process_command(&config).unwrap();
+}
+
+#[test]
 fn test_cli_program_write_buffer() {
     solana_logger::setup();
 
@@ -1522,12 +1626,13 @@ fn test_cli_program_write_buffer() {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -1544,9 +1649,7 @@ fn test_cli_program_write_buffer() {
         ))
         .unwrap();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
@@ -1567,6 +1670,7 @@ fn test_cli_program_write_buffer() {
         compute_unit_price: None,
         max_sign_attempts: 5,
         use_rpc: false,
+        skip_feature_verification: true,
     });
     config.output_format = OutputFormat::JsonCompact;
     let response = process_command(&config);
@@ -1606,6 +1710,7 @@ fn test_cli_program_write_buffer() {
         compute_unit_price: None,
         max_sign_attempts: 5,
         use_rpc: false,
+        skip_feature_verification: true,
     });
     let response = process_command(&config);
     let json: Value = serde_json::from_str(&response.unwrap()).unwrap();
@@ -1672,6 +1777,7 @@ fn test_cli_program_write_buffer() {
         compute_unit_price: None,
         max_sign_attempts: 5,
         use_rpc: false,
+        skip_feature_verification: true,
     });
     let response = process_command(&config);
     let json: Value = serde_json::from_str(&response.unwrap()).unwrap();
@@ -1714,6 +1820,7 @@ fn test_cli_program_write_buffer() {
         compute_unit_price: None,
         max_sign_attempts: 5,
         use_rpc: false,
+        skip_feature_verification: true,
     });
     let response = process_command(&config);
     let json: Value = serde_json::from_str(&response.unwrap()).unwrap();
@@ -1796,6 +1903,7 @@ fn test_cli_program_write_buffer() {
         compute_unit_price: None,
         max_sign_attempts: 5,
         use_rpc: false,
+        skip_feature_verification: true,
     });
     config.output_format = OutputFormat::JsonCompact;
     let response = process_command(&config);
@@ -1845,6 +1953,7 @@ fn test_cli_program_write_buffer() {
         compute_unit_price: None,
         max_sign_attempts: 5,
         use_rpc: false,
+        skip_feature_verification: true,
     });
     process_command(&config).unwrap();
     config.signers = vec![&keypair, &buffer_keypair];
@@ -1886,6 +1995,100 @@ fn test_cli_program_write_buffer() {
     );
 }
 
+#[test_case(true; "Feature enabled")]
+#[test_case(false; "Feature disabled")]
+fn test_cli_program_write_buffer_feature(enable_feature: bool) {
+    solana_logger::setup();
+
+    let mut program_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    program_path.push("tests");
+    program_path.push("fixtures");
+    program_path.push("alt_bn128");
+    program_path.set_extension("so");
+
+    let mint_keypair = Keypair::new();
+    let mint_pubkey = mint_keypair.pubkey();
+    let mut test_validator_builder = test_validator_genesis(mint_keypair);
+
+    // Deactivate the enable alt bn128 syscall and try to submit a program with that syscall
+    if !enable_feature {
+        test_validator_builder.deactivate_features(&[enable_alt_bn128_syscall::id()]);
+    }
+
+    let test_validator = test_validator_builder
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
+
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
+
+    let mut file = File::open(program_path.to_str().unwrap()).unwrap();
+    let mut program_data = Vec::new();
+    file.read_to_end(&mut program_data).unwrap();
+    let max_len = program_data.len();
+    let minimum_balance_for_buffer = rpc_client
+        .get_minimum_balance_for_rent_exemption(UpgradeableLoaderState::size_of_programdata(
+            max_len,
+        ))
+        .unwrap();
+
+    let keypair = Keypair::new();
+    config.signers = vec![&keypair];
+    config.command = CliCommand::Airdrop {
+        pubkey: None,
+        lamports: 100 * minimum_balance_for_buffer,
+    };
+    process_command(&config).unwrap();
+
+    // Write a buffer with default params
+    config.signers = vec![&keypair];
+    config.command = CliCommand::Program(ProgramCliCommand::WriteBuffer {
+        program_location: program_path.to_str().unwrap().to_string(),
+        fee_payer_signer_index: 0,
+        buffer_signer_index: None,
+        buffer_pubkey: None,
+        buffer_authority_signer_index: 0,
+        max_len: None,
+        skip_fee_check: false,
+        compute_unit_price: None,
+        max_sign_attempts: 5,
+        use_rpc: false,
+        skip_feature_verification: false,
+    });
+    config.output_format = OutputFormat::JsonCompact;
+
+    if enable_feature {
+        let response = process_command(&config);
+        assert!(response.is_ok());
+    } else {
+        expect_command_failure(
+            &config,
+            "Program contains a syscall from a deactivated feature",
+            "ELF error: ELF error: Unresolved symbol (sol_alt_bn128_group_op) at instruction #49 (ELF file offset 0x188)"
+        );
+
+        // If we bypass the verification, there should be no error
+        config.command = CliCommand::Program(ProgramCliCommand::WriteBuffer {
+            program_location: program_path.to_str().unwrap().to_string(),
+            fee_payer_signer_index: 0,
+            buffer_signer_index: None,
+            buffer_pubkey: None,
+            buffer_authority_signer_index: 0,
+            max_len: None,
+            skip_fee_check: false,
+            compute_unit_price: None,
+            max_sign_attempts: 5,
+            use_rpc: false,
+            skip_feature_verification: true,
+        });
+
+        // When we skip verification, we won't fail
+        let response = process_command(&config);
+        assert!(response.is_ok());
+    }
+}
+
 #[test]
 fn test_cli_program_set_buffer_authority() {
     solana_logger::setup();
@@ -1898,12 +2101,13 @@ fn test_cli_program_set_buffer_authority() {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -1915,9 +2119,7 @@ fn test_cli_program_set_buffer_authority() {
         ))
         .unwrap();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
@@ -1939,6 +2141,7 @@ fn test_cli_program_set_buffer_authority() {
         compute_unit_price: None,
         max_sign_attempts: 5,
         use_rpc: false,
+        skip_feature_verification: true,
     });
     process_command(&config).unwrap();
     let buffer_account = rpc_client.get_account(&buffer_keypair.pubkey()).unwrap();
@@ -2069,12 +2272,13 @@ fn test_cli_program_mismatch_buffer_authority() {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -2086,9 +2290,7 @@ fn test_cli_program_mismatch_buffer_authority() {
         ))
         .unwrap();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
@@ -2111,6 +2313,7 @@ fn test_cli_program_mismatch_buffer_authority() {
         compute_unit_price: None,
         max_sign_attempts: 5,
         use_rpc: false,
+        skip_feature_verification: true,
     });
     process_command(&config).unwrap();
     let buffer_account = rpc_client.get_account(&buffer_keypair.pubkey()).unwrap();
@@ -2194,12 +2397,13 @@ fn test_cli_program_deploy_with_offline_signing(use_offline_signer_as_fee_payer:
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let blockhash = rpc_client.get_latest_blockhash().unwrap();
 
@@ -2212,9 +2416,6 @@ fn test_cli_program_deploy_with_offline_signing(use_offline_signer_as_fee_payer:
             max_program_data_len,
         ))
         .unwrap();
-
-    let mut config = CliConfig::recent_for_tests();
-    config.json_rpc_url = test_validator.rpc_url();
 
     let online_signer = Keypair::new();
     let online_signer_identity = NullSigner::new(&online_signer.pubkey());
@@ -2387,12 +2588,13 @@ fn test_cli_program_show() {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -2404,9 +2606,7 @@ fn test_cli_program_show() {
         ))
         .unwrap();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.output_format = OutputFormat::Json;
 
     // Airdrop
@@ -2432,6 +2632,7 @@ fn test_cli_program_show() {
         compute_unit_price: None,
         max_sign_attempts: 5,
         use_rpc: false,
+        skip_feature_verification: true,
     });
     process_command(&config).unwrap();
 
@@ -2583,12 +2784,13 @@ fn test_cli_program_dump() {
 
     let mint_keypair = Keypair::new();
     let mint_pubkey = mint_keypair.pubkey();
-    let faucet_addr = run_local_faucet(mint_keypair, None);
-    let test_validator =
-        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -2600,9 +2802,7 @@ fn test_cli_program_dump() {
         ))
         .unwrap();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.output_format = OutputFormat::Json;
 
     // Airdrop
@@ -2628,6 +2828,7 @@ fn test_cli_program_dump() {
         compute_unit_price: None,
         max_sign_attempts: 5,
         use_rpc: false,
+        skip_feature_verification: true,
     });
     process_command(&config).unwrap();
 
@@ -2674,6 +2875,7 @@ fn create_buffer_with_offline_authority<'a>(
         compute_unit_price: None,
         max_sign_attempts: 5,
         use_rpc: false,
+        skip_feature_verification: true,
     });
     process_command(config).unwrap();
     let buffer_account = rpc_client.get_account(&buffer_signer.pubkey()).unwrap();
@@ -2729,8 +2931,9 @@ fn test_cli_program_deploy_with_args(compute_unit_price: Option<u64>, use_rpc: b
         .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
         .expect("validator start failed");
 
-    let rpc_client =
-        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::confirmed());
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
 
     let mut file = File::open(noop_path.to_str().unwrap()).unwrap();
     let mut program_data = Vec::new();
@@ -2746,9 +2949,7 @@ fn test_cli_program_deploy_with_args(compute_unit_price: Option<u64>, use_rpc: b
         .unwrap();
     let upgrade_authority = Keypair::new();
 
-    let mut config = CliConfig::recent_for_tests();
     let keypair = Keypair::new();
-    config.json_rpc_url = test_validator.rpc_url();
     config.signers = vec![&keypair];
     config.command = CliCommand::Airdrop {
         pubkey: None,
@@ -2875,4 +3076,175 @@ fn test_cli_program_deploy_with_args(compute_unit_price: Option<u64>, use_rpc: b
             &system_program::id()
         );
     }
+}
+
+#[test]
+fn test_cli_program_v4() {
+    let mut noop_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    noop_path.push("tests");
+    noop_path.push("fixtures");
+    noop_path.push("noop");
+    noop_path.set_extension("so");
+
+    let mint_keypair = Keypair::new();
+    let mint_pubkey = mint_keypair.pubkey();
+    let test_validator = test_validator_genesis(mint_keypair)
+        .start_with_mint_address(mint_pubkey, SocketAddrSpace::Unspecified)
+        .expect("validator start failed");
+
+    let mut config = CliConfig::recent_for_tests();
+    config.json_rpc_url = test_validator.rpc_url();
+    let rpc_client = setup_rpc_client(&mut config);
+
+    let payer_keypair = Keypair::new();
+    let upgrade_authority = Keypair::new();
+    let program_keypair = Keypair::new();
+    let buffer_keypair = Keypair::new();
+    config.signers = vec![
+        &payer_keypair,
+        &upgrade_authority,
+        &program_keypair,
+        &buffer_keypair,
+    ];
+    config.command = CliCommand::Airdrop {
+        pubkey: None,
+        lamports: 10000000,
+    };
+    process_command(&config).unwrap();
+    config.command = CliCommand::Airdrop {
+        pubkey: Some(program_keypair.pubkey()),
+        lamports: 1000,
+    };
+    process_command(&config).unwrap();
+
+    // Initial deployment
+    config.output_format = OutputFormat::JsonCompact;
+    config.command = CliCommand::ProgramV4(ProgramV4CliCommand::Deploy {
+        additional_cli_config: AdditionalCliConfig::default(),
+        program_address: program_keypair.pubkey(),
+        buffer_address: None,
+        upload_signer_index: Some(2),
+        authority_signer_index: 1,
+        path_to_elf: Some(noop_path.to_str().unwrap().to_string()),
+        upload_range: None..None,
+    });
+    assert!(process_command(&config).is_ok());
+    let program_account = rpc_client.get_account(&program_keypair.pubkey()).unwrap();
+    assert_eq!(program_account.owner, loader_v4::id());
+    assert!(program_account.executable);
+
+    // Single-step redeployment without buffer
+    config.command = CliCommand::ProgramV4(ProgramV4CliCommand::Deploy {
+        additional_cli_config: AdditionalCliConfig::default(),
+        program_address: program_keypair.pubkey(),
+        buffer_address: None,
+        upload_signer_index: None,
+        authority_signer_index: 1,
+        path_to_elf: Some(noop_path.to_str().unwrap().to_string()),
+        upload_range: None..None,
+    });
+    assert!(process_command(&config).is_ok());
+    let program_account = rpc_client.get_account(&program_keypair.pubkey()).unwrap();
+    assert_eq!(program_account.owner, loader_v4::id());
+    assert!(program_account.executable);
+
+    // Single-step redeployment with buffer
+    config.command = CliCommand::ProgramV4(ProgramV4CliCommand::Deploy {
+        additional_cli_config: AdditionalCliConfig::default(),
+        program_address: program_keypair.pubkey(),
+        buffer_address: Some(buffer_keypair.pubkey()),
+        upload_signer_index: Some(3),
+        authority_signer_index: 1,
+        path_to_elf: Some(noop_path.to_str().unwrap().to_string()),
+        upload_range: None..None,
+    });
+    assert!(process_command(&config).is_ok());
+    let program_account = rpc_client.get_account(&program_keypair.pubkey()).unwrap();
+    assert_eq!(program_account.owner, loader_v4::id());
+    assert!(program_account.executable);
+    let _error = rpc_client
+        .get_account(&buffer_keypair.pubkey())
+        .unwrap_err();
+
+    // Two-step redeployment with buffer
+    config.command = CliCommand::ProgramV4(ProgramV4CliCommand::Deploy {
+        additional_cli_config: AdditionalCliConfig::default(),
+        program_address: buffer_keypair.pubkey(),
+        buffer_address: Some(buffer_keypair.pubkey()),
+        upload_signer_index: Some(3),
+        authority_signer_index: 1,
+        path_to_elf: Some(noop_path.to_str().unwrap().to_string()),
+        upload_range: None..None,
+    });
+    assert!(process_command(&config).is_ok());
+    let buffer_account = rpc_client.get_account(&buffer_keypair.pubkey()).unwrap();
+    assert_eq!(buffer_account.owner, loader_v4::id());
+    assert!(buffer_account.executable);
+    config.command = CliCommand::ProgramV4(ProgramV4CliCommand::Deploy {
+        additional_cli_config: AdditionalCliConfig::default(),
+        program_address: program_keypair.pubkey(),
+        buffer_address: Some(buffer_keypair.pubkey()),
+        upload_signer_index: None,
+        authority_signer_index: 1,
+        path_to_elf: Some(noop_path.to_str().unwrap().to_string()),
+        upload_range: None..None,
+    });
+    assert!(process_command(&config).is_ok());
+    let program_account = rpc_client.get_account(&program_keypair.pubkey()).unwrap();
+    assert_eq!(program_account.owner, loader_v4::id());
+    assert!(program_account.executable);
+    let _error = rpc_client
+        .get_account(&buffer_keypair.pubkey())
+        .unwrap_err();
+
+    // Transfer authority over program
+    config.command = CliCommand::ProgramV4(ProgramV4CliCommand::TransferAuthority {
+        additional_cli_config: AdditionalCliConfig::default(),
+        program_address: program_keypair.pubkey(),
+        authority_signer_index: 1,
+        new_authority_signer_index: 2,
+    });
+    assert!(process_command(&config).is_ok());
+    let program_account = rpc_client.get_account(&program_keypair.pubkey()).unwrap();
+    assert_eq!(program_account.owner, loader_v4::id());
+    assert!(program_account.executable);
+
+    // Close program
+    config.command = CliCommand::ProgramV4(ProgramV4CliCommand::Retract {
+        additional_cli_config: AdditionalCliConfig::default(),
+        program_address: program_keypair.pubkey(),
+        authority_signer_index: 2,
+        close_program_entirely: true,
+    });
+    assert!(process_command(&config).is_ok());
+    let _error = rpc_client
+        .get_account(&program_keypair.pubkey())
+        .unwrap_err();
+
+    // Deployment at the closed address
+    config.command = CliCommand::ProgramV4(ProgramV4CliCommand::Deploy {
+        additional_cli_config: AdditionalCliConfig::default(),
+        program_address: program_keypair.pubkey(),
+        buffer_address: None,
+        upload_signer_index: Some(2),
+        authority_signer_index: 1,
+        path_to_elf: Some(noop_path.to_str().unwrap().to_string()),
+        upload_range: None..None,
+    });
+    assert!(process_command(&config).is_ok());
+    let program_account = rpc_client.get_account(&program_keypair.pubkey()).unwrap();
+    assert_eq!(program_account.owner, loader_v4::id());
+    assert!(program_account.executable);
+
+    // Finalize program
+    config.command = CliCommand::ProgramV4(ProgramV4CliCommand::Finalize {
+        additional_cli_config: AdditionalCliConfig::default(),
+        program_address: program_keypair.pubkey(),
+        authority_signer_index: 1,
+        next_version_signer_index: 2,
+    });
+    assert!(process_command(&config).is_ok());
+    let program_account = rpc_client.get_account(&program_keypair.pubkey()).unwrap();
+    assert_eq!(program_account.owner, loader_v4::id());
+    assert!(program_account.executable);
 }
