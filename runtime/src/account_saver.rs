@@ -1,6 +1,9 @@
 use {
     core::borrow::Borrow,
-    solana_account::AccountSharedData,
+    solana_account::{AccountSharedData, ReadableAccount},
+    solana_message::{
+        compiled_instruction::CompiledInstruction, inner_instruction::InnerInstructionsList,
+    },
     solana_pubkey::Pubkey,
     solana_svm::{
         rollback_accounts::RollbackAccounts,
@@ -78,6 +81,7 @@ pub fn collect_accounts_to_store<'a, T: SVMMessage>(
                         transaction,
                         transaction_ref,
                         &executed_tx.loaded_transaction.accounts,
+                        &executed_tx.execution_details.inner_instructions,
                     );
                 } else {
                     collect_accounts_for_failed_tx(
@@ -103,13 +107,85 @@ pub fn collect_accounts_to_store<'a, T: SVMMessage>(
     (accounts, transactions)
 }
 
+fn mark_mutable_accounts<'a, T: SVMMessage>(
+    program_id: &Pubkey,
+    accounts: &'a [u8],
+    transaction: &'a T,
+    transaction_accounts: &'a [(Pubkey, AccountSharedData)],
+    can_be_mutated: &mut [bool],
+) {
+    for index in accounts {
+        let i = *index as usize;
+
+        if !transaction.is_writable(i) {
+            continue;
+        }
+
+        let (pubkey, account) = &transaction_accounts[i];
+        if can_runtime_mutate_account(program_id, account.owner(), pubkey) {
+            can_be_mutated[i] = true;
+        }
+    }
+}
+
+fn can_runtime_mutate_account(
+    invoked_program_id: &Pubkey,
+    account_owner: &Pubkey,
+    account_pubkey: &Pubkey,
+) -> bool {
+    if solana_sdk_ids::sysvar::check_id(account_pubkey) {
+        return false;
+    }
+
+    account_owner == invoked_program_id
+}
+
 fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
     collected_accounts: &mut Vec<(&'a Pubkey, &'a AccountSharedData)>,
     collected_account_transactions: &mut Option<Vec<&'a SanitizedTransaction>>,
     transaction: &'a T,
     transaction_ref: Option<&'a SanitizedTransaction>,
     transaction_accounts: &'a [TransactionAccount],
+    inner_instructions: &Option<InnerInstructionsList>,
 ) {
+    let can_be_mutated = if let Some(inner_instructions) = &inner_instructions {
+        let mut can_be_mutated = vec![false; transaction.account_keys().len()];
+
+        // top-level instructions
+        for (program_id, instructions) in transaction.program_instructions_iter() {
+            mark_mutable_accounts(
+                program_id,
+                instructions.accounts,
+                transaction,
+                transaction_accounts,
+                &mut can_be_mutated,
+            );
+        }
+
+        // inner instructions
+        for instruction_list in inner_instructions {
+            let program_id = |ix: &CompiledInstruction| {
+                let prog_idx = ix.program_id_index as usize;
+                &transaction_accounts[prog_idx].0
+            };
+
+            for ix in instruction_list {
+                mark_mutable_accounts(
+                    program_id(&ix.instruction),
+                    &ix.instruction.accounts,
+                    transaction,
+                    transaction_accounts,
+                    &mut can_be_mutated,
+                );
+            }
+        }
+
+        can_be_mutated
+    } else {
+        // can be mutated by default, will be cut off by transaction.is_writable(index)
+        vec![true; transaction.account_keys().len()]
+    };
+
     for (i, (address, account)) in (0..transaction.account_keys().len()).zip(transaction_accounts) {
         if !transaction.is_writable(i) {
             continue;
@@ -120,6 +196,11 @@ fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
         // to be impossible for a committable transaction to modify an
         // invoked account if said account isn't passed to some program.
         if transaction.is_invoked(i) && !transaction.is_instruction_account(i) {
+            continue;
+        }
+
+        // Skip account if it cannot be mutated by the rules of runtime
+        if !can_be_mutated[i] {
             continue;
         }
 
