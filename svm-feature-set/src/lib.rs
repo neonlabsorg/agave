@@ -2,6 +2,7 @@
 pub struct SVMFeatureSet {
     pub move_precompile_verification_to_svm: bool,
     pub stricter_abi_and_runtime_constraints: bool,
+    pub account_data_direct_mapping: bool,
     pub enable_bpf_loader_set_authority_checked_ix: bool,
     pub enable_loader_v4: bool,
     pub deplete_cu_meter_on_vm_failure: bool,
@@ -30,13 +31,13 @@ pub struct SVMFeatureSet {
     pub mask_out_rent_epoch_in_vm_serialization: bool,
     pub simplify_alt_bn128_syscall_error_codes: bool,
     pub fix_alt_bn128_multiplication_input_length: bool,
-    pub loosen_cpi_size_restriction: bool,
     pub increase_tx_account_lock_limit: bool,
     pub enable_extend_program_checked: bool,
     pub formalize_loaded_transaction_data_size: bool,
     pub disable_zk_elgamal_proof_program: bool,
     pub reenable_zk_elgamal_proof_program: bool,
     pub raise_cpi_nesting_limit_to_8: bool,
+    pub provide_instruction_data_offset_in_vm_r2: bool,
 }
 
 impl SVMFeatureSet {
@@ -44,6 +45,7 @@ impl SVMFeatureSet {
         Self {
             move_precompile_verification_to_svm: true,
             stricter_abi_and_runtime_constraints: true,
+            account_data_direct_mapping: true,
             enable_bpf_loader_set_authority_checked_ix: true,
             enable_loader_v4: true,
             deplete_cu_meter_on_vm_failure: true,
@@ -72,13 +74,13 @@ impl SVMFeatureSet {
             mask_out_rent_epoch_in_vm_serialization: true,
             simplify_alt_bn128_syscall_error_codes: true,
             fix_alt_bn128_multiplication_input_length: true,
-            loosen_cpi_size_restriction: true,
             increase_tx_account_lock_limit: true,
             enable_extend_program_checked: true,
             formalize_loaded_transaction_data_size: true,
             disable_zk_elgamal_proof_program: true,
             reenable_zk_elgamal_proof_program: true,
             raise_cpi_nesting_limit_to_8: true,
+            provide_instruction_data_offset_in_vm_r2: true,
         }
     }
 }

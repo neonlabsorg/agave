@@ -76,7 +76,6 @@ pub(crate) fn process_message(
 mod tests {
     use {
         super::*,
-        agave_reserved_account_keys::ReservedAccountKeys,
         ed25519_dalek::ed25519::signature::Signer,
         openssl::{
             ec::{EcGroup, EcKey},
@@ -96,7 +95,9 @@ mod tests {
             declare_process_instruction,
             execution_budget::{SVMTransactionExecutionBudget, SVMTransactionExecutionCost},
             invoke_context::EnvironmentConfig,
-            loaded_programs::{ProgramCacheEntry, ProgramCacheForTxBatch},
+            loaded_programs::{
+                ProgramCacheEntry, ProgramCacheForTxBatch, ProgramRuntimeEnvironments,
+            },
             sysvar_cache::SysvarCache,
         },
         solana_pubkey::Pubkey,
@@ -109,7 +110,7 @@ mod tests {
         solana_svm_callback::InvokeContextCallback,
         solana_svm_feature_set::SVMFeatureSet,
         solana_transaction_context::TransactionContext,
-        std::sync::Arc,
+        std::{collections::HashSet, sync::Arc},
     };
 
     struct MockCallback {}
@@ -127,13 +128,12 @@ mod tests {
     }
 
     fn new_sanitized_message(message: Message) -> SanitizedMessage {
-        SanitizedMessage::try_from_legacy_message(message, &ReservedAccountKeys::empty_key_set())
-            .unwrap()
+        SanitizedMessage::try_from_legacy_message(message, &HashSet::new()).unwrap()
     }
 
     #[test]
     fn test_process_message_readonly_handling() {
-        #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
+        #[derive(serde::Serialize, serde::Deserialize)]
         enum MockSystemInstruction {
             Correct,
             TransferLamports { lamports: u64 },
@@ -149,16 +149,16 @@ mod tests {
                     MockSystemInstruction::Correct => Ok(()),
                     MockSystemInstruction::TransferLamports { lamports } => {
                         instruction_context
-                            .try_borrow_instruction_account(transaction_context, 0)?
+                            .try_borrow_instruction_account(0)?
                             .checked_sub_lamports(lamports)?;
                         instruction_context
-                            .try_borrow_instruction_account(transaction_context, 1)?
+                            .try_borrow_instruction_account(1)?
                             .checked_add_lamports(lamports)?;
                         Ok(())
                     }
                     MockSystemInstruction::ChangeData { data } => {
                         instruction_context
-                            .try_borrow_instruction_account(transaction_context, 1)?
+                            .try_borrow_instruction_account(1)?
                             .set_data_from_slice(&[data])?;
                         Ok(())
                     }
@@ -221,11 +221,14 @@ mod tests {
         ));
         let sysvar_cache = SysvarCache::default();
         let feature_set = SVMFeatureSet::all_enabled();
+        let program_runtime_environments = ProgramRuntimeEnvironments::default();
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
             &MockCallback {},
             &feature_set,
+            &program_runtime_environments,
+            &program_runtime_environments,
             &sysvar_cache,
         );
         let mut invoke_context = InvokeContext::new(
@@ -275,11 +278,14 @@ mod tests {
                 ),
             ]),
         ));
+        let program_runtime_environments = ProgramRuntimeEnvironments::default();
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
             &MockCallback {},
             &feature_set,
+            &program_runtime_environments,
+            &program_runtime_environments,
             &sysvar_cache,
         );
         let mut invoke_context = InvokeContext::new(
@@ -319,11 +325,14 @@ mod tests {
                 ),
             ]),
         ));
+        let program_runtime_environments = ProgramRuntimeEnvironments::default();
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
             &MockCallback {},
             &feature_set,
+            &program_runtime_environments,
+            &program_runtime_environments,
             &sysvar_cache,
         );
         let mut invoke_context = InvokeContext::new(
@@ -352,7 +361,7 @@ mod tests {
 
     #[test]
     fn test_process_message_duplicate_accounts() {
-        #[derive(serde_derive::Serialize, serde_derive::Deserialize)]
+        #[derive(serde::Serialize, serde::Deserialize)]
         enum MockSystemInstruction {
             BorrowFail,
             MultiBorrowMut,
@@ -363,15 +372,12 @@ mod tests {
             let transaction_context = &invoke_context.transaction_context;
             let instruction_context = transaction_context.get_current_instruction_context()?;
             let instruction_data = instruction_context.get_instruction_data();
-            let mut to_account =
-                instruction_context.try_borrow_instruction_account(transaction_context, 1)?;
+            let mut to_account = instruction_context.try_borrow_instruction_account(1)?;
             if let Ok(instruction) = bincode::deserialize(instruction_data) {
                 match instruction {
                     MockSystemInstruction::BorrowFail => {
-                        let from_account = instruction_context
-                            .try_borrow_instruction_account(transaction_context, 0)?;
-                        let dup_account = instruction_context
-                            .try_borrow_instruction_account(transaction_context, 2)?;
+                        let from_account = instruction_context.try_borrow_instruction_account(0)?;
+                        let dup_account = instruction_context.try_borrow_instruction_account(2)?;
                         if from_account.get_lamports() != dup_account.get_lamports() {
                             return Err(InstructionError::InvalidArgument);
                         }
@@ -379,10 +385,10 @@ mod tests {
                     }
                     MockSystemInstruction::MultiBorrowMut => {
                         let lamports_a = instruction_context
-                            .try_borrow_instruction_account(transaction_context, 0)?
+                            .try_borrow_instruction_account(0)?
                             .get_lamports();
                         let lamports_b = instruction_context
-                            .try_borrow_instruction_account(transaction_context, 2)?
+                            .try_borrow_instruction_account(2)?
                             .get_lamports();
                         if lamports_a != lamports_b {
                             return Err(InstructionError::InvalidArgument);
@@ -390,14 +396,14 @@ mod tests {
                         Ok(())
                     }
                     MockSystemInstruction::DoWork { lamports, data } => {
-                        let mut dup_account = instruction_context
-                            .try_borrow_instruction_account(transaction_context, 2)?;
+                        let mut dup_account =
+                            instruction_context.try_borrow_instruction_account(2)?;
                         dup_account.checked_sub_lamports(lamports)?;
                         to_account.checked_add_lamports(lamports)?;
                         dup_account.set_data_from_slice(&[data])?;
                         drop(dup_account);
-                        let mut from_account = instruction_context
-                            .try_borrow_instruction_account(transaction_context, 0)?;
+                        let mut from_account =
+                            instruction_context.try_borrow_instruction_account(0)?;
                         from_account.checked_sub_lamports(lamports)?;
                         to_account.checked_add_lamports(lamports)?;
                         Ok(())
@@ -455,11 +461,14 @@ mod tests {
         ));
         let sysvar_cache = SysvarCache::default();
         let feature_set = SVMFeatureSet::all_enabled();
+        let program_runtime_environments = ProgramRuntimeEnvironments::default();
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
             &MockCallback {},
             &feature_set,
+            &program_runtime_environments,
+            &program_runtime_environments,
             &sysvar_cache,
         );
         let mut invoke_context = InvokeContext::new(
@@ -494,11 +503,14 @@ mod tests {
             )],
             Some(transaction_context.get_key_of_account_at_index(0).unwrap()),
         ));
+        let program_runtime_environments = ProgramRuntimeEnvironments::default();
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
             &MockCallback {},
             &feature_set,
+            &program_runtime_environments,
+            &program_runtime_environments,
             &sysvar_cache,
         );
         let mut invoke_context = InvokeContext::new(
@@ -530,11 +542,14 @@ mod tests {
             )],
             Some(transaction_context.get_key_of_account_at_index(0).unwrap()),
         ));
+        let program_runtime_environments = ProgramRuntimeEnvironments::default();
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
             &MockCallback {},
             &feature_set,
+            &program_runtime_environments,
+            &program_runtime_environments,
             &sysvar_cache,
         );
         let mut invoke_context = InvokeContext::new(
@@ -678,11 +693,14 @@ mod tests {
             }
         }
         let feature_set = SVMFeatureSet::all_enabled();
+        let program_runtime_environments = ProgramRuntimeEnvironments::default();
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
             &MockCallback {},
             &feature_set,
+            &program_runtime_environments,
+            &program_runtime_environments,
             &sysvar_cache,
         );
         let mut invoke_context = InvokeContext::new(

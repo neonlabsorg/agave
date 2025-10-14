@@ -3,7 +3,8 @@ use {
     itertools::Itertools,
     serde::{
         de::{MapAccess, Visitor},
-        ser::{Serialize, Serializer},
+        ser::Serializer,
+        Deserialize, Serialize,
     },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_instruction::error::InstructionError,
@@ -96,7 +97,7 @@ impl VoteAccount {
         use {
             rand::Rng as _,
             solana_clock::Clock,
-            solana_vote_interface::state::{VoteInit, VoteState, VoteStateVersions},
+            solana_vote_interface::state::{VoteInit, VoteStateV3, VoteStateVersions},
         };
 
         let mut rng = rand::thread_rng();
@@ -114,10 +115,10 @@ impl VoteAccount {
             leader_schedule_epoch: rng.gen(),
             unix_timestamp: rng.gen(),
         };
-        let vote_state = VoteState::new(&vote_init, &clock);
+        let vote_state = VoteStateV3::new(&vote_init, &clock);
         let account = AccountSharedData::new_data(
             rng.gen(), // lamports
-            &VoteStateVersions::new_current(vote_state.clone()),
+            &VoteStateVersions::new_v3(vote_state.clone()),
             &solana_sdk_ids::vote::id(), // owner
         )
         .unwrap();
@@ -453,7 +454,7 @@ mod tests {
         solana_account::WritableAccount,
         solana_clock::Clock,
         solana_pubkey::Pubkey,
-        solana_vote_interface::state::{VoteInit, VoteState, VoteStateVersions},
+        solana_vote_interface::state::{VoteInit, VoteStateV3, VoteStateVersions},
         std::iter::repeat_with,
     };
 
@@ -474,10 +475,10 @@ mod tests {
             leader_schedule_epoch: rng.gen(),
             unix_timestamp: rng.gen(),
         };
-        let vote_state = VoteState::new(&vote_init, &clock);
+        let vote_state = VoteStateV3::new(&vote_init, &clock);
         AccountSharedData::new_data(
             rng.gen(), // lamports
-            &VoteStateVersions::new_current(vote_state.clone()),
+            &VoteStateVersions::new_v3(vote_state.clone()),
             &solana_sdk_ids::vote::id(), // owner
         )
         .unwrap()

@@ -31,14 +31,22 @@ use qualifier_attr::qualifiers;
 use {
     super::{
         decision_maker::{BufferedPacketsDecision, DecisionMaker, DecisionMakerWrapper},
-        packet_deserializer::PacketDeserializer,
+        transaction_scheduler::receive_and_buffer::calculate_priority_and_cost,
     },
-    crate::banking_trace::Channels,
+    crate::{
+        banking_stage::immutable_deserialized_packet::ImmutableDeserializedPacket,
+        banking_trace::Channels,
+    },
     agave_banking_stage_ingress_types::BankingPacketBatch,
     solana_poh::{poh_recorder::PohRecorder, transaction_recorder::TransactionRecorder},
     solana_runtime::bank_forks::BankForks,
+    solana_runtime_transaction::transaction_meta::StaticMeta,
     solana_unified_scheduler_pool::{BankingStageHelper, DefaultSchedulerPool},
-    std::sync::{Arc, RwLock},
+    std::{
+        num::NonZeroUsize,
+        ops::Deref,
+        sync::{Arc, RwLock},
+    },
 };
 
 #[allow(dead_code)]
@@ -49,12 +57,21 @@ pub(crate) fn ensure_banking_stage_setup(
     channels: &Channels,
     poh_recorder: &Arc<RwLock<PohRecorder>>,
     transaction_recorder: TransactionRecorder,
-    num_threads: u32,
+    num_threads: NonZeroUsize,
 ) {
-    let root_bank = bank_forks.read().unwrap().sharable_root_bank();
+    let sharable_banks = bank_forks.read().unwrap().sharable_banks();
     let unified_receiver = channels.unified_receiver().clone();
-    let mut decision_maker = DecisionMaker::new(poh_recorder.clone());
-    let banking_stage_monitor = Box::new(DecisionMakerWrapper::new(decision_maker.clone()));
+
+    let (is_exited, decision_maker) = {
+        let poh_recorder = poh_recorder.read().unwrap();
+        (
+            poh_recorder.is_exited.clone(),
+            DecisionMaker::from(poh_recorder.deref()),
+        )
+    };
+
+    let banking_stage_monitor =
+        Box::new(DecisionMakerWrapper::new(is_exited, decision_maker.clone()));
     let banking_packet_handler = Box::new(
         move |helper: &BankingStageHelper, batches: BankingPacketBatch| {
             let decision = decision_maker.make_consume_or_forward_decision();
@@ -64,11 +81,19 @@ pub(crate) fn ensure_banking_stage_setup(
                 // by solScCleaner.
                 return;
             }
-            let bank = root_bank.load();
+            let bank = sharable_banks.root();
             for batch in batches.iter() {
                 // over-provision nevertheless some of packets could be invalid.
                 let task_id_base = helper.generate_task_ids(batch.len());
-                let packets = PacketDeserializer::deserialize_packets_for_unified_scheduler(batch);
+                let packets = batch.iter().enumerate().filter_map(|(index, pkt)| {
+                    if !pkt.meta().discard() {
+                        let pkt_size = pkt.meta().size;
+                        let pkt = ImmutableDeserializedPacket::new(pkt).ok()?;
+                        Some((pkt, index, pkt_size))
+                    } else {
+                        None
+                    }
+                });
 
                 for (packet, packet_index, packet_size) in packets {
                     let Some((transaction, _deactivation_slot)) = packet
@@ -81,9 +106,22 @@ pub(crate) fn ensure_banking_stage_setup(
                         continue;
                     };
 
-                    let index = task_id_base + packet_index;
+                    let Ok(compute_budget_limits) = transaction
+                        .compute_budget_instruction_details()
+                        .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set)
+                    else {
+                        continue;
+                    };
 
-                    let task = helper.create_new_task(transaction, index, packet_size);
+                    let (priority, _cost) = calculate_priority_and_cost(
+                        &transaction,
+                        &compute_budget_limits.into(),
+                        &bank,
+                    );
+                    let task_id =
+                        BankingStageHelper::new_task_id(task_id_base + packet_index, priority);
+
+                    let task = helper.create_new_task(transaction, task_id, packet_size);
                     helper.send_new_task(task);
                 }
             }
@@ -91,7 +129,7 @@ pub(crate) fn ensure_banking_stage_setup(
     );
 
     pool.register_banking_stage(
-        Some(num_threads.try_into().unwrap()),
+        Some(num_threads.get()),
         unified_receiver,
         banking_packet_handler,
         transaction_recorder,

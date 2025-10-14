@@ -6,8 +6,8 @@ use {
         bank::{Bank, SquashTiming},
         bank_forks::SetRootError,
         snapshot_config::SnapshotConfig,
-        snapshot_utils::SnapshotInterval,
     },
+    agave_snapshots::SnapshotInterval,
     log::*,
     solana_clock::Slot,
     solana_measure::measure::Measure,
@@ -107,24 +107,16 @@ impl SnapshotController {
                 is_root_bank_squashed = bank_slot == root;
 
                 let mut snapshot_time = Measure::start("squash::snapshot_time");
-                if bank.has_initial_accounts_hash_verification_completed() {
-                    // Save off the status cache because these may get pruned if another
-                    // `set_root()` is called before the snapshots package can be generated
-                    let status_cache_slot_deltas =
-                        bank.status_cache.read().unwrap().root_slot_deltas();
-                    if let Err(e) = self.abs_request_sender.send(SnapshotRequest {
-                        snapshot_root_bank: Arc::clone(bank),
-                        status_cache_slot_deltas,
-                        request_kind,
-                        enqueued: Instant::now(),
-                    }) {
-                        warn!("Error sending snapshot request for bank: {bank_slot}, err: {e:?}");
-                    }
-                } else {
-                    info!(
-                        "Not sending snapshot request for bank: {bank_slot}, startup verification \
-                         is incomplete"
-                    );
+                // Save off the status cache because these may get pruned if another
+                // `set_root()` is called before the snapshots package can be generated
+                let status_cache_slot_deltas = bank.status_cache.read().unwrap().root_slot_deltas();
+                if let Err(e) = self.abs_request_sender.send(SnapshotRequest {
+                    snapshot_root_bank: Arc::clone(bank),
+                    status_cache_slot_deltas,
+                    request_kind,
+                    enqueued: Instant::now(),
+                }) {
+                    warn!("Error sending snapshot request for bank: {bank_slot}, err: {e:?}");
                 }
                 snapshot_time.stop();
                 total_snapshot_ms += snapshot_time.as_ms();

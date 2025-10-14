@@ -1,9 +1,9 @@
 [package]
 name = "agave-ledger-tool"
-description = "Blockchain, Rebuilt for Scale"
 documentation = "https://docs.rs/agave-ledger-tool"
 version = { workspace = true }
 authors = { workspace = true }
+description = { workspace = true }
 repository = { workspace = true }
 homepage = { workspace = true }
 license = { workspace = true }
@@ -18,6 +18,7 @@ dev-context-only-utils = []
 [dependencies]
 agave-feature-set = { workspace = true }
 agave-reserved-account-keys = { workspace = true }
+agave-snapshots = { workspace = true }
 agave-syscalls = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true, features = ["default"] }
@@ -35,7 +36,6 @@ rayon = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
-serde_derive = { workspace = true }
 serde_json = { workspace = true }
 solana-account  = { workspace = true }
 solana-account-decoder = { workspace = true }
@@ -44,6 +44,7 @@ solana-bpf-loader-program = { workspace = true }
 solana-clap-utils = { workspace = true }
 solana-cli-output = { workspace = true }
 solana-clock = { workspace = true }
+solana-cluster-type = { workspace = true }
 solana-compute-budget = { workspace = true }
 solana-core = { workspace = true, features = ["dev-context-only-utils"] }
 solana-cost-model = { workspace = true }
@@ -68,7 +69,7 @@ solana-rent = { workspace = true }
 solana-rpc = { workspace = true, features = ["dev-context-only-utils"] }
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
 solana-runtime-transaction = { workspace = true }
-solana-sbpf = { workspace = true, features = ["debugger"] }
+solana-sbpf = { workspace = true, features = ["debugger", "jit"] }
 solana-sdk-ids = { workspace = true }
 solana-shred-version = { workspace = true }
 solana-signature = { workspace = true }
