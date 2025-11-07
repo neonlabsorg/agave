@@ -2,29 +2,15 @@ use {
     super::vote_history_storage::{
         Result, SavedVoteHistory, SavedVoteHistoryVersions, VoteHistoryStorage,
     },
+    agave_votor_messages::{consensus_message::Block, vote::Vote},
     serde::{Deserialize, Serialize},
     solana_clock::Slot,
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_pubkey::Pubkey,
-    solana_votor_messages::{consensus_message::Block, vote::Vote},
     std::collections::{hash_map::Entry, HashMap, HashSet},
     thiserror::Error,
 };
-
-#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
-#[derive(PartialEq, Eq, Debug, Default, Clone, Copy, Serialize, Deserialize)]
-pub(crate) enum BlockhashStatus {
-    /// No vote since restart
-    #[default]
-    Uninitialized,
-    /// Non voting validator
-    NonVoting,
-    /// Hot spare validator
-    HotSpare,
-    /// Successfully generated vote tx with blockhash
-    Blockhash(Slot, Hash),
-}
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub enum VoteHistoryVersions {
@@ -45,7 +31,7 @@ impl VoteHistoryVersions {
 #[cfg_attr(
     feature = "frozen-abi",
     derive(AbiExample),
-    frozen_abi(digest = "H9oKKcWpebSTPtnXG6Aetwb7434CrW21pxnrrusYVEPy")
+    frozen_abi(digest = "5sT71PEL9bNaZhoQGjLwiMESWDRMMVmW1wMvtQpvZs5F")
 )]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
 pub struct VoteHistory {
@@ -181,34 +167,31 @@ impl VoteHistory {
         // in final version
         match vote {
             Vote::Notarize(vote) => {
-                assert!(self.voted.insert(vote.slot()));
-                assert!(self
-                    .voted_notar
-                    .insert(vote.slot(), *vote.block_id())
-                    .is_none());
+                assert!(self.voted.insert(vote.slot));
+                assert!(self.voted_notar.insert(vote.slot, vote.block_id).is_none());
             }
             Vote::Finalize(vote) => {
-                assert!(!self.skipped(vote.slot()));
-                self.its_over.insert(vote.slot());
+                assert!(!self.skipped(vote.slot));
+                self.its_over.insert(vote.slot);
             }
             Vote::Skip(vote) => {
-                self.voted.insert(vote.slot());
-                self.skipped.insert(vote.slot());
+                self.voted.insert(vote.slot);
+                self.skipped.insert(vote.slot);
             }
             Vote::NotarizeFallback(vote) => {
-                assert!(self.voted(vote.slot()));
-                assert!(!self.its_over(vote.slot()));
-                self.skipped.insert(vote.slot());
+                assert!(self.voted(vote.slot));
+                assert!(!self.its_over(vote.slot));
+                self.skipped.insert(vote.slot);
                 self.voted_notar_fallback
-                    .entry(vote.slot())
+                    .entry(vote.slot)
                     .or_default()
-                    .insert(*vote.block_id());
+                    .insert(vote.block_id);
             }
             Vote::SkipFallback(vote) => {
-                assert!(self.voted(vote.slot()));
-                assert!(!self.its_over(vote.slot()));
-                self.skipped.insert(vote.slot());
-                self.voted_skip_fallback.insert(vote.slot());
+                assert!(self.voted(vote.slot));
+                assert!(!self.its_over(vote.slot));
+                self.skipped.insert(vote.slot);
+                self.voted_skip_fallback.insert(vote.slot);
             }
         }
         self.votes_cast.entry(vote.slot()).or_default().push(vote);
@@ -312,8 +295,8 @@ impl VoteHistoryError {
 #[cfg(test)]
 mod test {
     use {
-        super::*, crate::vote_history_storage::FileVoteHistoryStorage, solana_signer::Signer,
-        solana_votor_messages::vote::Vote, tempfile::TempDir,
+        super::*, crate::vote_history_storage::FileVoteHistoryStorage,
+        agave_votor_messages::vote::Vote, solana_signer::Signer, tempfile::TempDir,
     };
 
     // Votes cast since is kept in HashMap, so order is not guaranteed.
@@ -525,9 +508,9 @@ mod test {
         vote_history.add_vote(vote_2);
 
         // Save to storage
-        assert!(vote_history
+        vote_history
             .save(&vote_history_storage, &node_keypair)
-            .is_ok());
+            .unwrap();
         // Restore from storage
         let restored_vote_history =
             VoteHistory::restore(&vote_history_storage, &node_keypair.pubkey())

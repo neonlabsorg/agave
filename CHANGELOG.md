@@ -8,16 +8,27 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 and follows a [Backwards Compatibility Policy](https://docs.anza.xyz/backwards-compatibility)
 
 Release channels have their own copy of this changelog:
-* [edge - v3.1](#edge-channel)
-* [beta - v3.0](https://github.com/anza-xyz/agave/blob/v3.0/CHANGELOG.md)
-* [stable - v2.3](https://github.com/anza-xyz/agave/blob/v2.3/CHANGELOG.md)
+* [edge - v4.0](#edge-channel)
+* [beta - v3.1](https://github.com/anza-xyz/agave/blob/v3.1/CHANGELOG.md)
+* [stable - v3.0](https://github.com/anza-xyz/agave/blob/v3.0/CHANGELOG.md)
 
 <a name="edge-channel"></a>
-## 3.1.0—Unreleased
+## 4.0.0-Unreleased
+### RPC
+#### Breaking
+#### Changes
+* Added `--enable-scheduler-bindings` which binds an IPC server at `<ledger-path>/scheduler_bindings.ipc` for external schedulers to connect to.
+### Validator
+#### Breaking
+#### Deprecations
+* Using `mmap` for `--accounts-db-access-storages-method` is now deprecated.
+
+## 3.1.0
 ### RPC
 #### Breaking
 * A signature verification failure in `simulateTransaction()` or the preflight stage of `sendTransaction()` will now be attached to the simulation result's `err` property as `TransactionError::SignatureFailure` instead of being thrown as a JSON RPC API error (-32003). Applications that already guard against JSON RPC exceptions should expect signature verification errors to appear on the simulation result instead. Applications that already handle the materialization of `TransactionErrors` on simulation results can now expect to receive errors of type `TransactionError::SignatureFailure` at those verification sites.
 #### Changes
+* The `getProgramAccounts` RPC endpoint now returns JSON-RPC errors when malformed filters are provided (previously these malformed filters would be silently ignored and the RPC call would execute an unfiltered query).
 * `PubsubClient` can now be constructed with the URI of an RPC (as a `str`, `String`, or `Uri`) as well as an `http::Request<()>`. The addition of `Request` allows you to set request headers when establishing a websocket connection with an RPC.
 ### Validator
 #### Breaking
@@ -42,6 +53,7 @@ Release channels have their own copy of this changelog:
 ### Validator
 
 #### Breaking
+* When XDP is enabled, the validator process requires the `CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_BPF`, and `CAP_PERFMON` capabilities. These can be configured in the systemd service file by setting `CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON` under the `[Service]` section or directly on the binary with the command `sudo setcap cap_net_raw,cap_net_admin,cap_bpf,cap_perfmon=p <path/to/agave-validator>` (this command must be run each time the binary is replaced)
 * Require increased `memlock` limits - recommended setting is `LimitMEMLOCK=2000000000` in systemd service configuration. Lack of sufficient limit (on Linux) will cause startup error.
 * Remove deprecated arguments
   * `--accounts-index-memory-limit-mb`

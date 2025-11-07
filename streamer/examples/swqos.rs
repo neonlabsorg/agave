@@ -8,6 +8,7 @@
 //! as sender's pubkey.
 
 use {
+    chrono::{NaiveDate, NaiveDateTime, NaiveTime, Utc},
     clap::Parser,
     crossbeam_channel::bounded,
     log::{debug, info},
@@ -15,7 +16,8 @@ use {
     solana_net_utils::sockets::{bind_to_with_config, SocketConfiguration},
     solana_pubkey::Pubkey,
     solana_streamer::{
-        nonblocking::quic::SpawnNonBlockingServerResult, quic::QuicServerParams,
+        nonblocking::{quic::SpawnNonBlockingServerResult, swqos::SwQosConfig},
+        quic::QuicStreamerConfig,
         streamer::StakedNodes,
     },
     std::{
@@ -27,7 +29,7 @@ use {
         sync::{Arc, RwLock},
         time::Duration,
     },
-    tokio::time::{sleep, Instant},
+    tokio::time::sleep,
     tokio_util::sync::CancellationToken,
 };
 
@@ -72,7 +74,7 @@ struct Cli {
     #[arg(short, long, default_value = "0.0.0.0:8008")]
     bind_to: SocketAddr,
 
-    #[arg(short, long, default_value = "./results/serverlog.bin")]
+    #[arg(short, long, default_value = "serverlog.bin")]
     log_file: String,
 
     #[arg(short, long, value_parser = parse_duration)]
@@ -85,7 +87,7 @@ struct Cli {
 // number of threads as in fn default_num_tpu_transaction_forward_receive_threads
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() -> anyhow::Result<()> {
-    solana_logger::setup();
+    agave_logger::setup();
     let cli = Cli::parse();
     let socket = bind_to_with_config(
         cli.bind_to.ip(),
@@ -111,29 +113,34 @@ async fn main() -> anyhow::Result<()> {
         stats,
         thread: run_thread,
         max_concurrent_connections: _,
-    } = solana_streamer::nonblocking::quic::spawn_server_with_cancel(
+    } = solana_streamer::nonblocking::testing_utilities::spawn_stake_weighted_qos_server(
         "quic_streamer_test",
         [socket.try_clone()?],
         &keypair,
         sender,
         staked_nodes,
-        QuicServerParams {
-            max_connections_per_peer: cli.max_connections_per_peer,
-            ..QuicServerParams::default()
+        QuicStreamerConfig {
+            max_connections_per_unstaked_peer: cli.max_connections_per_peer,
+            ..QuicStreamerConfig::default()
         },
+        SwQosConfig::default(),
         cancel.clone(),
     )?;
     info!("Server listening on {}", socket.local_addr()?);
 
     let path = cli.log_file.clone();
     let logger_thread = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let start = Instant::now();
+        let solana_epoch = NaiveDateTime::new(
+            NaiveDate::from_ymd_opt(2020, 3, 16).unwrap(),
+            NaiveTime::MIN,
+        );
         let logfile = std::fs::File::create(&path)?;
         info!("Logfile in {}", &path);
         let mut logfile = std::io::BufWriter::new(logfile);
         let mut sum = 0;
         for batch in receiver {
-            let delta_time = start.elapsed().as_micros() as u32;
+            let now = Utc::now().naive_utc();
+            let delta_time = (now - solana_epoch).num_microseconds().unwrap() as u64;
             for pkt in batch.iter() {
                 let pkt = pkt.to_bytes_packet();
                 if pkt.buffer().len() < 32 {
@@ -141,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 let pubkey: [u8; 32] = pkt.buffer()[0..32].try_into()?;
                 logfile.write_all(&pubkey)?;
-                let pkt_len = pkt.buffer().len();
+                let pkt_len = pkt.buffer().len() as u64;
                 logfile.write_all(&pkt_len.to_ne_bytes())?;
                 logfile.write_all(&delta_time.to_ne_bytes())?;
                 let pubkey = Pubkey::new_from_array(pubkey);
@@ -153,13 +160,25 @@ async fn main() -> anyhow::Result<()> {
         logfile.flush()?;
         Ok(())
     });
-
-    sleep(cli.test_duration).await;
+    // wait for test to finish, report errors early if they occur
+    let status = tokio::select! {
+        _ = sleep(cli.test_duration)=>{
+            info!("Test duration expired");
+            Ok(())
+        },
+        _ = run_thread => {
+            Err(anyhow::anyhow!("Server thread exited too early"))
+        },
+        v = logger_thread => {
+            match v {
+                Ok(Err(v))=>Err(v.context("Logger thread error")),
+                _=>Err(anyhow::anyhow!("Logger thread exited too early"))
+            }
+        }
+    };
     info!("Server terminating");
     cancel.cancel();
     drop(endpoints);
-    run_thread.await?;
-    logger_thread.await??;
     stats.report("final_stats");
-    Ok(())
+    status
 }

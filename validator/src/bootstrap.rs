@@ -1,8 +1,13 @@
 use {
+    agave_snapshots::{
+        paths as snapshot_paths, snapshot_archive_info::SnapshotArchiveInfoGetter as _,
+        SnapshotKind,
+    },
     itertools::Itertools,
     log::*,
     rand::{seq::SliceRandom, thread_rng, Rng},
     rayon::prelude::*,
+    solana_account::ReadableAccount,
     solana_clock::Slot,
     solana_commitment_config::CommitmentConfig,
     solana_core::validator::{ValidatorConfig, ValidatorStartProgress},
@@ -20,12 +25,9 @@ use {
     solana_metrics::datapoint_info,
     solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_runtime::{
-        snapshot_archive_info::SnapshotArchiveInfoGetter, snapshot_package::SnapshotKind,
-        snapshot_utils,
-    },
     solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
+    solana_vote_program::vote_state::VoteStateV4,
     std::{
         collections::{hash_map::RandomState, HashMap, HashSet},
         net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
@@ -261,9 +263,9 @@ fn check_vote_account(
         .value
         .ok_or_else(|| format!("identity account does not exist: {identity_pubkey}"))?;
 
-    let vote_state = solana_vote_program::vote_state::from(&vote_account);
+    let vote_state = VoteStateV4::deserialize(vote_account.data(), vote_account_address).ok();
     if let Some(vote_state) = vote_state {
-        if vote_state.authorized_voters().is_empty() {
+        if vote_state.authorized_voters.is_empty() {
             return Err("Vote account not yet initialized".to_string());
         }
 
@@ -274,7 +276,7 @@ fn check_vote_account(
             ));
         }
 
-        for (_, vote_account_authorized_voter_pubkey) in vote_state.authorized_voters().iter() {
+        for (_, vote_account_authorized_voter_pubkey) in vote_state.authorized_voters.iter() {
             if !authorized_voter_pubkeys.contains(vote_account_authorized_voter_pubkey) {
                 return Err(format!(
                     "authorized voter {vote_account_authorized_voter_pubkey} not available"
@@ -786,10 +788,10 @@ fn get_highest_local_snapshot_hash(
     incremental_snapshot_archives_dir: impl AsRef<Path>,
     incremental_snapshot_fetch: bool,
 ) -> Option<(Slot, Hash)> {
-    snapshot_utils::get_highest_full_snapshot_archive_info(full_snapshot_archives_dir)
+    snapshot_paths::get_highest_full_snapshot_archive_info(full_snapshot_archives_dir)
         .and_then(|full_snapshot_info| {
             if incremental_snapshot_fetch {
-                snapshot_utils::get_highest_incremental_snapshot_archive_info(
+                snapshot_paths::get_highest_incremental_snapshot_archive_info(
                     incremental_snapshot_archives_dir,
                     full_snapshot_info.slot(),
                 )
@@ -1129,7 +1131,7 @@ fn download_snapshots(
     }
 
     // Check and see if we've already got the full snapshot; if not, download it
-    if snapshot_utils::get_full_snapshot_archives(full_snapshot_archives_dir)
+    if snapshot_paths::get_full_snapshot_archives(full_snapshot_archives_dir)
         .into_iter()
         .any(|snapshot_archive| {
             snapshot_archive.slot() == full_snapshot_hash.0
@@ -1158,7 +1160,7 @@ fn download_snapshots(
     if bootstrap_config.incremental_snapshot_fetch {
         // Check and see if we've already got the incremental snapshot; if not, download it
         if let Some(incremental_snapshot_hash) = incremental_snapshot_hash {
-            if snapshot_utils::get_incremental_snapshot_archives(incremental_snapshot_archives_dir)
+            if snapshot_paths::get_incremental_snapshot_archives(incremental_snapshot_archives_dir)
                 .into_iter()
                 .any(|snapshot_archive| {
                     snapshot_archive.slot() == incremental_snapshot_hash.0
@@ -1224,7 +1226,7 @@ fn download_snapshot(
     };
     let desired_snapshot_hash = (
         desired_snapshot_hash.0,
-        solana_runtime::snapshot_hash::SnapshotHash(desired_snapshot_hash.1),
+        agave_snapshots::snapshot_hash::SnapshotHash(desired_snapshot_hash.1),
     );
     download_snapshot_archive(
         &rpc_contact_info
@@ -1367,7 +1369,7 @@ mod tests {
 
     #[test]
     fn test_build_known_snapshot_hashes() {
-        solana_logger::setup();
+        agave_logger::setup();
         let full_snapshot_hash1 = (400_000, Hash::new_unique());
         let full_snapshot_hash2 = (400_000, Hash::new_unique());
 

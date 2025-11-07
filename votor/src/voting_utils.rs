@@ -3,13 +3,16 @@
 use {
     crate::{
         commitment::{CommitmentAggregationData, CommitmentError},
-        consensus_metrics::ConsensusMetrics,
+        consensus_metrics::ConsensusMetricsEventSender,
         vote_history::{VoteHistory, VoteHistoryError},
         vote_history_storage::{SavedVoteHistory, SavedVoteHistoryVersions},
         voting_service::BLSOp,
     },
+    agave_votor_messages::{
+        consensus_message::{ConsensusMessage, VoteMessage, BLS_KEYPAIR_DERIVE_SEED},
+        vote::Vote,
+    },
     crossbeam_channel::{SendError, Sender},
-    parking_lot::RwLock as PlRwLock,
     solana_bls_signatures::{
         keypair::Keypair as BLSKeypair, pubkey::PubkeyCompressed as BLSPubkeyCompressed, BlsError,
         Pubkey as BLSPubkey,
@@ -20,10 +23,6 @@ use {
     solana_runtime::{bank::Bank, bank_forks::SharableBanks},
     solana_signer::Signer,
     solana_transaction::Transaction,
-    solana_votor_messages::{
-        consensus_message::{ConsensusMessage, VoteMessage, BLS_KEYPAIR_DERIVE_SEED},
-        vote::Vote,
-    },
     std::{collections::HashMap, sync::Arc},
     thiserror::Error,
 };
@@ -126,7 +125,7 @@ pub struct VotingContext {
     pub commitment_sender: Sender<CommitmentAggregationData>,
     pub wait_to_vote_slot: Option<u64>,
     pub sharable_banks: SharableBanks,
-    pub consensus_metrics: Arc<PlRwLock<ConsensusMetrics>>,
+    pub consensus_metrics_sender: ConsensusMetricsEventSender,
 }
 
 fn get_bls_keypair(
@@ -176,14 +175,11 @@ fn generate_vote_tx(vote: &Vote, bank: &Bank, context: &mut VotingContext) -> Ge
             );
             return GenerateVoteTxResult::HotSpare;
         }
-        let bls_pubkey_serialized = match vote_state_view.bls_pubkey_compressed() {
-            None => {
-                panic!(
-                    "No BLS pubkey in vote account {}",
-                    context.identity_keypair.pubkey()
-                );
-            }
-            Some(key) => key,
+        let Some(bls_pubkey_serialized) = vote_state_view.bls_pubkey_compressed() else {
+            panic!(
+                "No BLS pubkey in vote account {}",
+                context.identity_keypair.pubkey()
+            );
         };
         bls_pubkey_in_vote_account =
             (bincode::deserialize::<BLSPubkeyCompressed>(&bls_pubkey_serialized).unwrap())
@@ -286,18 +282,6 @@ fn insert_vote_and_create_bls_message(
     let saved_vote_history =
         SavedVoteHistory::new(&context.vote_history, &context.identity_keypair)?;
 
-    match context
-        .consensus_metrics
-        .write()
-        .record_vote(context.vote_account_pubkey, &vote)
-    {
-        Ok(()) => (),
-        Err(err) => {
-            let slot = vote.slot();
-            error!("recording vote on slot {slot} failed with {err:?}");
-        }
-    }
-
     // Return vote for sending
     Ok(BLSOp::PushVote {
         message: Arc::new(message),
@@ -390,7 +374,7 @@ mod tests {
             commitment_sender: unbounded().0,
             wait_to_vote_slot: None,
             sharable_banks,
-            consensus_metrics: Arc::new(PlRwLock::new(ConsensusMetrics::new(0))),
+            consensus_metrics_sender: unbounded().0,
         }
     }
 
@@ -575,7 +559,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "The bank 0 doesn't have its own epoch_stakes for")]
     fn test_panic_on_future_slot() {
-        solana_logger::setup();
+        agave_logger::setup();
         let (own_vote_sender, _own_vote_receiver) = crossbeam_channel::unbounded();
         // Create 10 node validatorvotekeypairs vec
         let validator_keypairs = (0..10)
@@ -592,7 +576,7 @@ mod tests {
 
     #[test]
     fn test_zero_staked_validator_fails_voting() {
-        solana_logger::setup();
+        agave_logger::setup();
         let (own_vote_sender, _own_vote_receiver) = crossbeam_channel::unbounded();
         // Create 10 node validatorvotekeypairs vec
         let validator_keypairs = (0..10)

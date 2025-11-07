@@ -6,7 +6,12 @@ use {
         commands::{run::args::RunArgs, FromClapArgMatches},
         ledger_lockfile, lock_ledger,
     },
-    agave_snapshots::{ArchiveFormat, SnapshotInterval},
+    agave_logger::redirect_stderr_to_file,
+    agave_snapshots::{
+        paths::BANK_SNAPSHOTS_DIR,
+        snapshot_config::{SnapshotConfig, SnapshotUsage},
+        ArchiveFormat, SnapshotInterval, SnapshotVersion,
+    },
     clap::{crate_name, value_t, value_t_or_exit, values_t, values_t_or_exit, ArgMatches},
     crossbeam_channel::unbounded,
     log::*,
@@ -15,7 +20,6 @@ use {
         accounts_db::{AccountShrinkThreshold, AccountsDbConfig, MarkObsoleteAccounts},
         accounts_file::StorageAccess,
         accounts_index::{AccountSecondaryIndexes, AccountsIndexConfig, IndexLimitMb, ScanFilter},
-        hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
         utils::{
             create_all_accounts_run_and_snapshot_dirs, create_and_canonicalize_directories,
             create_and_canonicalize_directory,
@@ -32,12 +36,14 @@ use {
         repair::repair_handler::RepairHandlerType,
         snapshot_packager_service::SnapshotPackagerService,
         system_monitor_service::SystemMonitorService,
+        tpu::MAX_VOTES_PER_SECOND,
         validator::{
             is_snapshot_config_valid, BlockProductionMethod, BlockVerificationMethod,
             SchedulerPacing, Validator, ValidatorConfig, ValidatorError, ValidatorStartProgress,
             ValidatorTpuConfig,
         },
     },
+    solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
     solana_gossip::{
         cluster_info::{NodeConfig, DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS},
         contact_info::ContactInfo,
@@ -49,18 +55,16 @@ use {
         blockstore_cleanup_service::{DEFAULT_MAX_LEDGER_SHREDS, DEFAULT_MIN_MAX_LEDGER_SHREDS},
         use_snapshot_archives_at_startup::{self, UseSnapshotArchivesAtStartup},
     },
-    solana_logger::redirect_stderr_to_file,
     solana_net_utils::multihomed_sockets::BindIpAddrs,
     solana_perf::recycler::enable_recycler_warming,
     solana_poh::poh_service,
     solana_pubkey::Pubkey,
-    solana_runtime::{
-        runtime_config::RuntimeConfig,
-        snapshot_config::{SnapshotConfig, SnapshotUsage},
-        snapshot_utils::{self, SnapshotVersion, BANK_SNAPSHOTS_DIR},
-    },
+    solana_runtime::{runtime_config::RuntimeConfig, snapshot_utils},
     solana_signer::Signer,
-    solana_streamer::quic::{QuicServerParams, DEFAULT_TPU_COALESCE},
+    solana_streamer::{
+        nonblocking::{simple_qos::SimpleQosConfig, swqos::SwQosConfig},
+        quic::{QuicStreamerConfig, SimpleQosQuicStreamerConfig, SwQosQuicStreamerConfig},
+    },
     solana_tpu_client::tpu_client::DEFAULT_TPU_ENABLE_UDP,
     solana_turbine::{
         broadcast_stage::BroadcastStageType,
@@ -74,9 +78,8 @@ use {
         num::{NonZeroU64, NonZeroUsize},
         path::{Path, PathBuf},
         process::exit,
-        str::FromStr,
+        str::{self, FromStr},
         sync::{atomic::AtomicBool, Arc, RwLock},
-        time::Duration,
     },
 };
 
@@ -113,12 +116,9 @@ pub fn execute(
     let identity_keypair = Arc::new(run_args.identity_keypair);
 
     let logfile = run_args.logfile;
-    let logfile = if logfile == "-" {
-        None
-    } else {
-        println!("log file: {logfile}");
-        Some(logfile)
-    };
+    if let Some(logfile) = logfile.as_ref() {
+        println!("log file: {}", logfile.display());
+    }
     let use_progress_bar = logfile.is_none();
     let _logger_thread = redirect_stderr_to_file(logfile);
 
@@ -160,9 +160,6 @@ pub fn execute(
 
     let private_rpc = matches.is_present("private_rpc");
     let do_port_check = !matches.is_present("no_port_check");
-    let tpu_coalesce = value_t!(matches, "tpu_coalesce_ms", u64)
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_TPU_COALESCE);
 
     let ledger_path = run_args.ledger_path;
 
@@ -221,10 +218,31 @@ pub fn execute(
         BindIpAddrs::new(parsed).map_err(|err| format!("invalid bind_addresses: {err}"))?
     };
 
-    if bind_addresses.len() > 1 && matches.is_present("use_connection_cache") {
-        Err(String::from(
-            "Connection cache can not be used in a multihoming context",
-        ))?;
+    if bind_addresses.len() > 1 {
+        for (flag, msg) in [
+            (
+                "use_connection_cache",
+                "Connection cache can not be used in a multihoming context",
+            ),
+            (
+                "advertised_ip",
+                "--advertised-ip cannot be used in a multihoming context. In multihoming, the \
+                 validator will advertise the first --bind-address as this node's public IP \
+                 address.",
+            ),
+            (
+                "tpu_vortexor_receiver_address",
+                "--tpu-vortexor-receiver-address can not be used in a multihoming context",
+            ),
+            (
+                "public_tpu_addr",
+                "--public-tpu-address can not be used in a multihoming context",
+            ),
+        ] {
+            if matches.is_present(flag) {
+                Err(String::from(msg))?;
+            }
+        }
     }
 
     let rpc_bind_address = if matches.is_present("rpc_bind_address") {
@@ -300,6 +318,11 @@ pub fn execute(
     };
     if let Ok(bins) = value_t!(matches, "accounts_index_bins", usize) {
         accounts_index_config.bins = Some(bins);
+    }
+    if let Ok(num_initial_accounts) =
+        value_t!(matches, "accounts_index_initial_accounts_count", usize)
+    {
+        accounts_index_config.num_initial_accounts = Some(num_initial_accounts);
     }
 
     accounts_index_config.index_limit_mb = if !matches.is_present("enable_accounts_disk_index") {
@@ -381,7 +404,11 @@ pub fn execute(
     let storage_access = matches
         .value_of("accounts_db_access_storages_method")
         .map(|method| match method {
-            "mmap" => StorageAccess::Mmap,
+            "mmap" => {
+                warn!("Using `mmap` for `--accounts-db-access-storages-method` is now deprecated.");
+                #[allow(deprecated)]
+                StorageAccess::Mmap
+            }
             "file" => StorageAccess::File,
             _ => {
                 // clap will enforce one of the above values is given
@@ -403,11 +430,19 @@ pub fn execute(
         })
         .unwrap_or_default();
 
-    let mark_obsolete_accounts = if matches.is_present("accounts_db_mark_obsolete_accounts") {
-        MarkObsoleteAccounts::Enabled
-    } else {
-        MarkObsoleteAccounts::Disabled
-    };
+    let mark_obsolete_accounts = matches
+        .value_of("accounts_db_mark_obsolete_accounts")
+        .map(|mark_obsolete_accounts| {
+            match mark_obsolete_accounts {
+                "enabled" => MarkObsoleteAccounts::Enabled,
+                "disabled" => MarkObsoleteAccounts::Disabled,
+                _ => {
+                    // clap will enforce one of the above values is given
+                    unreachable!("invalid value given to accounts_db_mark_obsolete_accounts")
+                }
+            }
+        })
+        .unwrap_or_default();
 
     let accounts_db_config = AccountsDbConfig {
         index: Some(accounts_index_config),
@@ -502,17 +537,6 @@ pub fn execute(
         UseSnapshotArchivesAtStartup
     );
 
-    if mark_obsolete_accounts == MarkObsoleteAccounts::Enabled
-        && use_snapshot_archives_at_startup != UseSnapshotArchivesAtStartup::Always
-    {
-        Err(format!(
-            "The --accounts-db-mark-obsolete-accounts option requires the \
-             --use-snapshot-archives-at-startup option to be set to {}. Current value: {}",
-            UseSnapshotArchivesAtStartup::Always,
-            use_snapshot_archives_at_startup
-        ))?;
-    }
-
     let mut validator_config = ValidatorConfig {
         require_tower: matches.is_present("require_tower"),
         tower_storage,
@@ -561,6 +585,9 @@ pub fn execute(
         no_os_network_stats_reporting: matches.is_present("no_os_network_stats_reporting"),
         no_os_cpu_stats_reporting: matches.is_present("no_os_cpu_stats_reporting"),
         no_os_disk_stats_reporting: matches.is_present("no_os_disk_stats_reporting"),
+        // The validator needs to open many files, check that the process has
+        // permission to do so in order to fail quickly and give a direct error
+        enforce_ulimit_nofile: true,
         poh_pinned_cpu_core: value_of(matches, "poh_pinned_cpu_core")
             .unwrap_or(poh_service::DEFAULT_PINNED_CPU_CORE),
         poh_hashes_per_batch: value_of(matches, "poh_hashes_per_batch")
@@ -572,7 +599,6 @@ pub fn execute(
         accounts_db_skip_shrink: true,
         accounts_db_force_initial_clean: matches.is_present("no_skip_initial_accounts_db_clean"),
         snapshot_config,
-        tpu_coalesce,
         no_wait_for_vote_to_start_leader: matches.is_present("no_wait_for_vote_to_start_leader"),
         wait_to_vote_slot: None,
         runtime_config: RuntimeConfig {
@@ -619,6 +645,7 @@ pub fn execute(
             ),
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
+        enable_scheduler_bindings: matches.is_present("enable_scheduler_bindings"),
         banking_trace_dir_byte_limit: parse_banking_trace_dir_byte_limit(matches),
         validator_exit: Arc::new(RwLock::new(Exit::default())),
         validator_exit_backpressure: [(
@@ -734,8 +761,18 @@ pub fn execute(
         })
         .transpose()?;
 
+    let advertised_ip = matches
+        .value_of("advertised_ip")
+        .map(|advertised_ip| {
+            solana_net_utils::parse_host(advertised_ip)
+                .map_err(|err| format!("failed to parse --advertised-ip: {err}"))
+        })
+        .transpose()?;
+
     let advertised_ip = if let Some(ip) = gossip_host {
         ip
+    } else if let Some(cli_ip) = advertised_ip {
+        cli_ip
     } else if !bind_addresses.active().is_unspecified() && !bind_addresses.active().is_loopback() {
         bind_addresses.active()
     } else if !entrypoint_addrs.is_empty() {
@@ -801,8 +838,13 @@ pub fn execute(
     info!("tpu_vortexor_receiver_address is {tpu_vortexor_receiver_address:?}");
     let num_quic_endpoints = value_t_or_exit!(matches, "num_quic_endpoints", NonZeroUsize);
 
-    let tpu_max_connections_per_peer =
-        value_t_or_exit!(matches, "tpu_max_connections_per_peer", u64);
+    let tpu_max_connections_per_peer: Option<u64> = matches
+        .value_of("tpu_max_connections_per_peer")
+        .and_then(|v| v.parse().ok());
+    let tpu_max_connections_per_unstaked_peer = tpu_max_connections_per_peer
+        .unwrap_or_else(|| value_t_or_exit!(matches, "tpu_max_connections_per_unstaked_peer", u64));
+    let tpu_max_connections_per_staked_peer = tpu_max_connections_per_peer
+        .unwrap_or_else(|| value_t_or_exit!(matches, "tpu_max_connections_per_staked_peer", u64));
     let tpu_max_staked_connections = value_t_or_exit!(matches, "tpu_max_staked_connections", u64);
     let tpu_max_unstaked_connections =
         value_t_or_exit!(matches, "tpu_max_unstaked_connections", u64);
@@ -848,6 +890,7 @@ pub fn execute(
         node.info.remove_tpu_forwards();
         node.info.remove_tvu();
         node.info.remove_serve_repair();
+        node.info.remove_alpenglow();
 
         // A node in this configuration shouldn't be an entrypoint to other nodes
         node.sockets.ip_echo = None;
@@ -923,34 +966,52 @@ pub fn execute(
     // the one pushed by bootstrap.
     node.info.hot_swap_pubkey(identity_keypair.pubkey());
 
-    let tpu_quic_server_config = QuicServerParams {
-        max_connections_per_peer: tpu_max_connections_per_peer.try_into().unwrap(),
-        max_staked_connections: tpu_max_staked_connections.try_into().unwrap(),
-        max_unstaked_connections: tpu_max_unstaked_connections.try_into().unwrap(),
-        max_streams_per_ms,
-        max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
-        coalesce: tpu_coalesce,
-        num_threads: tpu_transaction_receive_threads,
-        ..Default::default()
+    let tpu_quic_server_config = SwQosQuicStreamerConfig {
+        quic_streamer_config: QuicStreamerConfig {
+            max_connections_per_unstaked_peer: tpu_max_connections_per_unstaked_peer
+                .try_into()
+                .unwrap(),
+            max_connections_per_staked_peer: tpu_max_connections_per_staked_peer
+                .try_into()
+                .unwrap(),
+            max_staked_connections: tpu_max_staked_connections.try_into().unwrap(),
+            max_unstaked_connections: tpu_max_unstaked_connections.try_into().unwrap(),
+            max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
+            num_threads: tpu_transaction_receive_threads,
+            ..Default::default()
+        },
+        qos_config: SwQosConfig { max_streams_per_ms },
     };
 
-    let tpu_fwd_quic_server_config = QuicServerParams {
-        max_connections_per_peer: tpu_max_connections_per_peer.try_into().unwrap(),
-        max_staked_connections: tpu_max_fwd_staked_connections.try_into().unwrap(),
-        max_unstaked_connections: tpu_max_fwd_unstaked_connections.try_into().unwrap(),
-        max_streams_per_ms,
-        max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
-        coalesce: tpu_coalesce,
-        num_threads: tpu_transaction_forward_receive_threads,
-        ..Default::default()
+    let tpu_fwd_quic_server_config = SwQosQuicStreamerConfig {
+        quic_streamer_config: QuicStreamerConfig {
+            max_connections_per_staked_peer: tpu_max_connections_per_staked_peer
+                .try_into()
+                .unwrap(),
+            max_connections_per_unstaked_peer: tpu_max_connections_per_unstaked_peer
+                .try_into()
+                .unwrap(),
+            max_staked_connections: tpu_max_fwd_staked_connections.try_into().unwrap(),
+            max_unstaked_connections: tpu_max_fwd_unstaked_connections.try_into().unwrap(),
+            max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
+            num_threads: tpu_transaction_forward_receive_threads,
+            ..Default::default()
+        },
+        qos_config: SwQosConfig { max_streams_per_ms },
     };
 
-    // Vote shares TPU forward's characteristics, except that we accept 1 connection
-    // per peer and no unstaked connections are accepted.
-    let mut vote_quic_server_config = tpu_fwd_quic_server_config.clone();
-    vote_quic_server_config.max_connections_per_peer = 1;
-    vote_quic_server_config.max_unstaked_connections = 0;
-    vote_quic_server_config.num_threads = tpu_vote_transaction_receive_threads;
+    let vote_quic_server_config = SimpleQosQuicStreamerConfig {
+        quic_streamer_config: QuicStreamerConfig {
+            max_connections_per_unstaked_peer: 1,
+            max_staked_connections: tpu_max_fwd_staked_connections.try_into().unwrap(),
+            max_connections_per_ipaddr_per_min: tpu_max_connections_per_ipaddr_per_minute,
+            num_threads: tpu_vote_transaction_receive_threads,
+            ..Default::default()
+        },
+        qos_config: SimpleQosConfig {
+            max_streams_per_second: MAX_VOTES_PER_SECOND,
+        },
+    };
 
     let validator = match Validator::new(
         node,

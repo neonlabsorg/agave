@@ -9,7 +9,7 @@ use {
     solana_nohash_hasher::BuildNoHashHasher,
     solana_perf::{
         cuda_runtime::PinnedVec,
-        packet::{Packet, PacketBatch, PacketRef},
+        packet::{BytesPacketBatch, Packet, PacketBatch, PacketRef},
         perf_libs,
         recycler_cache::RecyclerCache,
         sigverify::{self, count_packets_in_batches, TxOffset},
@@ -308,6 +308,12 @@ pub fn verify_shreds_gpu(
         .map(|batch| match batch {
             PacketBatch::Pinned(batch) => Cow::Borrowed(batch),
             PacketBatch::Bytes(batch) => Cow::Owned(batch.to_pinned_packet_batch()),
+            PacketBatch::Single(packet) => {
+                // this is ugly, but unused (gpu code) and will be removed shortly in follow up PR
+                let mut batch = BytesPacketBatch::with_capacity(1);
+                batch.push(packet.clone());
+                Cow::Owned(batch.to_pinned_packet_batch())
+            }
         })
         .collect::<Vec<_>>();
     elems.extend(pinned_batches.iter().map(|batch| perf_libs::Elems {
@@ -460,6 +466,12 @@ fn sign_shreds_gpu(
         .map(|batch| match batch {
             PacketBatch::Pinned(batch) => Cow::Borrowed(batch),
             PacketBatch::Bytes(batch) => Cow::Owned(batch.to_pinned_packet_batch()),
+            PacketBatch::Single(packet) => {
+                // this is ugly, but unused (gpu code) and will be removed shortly in follow up PR
+                let mut batch = BytesPacketBatch::with_capacity(1);
+                batch.push(packet.clone());
+                Cow::Owned(batch.to_pinned_packet_batch())
+            }
         })
         .collect::<Vec<_>>();
     elems.extend(pinned_batches.iter().map(|batch| perf_libs::Elems {
@@ -546,7 +558,7 @@ mod tests {
     };
 
     fn run_test_sigverify_shred_cpu(slot: Slot) {
-        solana_logger::setup();
+        agave_logger::setup();
         let mut packet = Packet::default();
         let cache = RwLock::new(LruCache::new(/*capacity:*/ 128));
         let shredder = Shredder::new(slot, slot.saturating_sub(1), 0, 0).unwrap();
@@ -585,7 +597,7 @@ mod tests {
     }
 
     fn run_test_sigverify_shreds_cpu(thread_pool: &ThreadPool, slot: Slot) {
-        solana_logger::setup();
+        agave_logger::setup();
         let cache = RwLock::new(LruCache::new(/*capacity:*/ 128));
         let keypair = Keypair::new();
         let batch = make_packet_batch(&keypair, slot);
@@ -619,7 +631,7 @@ mod tests {
     }
 
     fn run_test_sigverify_shreds_gpu(thread_pool: &ThreadPool, slot: Slot) {
-        solana_logger::setup();
+        agave_logger::setup();
         let recycler_cache = RecyclerCache::default();
         let cache = RwLock::new(LruCache::new(/*capacity:*/ 128));
 

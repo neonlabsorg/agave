@@ -28,7 +28,9 @@ use {
         verifier::RequisiteVerifier,
     },
     solana_sdk_ids::{bpf_loader_upgradeable, sysvar},
-    solana_transaction_context::{IndexOfAccount, InstructionAccount, InstructionContext},
+    solana_transaction_context::{
+        instruction::InstructionContext, instruction_accounts::InstructionAccount, IndexOfAccount,
+    },
     std::{
         collections::HashMap,
         fmt::{self, Debug, Formatter},
@@ -240,18 +242,18 @@ impl VerboseDisplay for Output {}
 // https://github.com/rust-lang/rust/issues/74465
 struct LazyAnalysis<'a, 'b> {
     analysis: Option<Analysis<'a>>,
-    executable: &'a Executable<InvokeContext<'b>>,
+    executable: &'a Executable<InvokeContext<'b, 'b>>,
 }
 
 impl<'a, 'b> LazyAnalysis<'a, 'b> {
-    fn new(executable: &'a Executable<InvokeContext<'b>>) -> Self {
+    fn new(executable: &'a Executable<InvokeContext<'b, 'b>>) -> Self {
         Self {
             analysis: None,
             executable,
         }
     }
 
-    fn analyze(&mut self) -> &Analysis {
+    fn analyze(&mut self) -> &Analysis<'_> {
         if let Some(ref analysis) = self.analysis {
             return analysis;
         }
@@ -263,8 +265,8 @@ impl<'a, 'b> LazyAnalysis<'a, 'b> {
 fn load_program<'a>(
     filename: &Path,
     program_id: Pubkey,
-    invoke_context: &InvokeContext<'a>,
-) -> Executable<InvokeContext<'a>> {
+    invoke_context: &InvokeContext<'a, 'a>,
+) -> Executable<InvokeContext<'a, 'a>> {
     let mut file = File::open(filename).unwrap();
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic).unwrap();
@@ -324,9 +326,10 @@ fn load_program<'a>(
     #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
     verified_executable.jit_compile().unwrap();
     unsafe {
-        std::mem::transmute::<Executable<InvokeContext<'static>>, Executable<InvokeContext<'a>>>(
-            verified_executable,
-        )
+        std::mem::transmute::<
+            Executable<InvokeContext<'static, 'static>>,
+            Executable<InvokeContext<'a, 'a>>,
+        >(verified_executable)
     }
 }
 
@@ -488,7 +491,7 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
 
     // Adding `DELAY_VISIBILITY_SLOT_OFFSET` to slots to accommodate for delay visibility of the program
     let mut program_cache_for_tx_batch =
-        bank.new_program_cache_for_tx_batch_for_slot(bank.slot() + DELAY_VISIBILITY_SLOT_OFFSET);
+        ProgramCacheForTxBatch::new(bank.slot() + DELAY_VISIBILITY_SLOT_OFFSET);
     for key in cached_account_keys {
         program_cache_for_tx_batch.replenish(
             key,

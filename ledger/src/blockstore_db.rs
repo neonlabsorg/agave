@@ -349,7 +349,7 @@ impl Rocks {
         &self,
         cf: &ColumnFamily,
         key: impl AsRef<[u8]>,
-    ) -> Result<Option<DBPinnableSlice>> {
+    ) -> Result<Option<DBPinnableSlice<'_>>> {
         let opt = self.db.get_pinned_cf(cf, key)?;
         Ok(opt)
     }
@@ -363,7 +363,7 @@ impl Rocks {
         &self,
         cf: &ColumnFamily,
         keys: I,
-    ) -> impl Iterator<Item = Result<Option<DBPinnableSlice>>>
+    ) -> impl Iterator<Item = Result<Option<DBPinnableSlice<'_>>>>
     where
         K: AsRef<[u8]> + 'a + ?Sized,
         I: IntoIterator<Item = &'a K>,
@@ -394,11 +394,11 @@ impl Rocks {
         &self,
         cf: &ColumnFamily,
         iterator_mode: RocksIteratorMode,
-    ) -> DBIterator {
+    ) -> DBIterator<'_> {
         self.db.iterator_cf(cf, iterator_mode)
     }
 
-    pub(crate) fn raw_iterator_cf(&self, cf: &ColumnFamily) -> Result<DBRawIterator> {
+    pub(crate) fn raw_iterator_cf(&self, cf: &ColumnFamily) -> Result<DBRawIterator<'_>> {
         Ok(self.db.raw_iterator_cf(cf))
     }
 
@@ -1335,7 +1335,7 @@ pub mod tests {
 
     #[test]
     fn test_open_unknown_columns() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path();
@@ -1344,7 +1344,6 @@ pub mod tests {
         {
             let options = BlockstoreOptions {
                 access_type: AccessType::Primary,
-                enforce_ulimit_nofile: false,
                 ..BlockstoreOptions::default()
             };
             let mut rocks = Rocks::open(db_path.to_path_buf(), options).unwrap();
@@ -1361,7 +1360,6 @@ pub mod tests {
         {
             let options = BlockstoreOptions {
                 access_type: AccessType::Secondary,
-                enforce_ulimit_nofile: false,
                 ..BlockstoreOptions::default()
             };
             let _ = Rocks::open(db_path.to_path_buf(), options).unwrap();
@@ -1369,7 +1367,6 @@ pub mod tests {
         {
             let options = BlockstoreOptions {
                 access_type: AccessType::Primary,
-                enforce_ulimit_nofile: false,
                 ..BlockstoreOptions::default()
             };
             let _ = Rocks::open(db_path.to_path_buf(), options).unwrap();
@@ -1378,7 +1375,7 @@ pub mod tests {
 
     #[test]
     fn test_remove_deprecated_progam_costs_column_compat() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         fn is_program_costs_column_present(path: &Path) -> bool {
             DB::list_cf(&Options::default(), path)
@@ -1392,7 +1389,6 @@ pub mod tests {
 
         let options = BlockstoreOptions {
             access_type: AccessType::Primary,
-            enforce_ulimit_nofile: false,
             ..BlockstoreOptions::default()
         };
 

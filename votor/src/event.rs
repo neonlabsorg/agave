@@ -1,8 +1,8 @@
 use {
+    agave_votor_messages::consensus_message::Block,
     crossbeam_channel::{Receiver, Sender},
     solana_clock::Slot,
     solana_runtime::bank::Bank,
-    solana_votor_messages::consensus_message::Block,
     std::{sync::Arc, time::Instant},
 };
 
@@ -72,8 +72,6 @@ pub enum VotorEvent {
 
 impl VotorEvent {
     /// Ignore old events
-    #[allow(dead_code)]
-    // TODO(wen): remove allow(dead_code) when event_handler is fully integrated
     pub(crate) fn should_ignore(&self, root: Slot) -> bool {
         match self {
             VotorEvent::Block(completed_block) => completed_block.slot <= root,

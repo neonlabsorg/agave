@@ -201,7 +201,7 @@ impl PartialEq for HeaviestSubtreeForkChoice {
 impl PartialOrd for HeaviestSubtreeForkChoice {
     // Sort by root
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.tree_root.cmp(&other.tree_root))
+        Some(self.cmp(other))
     }
 }
 
@@ -848,7 +848,7 @@ impl HeaviestSubtreeForkChoice {
         }
     }
 
-    fn ancestor_iterator(&self, start_slot_hash_key: SlotHashKey) -> AncestorIterator {
+    fn ancestor_iterator(&self, start_slot_hash_key: SlotHashKey) -> AncestorIterator<'_> {
         AncestorIterator::new(start_slot_hash_key, &self.fork_infos)
     }
 

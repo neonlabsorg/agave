@@ -12,9 +12,9 @@ use {
         bank::{Bank, BankSlotDelta, DropCallback},
         bank_forks::BankForks,
         snapshot_controller::SnapshotController,
-        snapshot_package::{SnapshotKind, SnapshotPackage},
-        snapshot_utils::SnapshotError,
+        snapshot_package::SnapshotPackage,
     },
+    agave_snapshots::{error::SnapshotError, SnapshotKind},
     crossbeam_channel::{Receiver, SendError, Sender},
     log::*,
     rayon::iter::{IntoParallelIterator, ParallelIterator},
@@ -715,8 +715,8 @@ fn cmp_snapshot_request_kinds_by_priority(
 mod test {
     use {
         super::*,
-        crate::{genesis_utils::create_genesis_config, snapshot_config::SnapshotConfig},
-        agave_snapshots::SnapshotInterval,
+        crate::genesis_utils::create_genesis_config,
+        agave_snapshots::{snapshot_config::SnapshotConfig, SnapshotInterval},
         crossbeam_channel::unbounded,
         solana_account::AccountSharedData,
         solana_epoch_schedule::EpochSchedule,
@@ -840,9 +840,12 @@ mod test {
 
                 // Since we're not using `BankForks::set_root()`, we have to handle sending the
                 // correct snapshot requests ourself.
-                if bank.block_height() % FULL_SNAPSHOT_INTERVAL == 0 {
+                if bank.block_height().is_multiple_of(FULL_SNAPSHOT_INTERVAL) {
                     send_snapshot_request(Arc::clone(&bank), SnapshotRequestKind::FullSnapshot);
-                } else if bank.block_height() % INCREMENTAL_SNAPSHOT_INTERVAL == 0 {
+                } else if bank
+                    .block_height()
+                    .is_multiple_of(INCREMENTAL_SNAPSHOT_INTERVAL)
+                {
                     send_snapshot_request(
                         Arc::clone(&bank),
                         SnapshotRequestKind::IncrementalSnapshot,

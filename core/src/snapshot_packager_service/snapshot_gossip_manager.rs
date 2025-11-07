@@ -1,13 +1,13 @@
 use {
-    solana_clock::Slot,
-    solana_gossip::cluster_info::ClusterInfo,
-    solana_hash::Hash,
-    solana_runtime::{
+    agave_snapshots::{
         snapshot_hash::{
             FullSnapshotHash, IncrementalSnapshotHash, SnapshotHash, StartingSnapshotHashes,
         },
-        snapshot_package::SnapshotKind,
+        SnapshotKind,
     },
+    solana_clock::Slot,
+    solana_gossip::cluster_info::ClusterInfo,
+    solana_hash::Hash,
     std::sync::Arc,
 };
 

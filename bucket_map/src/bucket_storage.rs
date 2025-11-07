@@ -357,7 +357,7 @@ impl<O: BucketOccupied> BucketStorage<O> {
         };
         let ptr = {
             let ptr = slice.as_ptr().cast();
-            debug_assert!(ptr as usize % std::mem::align_of::<T>() == 0);
+            debug_assert!((ptr as usize).is_multiple_of(std::mem::align_of::<T>()));
             ptr
         };
         unsafe { std::slice::from_raw_parts(ptr, len as usize) }
@@ -382,7 +382,7 @@ impl<O: BucketOccupied> BucketStorage<O> {
         };
         let ptr = {
             let ptr = slice.as_mut_ptr().cast();
-            debug_assert!(ptr as usize % std::mem::align_of::<T>() == 0);
+            debug_assert!((ptr as usize).is_multiple_of(std::mem::align_of::<T>()));
             ptr
         };
         unsafe { std::slice::from_raw_parts_mut(ptr, len as usize) }
@@ -628,7 +628,7 @@ mod test {
             count.clone(),
         )
         .is_none());
-        solana_logger::setup();
+        agave_logger::setup();
         for len in [0, 1, 47, 48, 49, 4097] {
             // create a zero len file. That will fail to load since it is too small.
             let path = tmpdir.path().join("small");

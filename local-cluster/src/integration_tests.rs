@@ -16,7 +16,7 @@ use {
         local_cluster::{ClusterConfig, LocalCluster},
         validator_configs::*,
     },
-    agave_snapshots::SnapshotInterval,
+    agave_snapshots::{snapshot_config::SnapshotConfig, SnapshotInterval},
     log::*,
     solana_account::AccountSharedData,
     solana_accounts_db::utils::create_accounts_run_and_snapshot_dirs,
@@ -39,7 +39,6 @@ use {
     solana_native_token::LAMPORTS_PER_SOL,
     solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
-    solana_runtime::snapshot_config::SnapshotConfig,
     solana_signer::Signer,
     solana_streamer::socket::SocketAddrSpace,
     solana_turbine::broadcast_stage::BroadcastStageType,
@@ -106,7 +105,6 @@ pub fn open_blockstore(ledger_path: &Path) -> Blockstore {
         BlockstoreOptions {
             access_type: AccessType::Primary,
             recovery_mode: None,
-            enforce_ulimit_nofile: true,
             ..BlockstoreOptions::default()
         },
     )
@@ -118,7 +116,6 @@ pub fn open_blockstore(ledger_path: &Path) -> Blockstore {
             BlockstoreOptions {
                 access_type: AccessType::Secondary,
                 recovery_mode: None,
-                enforce_ulimit_nofile: true,
                 ..BlockstoreOptions::default()
             },
         )
@@ -254,6 +251,7 @@ pub fn run_kill_partition_switch_threshold<C>(
         on_before_partition_resolved,
         on_partition_resolved,
         ticks_per_slot,
+        true,
         vec![],
     )
 }
@@ -290,13 +288,17 @@ pub fn create_custom_leader_schedule_with_random_keys(
 }
 
 /// This function runs a network, initiates a partition based on a
-/// configuration, resolve the partition, then checks that the network
-/// continues to achieve consensus
-/// # Arguments
+/// configuration, resolve the partition, then checks that the network continues
+/// to achieve consensus.
+///
+/// # Arguments:
 /// * `partitions` - A slice of partition configurations, where each partition
 ///   configuration is a usize representing a node's stake
 /// * `leader_schedule` - An option that specifies whether the cluster should
 ///   run with a fixed, predetermined leader schedule
+/// * `no_wait_for_vote_to_start_leader` - provide option to only allow the
+///   bootstrap to build blocks at first to minimize forking during cluster
+///   startup.
 #[allow(clippy::cognitive_complexity)]
 pub fn run_cluster_partition<C>(
     partitions: &[usize],
@@ -306,9 +308,10 @@ pub fn run_cluster_partition<C>(
     on_before_partition_resolved: impl FnOnce(&mut LocalCluster, &mut C),
     on_partition_resolved: impl FnOnce(&mut LocalCluster, &mut C),
     ticks_per_slot: Option<u64>,
+    no_wait_for_vote_to_start_leader: bool,
     additional_accounts: Vec<(Pubkey, AccountSharedData)>,
 ) {
-    solana_logger::setup_with_default(RUST_LOG_FILTER);
+    agave_logger::setup_with_default(RUST_LOG_FILTER);
     info!("PARTITION_TEST!");
     let num_nodes = partitions.len();
     let node_stakes: Vec<_> = partitions
@@ -318,8 +321,23 @@ pub fn run_cluster_partition<C>(
     assert_eq!(node_stakes.len(), num_nodes);
     let mint_lamports = node_stakes.iter().sum::<u64>() * 2;
     let turbine_disabled = Arc::new(AtomicBool::new(false));
+    let wait_for_supermajority = if no_wait_for_vote_to_start_leader {
+        // This helps nodes get a little more in sync by waiting for
+        // supermajority to observe slot 0. It still doesn't provide perfect
+        // synchronization because there is quite a bit of work todo after the
+        // sync point before nodes are fully operational.
+        Some(0)
+    } else {
+        // If we sync nodes on a slot, this overrides the flag to wait on
+        // building blocks until the node votes. But waiting for the bootstrap
+        // to build a block provides greater synchronization (less
+        // partitioning), so let that take precedence for these tests.
+        None
+    };
     let mut validator_config = ValidatorConfig {
         turbine_disabled: turbine_disabled.clone(),
+        wait_for_supermajority,
+        no_wait_for_vote_to_start_leader,
         ..ValidatorConfig::default_for_test()
     };
 
@@ -346,11 +364,17 @@ pub fn run_cluster_partition<C>(
         }
     };
 
+    // Always ensure at least one node is allowed to build blocks.
+    let mut validator_configs = make_identical_validator_configs(&validator_config, num_nodes);
+    validator_configs
+        .first_mut()
+        .unwrap()
+        .no_wait_for_vote_to_start_leader = true;
     let slots_per_epoch = 2048;
     let mut config = ClusterConfig {
         mint_lamports,
         node_stakes,
-        validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
+        validator_configs,
         validator_keys: Some(
             validator_keys
                 .into_iter()
@@ -485,6 +509,7 @@ pub fn test_faulty_node(
     validator_configs[0].broadcast_stage_type = faulty_node_type;
     for config in &mut validator_configs {
         config.fixed_leader_schedule = Some(fixed_leader_schedule.clone());
+        config.wait_for_supermajority = Some(0);
     }
 
     let mut cluster_config = ClusterConfig {

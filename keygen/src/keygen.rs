@@ -1,5 +1,6 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
+    agave_votor_messages::consensus_message::BLS_KEYPAIR_DERIVE_SEED,
     bip39::{Mnemonic, MnemonicType, Seed},
     clap::{
         builder::ValueParser, crate_description, crate_name, value_parser, Arg, ArgAction,
@@ -36,7 +37,6 @@ use {
     solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_signer::Signer,
-    solana_votor_messages::consensus_message::BLS_KEYPAIR_DERIVE_SEED,
     std::{
         collections::HashSet,
         error,
@@ -749,7 +749,7 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                             break;
                         }
                         let attempts = attempts.fetch_add(1, Ordering::Relaxed);
-                        if attempts % 1_000_000 == 0 {
+                        if attempts.is_multiple_of(1_000_000) {
                             println!(
                                 "Searched {} keypairs in {}s. {} matches found.",
                                 attempts,

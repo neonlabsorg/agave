@@ -1,4 +1,12 @@
-#![cfg(feature = "agave-unstable-api")]
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 
 #[macro_use]
@@ -8,10 +16,8 @@ pub mod commitment;
 pub mod common;
 mod consensus_metrics;
 pub mod consensus_pool;
-#[allow(dead_code)]
 mod consensus_pool_service;
 pub mod event;
-#[allow(dead_code)]
 mod event_handler;
 pub mod root_utils;
 mod staked_validators_cache;

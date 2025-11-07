@@ -273,12 +273,12 @@ mod tests {
                 .map(|(node_ix, pubkey)| {
                     let mut contact_info = ContactInfo::new(*pubkey, 0_u64, 0_u16);
 
-                    assert!(contact_info
+                    contact_info
                         .set_alpenglow((
                             Ipv4Addr::LOCALHOST,
-                            8080_u16.saturating_add(node_ix as u16)
+                            8080_u16.saturating_add(node_ix as u16),
                         ))
-                        .is_ok());
+                        .unwrap();
 
                     contact_info
                 });
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_alpenglow_port_override() {
-        solana_logger::setup();
+        agave_logger::setup();
         let (bank_forks, cluster_info, node_pubkeys) = create_bank_forks_and_cluster_info(3, 0, 1);
         let pubkey_b = node_pubkeys[1];
 

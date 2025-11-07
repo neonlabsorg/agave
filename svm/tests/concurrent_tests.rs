@@ -67,16 +67,13 @@ fn program_cache_execution(threads: usize) {
                     &feature_set,
                     0,
                 );
-                let mut result = {
-                    let global_program_cache = processor.global_program_cache.read().unwrap();
-                    ProgramCacheForTxBatch::new(
-                        processor.slot,
-                        global_program_cache.latest_root_epoch,
-                    )
-                };
+                let mut result = ProgramCacheForTxBatch::new(processor.slot);
+                let program_runtime_environments_for_execution =
+                    processor.get_environments_for_epoch(processor.epoch);
                 processor.replenish_program_cache(
                     &account_loader,
                     &maps,
+                    &program_runtime_environments_for_execution,
                     &mut result,
                     &mut ExecuteTimings::default(),
                     false,
@@ -266,7 +263,12 @@ fn svm_concurrent() {
                     &*local_bank,
                     &th_txs,
                     check_results,
-                    &TransactionProcessingEnvironment::default(),
+                    &TransactionProcessingEnvironment {
+                        program_runtime_environments_for_execution: local_batch
+                            .environments
+                            .clone(),
+                        ..TransactionProcessingEnvironment::default()
+                    },
                     &processing_config,
                 );
 

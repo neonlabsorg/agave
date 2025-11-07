@@ -472,6 +472,11 @@ fn split_batches(batches: Vec<PacketBatch>) -> (Vec<BytesPacketBatch>, Vec<Pinne
         match batch {
             PacketBatch::Bytes(batch) => bytes_batches.push(batch),
             PacketBatch::Pinned(batch) => pinned_batches.push(batch),
+            PacketBatch::Single(packet) => {
+                let mut batch = BytesPacketBatch::with_capacity(1);
+                batch.push(packet);
+                bytes_batches.push(batch);
+            }
         }
     }
     (bytes_batches, pinned_batches)
@@ -650,6 +655,12 @@ pub fn ed25519_verify(
         .map(|batch| match batch {
             PacketBatch::Pinned(batch) => Cow::Borrowed(batch),
             PacketBatch::Bytes(batch) => Cow::Owned(batch.to_pinned_packet_batch()),
+            PacketBatch::Single(packet) => {
+                // this is ugly, but unused (gpu code) and will be removed shortly in follow up PR
+                let mut batch = BytesPacketBatch::with_capacity(1);
+                batch.push(packet.clone());
+                Cow::Owned(batch.to_pinned_packet_batch())
+            }
         })
         .collect::<Vec<_>>();
     for batch in pinned_batches.iter() {
@@ -865,7 +876,7 @@ mod tests {
 
     #[test]
     fn test_pubkey_too_small() {
-        solana_logger::setup();
+        agave_logger::setup();
         let mut tx = test_tx();
         let sig = tx.signatures[0];
         const NUM_SIG: usize = 18;
@@ -889,7 +900,7 @@ mod tests {
     fn test_pubkey_len() {
         // See that the verify cannot walk off the end of the packet
         // trying to index into the account_keys to access pubkey.
-        solana_logger::setup();
+        agave_logger::setup();
 
         const NUM_SIG: usize = 17;
         let keypair1 = Keypair::new();
@@ -1235,7 +1246,7 @@ mod tests {
 
     #[test]
     fn test_verify_multisig() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let tx = test_multisig_tx();
         let mut data = bincode::serialize(&tx).unwrap();
@@ -1273,7 +1284,7 @@ mod tests {
 
     #[test]
     fn test_verify_fuzz() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let tx = test_multisig_tx();
         let packet = BytesPacket::from_data(None, tx).unwrap();
@@ -1333,7 +1344,7 @@ mod tests {
 
     #[test]
     fn test_get_checked_scalar() {
-        solana_logger::setup();
+        agave_logger::setup();
         if perf_libs::api().is_none() {
             return;
         }
@@ -1368,7 +1379,7 @@ mod tests {
 
     #[test]
     fn test_ge_small_order() {
-        solana_logger::setup();
+        agave_logger::setup();
         if perf_libs::api().is_none() {
             return;
         }
@@ -1410,7 +1421,7 @@ mod tests {
 
     #[test]
     fn test_is_simple_vote_transaction() {
-        solana_logger::setup();
+        agave_logger::setup();
         let mut rng = rand::thread_rng();
 
         // transfer tx is not
@@ -1493,7 +1504,7 @@ mod tests {
 
     #[test]
     fn test_is_simple_vote_transaction_with_offsets() {
-        solana_logger::setup();
+        agave_logger::setup();
         let mut rng = rand::thread_rng();
 
         // batch of legacy messages

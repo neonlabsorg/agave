@@ -230,6 +230,8 @@ impl Tvu {
             rpc_subscriptions.clone(),
             slot_status_notifier.clone(),
             tvu_config.xdp_sender,
+            // votor_event_sender is Alpenglow specific sender, it is None if Alpenglow is not enabled.
+            None,
         );
 
         let (ancestor_duplicate_slots_sender, ancestor_duplicate_slots_receiver) = unbounded();
@@ -483,7 +485,7 @@ pub mod tests {
     };
 
     fn test_tvu_exit(enable_wen_restart: bool) {
-        solana_logger::setup();
+        agave_logger::setup();
         let leader = Node::new_localhost();
         let target1_keypair = Keypair::new();
         let target1 = Node::new_localhost_with_pubkey(&target1_keypair.pubkey());
