@@ -291,7 +291,7 @@ hyper-proxy = "0.9.1"
 im = "15.1.0"
 indexmap = "2.11.4"
 indicatif = "0.18.2"
-io-uring = "0.7.10"
+io-uring = "0.7.11"
 itertools = "0.12.1"
 jemallocator = { package = "tikv-jemallocator", version = "0.6.0", features = [
     "unprefixed_malloc_on_supported_platforms",
@@ -370,9 +370,9 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde-big-array = "0.5.1"
 serde_bytes = "0.11.19"
 serde_json = "1.0.145"
-serde_with = { version = "3.15.0", default-features = false }
+serde_with = { version = "3.15.1", default-features = false }
 serde_yaml = "0.9.34"
-serial_test = "2.0.0"
+serial_test = "3.2.0"
 sha2 = "0.10.9"
 sha3 = "0.10.8"
 shaq = { version = "1.0.0" }
@@ -509,7 +509,7 @@ solana-rpc-client-types = { path = "rpc-client-types", version = "=4.0.0-alpha.0
 solana-runtime = { path = "runtime", version = "=4.0.0-alpha.0", features = ["agave-unstable-api"] }
 solana-runtime-transaction = { path = "runtime-transaction", version = "=4.0.0-alpha.0", features = ["agave-unstable-api"] }
 solana-sanitize = "3.0.1"
-solana-sbpf = { version = "=0.13.0", default-features = false }
+solana-sbpf = { version = "=0.13.1", default-features = false }
 solana-sdk-ids = "3.0.0"
 solana-secp256k1-program = "3.0.0"
 solana-secp256k1-recover = "3.0.0"
