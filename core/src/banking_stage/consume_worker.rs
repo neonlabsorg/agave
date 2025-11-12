@@ -489,7 +489,7 @@ pub(crate) mod external {
             // creating an iterator for the results.
             let mut resolved_pubkeys = Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE);
 
-            for tx in batch.iter() {
+            for (tx, _) in batch.iter() {
                 resolved_pubkeys.push(self.resolve_transaction_ptr(
                     tx,
                     enable_static_instruction_limit,
@@ -632,7 +632,7 @@ pub(crate) mod external {
             let mut translation_results = Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE);
             let mut transactions = Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE);
             let mut max_ages = Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE);
-            for transaction_ptr in batch.iter() {
+            for (transaction_ptr, _) in batch.iter() {
                 match Self::translate_transaction(
                     transaction_ptr,
                     working_bank,
