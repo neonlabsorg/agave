@@ -554,10 +554,14 @@ impl Accounts {
         &self,
         accounts: impl StorableAccounts<'a>,
         transactions: Option<&'a [&'a SanitizedTransaction]>,
+        inner_instructions: Option<
+            &'a [&'a Option<solana_message::inner_instruction::InnerInstructionsList>],
+        >,
     ) {
         self.accounts_db.store_accounts_unfrozen(
             accounts,
             transactions,
+            inner_instructions,
             UpdateIndexThreadSelection::Inline,
         );
     }
@@ -574,6 +578,7 @@ impl Accounts {
         self.accounts_db.store_accounts_unfrozen(
             accounts,
             transactions,
+            None,
             UpdateIndexThreadSelection::PoolWithThreshold,
         );
     }

@@ -1,6 +1,7 @@
 use {
     core::borrow::Borrow,
     solana_account::AccountSharedData,
+    solana_message::inner_instruction::InnerInstructionsList,
     solana_pubkey::Pubkey,
     solana_svm::{
         rollback_accounts::RollbackAccounts,
@@ -55,10 +56,14 @@ pub fn collect_accounts_to_store<'a, T: SVMMessage>(
 ) -> (
     Vec<(&'a Pubkey, &'a AccountSharedData)>,
     Option<Vec<&'a SanitizedTransaction>>,
+    Option<Vec<&'a Option<InnerInstructionsList>>>,
 ) {
     let collect_capacity = max_number_of_accounts_to_collect(txs, processing_results);
     let mut accounts = Vec::with_capacity(collect_capacity);
     let mut transactions = txs_refs
+        .is_some()
+        .then(|| Vec::with_capacity(collect_capacity));
+    let mut inner_instructions = txs_refs
         .is_some()
         .then(|| Vec::with_capacity(collect_capacity));
     for (index, (processing_result, transaction)) in processing_results.iter().zip(txs).enumerate()
@@ -75,14 +80,17 @@ pub fn collect_accounts_to_store<'a, T: SVMMessage>(
                     collect_accounts_for_successful_tx(
                         &mut accounts,
                         &mut transactions,
+                        &mut inner_instructions,
                         transaction,
                         transaction_ref,
                         &executed_tx.loaded_transaction.accounts,
+                        &executed_tx.execution_details.inner_instructions,
                     );
                 } else {
                     collect_accounts_for_failed_tx(
                         &mut accounts,
                         &mut transactions,
+                        &mut inner_instructions,
                         transaction_ref,
                         &executed_tx.loaded_transaction.rollback_accounts,
                     );
@@ -92,21 +100,24 @@ pub fn collect_accounts_to_store<'a, T: SVMMessage>(
                 collect_accounts_for_failed_tx(
                     &mut accounts,
                     &mut transactions,
+                    &mut inner_instructions,
                     transaction_ref,
                     &fees_only_tx.rollback_accounts,
                 );
             }
         }
     }
-    (accounts, transactions)
+    (accounts, transactions, inner_instructions)
 }
 
 fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
     collected_accounts: &mut Vec<(&'a Pubkey, &'a AccountSharedData)>,
     collected_account_transactions: &mut Option<Vec<&'a SanitizedTransaction>>,
+    collected_inner_instructions: &mut Option<Vec<&'a Option<InnerInstructionsList>>>,
     transaction: &'a T,
     transaction_ref: Option<&'a SanitizedTransaction>,
     transaction_accounts: &'a [TransactionAccount],
+    inner_instructions: &'a Option<InnerInstructionsList>,
 ) {
     for (i, (address, account)) in (0..transaction.account_keys().len()).zip(transaction_accounts) {
         if !transaction.is_writable(i) {
@@ -126,12 +137,16 @@ fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
             collected_account_transactions
                 .push(transaction_ref.expect("transaction ref must exist if collecting"));
         }
+        if let Some(collected_inner_instructions) = collected_inner_instructions {
+            collected_inner_instructions.push(inner_instructions);
+        }
     }
 }
 
 fn collect_accounts_for_failed_tx<'a>(
     collected_accounts: &mut Vec<(&'a Pubkey, &'a AccountSharedData)>,
     collected_account_transactions: &mut Option<Vec<&'a SanitizedTransaction>>,
+    collected_inner_instructions: &mut Option<Vec<&'a Option<InnerInstructionsList>>>,
     transaction_ref: Option<&'a SanitizedTransaction>,
     rollback_accounts: &'a RollbackAccounts,
 ) {
@@ -140,6 +155,10 @@ fn collect_accounts_for_failed_tx<'a>(
         if let Some(collected_account_transactions) = collected_account_transactions {
             collected_account_transactions
                 .push(transaction_ref.expect("transaction ref must exist if collecting"));
+        }
+        if let Some(collected_inner_instructions) = collected_inner_instructions {
+            // Failed transactions don't have inner instructions
+            collected_inner_instructions.push(&None);
         }
     }
 }
@@ -271,7 +290,7 @@ mod tests {
 
         for collect_transactions in [false, true] {
             let transaction_refs = collect_transactions.then(|| txs.iter().collect::<Vec<_>>());
-            let (collected_accounts, transactions) =
+            let (collected_accounts, transactions, _) =
                 collect_accounts_to_store(&txs, &transaction_refs, &processing_results);
             assert_eq!(collected_accounts.len(), 2);
             assert!(collected_accounts
@@ -335,7 +354,7 @@ mod tests {
 
         for collect_transactions in [false, true] {
             let transaction_refs = collect_transactions.then(|| txs.iter().collect::<Vec<_>>());
-            let (collected_accounts, transactions) =
+            let (collected_accounts, transactions, _) =
                 collect_accounts_to_store(&txs, &transaction_refs, &processing_results);
             assert_eq!(collected_accounts.len(), 1);
             assert_eq!(
@@ -427,7 +446,7 @@ mod tests {
 
         for collect_transactions in [false, true] {
             let transaction_refs = collect_transactions.then(|| txs.iter().collect::<Vec<_>>());
-            let (collected_accounts, transactions) =
+            let (collected_accounts, transactions, _) =
                 collect_accounts_to_store(&txs, &transaction_refs, &processing_results);
             assert_eq!(collected_accounts.len(), 2);
             assert_eq!(
@@ -532,7 +551,7 @@ mod tests {
 
         for collect_transactions in [false, true] {
             let transaction_refs = collect_transactions.then(|| txs.iter().collect::<Vec<_>>());
-            let (collected_accounts, transactions) =
+            let (collected_accounts, transactions, _) =
                 collect_accounts_to_store(&txs, &transaction_refs, &processing_results);
             assert_eq!(collected_accounts.len(), 1);
             let collected_nonce_account = collected_accounts
@@ -588,7 +607,7 @@ mod tests {
 
         for collect_transactions in [false, true] {
             let transaction_refs = collect_transactions.then(|| txs.iter().collect::<Vec<_>>());
-            let (collected_accounts, transactions) =
+            let (collected_accounts, transactions, _) =
                 collect_accounts_to_store(&txs, &transaction_refs, &processing_results);
             assert_eq!(collected_accounts.len(), 1);
             assert_eq!(
