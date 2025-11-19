@@ -1,7 +1,85 @@
 use {
-    crate::accounts_db::AccountsDb, solana_account::AccountSharedData, solana_clock::Slot,
-    solana_pubkey::Pubkey, solana_transaction::sanitized::SanitizedTransaction,
+    crate::accounts_db::AccountsDb,
+    solana_account::{AccountSharedData, ReadableAccount},
+    solana_clock::Slot,
+    solana_pubkey::Pubkey,
+    solana_system_interface::program as system_program,
+    solana_transaction::sanitized::SanitizedTransaction,
 };
+
+/// Determines if an account can be mutated by a program during transaction execution.
+/// This implements Solana's runtime rules for account mutability:
+/// - Sysvars cannot be mutated (checked by base58 prefix)
+/// - System program can modify any account's lamports
+/// - Other programs can only modify accounts they own
+fn can_runtime_mutate_account(
+    invoked_program_id: &Pubkey,
+    account_owner: &Pubkey,
+    account_pubkey: &Pubkey,
+) -> bool {
+    let pubkey_str = account_pubkey.to_string();
+    if pubkey_str.starts_with("Sysvar") {
+        return false;
+    }
+
+    if system_program::check_id(invoked_program_id) {
+        return true;
+    }
+
+    account_owner == invoked_program_id
+}
+
+/// Determines whether an account should be notified to Geyser plugins.
+/// Returns true if the account can actually be mutated by the transaction.
+///
+/// Optimized to check account mutability with early exits:
+/// - Fee payer (index 0) is always mutable
+/// - Only writable accounts are checked
+/// - Only instructions that touch the account are examined
+/// - Ownership rules determine if program can mutate the account
+fn should_notify_account_to_geyser(
+    txn: &Option<&SanitizedTransaction>,
+    account: &AccountSharedData,
+    pubkey: &Pubkey,
+) -> bool {
+    let Some(txn) = txn else {
+        return true;
+    };
+
+    let message = txn.message();
+    let account_keys = message.account_keys();
+
+    let account_index = account_keys.iter().position(|key| key == pubkey);
+    let Some(account_index) = account_index else {
+        // Account not in transaction - shouldn't happen, but notify to be safe
+        return true;
+    };
+
+    if !message.is_writable(account_index) {
+        return false;
+    }
+
+    if account_index == 0 {
+        return true;
+    }
+
+    for (program_id, instruction) in message.program_instructions_iter() {
+        let touches_account = instruction
+            .accounts
+            .iter()
+            .any(|&idx| idx as usize == account_index);
+
+        if !touches_account {
+            continue;
+        }
+
+        if can_runtime_mutate_account(program_id, account.owner(), pubkey) {
+            return true;
+        }
+    }
+
+    false
+}
 
 impl AccountsDb {
     pub fn notify_account_at_accounts_update(
@@ -13,13 +91,16 @@ impl AccountsDb {
         write_version: u64,
     ) {
         if let Some(accounts_update_notifier) = &self.accounts_update_notifier {
-            accounts_update_notifier.notify_account_update(
-                slot,
-                account,
-                txn,
-                pubkey,
-                write_version,
-            );
+            // Filter accounts based on whether they can actually be mutated by the transaction
+            if should_notify_account_to_geyser(txn, account, pubkey) {
+                accounts_update_notifier.notify_account_update(
+                    slot,
+                    account,
+                    txn,
+                    pubkey,
+                    write_version,
+                );
+            }
         }
     }
 }
