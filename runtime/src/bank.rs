@@ -3640,7 +3640,7 @@ impl Bank {
                         .collect::<Vec<_>>()
                 });
 
-            let (accounts_to_store, transactions) = collect_accounts_to_store(
+            let (accounts_to_store, transactions, inner_instructions) = collect_accounts_to_store(
                 sanitized_txs,
                 &maybe_transaction_refs,
                 &processing_results,
@@ -3650,9 +3650,11 @@ impl Bank {
             self.update_bank_hash_stats(&to_store);
             // See https://github.com/solana-labs/solana/pull/31455 for discussion
             // on *not* updating the index within a threadpool.
-            self.rc
-                .accounts
-                .store_accounts_seq(to_store, transactions.as_deref());
+            self.rc.accounts.store_accounts_seq(
+                to_store,
+                transactions.as_deref(),
+                inner_instructions.as_deref(),
+            );
         });
 
         // Cached vote and stake accounts are synchronized with accounts-db
