@@ -4,6 +4,7 @@ use {
     solana_clock::Slot,
     solana_message::inner_instruction::InnerInstructionsList,
     solana_pubkey::Pubkey,
+    solana_sdk_ids::sysvar as sysvar_program,
     solana_system_interface::program as system_program,
     solana_transaction::sanitized::SanitizedTransaction,
 };
@@ -13,13 +14,8 @@ use {
 /// - Sysvars cannot be mutated (checked by base58 prefix)
 /// - System program can modify any account's lamports
 /// - Other programs can only modify accounts they own
-fn can_runtime_mutate_account(
-    invoked_program_id: &Pubkey,
-    account_owner: &Pubkey,
-    account_pubkey: &Pubkey,
-) -> bool {
-    let pubkey_str = account_pubkey.to_string();
-    if pubkey_str.starts_with("Sysvar") {
+fn can_runtime_mutate_account(invoked_program_id: &Pubkey, account_owner: &Pubkey) -> bool {
+    if sysvar_program::check_id(account_owner) {
         return false;
     }
 
@@ -81,7 +77,7 @@ fn should_notify_account_to_geyser(
             continue;
         }
 
-        if can_runtime_mutate_account(program_id, account.owner(), pubkey) {
+        if can_runtime_mutate_account(program_id, account.owner()) {
             return true;
         }
     }
@@ -101,7 +97,7 @@ fn should_notify_account_to_geyser(
 
             let prog_idx = ix.instruction.program_id_index as usize;
             if let Some(program_id) = account_keys.get(prog_idx) {
-                if can_runtime_mutate_account(program_id, account.owner(), pubkey) {
+                if can_runtime_mutate_account(program_id, account.owner()) {
                     return true;
                 }
             }
