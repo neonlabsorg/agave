@@ -56,7 +56,7 @@ pub fn collect_accounts_to_store<'a, T: SVMMessage>(
 ) -> (
     Vec<(&'a Pubkey, &'a AccountSharedData)>,
     Option<Vec<&'a SanitizedTransaction>>,
-    Option<Vec<&'a Option<InnerInstructionsList>>>,
+    Option<Vec<&'a InnerInstructionsList>>,
 ) {
     let collect_capacity = max_number_of_accounts_to_collect(txs, processing_results);
     let mut accounts = Vec::with_capacity(collect_capacity);
@@ -113,7 +113,7 @@ pub fn collect_accounts_to_store<'a, T: SVMMessage>(
 fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
     collected_accounts: &mut Vec<(&'a Pubkey, &'a AccountSharedData)>,
     collected_account_transactions: &mut Option<Vec<&'a SanitizedTransaction>>,
-    collected_inner_instructions: &mut Option<Vec<&'a Option<InnerInstructionsList>>>,
+    collected_inner_instructions: &mut Option<Vec<&'a InnerInstructionsList>>,
     transaction: &'a T,
     transaction_ref: Option<&'a SanitizedTransaction>,
     transaction_accounts: &'a [TransactionAccount],
@@ -138,7 +138,13 @@ fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
                 .push(transaction_ref.expect("transaction ref must exist if collecting"));
         }
         if let Some(collected_inner_instructions) = collected_inner_instructions {
-            collected_inner_instructions.push(inner_instructions);
+            // Use static empty vec for None case to avoid temporary value
+            static EMPTY_INNER_INSTRUCTIONS: InnerInstructionsList = Vec::new();
+
+            let inner_instr = inner_instructions
+                .as_ref()
+                .unwrap_or(&EMPTY_INNER_INSTRUCTIONS);
+            collected_inner_instructions.push(inner_instr);
         }
     }
 }
@@ -146,7 +152,7 @@ fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
 fn collect_accounts_for_failed_tx<'a>(
     collected_accounts: &mut Vec<(&'a Pubkey, &'a AccountSharedData)>,
     collected_account_transactions: &mut Option<Vec<&'a SanitizedTransaction>>,
-    collected_inner_instructions: &mut Option<Vec<&'a Option<InnerInstructionsList>>>,
+    collected_inner_instructions: &mut Option<Vec<&'a InnerInstructionsList>>,
     transaction_ref: Option<&'a SanitizedTransaction>,
     rollback_accounts: &'a RollbackAccounts,
 ) {
@@ -157,8 +163,11 @@ fn collect_accounts_for_failed_tx<'a>(
                 .push(transaction_ref.expect("transaction ref must exist if collecting"));
         }
         if let Some(collected_inner_instructions) = collected_inner_instructions {
+            // Default empty inner instructions for failed transactions
+            static EMPTY_INNER_INSTRUCTIONS: InnerInstructionsList = Vec::new();
+
             // Failed transactions don't have inner instructions
-            collected_inner_instructions.push(&None);
+            collected_inner_instructions.push(&EMPTY_INNER_INSTRUCTIONS);
         }
     }
 }

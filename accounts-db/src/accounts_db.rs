@@ -6110,9 +6110,7 @@ impl AccountsDb {
         &self,
         accounts: impl StorableAccounts<'a>,
         transactions: Option<&'a [&'a SanitizedTransaction]>,
-        inner_instructions: Option<
-            &'a [&'a Option<InnerInstructionsList>],
-        >,
+        inner_instructions: Option<&'a [&'a InnerInstructionsList]>,
         update_index_thread_selection: UpdateIndexThreadSelection,
     ) {
         // If all transactions in a batch are errored,
@@ -6279,7 +6277,7 @@ impl AccountsDb {
         slot: Slot,
         accounts_and_meta_to_store: &impl StorableAccounts<'b>,
         txs: Option<&[&SanitizedTransaction]>,
-        inner_instructions: Option<&[&Option<InnerInstructionsList>]>,
+        inner_instructions: Option<&[&InnerInstructionsList]>,
     ) -> Vec<AccountInfo> {
         let mut current_write_version = if self.accounts_update_notifier.is_some() {
             self.write_version
@@ -6307,7 +6305,7 @@ impl AccountsDb {
                         &txn,
                         pubkey,
                         current_write_version,
-                        inner_instr.unwrap_or(&None),
+                        &inner_instr,
                     );
                     current_write_version = current_write_version.saturating_add(1);
 

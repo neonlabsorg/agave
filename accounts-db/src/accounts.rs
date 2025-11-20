@@ -17,7 +17,7 @@ use {
         self as address_lookup_table, error::AddressLookupError, state::AddressLookupTable,
     },
     solana_clock::{BankId, Slot},
-    solana_message::v0::LoadedAddresses,
+    solana_message::{inner_instruction::InnerInstructionsList, v0::LoadedAddresses},
     solana_pubkey::Pubkey,
     solana_slot_hashes::SlotHashes,
     solana_svm_transaction::{
@@ -554,9 +554,7 @@ impl Accounts {
         &self,
         accounts: impl StorableAccounts<'a>,
         transactions: Option<&'a [&'a SanitizedTransaction]>,
-        inner_instructions: Option<
-            &'a [&'a Option<solana_message::inner_instruction::InnerInstructionsList>],
-        >,
+        inner_instructions: Option<&'a [&'a InnerInstructionsList]>,
     ) {
         self.accounts_db.store_accounts_unfrozen(
             accounts,

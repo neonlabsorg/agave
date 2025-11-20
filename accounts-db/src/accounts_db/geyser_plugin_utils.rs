@@ -11,6 +11,7 @@ use {
     solana_message::inner_instruction::InnerInstructionsList,
     solana_metrics::*,
     solana_pubkey::Pubkey,
+    solana_sdk_ids::sysvar as sysvar_program,
     solana_system_interface::program as system_program,
     solana_transaction::sanitized::SanitizedTransaction,
     std::{
@@ -59,13 +60,8 @@ impl AddAssign for GeyserPluginNotifyAtSnapshotRestoreStats {
 /// - Sysvars cannot be mutated (checked by base58 prefix)
 /// - System program can modify any account's lamports
 /// - Other programs can only modify accounts they own
-fn can_runtime_mutate_account(
-    invoked_program_id: &Pubkey,
-    account_owner: &Pubkey,
-    account_pubkey: &Pubkey,
-) -> bool {
-    let pubkey_str = account_pubkey.to_string();
-    if pubkey_str.starts_with("Sysvar") {
+fn can_runtime_mutate_account(invoked_program_id: &Pubkey, account_owner: &Pubkey) -> bool {
+    if sysvar_program::check_id(account_owner) {
         return false;
     }
 
@@ -89,7 +85,7 @@ fn should_notify_account_to_geyser(
     txn: &Option<&SanitizedTransaction>,
     account: &AccountSharedData,
     pubkey: &Pubkey,
-    inner_instructions: &Option<InnerInstructionsList>,
+    inner_instructions: &Option<&InnerInstructionsList>,
 ) -> bool {
     let Some(txn) = txn else {
         return true;
@@ -112,6 +108,10 @@ fn should_notify_account_to_geyser(
         return true;
     }
 
+    let Some(inner_instructions) = inner_instructions else {
+        return true;
+    };
+
     // Check top-level instructions
     for (program_id, instruction) in message.program_instructions_iter() {
         let touches_account = instruction
@@ -123,30 +123,28 @@ fn should_notify_account_to_geyser(
             continue;
         }
 
-        if can_runtime_mutate_account(program_id, account.owner(), pubkey) {
+        if can_runtime_mutate_account(program_id, account.owner()) {
             return true;
         }
     }
 
     // Check inner instructions (CPIs)
-    if let Some(inner_instructions) = inner_instructions {
-        for instruction_list in inner_instructions {
-            for ix in instruction_list {
-                let touches_account = ix
-                    .instruction
-                    .accounts
-                    .iter()
-                    .any(|&idx| idx as usize == account_index);
+    for instruction_list in inner_instructions.iter() {
+        for ix in instruction_list {
+            let touches_account = ix
+                .instruction
+                .accounts
+                .iter()
+                .any(|&idx| idx as usize == account_index);
 
-                if !touches_account {
-                    continue;
-                }
+            if !touches_account {
+                continue;
+            }
 
-                let prog_idx = ix.instruction.program_id_index as usize;
-                if let Some(program_id) = account_keys.get(prog_idx) {
-                    if can_runtime_mutate_account(program_id, account.owner(), pubkey) {
-                        return true;
-                    }
+            let prog_idx = ix.instruction.program_id_index as usize;
+            if let Some(program_id) = account_keys.get(prog_idx) {
+                if can_runtime_mutate_account(program_id, account.owner()) {
+                    return true;
                 }
             }
         }
@@ -193,7 +191,7 @@ impl AccountsDb {
         txn: &Option<&SanitizedTransaction>,
         pubkey: &Pubkey,
         write_version: u64,
-        inner_instructions: &Option<InnerInstructionsList>,
+        inner_instructions: &Option<&InnerInstructionsList>,
     ) {
         if let Some(accounts_update_notifier) = &self.accounts_update_notifier {
             // Filter accounts based on whether they can actually be mutated by the transaction
