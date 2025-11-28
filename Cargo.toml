@@ -704,3 +704,15 @@ crossbeam-epoch = { git = "https://github.com/anza-xyz/crossbeam", rev = "fd279d
 # There is a similar override in `programs/sbf/Cargo.toml`.  Please keep both
 # comments and the overrides in sync.
 solana-curve25519 = { path = "curves/curve25519" }
+
+solana-genesis-config = { git = "https://github.com/neonlabsorg/solana-sdk.git", branch = "gasless" }
+solana-fee-structure  = { git = "https://github.com/neonlabsorg/solana-sdk.git", branch = "gasless" }
+solana-rent           = { git = "https://github.com/neonlabsorg/solana-sdk.git", branch = "gasless" }
+solana-inflation      = { git = "https://github.com/neonlabsorg/solana-sdk.git", branch = "gasless" }
+solana-poh-config     = { git = "https://github.com/neonlabsorg/solana-sdk.git", branch = "gasless" }
+solana-native-token   = { git = "https://github.com/neonlabsorg/solana-sdk.git", branch = "gasless" }
+solana-clock = { git = "https://github.com/neonlabsorg/solana-sdk.git", branch = "gasless" }
+solana-account-info = { git = "https://github.com/neonlabsorg/solana-sdk.git", branch = "gasless" }
+solana-account-view = { git = "https://github.com/neonlabsorg/solana-sdk.git", branch = "gasless" }
+solana-fee-calculator = { git = "https://github.com/neonlabsorg/solana-sdk.git", branch = "gasless" }
+solana-system-interface = { git = "https://github.com/neonlabsorg/solana-sdk.git", branch = "gasless" }
