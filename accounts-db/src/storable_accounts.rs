@@ -367,7 +367,7 @@ pub mod tests {
             accounts_file::AccountsFileProvider,
         },
         rand::Rng,
-        solana_account::{accounts_equal, AccountSharedData, WritableAccount},
+        solana_account::{accounts_equal, AccountSharedData},
         std::sync::Arc,
     };
 
@@ -547,9 +547,9 @@ pub mod tests {
                     let mut raw4 = Vec::new();
                     for entry in 0..entries {
                         let pk = Pubkey::from([entry; 32]);
-                        let account = AccountSharedData::create(
+                        let account = AccountSharedData::create_from_existing_shared_data(
                             (entry as u64) * starting_slot,
-                            Vec::default(),
+                            Arc::new(Vec::default()),
                             Pubkey::default(),
                             false,
                             0,
@@ -678,9 +678,9 @@ pub mod tests {
             let mut raw2 = Vec::new();
             for entry in 0..entries {
                 let pk = Pubkey::from([entry; 32]);
-                let account = AccountSharedData::create(
+                let account = AccountSharedData::create_from_existing_shared_data(
                     entry as u64,
-                    Vec::default(),
+                    Arc::new(Vec::default()),
                     Pubkey::default(),
                     false,
                     0,
@@ -813,7 +813,7 @@ pub mod tests {
         // each slot has a random number of accounts, between 1 and 10
         for _slot in 0..num_slots {
             // generate random accounts per slot
-            let n = rand::thread_rng().gen_range(1..10);
+            let n = rand::rng().random_range(1..10);
             total += n;
             let accounts = (0..n).map(|_| &account_from_storage).collect::<Vec<_>>();
             all_accounts.push(accounts);

@@ -15,7 +15,7 @@ use {
         restart::RestartableBucket,
         MaxSearch, RefCount,
     },
-    rand::{thread_rng, Rng},
+    rand::{rng, Rng},
     solana_measure::measure::Measure,
     solana_pubkey::Pubkey,
     std::{
@@ -129,7 +129,7 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
         let elem_size = NonZeroU64::new(std::mem::size_of::<IndexEntry<T>>() as u64).unwrap();
         let (index, random, reused_file_at_startup) = reuse_path
             .and_then(|path| {
-                // try to re-use the file this bucket was using last time we were running
+                // try to reuse the file this bucket was using last time we were running
                 restartable_bucket.get().and_then(|(_file_name, random)| {
                     let result = BucketStorage::load_on_restart(
                         path.clone(),
@@ -140,14 +140,14 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
                     )
                     .map(|index| (index, random, true /* true = reused file */));
                     if result.is_none() {
-                        // we couldn't re-use it, so delete it
+                        // we couldn't reuse it, so delete it
                         _ = fs::remove_file(path);
                     }
                     result
                 })
             })
             .unwrap_or_else(|| {
-                // no file to re-use, so create a new file
+                // no file to reuse, so create a new file
                 let (index, file_name) = BucketStorage::new(
                     Arc::clone(&drives),
                     1,
@@ -156,7 +156,7 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
                     Arc::clone(&stats.index),
                     count,
                 );
-                let random = thread_rng().gen();
+                let random = rng().random();
                 restartable_bucket.set_file(file_name, random);
                 (index, random, false /* true = reused file */)
             });
@@ -505,7 +505,7 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
     ) -> Result<(), BucketMapError> {
         let num_slots = data_len as u64;
         let best_fit_bucket = MultipleSlots::data_bucket_from_num_slots(data_len as u64);
-        // num_slots > 1 becuase we can store num_slots = 0 or num_slots = 1 in the index entry
+        // num_slots > 1 because we can store num_slots = 0 or num_slots = 1 in the index entry
         let requires_data_bucket = num_slots > 1 || ref_count != 1;
         if requires_data_bucket && self.data.get(best_fit_bucket as usize).is_none() {
             // fail early if the data bucket we need doesn't exist - we don't want the index entry partially allocated
@@ -593,7 +593,7 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
         let best_bucket = &mut self.data[best_fit_bucket as usize];
         let cap_power = best_bucket.contents.capacity_pow2();
         let cap = best_bucket.capacity();
-        let pos = thread_rng().gen_range(0..cap);
+        let pos = rng().random_range(0..cap);
         let mut success = false;
         // max search is increased here by a lot for this search. The idea is that we just have to find an empty bucket somewhere.
         // We don't mind waiting on a new write (by searching longer). Writing is done in the background only.
@@ -1012,7 +1012,7 @@ mod tests {
                         &mut hashed,
                         &mut entries_created,
                         &mut duplicates,
-                        // call re-use code first
+                        // call reuse code first
                         true,
                     );
                     assert_eq!(entries_created, 0);

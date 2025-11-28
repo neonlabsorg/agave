@@ -86,7 +86,9 @@ impl PartitionedStakeRewards {
     }
 
     unsafe fn assume_init(&mut self, num_stake_rewards: usize) {
-        self.rewards.set_len(self.rewards.capacity());
+        unsafe {
+            self.rewards.set_len(self.rewards.capacity());
+        }
         self.num_rewards = num_stake_rewards;
     }
 }
@@ -952,7 +954,7 @@ mod tests {
                 let _ = bank_forks.write().unwrap().set_root(slot - 1, None, None);
                 assert_eq!(curr_bank.get_epoch_rewards_cache_len(), 0);
             } else if slot == SLOTS_PER_EPOCH + 2 {
-                // When curr_slot == SLOTS_PER_EPOCH + 2, the 3nd block of
+                // When curr_slot == SLOTS_PER_EPOCH + 2, the 3rd block of
                 // epoch 1, reward distribution should happen in this block.
                 // however, all stake rewards are paid at the this block
                 // therefore reward_status should have transitioned to inactive.
@@ -1008,7 +1010,7 @@ mod tests {
         let vote_account = genesis_config
             .accounts
             .iter()
-            .find(|(&address, _)| address == vote_key)
+            .find(|(address, _)| **address == vote_key)
             .map(|(_, account)| account)
             .unwrap()
             .clone();

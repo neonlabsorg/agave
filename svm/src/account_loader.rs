@@ -69,7 +69,7 @@ pub(crate) enum TransactionLoadResult {
 #[cfg_attr(feature = "svm-internal", field_qualifiers(nonce(pub)))]
 pub struct CheckedTransactionDetails {
     pub(crate) nonce: Option<NonceInfo>,
-    pub(crate) compute_budget_and_limits: Result<SVMTransactionExecutionAndFeeBudgetLimits>,
+    pub(crate) compute_budget_and_limits: SVMTransactionExecutionAndFeeBudgetLimits,
 }
 
 #[cfg(feature = "dev-context-only-utils")]
@@ -77,12 +77,12 @@ impl Default for CheckedTransactionDetails {
     fn default() -> Self {
         Self {
             nonce: None,
-            compute_budget_and_limits: Ok(SVMTransactionExecutionAndFeeBudgetLimits {
+            compute_budget_and_limits: SVMTransactionExecutionAndFeeBudgetLimits {
                 budget: SVMTransactionExecutionBudget::default(),
                 loaded_accounts_data_size_limit: NonZeroU32::new(32)
                     .expect("Failed to set loaded_accounts_bytes"),
                 fee_details: FeeDetails::default(),
-            }),
+            },
         }
     }
 }
@@ -90,7 +90,7 @@ impl Default for CheckedTransactionDetails {
 impl CheckedTransactionDetails {
     pub fn new(
         nonce: Option<NonceInfo>,
-        compute_budget_and_limits: Result<SVMTransactionExecutionAndFeeBudgetLimits>,
+        compute_budget_and_limits: SVMTransactionExecutionAndFeeBudgetLimits,
     ) -> Self {
         Self {
             nonce,
@@ -2467,9 +2467,9 @@ mod tests {
         let mut next_size = 1;
         let mut make_account = |pubkey, owner, executable| {
             let size = next_size;
-            let account = AccountSharedData::create(
+            let account = AccountSharedData::create_from_existing_shared_data(
                 LAMPORTS_PER_SOL,
-                vec![0; size],
+                Arc::new(vec![0; size]),
                 owner,
                 executable,
                 u64::MAX,
@@ -2789,9 +2789,9 @@ mod tests {
 
         // arbitrary accounts
         for _ in 0..128 {
-            let account = AccountSharedData::create(
+            let account = AccountSharedData::create_from_existing_shared_data(
                 1,
-                vec![0; rng.gen_range(0, 128)],
+                Arc::new(vec![0; rng.gen_range(0, 128)]),
                 Pubkey::new_unique(),
                 rng.gen(),
                 u64::MAX,
@@ -2803,9 +2803,9 @@ mod tests {
         let mut fee_payers = vec![];
         for _ in 0..8 {
             let fee_payer = Pubkey::new_unique();
-            let account = AccountSharedData::create(
+            let account = AccountSharedData::create_from_existing_shared_data(
                 LAMPORTS_PER_SOL,
-                vec![0; rng.gen_range(0, 32)],
+                Arc::new(vec![0; rng.gen_range(0, 32)]),
                 system_program::id(),
                 rng.gen(),
                 u64::MAX,
@@ -2820,9 +2820,9 @@ mod tests {
         for loader in PROGRAM_OWNERS {
             for _ in 0..16 {
                 let program_id = Pubkey::new_unique();
-                let mut account = AccountSharedData::create(
+                let mut account = AccountSharedData::create_from_existing_shared_data(
                     1,
-                    vec![0; rng.gen_range(0, 512)],
+                    Arc::new(vec![0; rng.gen_range(0, 512)]),
                     *loader,
                     rng.gen(),
                     u64::MAX,
@@ -2838,13 +2838,14 @@ mod tests {
                     let has_programdata = rng.gen();
 
                     if has_programdata {
-                        let programdata_account = AccountSharedData::create(
-                            1,
-                            vec![0; rng.gen_range(0, 512)],
-                            *loader,
-                            rng.gen(),
-                            u64::MAX,
-                        );
+                        let programdata_account =
+                            AccountSharedData::create_from_existing_shared_data(
+                                1,
+                                Arc::new(vec![0; rng.gen_range(0, 512)]),
+                                *loader,
+                                rng.gen(),
+                                u64::MAX,
+                            );
                         programdata_tracker.insert(
                             program_id,
                             (programdata_address, programdata_account.data().len()),
@@ -2989,7 +2990,7 @@ mod tests {
             &expected_hit_account.data_clone()
         ));
 
-        // reload doesnt affect this
+        // reload doesn't affect this
         account_loader.load_account(&hit_address);
         let actual_hit_account = account_loader.loaded_accounts.get(&hit_address);
 

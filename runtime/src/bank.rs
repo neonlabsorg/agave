@@ -221,7 +221,7 @@ pub const MAX_LEADER_SCHEDULE_STAKES: Epoch = 5;
 pub type BankStatusCache = StatusCache<Result<()>>;
 #[cfg_attr(
     feature = "frozen-abi",
-    frozen_abi(digest = "FUttxQbsCnX5VMRuj8c2sUxZKNARUTaomdgsbg8wM3D6")
+    frozen_abi(digest = "23uAyYmzMrmPvPDKf6SvF1YoojYstmEPmdkfAQDnpwsq")
 )]
 pub type BankSlotDelta = SlotDelta<Result<()>>;
 
@@ -606,7 +606,7 @@ impl PartialEq for Bank {
             && *stakes_cache.stakes() == *other.stakes_cache.stakes()
             && epoch_stakes == &other.epoch_stakes
             && is_delta.load(Relaxed) == other.is_delta.load(Relaxed)
-            // No deadlock is possbile, when Arc::ptr_eq() returns false, because of being
+            // No deadlock is possible, when Arc::ptr_eq() returns false, because of being
             // different Mutexes.
             && (Arc::ptr_eq(hash_overrides, &other.hash_overrides) ||
                 *hash_overrides.lock().unwrap() == *other.hash_overrides.lock().unwrap())
@@ -2468,7 +2468,7 @@ impl Bank {
     /// Recalculates the bank hash
     ///
     /// This is used by ledger-tool when creating a snapshot, which
-    /// recalcuates the bank hash.
+    /// recalculates the bank hash.
     ///
     /// Note that the account state is *not* allowed to change by rehashing.
     /// If modifying accounts in ledger-tool is needed, create a new bank.
@@ -5061,36 +5061,35 @@ impl Bank {
         &self.epoch_stakes
     }
 
-    /// Get the staked nodes map for the current Bank::epoch
+    /// Returns a mapping from validator [`Pubkey`] to stake in Lamports for the current Bank::epoch.
     pub fn current_epoch_staked_nodes(&self) -> Arc<HashMap<Pubkey, u64>> {
         self.current_epoch_stakes().stakes().staked_nodes()
     }
 
+    /// Returns a mapping from validator [`Pubkey`] to stake in Lamports for the given epoch.
     pub fn epoch_staked_nodes(&self, epoch: Epoch) -> Option<Arc<HashMap<Pubkey, u64>>> {
         Some(self.epoch_stakes.get(&epoch)?.stakes().staked_nodes())
     }
 
-    /// Get the total epoch stake for the given epoch.
+    /// Returns the total stake in Lamports for the given epoch.
     pub fn epoch_total_stake(&self, epoch: Epoch) -> Option<u64> {
         self.epoch_stakes
             .get(&epoch)
             .map(|epoch_stakes| epoch_stakes.total_stake())
     }
 
-    /// Get the total epoch stake for the current Bank::epoch
+    /// Returns the total stake in Lamports for the current Bank::epoch.
     pub fn get_current_epoch_total_stake(&self) -> u64 {
         self.current_epoch_stakes().total_stake()
     }
 
-    /// vote accounts for the specific epoch along with the stake
-    ///   attributed to each account
+    /// Returns a mapping from [`Pubkey`] to (stake in Lamports and [`VoteAccount`]) for the given epoch.
     pub fn epoch_vote_accounts(&self, epoch: Epoch) -> Option<&VoteAccountsHashMap> {
         let epoch_stakes = self.epoch_stakes.get(&epoch)?.stakes();
         Some(epoch_stakes.vote_accounts().as_ref())
     }
 
-    /// Get the vote accounts along with the stake attributed to each account
-    /// for the current Bank::epoch
+    /// Returns a mapping from [`Pubkey`] to (stake in Lamports and [`VoteAccount`]) for the current Bank::epoch.
     pub fn get_current_epoch_vote_accounts(&self) -> &VoteAccountsHashMap {
         self.current_epoch_stakes()
             .stakes()
@@ -5118,14 +5117,13 @@ impl Bank {
             .get(node_id)
     }
 
-    /// Get the total stake belonging to vote accounts associated with the given node id for the
-    /// given epoch.
+    /// Returns the total stake in Lamports belonging to vote accounts associated with the given node_id for the given epoch.
     pub fn epoch_node_id_to_stake(&self, epoch: Epoch, node_id: &Pubkey) -> Option<u64> {
         self.epoch_stakes(epoch)
             .and_then(|epoch_stakes| epoch_stakes.node_id_to_stake(node_id))
     }
 
-    /// Get the fixed total stake of all vote accounts for current epoch
+    /// Returns the total stake in Lamports of all vote accounts for current Bank::epoch.
     pub fn total_epoch_stake(&self) -> u64 {
         self.epoch_stakes
             .get(&self.epoch)

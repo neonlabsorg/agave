@@ -241,6 +241,7 @@ mod tests {
             crds_data::CrdsData, crds_value::CrdsValue, node::Node,
         },
         solana_keypair::Keypair,
+        solana_net_utils::SocketAddrSpace,
         solana_pubkey::Pubkey,
         solana_runtime::{
             bank::Bank,
@@ -250,7 +251,6 @@ mod tests {
             },
         },
         solana_signer::Signer,
-        solana_streamer::socket::SocketAddrSpace,
         solana_time_utils::timestamp,
         std::{
             collections::HashMap,
@@ -312,7 +312,7 @@ mod tests {
         num_zero_stake_nodes: usize,
         base_slot: u64,
     ) -> (Arc<RwLock<BankForks>>, ClusterInfo, Vec<Pubkey>) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let validator_keypairs = (0..num_nodes)
             .map(|_| ValidatorVoteKeypairs::new(Keypair::new(), Keypair::new(), Keypair::new()))
             .collect::<Vec<ValidatorVoteKeypairs>>();
@@ -332,7 +332,7 @@ mod tests {
                 if node_ix < num_zero_stake_nodes {
                     0
                 } else {
-                    rng.gen_range(1..997)
+                    rng.random_range(1..997)
                 }
             })
             .collect();

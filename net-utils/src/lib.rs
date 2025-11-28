@@ -12,8 +12,6 @@
 // Activate some of the Rust 2024 lints to make the future migration easier.
 #![warn(if_let_rescope)]
 #![warn(keyword_idents_2024)]
-#![warn(missing_unsafe_on_extern)]
-#![warn(rust_2024_guarded_string_incompatible_syntax)]
 #![warn(rust_2024_incompatible_pat)]
 #![warn(tail_expr_drop_order)]
 #![warn(unsafe_attr_outside_unsafe)]
@@ -22,25 +20,29 @@
 mod ip_echo_client;
 mod ip_echo_server;
 pub mod multihomed_sockets;
+pub mod socket_addr_space;
 pub mod sockets;
 pub mod token_bucket;
 
 #[cfg(feature = "dev-context-only-utils")]
 pub mod tooling_for_tests;
 
-pub use ip_echo_server::{
-    ip_echo_server, IpEchoServer, DEFAULT_IP_ECHO_SERVER_THREADS, MAX_PORT_COUNT_PER_MESSAGE,
-    MINIMUM_IP_ECHO_SERVER_THREADS,
-};
 use {
     ip_echo_client::{ip_echo_server_request, ip_echo_server_request_with_binding},
     ip_echo_server::IpEchoServerMessage,
-    rand::{thread_rng, Rng},
+    rand::{rng, Rng},
     std::{
         io::{self},
         net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket},
     },
     url::Url,
+};
+pub use {
+    ip_echo_server::{
+        ip_echo_server, IpEchoServer, DEFAULT_IP_ECHO_SERVER_THREADS, MAX_PORT_COUNT_PER_MESSAGE,
+        MINIMUM_IP_ECHO_SERVER_THREADS,
+    },
+    socket_addr_space::SocketAddrSpace,
 };
 
 /// A data type representing a public Udp socket
@@ -281,7 +283,7 @@ pub fn find_available_ports_in_range<const N: usize>(
     let mut next_port_to_try = range
         .clone()
         .cycle() // loop over the end of the range
-        .skip(thread_rng().gen_range(range.clone()) as usize) // skip to random position
+        .skip(rng().random_range(range.clone()) as usize) // skip to random position
         .take(range.len()) // never take the same value twice
         .peekable();
     let mut num = 0;

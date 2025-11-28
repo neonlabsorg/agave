@@ -16,12 +16,23 @@ Release channels have their own copy of this changelog:
 ## 4.0.0-Unreleased
 ### RPC
 #### Breaking
+* `--public-tpu-address` and `--public-tpu-forwards-address` CLI arguments and `setPublicTpuForwardsAddress`, `setPublicTpuAddress` RPC methods now specify QUIC ports, not UDP.
 #### Changes
 * Added `--enable-scheduler-bindings` which binds an IPC server at `<ledger-path>/scheduler_bindings.ipc` for external schedulers to connect to.
 ### Validator
 #### Breaking
+* Removed deprecated arguments
+  * `--accounts-db-clean-threads`
+  * `--accounts-db-hash-threads`
+  * `--accounts-db-read-cache-limit-mb`
+  * `--accounts-hash-cache-path`
+  * `--disable-accounts-disk-index`
+  * `--dev-halt-at-slot`
 #### Deprecations
 * Using `mmap` for `--accounts-db-access-storages-method` is now deprecated.
+### CLI
+#### Changes
+* Support Trezor hardware wallets using `usb://trezor`
 
 ## 3.1.0
 ### RPC
@@ -35,6 +46,13 @@ Release channels have their own copy of this changelog:
 #### Deprecations
 * The `--monitor` flag with `agave-validator exit` is now deprecated. Operators can use the `monitor` command after `exit` instead.
 * The `--disable-accounts-disk-index` flag is now deprecated.
+* All monorepo crates falling outside the
+[backward compatibility policy](https://docs.anza.xyz/backwards-compatibility) are now
+deprecated, signaling their inclusion in the Agave Unstable API. Enable the
+`agave-unstable-api` crate feature to acknowledge use of an interface that may break
+without warning. From v4.0.0 onward, symbols in these crates will be unavailable without
+`agave-unstable-api` enabled.
+* The `--dev-halt-at-slot` flag is now deprecated.
 
 #### Changes
 * The accounts index is now kept entirely in memory by default.
@@ -54,6 +72,7 @@ Release channels have their own copy of this changelog:
 
 #### Breaking
 * When XDP is enabled, the validator process requires the `CAP_NET_RAW`, `CAP_NET_ADMIN`, `CAP_BPF`, and `CAP_PERFMON` capabilities. These can be configured in the systemd service file by setting `CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_BPF CAP_PERFMON` under the `[Service]` section or directly on the binary with the command `sudo setcap cap_net_raw,cap_net_admin,cap_bpf,cap_perfmon=p <path/to/agave-validator>` (this command must be run each time the binary is replaced)
+* Enabling XDP zero copy on systems configured with LACP bond requires manually passing  `--experimental-retransmit-xdp-interface <real-interface>` (e.g.: `eno17395np0` not `bond0`), as zero copy is only available on physical interfaces.
 * Require increased `memlock` limits - recommended setting is `LimitMEMLOCK=2000000000` in systemd service configuration. Lack of sufficient limit (on Linux) will cause startup error.
 * Remove deprecated arguments
   * `--accounts-index-memory-limit-mb`
@@ -298,15 +317,3 @@ makes the feature code complete.
 * Link to any relevant feature gate issues or SIMDs.
 * If you add entries on multiple branches use the same wording if possible.
 This simplifies the process of diffing between versions of the log.
-
-## Maintaining This Changelog
-### When creating a new release branch:
-* Commit to master updating the changelog:
-  * Update the edge, beta, and stable links
-  * Create new section: `vx.y+1.0 - Unreleased`
-  * Remove `Unreleased` annotation from vx.y.0 section.
-* Create vx.y branch starting at that commit.
-* Commit to `vx.y` updating the changelog:
-  * Remove the `vx.y+1.0 - Unreleased` section
-  * Remove the channel links
-* Tag vx.y.0 on the new branch

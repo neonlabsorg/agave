@@ -15,7 +15,7 @@ use {
 /// This data structure is supposed to be shared with programs in ABIv2, so do not modify it
 /// without consulting SIMD-0177.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct InstructionAccount {
     /// Points to the account and its key in the `TransactionContext`
     pub index_in_transaction: IndexOfAccount,
@@ -288,6 +288,7 @@ impl BorrowedInstructionAccount<'_, '_> {
     #[inline]
     #[deprecated(since = "2.1.0", note = "Use `get_owner` instead")]
     pub fn is_executable(&self) -> bool {
+        #[allow(deprecated)]
         self.account.executable()
     }
 

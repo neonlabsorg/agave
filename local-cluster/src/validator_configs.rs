@@ -6,7 +6,7 @@ use {
 
 pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
     ValidatorConfig {
-        halt_at_slot: config.halt_at_slot,
+        logfile: config.logfile.clone(),
         expected_genesis_hash: config.expected_genesis_hash,
         expected_bank_hash: config.expected_bank_hash,
         expected_shred_version: config.expected_shred_version,
@@ -79,7 +79,6 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         replay_transactions_threads: config.replay_transactions_threads,
         tvu_shred_sigverify_threads: config.tvu_shred_sigverify_threads,
         delay_leader_block_for_pending_fork: config.delay_leader_block_for_pending_fork,
-        use_tpu_client_next: config.use_tpu_client_next,
         retransmit_xdp: config.retransmit_xdp.clone(),
         repair_handler_type: config.repair_handler_type.clone(),
     }

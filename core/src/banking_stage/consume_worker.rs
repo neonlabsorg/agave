@@ -347,6 +347,11 @@ pub(crate) mod external {
                     .map(|()| true);
             }
 
+            let BankPair {
+                root_bank,
+                working_bank: _,
+            } = self.sharable_banks.load();
+
             // Loop here to avoid exposing internal error to external scheduler.
             // In the vast majority of cases, this will iterate a single time;
             // If we began execution when a slot was still in process, and could
@@ -385,7 +390,7 @@ pub(crate) mod external {
                     )
                 };
                 let (translation_results, transactions, max_ages) =
-                    Self::translate_transaction_batch(&batch, bank);
+                    Self::translate_transaction_batch(&batch, bank, &root_bank);
 
                 // Enforce all or nothing on translation_results.
                 let execution_flags = ExecutionFlags {
@@ -497,7 +502,7 @@ pub(crate) mod external {
 
             // Do resolving next since we (currently) need resolved transactions for status checks.
             let (parsing_and_resolve_results, txs, max_ages) =
-                Self::translate_transaction_batch(&batch, &root_bank);
+                Self::translate_transaction_batch(&batch, &working_bank, &root_bank);
 
             if message.flags & check_flags::LOAD_ADDRESS_LOOKUP_TABLES != 0 {
                 self.check_resolve_pubkeys(
@@ -756,7 +761,7 @@ pub(crate) mod external {
                 .is_active(&agave_feature_set::static_instruction_limit::ID);
             let mut parsing_results = Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE);
             let mut parsed_transactions = Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE);
-            for tx_ptr in batch.iter() {
+            for (tx_ptr, _) in batch.iter() {
                 // Parsing and basic sanitization checks
                 match SanitizedTransactionView::try_new_sanitized(
                     tx_ptr,
@@ -939,20 +944,22 @@ pub(crate) mod external {
         /// Translate batch of transactions into usable
         fn translate_transaction_batch(
             batch: &TransactionPtrBatch,
-            bank: &Bank,
+            working_bank: &Bank,
+            root_bank: &Bank,
         ) -> (Vec<Result<(), PacketHandlingError>>, Vec<Tx>, Vec<MaxAge>) {
-            let enable_static_instruction_limit = bank
+            let enable_static_instruction_limit = root_bank
                 .feature_set
                 .is_active(&agave_feature_set::static_instruction_limit::ID);
-            let transaction_account_lock_limit = bank.get_transaction_account_lock_limit();
+            let transaction_account_lock_limit = working_bank.get_transaction_account_lock_limit();
 
             let mut translation_results = Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE);
             let mut transactions = Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE);
             let mut max_ages = Vec::with_capacity(MAX_TRANSACTIONS_PER_MESSAGE);
-            for transaction_ptr in batch.iter() {
+            for (transaction_ptr, _) in batch.iter() {
                 match Self::translate_transaction(
                     transaction_ptr,
-                    bank,
+                    working_bank,
+                    root_bank,
                     enable_static_instruction_limit,
                     transaction_account_lock_limit,
                 ) {
@@ -970,13 +977,15 @@ pub(crate) mod external {
 
         fn translate_transaction(
             transaction_ptr: TransactionPtr,
-            bank: &Bank,
+            working_bank: &Bank,
+            root_bank: &Bank,
             enable_static_instruction_limit: bool,
             transaction_account_lock_limit: usize,
         ) -> Result<(Tx, MaxAge), PacketHandlingError> {
             translate_to_runtime_view(
                 transaction_ptr,
-                bank,
+                working_bank,
+                root_bank,
                 enable_static_instruction_limit,
                 transaction_account_lock_limit,
             )
@@ -984,7 +993,7 @@ pub(crate) mod external {
                 (
                     view,
                     MaxAge {
-                        sanitized_epoch: bank.epoch(),
+                        sanitized_epoch: root_bank.epoch(),
                         alt_invalidation_slot: deactivation_slot,
                     },
                 )
@@ -995,16 +1004,18 @@ pub(crate) mod external {
         /// - destination is appropriately sized
         /// - destination does not overlap with loaded_addresses allocation
         unsafe fn copy_loaded_addresses(loaded_addresses: &LoadedAddresses, dest: NonNull<Pubkey>) {
-            core::ptr::copy_nonoverlapping(
-                loaded_addresses.writable.as_ptr(),
-                dest.as_ptr(),
-                loaded_addresses.writable.len(),
-            );
-            core::ptr::copy_nonoverlapping(
-                loaded_addresses.readonly.as_ptr(),
-                dest.add(loaded_addresses.writable.len()).as_ptr(),
-                loaded_addresses.readonly.len(),
-            );
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    loaded_addresses.writable.as_ptr(),
+                    dest.as_ptr(),
+                    loaded_addresses.writable.len(),
+                );
+                core::ptr::copy_nonoverlapping(
+                    loaded_addresses.readonly.as_ptr(),
+                    dest.add(loaded_addresses.writable.len()).as_ptr(),
+                    loaded_addresses.readonly.len(),
+                );
+            }
         }
 
         /// Returns `true` if a message is valid and can be processed.
@@ -1135,6 +1146,7 @@ pub(crate) mod external {
                 .map(|_| {
                     translate_to_runtime_view(
                         &simple_tx[..],
+                        &bank,
                         &bank,
                         true,
                         bank.get_transaction_account_lock_limit(),
@@ -1365,8 +1377,8 @@ pub(crate) mod external {
             fn to_resolved_view(
                 tx: &'_ [u8],
             ) -> RuntimeTransaction<ResolvedTransactionView<&'_ [u8]>> {
-                RuntimeTransaction::<ResolvedTransactionView<_>>::try_from(
-                    RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
+                RuntimeTransaction::<ResolvedTransactionView<_>>::try_new(
+                    RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
                         SanitizedTransactionView::try_new_sanitized(tx, true).unwrap(),
                         solana_transaction::sanitized::MessageHash::Compute,
                         Some(false),
@@ -1499,7 +1511,7 @@ fn active_leader_state_with_timeout(
     // If the initial check above didn't find a bank, we will
     // spin up to some timeout to wait for a bank to execute on.
     // This is conservatively long because transitions between slots
-    // can occassionally be slow.
+    // can occasionally be slow.
     const TIMEOUT: Duration = Duration::from_millis(50);
     let now = Instant::now();
     while now.elapsed() < TIMEOUT {
@@ -1512,7 +1524,7 @@ fn active_leader_state_with_timeout(
     None
 }
 
-/// Returns an active leader state if avaiable, otherwise None.
+/// Returns an active leader state if available, otherwise None.
 fn active_leader_state(
     shared_leader_state: &SharedLeaderState,
 ) -> Option<arc_swap::Guard<Arc<LeaderState>>> {
@@ -2261,8 +2273,8 @@ mod tests {
             mint_keypair,
             genesis_config,
             bank,
-            ref mut record_receiver,
-            ref mut shared_leader_state,
+            record_receiver,
+            shared_leader_state,
             consume_sender,
             consumed_receiver,
             ..
@@ -2315,8 +2327,8 @@ mod tests {
             mint_keypair,
             genesis_config,
             bank,
-            ref mut record_receiver,
-            ref mut shared_leader_state,
+            record_receiver,
+            shared_leader_state,
             consume_sender,
             consumed_receiver,
             ..
@@ -2380,8 +2392,8 @@ mod tests {
             mint_keypair,
             genesis_config,
             bank,
-            ref mut record_receiver,
-            ref mut shared_leader_state,
+            record_receiver,
+            shared_leader_state,
             consume_sender,
             consumed_receiver,
             ..
@@ -2459,8 +2471,8 @@ mod tests {
             mint_keypair,
             genesis_config,
             bank,
-            ref mut record_receiver,
-            ref mut shared_leader_state,
+            record_receiver,
+            shared_leader_state,
             consume_sender,
             consumed_receiver,
             ..

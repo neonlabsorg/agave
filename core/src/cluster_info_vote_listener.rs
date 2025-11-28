@@ -281,7 +281,7 @@ impl ClusterInfoVoteListener {
         let mut packet_batches = packet::to_packet_batches(&votes, 1);
 
         // Votes should already be filtered by this point.
-        sigverify::ed25519_verify_cpu(
+        sigverify::ed25519_verify(
             &mut packet_batches,
             /*reject_non_vote=*/ false,
             votes.len(),
@@ -704,7 +704,7 @@ impl ClusterInfoVoteListener {
         gossip_vote_slot_confirming_time.stop();
         let gossip_vote_slot_confirming_time_us = gossip_vote_slot_confirming_time.as_us();
 
-        if let Some(ref mut vote_processing_time) = vote_processing_time {
+        if let Some(vote_processing_time) = vote_processing_time {
             vote_processing_time.update(
                 gossip_vote_txn_processing_time_us,
                 gossip_vote_slot_confirming_time_us,

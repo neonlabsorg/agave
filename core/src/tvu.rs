@@ -160,7 +160,6 @@ impl Tvu {
         wait_to_vote_slot: Option<Slot>,
         snapshot_controller: Option<Arc<SnapshotController>>,
         log_messages_bytes_limit: Option<usize>,
-        connection_cache: Option<&Arc<ConnectionCache>>,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
         banking_tracer: Arc<BankingTracer>,
         turbine_quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
@@ -361,7 +360,7 @@ impl Tvu {
         );
 
         let warm_quic_cache_service = create_cache_warmer_if_needed(
-            connection_cache,
+            None,
             vote_connection_cache,
             cluster_info,
             poh_recorder,
@@ -475,11 +474,11 @@ pub mod tests {
             create_new_tmp_ledger,
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
         },
+        solana_net_utils::SocketAddrSpace,
         solana_poh::poh_recorder::create_test_recorder,
         solana_rpc::optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         solana_runtime::bank::Bank,
         solana_signer::Signer,
-        solana_streamer::socket::SocketAddrSpace,
         solana_tpu_client::tpu_client::{DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC},
         std::sync::atomic::{AtomicU64, Ordering},
     };
@@ -603,7 +602,6 @@ pub mod tests {
             None,
             None, // snapshot_controller
             None,
-            Some(&Arc::new(ConnectionCache::new("connection_cache_test"))),
             &ignored_prioritization_fee_cache,
             BankingTracer::new_disabled(),
             turbine_quic_endpoint_sender,
