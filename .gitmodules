@@ -1,0 +1,4 @@
+[submodule "neon/solana-sdk"]
+	path = neon/solana-sdk
+	url = https://github.com/neonlabsorg/solana-sdk
+	branch = block-25-ms
