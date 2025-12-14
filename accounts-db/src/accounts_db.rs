@@ -72,6 +72,7 @@ use {
     solana_epoch_schedule::EpochSchedule,
     solana_lattice_hash::lt_hash::LtHash,
     solana_measure::{measure::Measure, measure_us},
+    solana_message::inner_instruction::InnerInstructionsList,
     solana_nohash_hasher::{BuildNoHashHasher, IntMap, IntSet},
     solana_pubkey::Pubkey,
     solana_rayon_threadlimit::get_thread_count,
@@ -5794,6 +5795,7 @@ impl AccountsDb {
         &self,
         accounts: impl StorableAccounts<'a>,
         transactions: Option<&'a [&'a SanitizedTransaction]>,
+        inner_instructions: Option<&'a [&'a InnerInstructionsList]>,
         update_index_thread_selection: UpdateIndexThreadSelection,
     ) {
         // If all transactions in a batch are errored,
@@ -5813,7 +5815,12 @@ impl AccountsDb {
 
         // Store the accounts in the write cache
         let mut store_accounts_time = Measure::start("store_accounts");
-        let infos = self.write_accounts_to_cache(accounts.target_slot(), &accounts, transactions);
+        let infos = self.write_accounts_to_cache(
+            accounts.target_slot(),
+            &accounts,
+            transactions,
+            inner_instructions,
+        );
         store_accounts_time.stop();
         self.stats
             .store_accounts
@@ -5963,6 +5970,7 @@ impl AccountsDb {
         slot: Slot,
         accounts_and_meta_to_store: &impl StorableAccounts<'b>,
         txs: Option<&[&SanitizedTransaction]>,
+        inner_instructions: Option<&[&InnerInstructionsList]>,
     ) -> Vec<AccountInfo> {
         let mut current_write_version = if self.accounts_update_notifier.is_some() {
             self.write_version
@@ -5974,6 +5982,10 @@ impl AccountsDb {
         (0..accounts_and_meta_to_store.len())
             .map(|index| {
                 let txn = txs.map(|txs| *txs.get(index).expect("txs must be present if provided"));
+                let inner_instr = inner_instructions.map(|ii| {
+                    *ii.get(index)
+                        .expect("inner_instructions must be present if provided")
+                });
                 accounts_and_meta_to_store.account_default_if_zero_lamport(index, |account| {
                     let account_shared_data = account.take_account();
                     let pubkey = account.pubkey();
@@ -5986,6 +5998,7 @@ impl AccountsDb {
                         &txn,
                         pubkey,
                         current_write_version,
+                        &inner_instr,
                     );
                     current_write_version = current_write_version.saturating_add(1);
 
@@ -7290,6 +7303,7 @@ impl AccountsDb {
     pub fn store_for_tests<'a>(&self, accounts: impl StorableAccounts<'a>) {
         self.store_accounts_unfrozen(
             accounts,
+            None,
             None,
             UpdateIndexThreadSelection::PoolWithThreshold,
         );

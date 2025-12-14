@@ -1,7 +1,111 @@
 use {
-    crate::accounts_db::AccountsDb, solana_account::AccountSharedData, solana_clock::Slot,
-    solana_pubkey::Pubkey, solana_transaction::sanitized::SanitizedTransaction,
+    crate::accounts_db::AccountsDb,
+    solana_account::{AccountSharedData, ReadableAccount},
+    solana_clock::Slot,
+    solana_message::inner_instruction::InnerInstructionsList,
+    solana_pubkey::Pubkey,
+    solana_sdk_ids::sysvar as sysvar_program,
+    solana_system_interface::program as system_program,
+    solana_transaction::sanitized::SanitizedTransaction,
 };
+
+/// Determines if an account can be mutated by a program during transaction execution.
+/// This implements Solana's runtime rules for account mutability:
+/// - Sysvars cannot be mutated (checked by base58 prefix)
+/// - System program can modify any account's lamports
+/// - Other programs can only modify accounts they own
+fn can_runtime_mutate_account(invoked_program_id: &Pubkey, account_owner: &Pubkey) -> bool {
+    if sysvar_program::check_id(account_owner) {
+        return false;
+    }
+
+    if system_program::check_id(invoked_program_id) {
+        return true;
+    }
+
+    account_owner == invoked_program_id
+}
+
+/// Determines whether an account should be notified to Geyser plugins.
+/// Returns true if the account can actually be mutated by the transaction.
+///
+/// Optimized to check account mutability with early exits:
+/// - Fee payer (index 0) is always mutable
+/// - Only writable accounts are checked
+/// - Top-level instructions that touch the account are examined
+/// - Inner instructions (CPIs) that touch the account are also examined
+/// - Ownership rules determine if program can mutate the account
+fn should_notify_account_to_geyser(
+    txn: &Option<&SanitizedTransaction>,
+    account: &AccountSharedData,
+    pubkey: &Pubkey,
+    inner_instructions: &Option<&InnerInstructionsList>,
+) -> bool {
+    let Some(txn) = txn else {
+        return true;
+    };
+
+    let message = txn.message();
+    let account_keys = message.account_keys();
+
+    let account_index = account_keys.iter().position(|key| key == pubkey);
+    let Some(account_index) = account_index else {
+        // Account not in transaction - shouldn't happen, but notify to be safe
+        return true;
+    };
+
+    if !message.is_writable(account_index) {
+        return false;
+    }
+
+    if account_index == 0 {
+        return true;
+    }
+
+    let Some(inner_instructions) = inner_instructions else {
+        return true;
+    };
+
+    // Check top-level instructions
+    for (program_id, instruction) in message.program_instructions_iter() {
+        let touches_account = instruction
+            .accounts
+            .iter()
+            .any(|&idx| idx as usize == account_index);
+
+        if !touches_account {
+            continue;
+        }
+
+        if can_runtime_mutate_account(program_id, account.owner()) {
+            return true;
+        }
+    }
+
+    // Check inner instructions (CPIs)
+    for instruction_list in inner_instructions.iter() {
+        for ix in instruction_list {
+            let touches_account = ix
+                .instruction
+                .accounts
+                .iter()
+                .any(|&idx| idx as usize == account_index);
+
+            if !touches_account {
+                continue;
+            }
+
+            let prog_idx = ix.instruction.program_id_index as usize;
+            if let Some(program_id) = account_keys.get(prog_idx) {
+                if can_runtime_mutate_account(program_id, account.owner()) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
 
 impl AccountsDb {
     pub fn notify_account_at_accounts_update(
@@ -11,15 +115,19 @@ impl AccountsDb {
         txn: &Option<&SanitizedTransaction>,
         pubkey: &Pubkey,
         write_version: u64,
+        inner_instructions: &Option<&InnerInstructionsList>,
     ) {
         if let Some(accounts_update_notifier) = &self.accounts_update_notifier {
-            accounts_update_notifier.notify_account_update(
-                slot,
-                account,
-                txn,
-                pubkey,
-                write_version,
-            );
+            // Filter accounts based on whether they can actually be mutated by the transaction
+            if should_notify_account_to_geyser(txn, account, pubkey, inner_instructions) {
+                accounts_update_notifier.notify_account_update(
+                    slot,
+                    account,
+                    txn,
+                    pubkey,
+                    write_version,
+                );
+            }
         }
     }
 }
@@ -36,7 +144,6 @@ pub mod tests {
             utils::create_account_shared_data,
         },
         dashmap::DashMap,
-        solana_account::ReadableAccount as _,
         std::sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
