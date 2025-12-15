@@ -20,7 +20,6 @@ use {
     solana_clock as clock,
     solana_cluster_type::ClusterType,
     solana_commitment_config::CommitmentConfig,
-    solana_entry::poh::compute_hashes_per_tick,
     solana_epoch_schedule::EpochSchedule,
     solana_feature_gate_interface as feature,
     solana_fee_calculator::FeeRateGovernor,
@@ -490,12 +489,12 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 .long("hashes-per-tick")
                 .value_name("NUM_HASHES|\"auto\"|\"sleep\"")
                 .takes_value(true)
-                .default_value("auto")
+                .default_value("sleep")
                 .help(
                     "How many PoH hashes to roll before emitting the next tick. \
-                     If \"auto\", determine based on --target-tick-duration \
-                     and the hash rate of this computer. If \"sleep\", for development \
-                     sleep for --target-tick-duration instead of hashing",
+                     If \"auto\" or \"sleep\", disable continuous PoH hashing and use \
+                     time-based ticks (sleep for --target-tick-duration). Transaction \
+                     hash chain is still preserved. Specify a number to enable PoH hashing.",
                 ),
         )
         .arg(
@@ -669,17 +668,9 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         });
 
     match matches.value_of("hashes_per_tick").unwrap() {
-        "auto" => match cluster_type {
-            ClusterType::Development => {
-                let hashes_per_tick =
-                    compute_hashes_per_tick(poh_config.target_tick_duration, 1_000_000);
-                poh_config.hashes_per_tick = Some(hashes_per_tick / 2); // use 50% of peak ability
-            }
-            ClusterType::Devnet | ClusterType::Testnet | ClusterType::MainnetBeta => {
-                poh_config.hashes_per_tick = Some(clock::DEFAULT_HASHES_PER_TICK);
-            }
-        },
-        "sleep" => {
+        "auto" | "sleep" => {
+            // Low power mode - disable continuous PoH hashing.
+            // Transaction hash chain is still preserved via Poh::record().
             poh_config.hashes_per_tick = None;
         }
         _ => {
