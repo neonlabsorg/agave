@@ -3572,7 +3572,7 @@ fn test_program_fees() {
     genesis_config.fee_rate_governor = FeeRateGovernor::new(congestion_multiplier, 0);
     let mut bank = Bank::new_for_tests(&genesis_config);
     let fee_structure = FeeStructure {
-        lamports_per_signature: 5000,
+        lamports_per_signature: 0,
         lamports_per_write_lock: 0,
         compute_fee_bins: vec![
             FeeBin {
