@@ -153,7 +153,7 @@ use {
     solana_sysvar_id::SysvarId,
     solana_time_utils::years_as_slots,
     solana_transaction::{
-        sanitized::{MessageHash, SanitizedTransaction, MAX_TX_ACCOUNT_LOCKS},
+        sanitized::{MessageHash, SanitizedTransaction},
         versioned::VersionedTransaction,
         Transaction, TransactionVerificationMode,
     },
