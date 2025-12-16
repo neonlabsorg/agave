@@ -12,6 +12,7 @@ target/
 /config/
 
 .cache
+bin/
 
 # log files
 *.log
