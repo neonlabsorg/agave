@@ -2944,16 +2944,17 @@ impl Bank {
 
     /// Get the max number of accounts that a transaction may lock in this block
     pub fn get_transaction_account_lock_limit(&self) -> usize {
-        if let Some(transaction_account_lock_limit) = self.transaction_account_lock_limit {
-            transaction_account_lock_limit
-        } else if self
-            .feature_set
-            .is_active(&feature_set::increase_tx_account_lock_limit::id())
-        {
-            MAX_TX_ACCOUNT_LOCKS
-        } else {
-            64
-        }
+        // if let Some(transaction_account_lock_limit) = self.transaction_account_lock_limit {
+        //     transaction_account_lock_limit
+        // } else if self
+        //     .feature_set
+        //     .is_active(&feature_set::increase_tx_account_lock_limit::id())
+        // {
+        //     MAX_TX_ACCOUNT_LOCKS
+        // } else {
+        //     64
+        // }
+        256
     }
 
     /// Prepare a transaction batch from a list of versioned transactions from
@@ -5390,14 +5391,14 @@ impl Bank {
         if new_feature_activations.contains(&feature_set::pico_inflation::id()) {
             *self.inflation.write().unwrap() = Inflation::pico();
             self.fee_rate_governor.burn_percent = solana_fee_calculator::DEFAULT_BURN_PERCENT; // 50% fee burn
-            self.rent_collector.rent.burn_percent = 50; // 50% rent burn
+            self.rent_collector.rent.burn_percent = 0; // 50% rent burn
         }
 
         if !new_feature_activations.is_disjoint(&self.feature_set.full_inflation_features_enabled())
         {
             *self.inflation.write().unwrap() = Inflation::full();
             self.fee_rate_governor.burn_percent = solana_fee_calculator::DEFAULT_BURN_PERCENT; // 50% fee burn
-            self.rent_collector.rent.burn_percent = 50; // 50% rent burn
+            self.rent_collector.rent.burn_percent = 0; // 50% rent burn
         }
 
         if !debug_do_not_add_builtins {
