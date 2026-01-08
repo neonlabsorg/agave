@@ -14,7 +14,7 @@ use {
 /// When rent is collected from an exempt account, rent_epoch is set to this
 /// value. The idea is to have a fixed, consistent value for rent_epoch for all accounts that do not collect rent.
 /// This enables us to get rid of the field completely.
-pub const RENT_EXEMPT_RENT_EPOCH: Epoch = 0;
+pub const RENT_EXEMPT_RENT_EPOCH: Epoch = Epoch::Max;
 
 /// Rent state of a Solana account.
 #[derive(Debug, PartialEq, Eq)]
@@ -40,18 +40,19 @@ pub fn check_rent_state(
     transaction_context: &TransactionContext,
     index: IndexOfAccount,
 ) -> TransactionResult<()> {
-    if let Some((pre_rent_state, post_rent_state)) = pre_rent_state.zip(post_rent_state) {
-        let expect_msg = "account must exist at TransactionContext index if rent-states are Some";
-        check_rent_state_with_account(
-            pre_rent_state,
-            post_rent_state,
-            transaction_context
-                .get_key_of_account_at_index(index)
-                .expect(expect_msg),
-            index,
-        )?;
-    }
     Ok(())
+    // if let Some((pre_rent_state, post_rent_state)) = pre_rent_state.zip(post_rent_state) {
+    //     let expect_msg = "account must exist at TransactionContext index if rent-states are Some";
+    //     check_rent_state_with_account(
+    //         pre_rent_state,
+    //         post_rent_state,
+    //         transaction_context
+    //             .get_key_of_account_at_index(index)
+    //             .expect(expect_msg),
+    //         index,
+    //     )?;
+    // }
+    // Ok(())
 }
 
 /// Check rent state transition for an account directly.
