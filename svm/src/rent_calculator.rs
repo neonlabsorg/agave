@@ -14,7 +14,7 @@ use {
 /// When rent is collected from an exempt account, rent_epoch is set to this
 /// value. The idea is to have a fixed, consistent value for rent_epoch for all accounts that do not collect rent.
 /// This enables us to get rid of the field completely.
-pub const RENT_EXEMPT_RENT_EPOCH: Epoch = Epoch::Max;
+pub const RENT_EXEMPT_RENT_EPOCH: Epoch = Epoch::MAX;
 
 /// Rent state of a Solana account.
 #[derive(Debug, PartialEq, Eq)]
@@ -35,10 +35,10 @@ pub enum RentState {
 /// This method has a default implementation that calls into
 /// `check_rent_state_with_account`.
 pub fn check_rent_state(
-    pre_rent_state: Option<&RentState>,
-    post_rent_state: Option<&RentState>,
-    transaction_context: &TransactionContext,
-    index: IndexOfAccount,
+    _pre_rent_state: Option<&RentState>,
+    _post_rent_state: Option<&RentState>,
+    _transaction_context: &TransactionContext,
+    _index: IndexOfAccount,
 ) -> TransactionResult<()> {
     Ok(())
     // if let Some((pre_rent_state, post_rent_state)) = pre_rent_state.zip(post_rent_state) {
