@@ -684,6 +684,6 @@ solana-clock = { path = "neon/solana-sdk/clock" }
 solana-sdk-macro = { path = "neon/solana-sdk/sdk-macro" }
 solana-sysvar = { path = "neon/solana-sdk/sysvar" }
 solana-rent = { path = "neon/solana-sdk/rent" }
-solana-rent-collector = { path = "neon/solana-sdk/rent-collector " }
+solana-rent-collector = { path = "neon/solana-sdk/rent-collector" }
 solana-fee-calculator = { path = "neon/solana-sdk/fee-calculator" }
 solana-fee-structure = { path = "neon/solana-sdk/fee-structure" }
