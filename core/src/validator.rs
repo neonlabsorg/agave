@@ -84,6 +84,7 @@ use {
         poh_service::{self, PohService},
         transaction_recorder::TransactionRecorder,
     },
+    solana_poh_config::PohConfig,
     solana_pubkey::Pubkey,
     solana_rayon_threadlimit::get_thread_count,
     solana_rpc::{
@@ -912,6 +913,14 @@ impl Validator {
         let prioritization_fee_cache = Arc::new(PrioritizationFeeCache::default());
 
         let leader_schedule_cache = Arc::new(leader_schedule_cache);
+
+        // Force low-power mode: disable continuous PoH hashing
+        // This overrides genesis config to always use time-based ticks instead of hash-based ticks
+        let poh_config = PohConfig {
+            hashes_per_tick: None,
+            ..genesis_config.poh_config.clone()
+        };
+
         let startup_verification_complete;
         let (mut poh_recorder, entry_receiver) = {
             let bank = &bank_forks.read().unwrap().working_bank();
@@ -926,7 +935,7 @@ impl Validator {
                 blockstore.clone(),
                 blockstore.get_new_shred_signal(0),
                 &leader_schedule_cache,
-                &genesis_config.poh_config,
+                &poh_config,
                 exit.clone(),
             )
         };
@@ -1338,7 +1347,7 @@ impl Validator {
 
         let poh_service = PohService::new(
             poh_recorder.clone(),
-            &genesis_config.poh_config,
+            &poh_config,
             exit.clone(),
             bank_forks.read().unwrap().root_bank().ticks_per_slot(),
             config.poh_pinned_cpu_core,
