@@ -111,6 +111,7 @@ impl PohService {
             .name("solPohTickProd".to_string())
             .spawn(move || {
                 if poh_config.hashes_per_tick.is_none() {
+                    info!("PoH service starting in LOW-POWER mode (no continuous hashing)");
                     if poh_config.target_tick_count.is_none() {
                         Self::low_power_tick_producer(
                             poh_recorder,
@@ -127,6 +128,10 @@ impl PohService {
                         );
                     }
                 } else {
+                    info!(
+                        "PoH service starting in HASH mode (hashes_per_tick={})",
+                        poh_config.hashes_per_tick.unwrap()
+                    );
                     // PoH service runs in a tight loop, generating hashes as fast as possible.
                     // Let's dedicate one of the CPU cores to this thread so that it can gain
                     // from cache performance.
