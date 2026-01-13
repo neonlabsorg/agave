@@ -16,7 +16,7 @@ use {
         state_traits::StateMut, Account, AccountSharedData, ReadableAccount, WritableAccount,
         PROGRAM_OWNERS,
     },
-    solana_clock::Slot,
+    solana_clock::{Epoch, Slot},
     solana_fee_structure::FeeDetails,
     solana_instruction::{BorrowedAccountMeta, BorrowedInstruction},
     solana_instructions_sysvar::construct_instructions_data,
@@ -39,6 +39,14 @@ use {
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::num::{NonZeroU32, Saturating},
 };
+
+fn is_default_account(account: &AccountSharedData) -> bool {
+    account.lamports() == 0
+        && account.data().is_empty()
+        && !account.executable()
+        && account.rent_epoch() == Epoch::default()
+        && account.owner() == &Pubkey::default()
+}
 
 // Per SIMD-0186, all accounts are assigned a base size of 64 bytes to cover
 // the storage cost of metadata.
@@ -259,10 +267,10 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
     // &mut self to insert the account. Wrappers with &self ignore it.
     fn do_load(&self, account_key: &Pubkey) -> (Option<AccountSharedData>, bool) {
         if let Some(account) = self.loaded_accounts.get(account_key) {
-            // If lamports is 0, a previous transaction deallocated this account.
-            // We return None instead of the account we found so it can be created fresh.
+            // If the account is a default tombstone, treat it as deallocated.
+            // We return None so it can be created fresh.
             // We *never* remove accounts, or else we would fetch stale state from accounts-db.
-            let option_account = if account.lamports() == 0 {
+            let option_account = if is_default_account(account) {
                 None
             } else {
                 Some(account.clone())
@@ -375,21 +383,21 @@ pub fn validate_fee_payer(
     rent: &Rent,
     fee: u64,
 ) -> Result<()> {
-    if payer_account.lamports() == 0 {
+    if is_default_account(payer_account) {
         error_metrics.account_not_found += 1;
         return Err(TransactionError::AccountNotFound);
     }
-    let system_account_kind = get_system_account_kind(payer_account).ok_or_else(|| {
-        error_metrics.invalid_account_for_fee += 1;
-        TransactionError::InvalidAccountForFee
-    })?;
-    let min_balance = match system_account_kind {
-        SystemAccountKind::System => 0,
-        SystemAccountKind::Nonce => {
-            // Should we ever allow a fees charge to zero a nonce account's
-            // balance. The state MUST be set to uninitialized in that case
+    if fee != 0 && payer_account.lamports() == 0 {
+        error_metrics.insufficient_funds += 1;
+        return Err(TransactionError::InsufficientFundsForFee);
+    }
+    let min_balance = match get_system_account_kind(payer_account) {
+        Some(SystemAccountKind::System) => 0,
+        Some(SystemAccountKind::Nonce) => {
+            // Preserve nonce account minimum balance requirements.
             rent.minimum_balance(NonceState::size())
         }
+        None => 0,
     };
 
     payer_account
@@ -1418,7 +1426,7 @@ mod tests {
             }
         }
 
-        // If payer account has no balance, expected AccountNotFound Error
+        // If payer account has no balance, expected InsufficientFundsForFee Error
         // regardless feature gate status, or if payer is nonce account.
         {
             for is_nonce in [true, false] {
@@ -1427,7 +1435,7 @@ mod tests {
                         is_nonce,
                         payer_init_balance: 0,
                         fee,
-                        expected_result: Err(TransactionError::AccountNotFound),
+                        expected_result: Err(TransactionError::InsufficientFundsForFee),
                         payer_post_balance: 0,
                     },
                     &rent,
