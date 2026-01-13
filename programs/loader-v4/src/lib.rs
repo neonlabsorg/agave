@@ -213,7 +213,6 @@ fn process_instruction_set_program_length(
     } else {
         let rent = invoke_context.get_sysvar_cache().get_rent()?;
         rent.minimum_balance(LoaderV4State::program_data_offset().saturating_add(new_size as usize))
-            .max(1)
     };
     match program.get_lamports().cmp(&required_lamports) {
         std::cmp::Ordering::Less => {

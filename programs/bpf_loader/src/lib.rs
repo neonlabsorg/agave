@@ -577,7 +577,7 @@ fn process_loader_upgradeable_instruction(
             let mut instruction = system_instruction::create_account(
                 &payer_key,
                 &programdata_key,
-                1.max(rent.minimum_balance(programdata_len)),
+                rent.minimum_balance(programdata_len),
                 programdata_len as u64,
                 program_id,
             );
@@ -720,7 +720,7 @@ fn process_loader_upgradeable_instruction(
             let programdata = instruction_context.try_borrow_instruction_account(0)?;
             let programdata_data_offset = UpgradeableLoaderState::size_of_programdata_metadata();
             let programdata_balance_required =
-                1.max(rent.minimum_balance(programdata.get_data().len()));
+                rent.minimum_balance(programdata.get_data().len());
             if programdata.get_data().len()
                 < UpgradeableLoaderState::size_of_programdata(buffer_data_len)
             {
@@ -1355,7 +1355,7 @@ fn common_extend_program(
     let required_payment = {
         let balance = programdata_account.get_lamports();
         let rent = invoke_context.get_sysvar_cache().get_rent()?;
-        let min_balance = rent.minimum_balance(new_len).max(1);
+        let min_balance = rent.minimum_balance(new_len);
         min_balance.saturating_sub(balance)
     };
 
@@ -2306,10 +2306,10 @@ mod tests {
             let spill_address = Pubkey::new_unique();
             let rent = Rent::default();
             let min_program_balance =
-                1.max(rent.minimum_balance(UpgradeableLoaderState::size_of_program()));
-            let min_programdata_balance = 1.max(rent.minimum_balance(
+                rent.minimum_balance(UpgradeableLoaderState::size_of_program());
+            let min_programdata_balance = rent.minimum_balance(
                 UpgradeableLoaderState::size_of_programdata(elf_orig.len().max(elf_new.len())),
-            ));
+            );
             let (programdata_address, _) =
                 Pubkey::find_program_address(&[program_address.as_ref()], &loader_id);
             let mut buffer_account = AccountSharedData::new(
