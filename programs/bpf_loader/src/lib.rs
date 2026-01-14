@@ -489,6 +489,13 @@ fn process_loader_upgradeable_instruction(
             )?;
         }
         UpgradeableLoaderInstruction::DeployWithMaxDataLen { max_data_len } => {
+            if invoke_context.environment_config.disable_program_deployment {
+                ic_logger_msg!(
+                    log_collector,
+                    "Program deployment is disabled by validator configuration"
+                );
+                return Err(InstructionError::InvalidArgument);
+            }
             instruction_context.check_number_of_instruction_accounts(4)?;
             let payer_key = *instruction_context.get_key_of_instruction_account(0)?;
             let programdata_key = *instruction_context.get_key_of_instruction_account(1)?;
@@ -653,6 +660,13 @@ fn process_loader_upgradeable_instruction(
             ic_logger_msg!(log_collector, "Deployed program {:?}", new_program_id);
         }
         UpgradeableLoaderInstruction::Upgrade => {
+            if invoke_context.environment_config.disable_program_deployment {
+                ic_logger_msg!(
+                    log_collector,
+                    "Program deployment is disabled by validator configuration"
+                );
+                return Err(InstructionError::InvalidArgument);
+            }
             instruction_context.check_number_of_instruction_accounts(3)?;
             let programdata_key = *instruction_context.get_key_of_instruction_account(0)?;
             let rent =

@@ -56,6 +56,21 @@ const WEN_RESTART_HELP: &str =
      If wen_restart fails, refer to the progress file (in proto3 format) for further debugging and \
      watch the discord channel for instructions.";
 
+fn parse_bool_value(value: &str) -> std::result::Result<bool, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "t" | "y" | "yes" | "on" => Ok(true),
+        "0" | "false" | "f" | "n" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "Invalid boolean value: {value}. Use true/false, 1/0, yes/no, on/off."
+        )),
+    }
+}
+
+fn validate_bool_value(value: String) -> std::result::Result<(), String> {
+    parse_bool_value(&value).map(|_| ())
+}
+
 pub mod account_secondary_indexes;
 pub mod blockstore_options;
 pub mod json_rpc_config;
@@ -74,6 +89,7 @@ pub struct RunArgs {
     pub blockstore_options: BlockstoreOptions,
     pub json_rpc_config: JsonRpcConfig,
     pub pub_sub_config: PubSubConfig,
+    pub disable_program_deployment: bool,
 }
 
 impl FromClapArgMatches for RunArgs {
@@ -112,6 +128,12 @@ impl FromClapArgMatches for RunArgs {
         )?;
 
         let socket_addr_space = SocketAddrSpace::new(matches.is_present("allow_private_addr"));
+        let disable_program_deployment = match matches.value_of("disable_program_deployment") {
+            Some(value) => parse_bool_value(value).map_err(|err| {
+                crate::commands::Error::Dynamic(Box::<dyn std::error::Error>::from(err))
+            })?,
+            None => false,
+        };
 
         Ok(RunArgs {
             identity_keypair,
@@ -123,6 +145,7 @@ impl FromClapArgMatches for RunArgs {
             blockstore_options: BlockstoreOptions::from_clap_arg_match(matches)?,
             json_rpc_config: JsonRpcConfig::from_clap_arg_match(matches)?,
             pub_sub_config: PubSubConfig::from_clap_arg_match(matches)?,
+            disable_program_deployment,
         })
     }
 }
@@ -1551,6 +1574,17 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Maximum number of bytes written to the program log before truncation"),
     )
     .arg(
+        Arg::with_name("disable_program_deployment")
+            .long("disable-program-deployment")
+            .takes_value(true)
+            .value_name("BOOL")
+            .validator(validate_bool_value)
+            .help(
+                "Disable program deployment and upgrade when set to true/1/yes/on \
+                 [default: false]",
+            ),
+    )
+    .arg(
         Arg::with_name("banking_trace_dir_byte_limit")
             // expose friendly alternative name to cli than internal
             // implementation-oriented one
@@ -1753,6 +1787,7 @@ mod tests {
                         solana_rpc::rpc_pubsub_service::DEFAULT_QUEUE_CAPACITY_ITEMS,
                     ..PubSubConfig::default_for_tests()
                 },
+                disable_program_deployment: false,
             }
         }
     }
@@ -1769,6 +1804,7 @@ mod tests {
                 blockstore_options: self.blockstore_options.clone(),
                 json_rpc_config: self.json_rpc_config.clone(),
                 pub_sub_config: self.pub_sub_config.clone(),
+                disable_program_deployment: self.disable_program_deployment,
             }
         }
     }

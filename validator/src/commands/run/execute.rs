@@ -645,6 +645,7 @@ pub fn execute(
         wait_to_vote_slot: None,
         runtime_config: RuntimeConfig {
             log_messages_bytes_limit: value_of(matches, "log_messages_bytes_limit"),
+            disable_program_deployment: run_args.disable_program_deployment,
             ..RuntimeConfig::default()
         },
         staked_nodes_overrides: staked_nodes_overrides.clone(),

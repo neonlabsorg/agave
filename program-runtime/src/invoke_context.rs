@@ -145,6 +145,7 @@ impl BpfAllocator {
 pub struct EnvironmentConfig<'a> {
     pub blockhash: Hash,
     pub blockhash_lamports_per_signature: u64,
+    pub disable_program_deployment: bool,
     epoch_stake_callback: &'a dyn InvokeContextCallback,
     feature_set: &'a SVMFeatureSet,
     sysvar_cache: &'a SysvarCache,
@@ -153,6 +154,7 @@ impl<'a> EnvironmentConfig<'a> {
     pub fn new(
         blockhash: Hash,
         blockhash_lamports_per_signature: u64,
+        disable_program_deployment: bool,
         epoch_stake_callback: &'a dyn InvokeContextCallback,
         feature_set: &'a SVMFeatureSet,
         sysvar_cache: &'a SysvarCache,
@@ -160,6 +162,7 @@ impl<'a> EnvironmentConfig<'a> {
         Self {
             blockhash,
             blockhash_lamports_per_signature,
+            disable_program_deployment,
             epoch_stake_callback,
             feature_set,
             sysvar_cache,
@@ -790,6 +793,7 @@ macro_rules! with_mock_invoke_context_with_feature_set {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
+            false,
             &MockInvokeContextCallback {},
             $feature_set,
             &sysvar_cache,

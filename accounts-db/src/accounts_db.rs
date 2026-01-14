@@ -263,8 +263,7 @@ enum LoadZeroLamports {
     /// Note that this is non-deterministic if clean is running asynchronously.
     /// If a zero lamport account exists in the index, then Some is returned.
     /// Once it is cleaned from the index, None is returned.
-    #[cfg(feature = "dev-context-only-utils")]
-    SomeWithZeroLamportAccountForTests,
+    Some,
 }
 
 #[derive(Debug)]
@@ -4096,6 +4095,15 @@ impl AccountsDb {
         self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::None)
     }
 
+    pub fn load_allow_tombstone(
+        &self,
+        ancestors: &Ancestors,
+        pubkey: &Pubkey,
+        load_hint: LoadHint,
+    ) -> Option<(AccountSharedData, Slot)> {
+        self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::Some)
+    }
+
     /// load the account with `pubkey` into the read only accounts cache.
     /// The goal is to make subsequent loads (which caller expects to occur) to find the account quickly.
     pub fn load_account_into_read_cache(&self, ancestors: &Ancestors, pubkey: &Pubkey) {
@@ -7543,7 +7551,7 @@ impl AccountsDb {
             None,
             LoadHint::Unspecified,
             // callers of this expect zero lamport accounts that exist in the index to be returned as Some(empty)
-            LoadZeroLamports::SomeWithZeroLamportAccountForTests,
+            LoadZeroLamports::Some,
         )
     }
 

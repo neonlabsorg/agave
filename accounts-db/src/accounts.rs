@@ -161,7 +161,7 @@ impl Accounts {
         }
     }
     /// Slow because lock is held for 1 operation instead of many
-    /// This always returns None for zero-lamport accounts.
+    /// This returns None for default tombstone accounts.
     fn load_slow(
         &self,
         ancestors: &Ancestors,
@@ -199,6 +199,15 @@ impl Accounts {
         pubkey: &Pubkey,
     ) -> Option<(AccountSharedData, Slot)> {
         self.load_slow(ancestors, pubkey, LoadHint::Unspecified)
+    }
+
+    pub fn load_without_fixed_root_allow_tombstone(
+        &self,
+        ancestors: &Ancestors,
+        pubkey: &Pubkey,
+    ) -> Option<(AccountSharedData, Slot)> {
+        self.accounts_db
+            .load_allow_tombstone(ancestors, pubkey, LoadHint::Unspecified)
     }
 
     /// scans underlying accounts_db for this delta (slot) with a map function

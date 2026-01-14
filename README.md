@@ -116,3 +116,17 @@ problem is solved by this code?" On the other hand, if a test does fail and you 
 better way to solve the same problem, a Pull Request with your solution would most certainly be
 welcome! Likewise, if rewriting a test can better communicate what code it's protecting, please
 send us that patch!
+
+# Disable program deployment
+
+You can block program deploys and upgrades at validator startup with
+`--disable-program-deployment`. The default is `false`.
+
+Example:
+
+```bash
+$ agave-validator --disable-program-deployment yes ...
+```
+
+Accepted values: `true/false`, `1/0`, `y/n`, `yes/no`, `on/off`. When set to `true`, any deploy or
+upgrade instruction is rejected with an error.

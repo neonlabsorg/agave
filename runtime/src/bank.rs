@@ -555,6 +555,7 @@ impl PartialEq for Bank {
             collector_fee_details: _,
             compute_budget: _,
             transaction_account_lock_limit: _,
+            disable_program_deployment: _,
             fee_structure: _,
             cache_for_accounts_lt_hash: _,
             stats_for_accounts_lt_hash: _,
@@ -874,6 +875,9 @@ pub struct Bank {
     /// The max number of accounts that a transaction may lock.
     transaction_account_lock_limit: Option<usize>,
 
+    /// Disallow program deployment instructions when true.
+    disable_program_deployment: bool,
+
     /// Fee structure to use for assessing transaction fees.
     fee_structure: FeeStructure,
 
@@ -1099,6 +1103,7 @@ impl Bank {
             collector_fee_details: RwLock::new(CollectorFeeDetails::default()),
             compute_budget: None,
             transaction_account_lock_limit: None,
+            disable_program_deployment: false,
             fee_structure: FeeStructure::default(),
             #[cfg(feature = "dev-context-only-utils")]
             hash_overrides: Arc::new(Mutex::new(HashOverrides::default())),
@@ -1140,6 +1145,7 @@ impl Bank {
         bank.ancestors = Ancestors::from(vec![bank.slot()]);
         bank.compute_budget = runtime_config.compute_budget;
         bank.transaction_account_lock_limit = runtime_config.transaction_account_lock_limit;
+        bank.disable_program_deployment = runtime_config.disable_program_deployment;
         bank.transaction_debug_keys = debug_keys;
         bank.cluster_type = Some(genesis_config.cluster_type);
 
@@ -1352,6 +1358,7 @@ impl Bank {
             collector_fee_details: RwLock::new(CollectorFeeDetails::default()),
             compute_budget: parent.compute_budget,
             transaction_account_lock_limit: parent.transaction_account_lock_limit,
+            disable_program_deployment: parent.disable_program_deployment,
             fee_structure: parent.fee_structure.clone(),
             #[cfg(feature = "dev-context-only-utils")]
             hash_overrides: parent.hash_overrides.clone(),
@@ -1812,6 +1819,7 @@ impl Bank {
             collector_fee_details: RwLock::new(CollectorFeeDetails::default()),
             compute_budget: runtime_config.compute_budget,
             transaction_account_lock_limit: runtime_config.transaction_account_lock_limit,
+            disable_program_deployment: runtime_config.disable_program_deployment,
             fee_structure: FeeStructure::default(),
             #[cfg(feature = "dev-context-only-utils")]
             hash_overrides: Arc::new(Mutex::new(HashOverrides::default())),
@@ -3293,6 +3301,7 @@ impl Bank {
             epoch_total_stake: self.get_current_epoch_total_stake(),
             feature_set: self.feature_set.runtime_features(),
             rent: self.rent_collector.rent.clone(),
+            disable_program_deployment: self.disable_program_deployment,
         };
 
         let sanitized_output = self
@@ -4216,6 +4225,13 @@ impl Bank {
     // processing. That alternative fn provides more safety.
     pub fn get_account(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
         self.get_account_modified_slot(pubkey)
+            .map(|(acc, _slot)| acc)
+    }
+
+    pub fn get_account_allow_tombstone(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+        self.rc
+            .accounts
+            .load_without_fixed_root_allow_tombstone(&self.ancestors, pubkey)
             .map(|(acc, _slot)| acc)
     }
 

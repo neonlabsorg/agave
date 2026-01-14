@@ -138,6 +138,8 @@ pub struct TransactionProcessingEnvironment {
     pub feature_set: SVMFeatureSet,
     /// Rent calculator to use for the transaction batch.
     pub rent: Rent,
+    /// Whether program deployment is disabled for this runtime.
+    pub disable_program_deployment: bool,
 }
 
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
@@ -893,6 +895,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             EnvironmentConfig::new(
                 environment.blockhash,
                 environment.blockhash_lamports_per_signature,
+                environment.disable_program_deployment,
                 callback,
                 &environment.feature_set,
                 sysvar_cache,
