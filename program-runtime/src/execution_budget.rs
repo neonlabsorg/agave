@@ -22,12 +22,12 @@ pub const MAX_CALL_DEPTH: usize = 64;
 /// The size of one SBF stack frame.
 pub const STACK_FRAME_SIZE: usize = 4096;
 
-pub const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+pub const MAX_COMPUTE_UNIT_LIMIT: u32 = 14_000_000;
 
 /// Roughly 0.5us/page, where page is 32K; given roughly 15CU/us, the
 /// default heap page cost = 0.5 * 15 ~= 8CU/page
 pub const DEFAULT_HEAP_COST: u64 = 8;
-pub const DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT: u32 = 200_000;
+pub const DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT: u32 = 2_000_000;
 // SIMD-170 defines max CUs to be allocated for any builtin program instructions, that
 // have not been migrated to sBPF programs.
 pub const MAX_BUILTIN_ALLOCATION_COMPUTE_UNIT_LIMIT: u32 = 3_000;

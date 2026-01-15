@@ -6737,8 +6737,8 @@ fn test_reserved_account_keys() {
 
 #[test]
 fn test_block_limits() {
-    const MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_FIRST: u64 = 24_000_000;
-    const MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_SECOND: u64 = 40_000_000;
+    const MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_FIRST: u64 = 240_000_000;
+    const MAX_WRITABLE_ACCOUNT_UNITS_SIMD_0306_SECOND: u64 = 400_000_000;
     let (bank0, _bank_forks) = create_simple_test_arc_bank(100_000);
     let mut bank = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
 
