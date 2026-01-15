@@ -4,8 +4,9 @@ use {
     crate::{
         account_loader::{
             load_transaction, update_rent_exempt_status_for_account, validate_fee_payer,
-            AccountLoader, CheckedTransactionDetails, LoadedTransaction, TransactionCheckResult,
-            TransactionLoadResult, ValidatedTransactionDetails,
+            AccountLoader, CheckedTransactionDetails, LoadedTransaction, LoadedTransactionAccount,
+            TransactionCheckResult, TransactionLoadResult, ValidatedTransactionDetails,
+            TRANSACTION_ACCOUNT_BASE_SIZE,
         },
         account_overrides::AccountOverrides,
         message_processor::process_message,
@@ -137,6 +138,8 @@ pub struct TransactionProcessingEnvironment {
     pub feature_set: SVMFeatureSet,
     /// Rent calculator to use for the transaction batch.
     pub rent: Rent,
+    /// Whether program deployment is disabled for this runtime.
+    pub disable_program_deployment: bool,
 }
 
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
@@ -608,12 +611,26 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         // We *must* use load_transaction_account() here because *this* is when the fee-payer
         // is loaded for the transaction. Transaction loading skips the first account and
         // loads (and thus inspects) all others normally.
-        let Some(mut loaded_fee_payer) =
-            account_loader.load_transaction_account(fee_payer_address, true)
-        else {
-            error_counters.account_not_found += 1;
-            return Err(TransactionError::AccountNotFound);
-        };
+        let mut loaded_fee_payer =
+            if let Some(loaded_fee_payer) = account_loader.load_transaction_account(
+                fee_payer_address,
+                true,
+            ) {
+                loaded_fee_payer
+            } else if compute_budget_and_limits.fee_details.total_fee() == 0 {
+                let base_account_size = if account_loader.feature_set.formalize_loaded_transaction_data_size {
+                    TRANSACTION_ACCOUNT_BASE_SIZE
+                } else {
+                    0
+                };
+                LoadedTransactionAccount {
+                    loaded_size: base_account_size,
+                    account: AccountSharedData::new(0, 0, &system_program::id()),
+                }
+            } else {
+                error_counters.account_not_found += 1;
+                return Err(TransactionError::AccountNotFound);
+            };
 
         let fee_payer_loaded_rent_epoch = loaded_fee_payer.account.rent_epoch();
         update_rent_exempt_status_for_account(rent, &mut loaded_fee_payer.account);
@@ -878,6 +895,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             EnvironmentConfig::new(
                 environment.blockhash,
                 environment.blockhash_lamports_per_signature,
+                environment.disable_program_deployment,
                 callback,
                 &environment.feature_set,
                 sysvar_cache,
@@ -2126,8 +2144,8 @@ mod tests {
                 &mut error_counters,
             );
 
-        assert_eq!(error_counters.account_not_found.0, 1);
-        assert_eq!(result, Err(TransactionError::AccountNotFound));
+        assert_eq!(error_counters.account_not_found.0, 0);
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -2249,8 +2267,8 @@ mod tests {
                 &mut error_counters,
             );
 
-        assert_eq!(error_counters.invalid_account_for_fee.0, 1);
-        assert_eq!(result, Err(TransactionError::InvalidAccountForFee));
+        assert_eq!(error_counters.invalid_account_for_fee.0, 0);
+        assert_eq!(result, Ok(()));
     }
 
     #[test]

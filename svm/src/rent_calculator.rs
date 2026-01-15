@@ -3,12 +3,12 @@
 //! Rent management for SVM.
 
 use {
-    solana_account::{AccountSharedData, ReadableAccount},
+    solana_account::AccountSharedData,
     solana_clock::Epoch,
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_transaction_context::{IndexOfAccount, TransactionContext},
-    solana_transaction_error::{TransactionError, TransactionResult},
+    solana_transaction_error::TransactionResult,
 };
 
 /// When rent is collected from an exempt account, rent_epoch is set to this
@@ -35,23 +35,24 @@ pub enum RentState {
 /// This method has a default implementation that calls into
 /// `check_rent_state_with_account`.
 pub fn check_rent_state(
-    pre_rent_state: Option<&RentState>,
-    post_rent_state: Option<&RentState>,
-    transaction_context: &TransactionContext,
-    index: IndexOfAccount,
+    _pre_rent_state: Option<&RentState>,
+    _post_rent_state: Option<&RentState>,
+    _transaction_context: &TransactionContext,
+    _index: IndexOfAccount,
 ) -> TransactionResult<()> {
-    if let Some((pre_rent_state, post_rent_state)) = pre_rent_state.zip(post_rent_state) {
-        let expect_msg = "account must exist at TransactionContext index if rent-states are Some";
-        check_rent_state_with_account(
-            pre_rent_state,
-            post_rent_state,
-            transaction_context
-                .get_key_of_account_at_index(index)
-                .expect(expect_msg),
-            index,
-        )?;
-    }
     Ok(())
+    // if let Some((pre_rent_state, post_rent_state)) = pre_rent_state.zip(post_rent_state) {
+    //     let expect_msg = "account must exist at TransactionContext index if rent-states are Some";
+    //     check_rent_state_with_account(
+    //         pre_rent_state,
+    //         post_rent_state,
+    //         transaction_context
+    //             .get_key_of_account_at_index(index)
+    //             .expect(expect_msg),
+    //         index,
+    //     )?;
+    // }
+    // Ok(())
 }
 
 /// Check rent state transition for an account directly.
@@ -60,19 +61,20 @@ pub fn check_rent_state(
 /// transition is allowed and returns an error if it is not. It also
 /// verifies that the account is not the incinerator.
 pub fn check_rent_state_with_account(
-    pre_rent_state: &RentState,
-    post_rent_state: &RentState,
-    address: &Pubkey,
-    account_index: IndexOfAccount,
+    _pre_rent_state: &RentState,
+    _post_rent_state: &RentState,
+    _address: &Pubkey,
+    _account_index: IndexOfAccount,
 ) -> TransactionResult<()> {
-    if !solana_sdk_ids::incinerator::check_id(address)
-        && !transition_allowed(pre_rent_state, post_rent_state)
-    {
-        let account_index = account_index as u8;
-        Err(TransactionError::InsufficientFundsForRent { account_index })
-    } else {
-        Ok(())
-    }
+    // if !solana_sdk_ids::incinerator::check_id(address)
+    //     && !transition_allowed(pre_rent_state, post_rent_state)
+    // {
+    //     let account_index = account_index as u8;
+    //     Err(TransactionError::InsufficientFundsForRent { account_index })
+    // } else {
+    //     Ok(())
+    // }
+    Ok(())
 }
 
 /// Determine the rent state of an account.
@@ -80,17 +82,18 @@ pub fn check_rent_state_with_account(
 /// This method has a default implementation that treats accounts with zero
 /// lamports as uninitialized and uses the implemented `get_rent` to
 /// determine whether an account is rent-exempt.
-pub fn get_account_rent_state(rent: &Rent, account: &AccountSharedData) -> RentState {
-    if account.lamports() == 0 {
-        RentState::Uninitialized
-    } else if rent.is_exempt(account.lamports(), account.data().len()) {
-        RentState::RentExempt
-    } else {
-        RentState::RentPaying {
-            data_size: account.data().len(),
-            lamports: account.lamports(),
-        }
-    }
+pub fn get_account_rent_state(_rent: &Rent, _account: &AccountSharedData) -> RentState {
+    // if account.lamports() == 0 {
+    //     RentState::Uninitialized
+    // } else if rent.is_exempt(account.lamports(), account.data().len()) {
+    //     RentState::RentExempt
+    // } else {
+    //     RentState::RentPaying {
+    //         data_size: account.data().len(),
+    //         lamports: account.lamports(),
+    //     }
+    // }
+    RentState::RentExempt
 }
 
 /// Check whether a transition from the pre_rent_state to the
@@ -101,23 +104,24 @@ pub fn get_account_rent_state(rent: &Rent, account: &AccountSharedData) -> RentS
 /// Pre-state `RentState::RentPaying` can only transition to
 /// `RentState::RentPaying` if the data size remains the same and the
 /// account is not credited.
-pub fn transition_allowed(pre_rent_state: &RentState, post_rent_state: &RentState) -> bool {
-    match post_rent_state {
-        RentState::Uninitialized | RentState::RentExempt => true,
-        RentState::RentPaying {
-            data_size: post_data_size,
-            lamports: post_lamports,
-        } => {
-            match pre_rent_state {
-                RentState::Uninitialized | RentState::RentExempt => false,
-                RentState::RentPaying {
-                    data_size: pre_data_size,
-                    lamports: pre_lamports,
-                } => {
-                    // Cannot remain RentPaying if resized or credited.
-                    post_data_size == pre_data_size && post_lamports <= pre_lamports
-                }
-            }
-        }
-    }
+pub fn transition_allowed(_pre_rent_state: &RentState, _post_rent_state: &RentState) -> bool {
+    // match post_rent_state {
+    //     RentState::Uninitialized | RentState::RentExempt => true,
+    //     RentState::RentPaying {
+    //         data_size: post_data_size,
+    //         lamports: post_lamports,
+    //     } => {
+    //         match pre_rent_state {
+    //             RentState::Uninitialized | RentState::RentExempt => false,
+    //             RentState::RentPaying {
+    //                 data_size: pre_data_size,
+    //                 lamports: pre_lamports,
+    //             } => {
+    //                 // Cannot remain RentPaying if resized or credited.
+    //                 post_data_size == pre_data_size && post_lamports <= pre_lamports
+    //             }
+    //         }
+    //     }
+    // }
+    true
 }

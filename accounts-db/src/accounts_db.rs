@@ -28,6 +28,7 @@ use crate::append_vec::StoredAccountMeta;
 use qualifier_attr::qualifiers;
 use {
     crate::{
+        account_utils::{is_default_account, is_default_account_meta},
         account_info::{AccountInfo, Offset, StorageLocation},
         account_storage::{
             stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
@@ -252,18 +253,17 @@ pub enum StoreReclaims {
     Ignore,
 }
 
-/// specifies how to return zero lamport accounts from a load
+/// specifies how to return tombstone accounts from a load
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoadZeroLamports {
-    /// return None if loaded account has zero lamports
+    /// return None if loaded account is a default tombstone
     None,
-    /// return Some(account with zero lamports) if loaded account has zero lamports
+    /// return Some(account) even if it is a default tombstone
     /// This used to be the only behavior.
     /// Note that this is non-deterministic if clean is running asynchronously.
     /// If a zero lamport account exists in the index, then Some is returned.
     /// Once it is cleaned from the index, None is returned.
-    #[cfg(feature = "dev-context-only-utils")]
-    SomeWithZeroLamportAccountForTests,
+    Some,
 }
 
 #[derive(Debug)]
@@ -371,7 +371,7 @@ impl AccountFromStorage {
         AccountFromStorage {
             index_info: AccountInfo::new(
                 StorageLocation::AppendVec(storage_id, account.offset()),
-                account.is_zero_lamport(),
+                is_default_account(account),
             ),
             pubkey: *account.pubkey(),
             data_len: account.data_len() as u64,
@@ -2010,8 +2010,14 @@ impl AccountsDb {
                             .accounts
                             .scan_accounts_without_data(|_offset, account| {
                                 let pubkey = *account.pubkey();
-                                let is_zero_lamport = account.is_zero_lamport();
-                                insert_candidate(pubkey, is_zero_lamport);
+                                let is_tombstone = is_default_account_meta(
+                                    account.lamports,
+                                    account.data_len,
+                                    account.owner,
+                                    account.executable,
+                                    account.rent_epoch,
+                                );
+                                insert_candidate(pubkey, is_tombstone);
                             })
                             .expect("must scan accounts storage");
                     });
@@ -2964,10 +2970,17 @@ impl AccountsDb {
             .scan_accounts_without_data(|offset, account| {
                 // file_id is unused and can be anything. We will always be loading whatever storage is in the slot.
                 let file_id = 0;
+                let is_tombstone = is_default_account_meta(
+                    account.lamports,
+                    account.data_len,
+                    account.owner,
+                    account.executable,
+                    account.rent_epoch,
+                );
                 stored_accounts.push(AccountFromStorage {
                     index_info: AccountInfo::new(
                         StorageLocation::AppendVec(file_id, offset),
-                        account.is_zero_lamport(),
+                        is_tombstone,
                     ),
                     pubkey: *account.pubkey(),
                     data_len: account.data_len as u64,
@@ -4082,6 +4095,15 @@ impl AccountsDb {
         self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::None)
     }
 
+    pub fn load_allow_tombstone(
+        &self,
+        ancestors: &Ancestors,
+        pubkey: &Pubkey,
+        load_hint: LoadHint,
+    ) -> Option<(AccountSharedData, Slot)> {
+        self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::Some)
+    }
+
     /// load the account with `pubkey` into the read only accounts cache.
     /// The goal is to make subsequent loads (which caller expects to occur) to find the account quickly.
     pub fn load_account_into_read_cache(&self, ancestors: &Ancestors, pubkey: &Pubkey) {
@@ -4096,7 +4118,7 @@ impl AccountsDb {
         );
     }
 
-    /// note this returns None for accounts with zero lamports
+    /// note this returns None for default tombstone accounts
     pub fn load_with_fixed_root(
         &self,
         ancestors: &Ancestors,
@@ -4427,7 +4449,7 @@ impl AccountsDb {
     /// Load account with `pubkey` and maybe put into read cache.
     ///
     /// Return the account and the slot when the account was last stored.
-    /// Return None for ZeroLamport accounts.
+    /// Return None for default tombstone accounts.
     pub fn load_account_with(
         &self,
         ancestors: &Ancestors,
@@ -4442,7 +4464,7 @@ impl AccountsDb {
         if !in_write_cache {
             let result = self.read_only_accounts_cache.load(*pubkey, slot);
             if let Some(account) = result {
-                if account.is_zero_lamport() {
+                if is_default_account(&account) {
                     return None;
                 }
                 return Some((account, slot));
@@ -4462,7 +4484,7 @@ impl AccountsDb {
         // since the cache could be flushed in between the 2 calls.
         let in_write_cache = matches!(account_accessor, LoadedAccountAccessor::Cached(_));
         let account = account_accessor.check_and_get_loaded_account_shared_data();
-        if account.is_zero_lamport() {
+        if is_default_account(&account) {
             return None;
         }
 
@@ -4510,7 +4532,8 @@ impl AccountsDb {
             if !in_write_cache {
                 let result = self.read_only_accounts_cache.load(*pubkey, slot);
                 if let Some(account) = result {
-                    if load_zero_lamports == LoadZeroLamports::None && account.is_zero_lamport() {
+                    if load_zero_lamports == LoadZeroLamports::None && is_default_account(&account)
+                    {
                         return None;
                     }
                     return Some((account, slot));
@@ -4540,7 +4563,7 @@ impl AccountsDb {
         // since the cache could be flushed in between the 2 calls.
         let in_write_cache = matches!(account_accessor, LoadedAccountAccessor::Cached(_));
         let account = account_accessor.check_and_get_loaded_account_shared_data();
-        if load_zero_lamports == LoadZeroLamports::None && account.is_zero_lamport() {
+        if load_zero_lamports == LoadZeroLamports::None && is_default_account(&account) {
             return None;
         }
 
@@ -6284,8 +6307,10 @@ impl AccountsDb {
                 accounts_and_meta_to_store.account_default_if_zero_lamport(index, |account| {
                     let account_shared_data = account.to_account_shared_data();
                     let pubkey = account.pubkey();
-                    let account_info =
-                        AccountInfo::new(StorageLocation::Cached, account.is_zero_lamport());
+                    let account_info = AccountInfo::new(
+                        StorageLocation::Cached,
+                        accounts_and_meta_to_store.is_tombstone(index),
+                    );
 
                     self.notify_account_at_accounts_update(
                         slot,
@@ -6343,7 +6368,7 @@ impl AccountsDb {
             for (i, offset) in stored_accounts_info.offsets.iter().enumerate() {
                 infos.push(AccountInfo::new(
                     StorageLocation::AppendVec(store_id, *offset),
-                    accounts_and_meta_to_store.is_zero_lamport(i),
+                    accounts_and_meta_to_store.is_tombstone(i),
                 ));
             }
             storage.add_accounts(
@@ -6644,20 +6669,20 @@ impl AccountsDb {
         let (insert_time_us, generate_index_results) = {
             let mut keyed_account_infos = vec![];
             // this closure is the shared code when scanning the storage
-            let mut itemizer = |info: IndexInfo| {
+            let mut itemizer = |info: IndexInfo, is_tombstone: bool| {
                 stored_size_alive += info.stored_size_aligned;
-                if info.index_info.lamports > 0 {
+                if is_tombstone {
+                    // default tombstone accounts
+                    zero_lamport_pubkeys.push(info.index_info.pubkey);
+                } else {
                     accounts_data_len += info.index_info.data_len;
                     all_accounts_are_zero_lamports = false;
-                } else {
-                    // zero lamport accounts
-                    zero_lamport_pubkeys.push(info.index_info.pubkey);
                 }
                 keyed_account_infos.push((
                     info.index_info.pubkey,
                     AccountInfo::new(
                         StorageLocation::AppendVec(store_id, info.index_info.offset), // will never be cached
-                        info.index_info.is_zero_lamport(),
+                        is_tombstone,
                     ),
                 ));
             };
@@ -6668,6 +6693,7 @@ impl AccountsDb {
                     let data_len = account.data.len() as u64;
                     let stored_size_aligned =
                         storage.accounts.calculate_stored_size(data_len as usize);
+                    let is_tombstone = is_default_account(&account);
                     let info = IndexInfo {
                         stored_size_aligned,
                         index_info: IndexInfoInner {
@@ -6677,7 +6703,7 @@ impl AccountsDb {
                             data_len,
                         },
                     };
-                    itemizer(info);
+                    itemizer(info, is_tombstone);
                     self.accounts_index.update_secondary_indexes(
                         account.pubkey,
                         &account,
@@ -6692,6 +6718,13 @@ impl AccountsDb {
                         let data_len = account.data_len as u64;
                         let stored_size_aligned =
                             storage.accounts.calculate_stored_size(data_len as usize);
+                        let is_tombstone = is_default_account_meta(
+                            account.lamports,
+                            account.data_len,
+                            account.owner,
+                            account.executable,
+                            account.rent_epoch,
+                        );
                         let info = IndexInfo {
                             stored_size_aligned,
                             index_info: IndexInfoInner {
@@ -6701,7 +6734,7 @@ impl AccountsDb {
                                 data_len,
                             },
                         };
-                        itemizer(info);
+                        itemizer(info, is_tombstone);
                     })
             }
             .expect("must scan accounts storage");
@@ -6857,9 +6890,16 @@ impl AccountsDb {
                                     for (slot2, account_info2) in slot_list.iter() {
                                         if *slot2 == slot {
                                             count += 1;
+                                            let is_tombstone = is_default_account_meta(
+                                                account.lamports,
+                                                account.data_len,
+                                                account.owner,
+                                                account.executable,
+                                                account.rent_epoch,
+                                            );
                                             let ai = AccountInfo::new(
                                                 StorageLocation::AppendVec(store_id, offset), // will never be cached
-                                                account.is_zero_lamport(),
+                                                is_tombstone,
                                             );
                                             assert_eq!(&ai, account_info2);
                                         }
@@ -7511,7 +7551,7 @@ impl AccountsDb {
             None,
             LoadHint::Unspecified,
             // callers of this expect zero lamport accounts that exist in the index to be returned as Some(empty)
-            LoadZeroLamports::SomeWithZeroLamportAccountForTests,
+            LoadZeroLamports::Some,
         )
     }
 

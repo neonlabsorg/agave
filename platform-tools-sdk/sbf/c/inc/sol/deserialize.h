@@ -16,7 +16,7 @@ extern "C" {
 /**
  * Maximum number of bytes a program may add to an account during a single realloc
  */
-#define MAX_PERMITTED_DATA_INCREASE (1024 * 10)
+#define MAX_PERMITTED_DATA_INCREASE (1024 * 10 * 10)
 
 /**
  * De-serializes the input parameters into usable types

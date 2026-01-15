@@ -213,7 +213,6 @@ fn process_instruction_set_program_length(
     } else {
         let rent = invoke_context.get_sysvar_cache().get_rent()?;
         rent.minimum_balance(LoaderV4State::program_data_offset().saturating_add(new_size as usize))
-            .max(1)
     };
     match program.get_lamports().cmp(&required_lamports) {
         std::cmp::Ordering::Less => {
@@ -263,6 +262,13 @@ fn process_instruction_set_program_length(
 
 fn process_instruction_deploy(invoke_context: &mut InvokeContext) -> Result<(), InstructionError> {
     let log_collector = invoke_context.get_log_collector();
+    if invoke_context.environment_config.disable_program_deployment {
+        ic_logger_msg!(
+            log_collector,
+            "Program deployment is disabled by validator configuration"
+        );
+        return Err(InstructionError::InvalidArgument);
+    }
     let transaction_context = &invoke_context.transaction_context;
     let instruction_context = transaction_context.get_current_instruction_context()?;
     let mut program = instruction_context.try_borrow_instruction_account(0)?;

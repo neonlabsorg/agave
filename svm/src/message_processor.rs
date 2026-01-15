@@ -222,6 +222,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
+            false,
             &MockCallback {},
             &feature_set,
             &sysvar_cache,
@@ -276,6 +277,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
+            false,
             &MockCallback {},
             &feature_set,
             &sysvar_cache,
@@ -320,6 +322,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
+            false,
             &MockCallback {},
             &feature_set,
             &sysvar_cache,
@@ -453,6 +456,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
+            false,
             &MockCallback {},
             &feature_set,
             &sysvar_cache,
@@ -492,6 +496,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
+            false,
             &MockCallback {},
             &feature_set,
             &sysvar_cache,
@@ -528,6 +533,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
+            false,
             &MockCallback {},
             &feature_set,
             &sysvar_cache,
@@ -676,6 +682,7 @@ mod tests {
         let environment_config = EnvironmentConfig::new(
             Hash::default(),
             0,
+            false,
             &MockCallback {},
             &feature_set,
             &sysvar_cache,

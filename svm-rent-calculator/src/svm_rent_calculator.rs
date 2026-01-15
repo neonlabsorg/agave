@@ -19,21 +19,21 @@ pub fn check_rent_state(
     transaction_context: &TransactionContext,
     index: IndexOfAccount,
 ) -> TransactionResult<()> {
-    if let Some((pre_rent_state, post_rent_state)) = pre_rent_state.zip(post_rent_state) {
-        let expect_msg = "account must exist at TransactionContext index if rent-states are Some";
-        check_rent_state_with_account(
-            pre_rent_state,
-            post_rent_state,
-            transaction_context
-                .get_key_of_account_at_index(index)
-                .expect(expect_msg),
-            &transaction_context
-                .accounts()
-                .try_borrow(index)
-                .expect(expect_msg),
-            index,
-        )?;
-    }
+    // if let Some((pre_rent_state, post_rent_state)) = pre_rent_state.zip(post_rent_state) {
+    //     let expect_msg = "account must exist at TransactionContext index if rent-states are Some";
+    //     check_rent_state_with_account(
+    //         pre_rent_state,
+    //         post_rent_state,
+    //         transaction_context
+    //             .get_key_of_account_at_index(index)
+    //             .expect(expect_msg),
+    //         &transaction_context
+    //             .accounts()
+    //             .try_borrow(index)
+    //             .expect(expect_msg),
+    //         index,
+    //     )?;
+    // }
     Ok(())
 }
 
@@ -49,14 +49,15 @@ pub fn check_rent_state_with_account(
     _account_state: &AccountSharedData,
     account_index: IndexOfAccount,
 ) -> TransactionResult<()> {
-    if !solana_sdk_ids::incinerator::check_id(address)
-        && !transition_allowed(pre_rent_state, post_rent_state)
-    {
-        let account_index = account_index as u8;
-        Err(TransactionError::InsufficientFundsForRent { account_index })
-    } else {
-        Ok(())
-    }
+    Ok(())
+    // if !solana_sdk_ids::incinerator::check_id(address)
+    //     && !transition_allowed(pre_rent_state, post_rent_state)
+    // {
+    //     let account_index = account_index as u8;
+    //     Err(TransactionError::InsufficientFundsForRent { account_index })
+    // } else {
+    //     Ok(())
+    // }
 }
 
 /// Determine the rent state of an account.
@@ -65,16 +66,17 @@ pub fn check_rent_state_with_account(
 /// lamports as uninitialized and uses the implemented `get_rent` to
 /// determine whether an account is rent-exempt.
 pub fn get_account_rent_state(rent: &Rent, account: &AccountSharedData) -> RentState {
-    if account.lamports() == 0 {
-        RentState::Uninitialized
-    } else if rent.is_exempt(account.lamports(), account.data().len()) {
-        RentState::RentExempt
-    } else {
-        RentState::RentPaying {
-            data_size: account.data().len(),
-            lamports: account.lamports(),
-        }
-    }
+    // if account.lamports() == 0 {
+    //     RentState::Uninitialized
+    // } else if rent.is_exempt(account.lamports(), account.data().len()) {
+    //     RentState::RentExempt
+    // } else {
+    //     RentState::RentPaying {
+    //         data_size: account.data().len(),
+    //         lamports: account.lamports(),
+    //     }
+    // }
+    RentState::RentExempt
 }
 
 /// Check whether a transition from the pre_rent_state to the

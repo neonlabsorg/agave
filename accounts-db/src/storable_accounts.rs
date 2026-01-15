@@ -1,6 +1,7 @@
 //! trait for abstracting underlying storage of pubkey and account pairs to be written
 use {
     crate::{
+        account_utils::is_default_account,
         account_storage::stored_account_info::StoredAccountInfo,
         accounts_db::{AccountFromStorage, AccountStorageEntry, AccountsDb},
         is_zero_lamport::IsZeroLamport,
@@ -117,7 +118,15 @@ pub trait StorableAccounts<'a>: Sync {
     fn data_len(&self, index: usize) -> usize;
     /// pubkey of account at 'index'
     fn pubkey(&self, index: usize) -> &Pubkey;
-    /// None if account is zero lamports
+    /// true if the account is a tombstone default account
+    fn is_tombstone(&self, index: usize) -> bool {
+        if !self.is_zero_lamport(index) {
+            return false;
+        }
+
+        self.account(index, |account| is_default_account(&account))
+    }
+    /// None if account is a tombstone default account
     fn account_default_if_zero_lamport<Ret>(
         &self,
         index: usize,
@@ -126,10 +135,16 @@ pub trait StorableAccounts<'a>: Sync {
         // Calling `self.account` may be expensive if backed by disk storage.
         // Check if the account is zero lamports first.
         if self.is_zero_lamport(index) {
-            callback(AccountForStorage::AddressAndAccount((
-                self.pubkey(index),
-                &DEFAULT_ACCOUNT_SHARED_DATA,
-            )))
+            self.account(index, |account| {
+                if is_default_account(&account) {
+                    callback(AccountForStorage::AddressAndAccount((
+                        self.pubkey(index),
+                        &DEFAULT_ACCOUNT_SHARED_DATA,
+                    )))
+                } else {
+                    callback(account)
+                }
+            })
         } else {
             self.account(index, callback)
         }

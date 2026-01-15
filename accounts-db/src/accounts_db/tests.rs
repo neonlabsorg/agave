@@ -3239,7 +3239,7 @@ fn test_flush_cache_clean() {
             &account_key,
             Some(0),
             LoadHint::Unspecified,
-            LoadZeroLamports::SomeWithZeroLamportAccountForTests,
+            LoadZeroLamports::Some,
         )
         .unwrap();
     assert_eq!(account.0.lamports(), 0);
@@ -3324,7 +3324,7 @@ fn test_flush_cache_dont_clean_zero_lamport_account() {
             &zero_lamport_account_key,
             max_root,
             load_hint,
-            LoadZeroLamports::SomeWithZeroLamportAccountForTests,
+            LoadZeroLamports::Some,
         )
         .unwrap()
         .0
@@ -3465,7 +3465,7 @@ fn test_scan_flush_accounts_cache_then_clean_drop() {
             &account_key,
             Some(0),
             LoadHint::Unspecified,
-            LoadZeroLamports::SomeWithZeroLamportAccountForTests,
+            LoadZeroLamports::Some,
         )
         .unwrap();
     assert_eq!(account.0.lamports(), zero_lamport_account.lamports());

@@ -181,6 +181,7 @@ impl<'append_vec> StoredAccountNoData<'append_vec> {
     ///
     /// Note that we are not comparing against AccountSharedData::default() because we do not have access to the account data,
     /// so we compare data _length_ in lieu of actual data. This check otherwise identical to AccountSharedData::default().
+    #[allow(dead_code)]
     pub fn is_default_account(&self) -> bool {
         self.account_meta.lamports == 0
             && self.meta.data_len == 0
@@ -190,8 +191,8 @@ impl<'append_vec> StoredAccountNoData<'append_vec> {
     }
 
     pub fn sanitize_lamports(&self) -> bool {
-        // Check if the account data matches that of a default account if it has 0 lamports.
-        self.account_meta.lamports != 0 || self.is_default_account()
+        // Zero-lamport accounts may carry state in this fork.
+        true
     }
 
     pub fn ref_executable_byte(&self) -> &u8 {

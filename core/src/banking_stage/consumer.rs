@@ -793,7 +793,7 @@ mod tests {
         let nonce_state = nonce::state::State::Initialized(nonce::state::Data {
             authority: mint_keypair.pubkey(),
             durable_nonce,
-            fee_calculator: FeeCalculator::new(5000),
+            fee_calculator: FeeCalculator::new(0),
         });
 
         store_nonce_account(&bank, nonce_pubkey, nonce_state);
