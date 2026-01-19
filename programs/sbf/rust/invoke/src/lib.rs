@@ -1338,7 +1338,7 @@ fn process_instruction<'a>(
             const MM_HEAP_START: u64 = 0x300000000;
             static ZEROS: [u8; 256 * 1024] = [0; 256 * 1024];
             const STACK_FRAME_SIZE: usize = 4096;
-            const MAX_CALL_DEPTH: usize = 64;
+            const MAX_CALL_DEPTH: usize = 256;
 
             // Check that the heap is always zeroed.
             //
