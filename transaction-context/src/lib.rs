@@ -145,7 +145,7 @@ impl TransactionAccounts {
         Ok(())
     }
 
-    fn update_accounts_resize_delta(
+    pub fn update_accounts_resize_delta(
         &self,
         old_len: usize,
         new_len: usize,
@@ -157,7 +157,7 @@ impl TransactionAccounts {
         Ok(())
     }
 
-    fn can_data_be_resized(&self, old_len: usize, new_len: usize) -> Result<(), InstructionError> {
+    pub fn can_data_be_resized(&self, old_len: usize, new_len: usize) -> Result<(), InstructionError> {
         // The new length can not exceed the maximum permitted length
         if new_len > MAX_ACCOUNT_DATA_LEN as usize {
             return Err(InstructionError::InvalidRealloc);

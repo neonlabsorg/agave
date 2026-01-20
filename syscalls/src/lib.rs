@@ -471,6 +471,7 @@ pub fn create_program_runtime_environment_v1<'a>(
     result.register_function("sol_account_data_write", SyscallAccountDataWrite::vm)?;
     result.register_function("sol_account_lamports_get", SyscallAccountLamportsGet::vm)?;
     result.register_function("sol_account_lamports_set", SyscallAccountLamportsSet::vm)?;
+    result.register_function("sol_account_realloc", SyscallAccountRealloc::vm)?;
 
     // Cross-program invocation
     result.register_function("sol_invoke_signed_c", SyscallInvokeSignedC::vm)?;
@@ -1780,6 +1781,73 @@ declare_builtin_function!(
                 .touch(index)?;
             account.set_lamports(lamports);
         }
+
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Resize data for a dynamically loaded account
+    SyscallAccountRealloc,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        account_index: u64,
+        new_len: u64,
+        zero_init: u64,
+        _arg4: u64,
+        _arg5: u64,
+        _memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        let syscall_base_cost = execution_cost.syscall_base_cost;
+        let cpi_bytes_per_unit = execution_cost.cpi_bytes_per_unit;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+
+        let index = get_dynamic_account_index(invoke_context, account_index)?;
+        if !invoke_context
+            .transaction_context
+            .is_dynamic_account_writable(index)?
+        {
+            return Err(Box::new(InstructionError::ReadonlyDataModified));
+        }
+
+        let new_len = usize::try_from(new_len).map_err(|_| InstructionError::InvalidArgument)?;
+
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_current_instruction_context()?;
+        let program_id = instruction_context.get_program_key()?;
+
+        let mut account = invoke_context
+            .transaction_context
+            .accounts()
+            .try_borrow_mut(index)?;
+        if account.owner() != program_id {
+            return Err(Box::new(InstructionError::ExternalAccountDataModified));
+        }
+
+        let old_len = account.data().len();
+        if new_len != old_len {
+            invoke_context
+                .transaction_context
+                .accounts()
+                .can_data_be_resized(old_len, new_len)?;
+            invoke_context
+                .transaction_context
+                .accounts()
+                .update_accounts_resize_delta(old_len, new_len)?;
+            let fill = if zero_init != 0 { 0 } else { 0 };
+            account.resize(new_len, fill);
+            invoke_context
+                .transaction_context
+                .accounts()
+                .touch(index)?;
+        }
+
+        let data_len_cost = (new_len as u64)
+            .checked_div(cpi_bytes_per_unit)
+            .unwrap_or(u64::MAX);
+        consume_compute_meter(invoke_context, data_len_cost)?;
 
         Ok(SUCCESS)
     }
