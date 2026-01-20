@@ -1,31 +1,30 @@
 use {
     crate::execution_budget::{
-        MAX_CALL_DEPTH, MAX_HEAP_FRAME_BYTES, MAX_INSTRUCTION_STACK_DEPTH, MIN_HEAP_FRAME_BYTES,
-        STACK_FRAME_SIZE,
+        MAX_CALL_DEPTH, MAX_HEAP_FRAME_BYTES, MIN_HEAP_FRAME_BYTES, STACK_FRAME_SIZE,
     },
     solana_sbpf::{aligned_memory::AlignedMemory, ebpf::HOST_ALIGN},
-    std::array,
 };
 
 trait Reset {
     fn reset(&mut self);
 }
 
-struct Pool<T: Reset, const SIZE: usize> {
-    items: [Option<T>; SIZE],
+struct Pool<T: Reset> {
+    items: Vec<Option<T>>,
     next_empty: usize,
 }
 
-impl<T: Reset, const SIZE: usize> Pool<T, SIZE> {
-    fn new(items: [T; SIZE]) -> Self {
+impl<T: Reset> Pool<T> {
+    fn new(items: Vec<T>) -> Self {
+        let next_empty = items.len();
         Self {
-            items: items.map(|i| Some(i)),
-            next_empty: SIZE,
+            items: items.into_iter().map(Some).collect(),
+            next_empty,
         }
     }
 
     fn len(&self) -> usize {
-        SIZE
+        self.items.len()
     }
 
     fn get(&mut self) -> Option<T> {
@@ -39,15 +38,17 @@ impl<T: Reset, const SIZE: usize> Pool<T, SIZE> {
     }
 
     fn put(&mut self, mut value: T) -> bool {
-        self.items
-            .get_mut(self.next_empty)
-            .map(|item| {
-                value.reset();
-                item.replace(value);
-                self.next_empty = self.next_empty.saturating_add(1);
-                true
-            })
-            .unwrap_or(false)
+        if self.next_empty >= self.items.len() {
+            return false;
+        }
+        if let Some(item) = self.items.get_mut(self.next_empty) {
+            value.reset();
+            item.replace(value);
+            self.next_empty = self.next_empty.saturating_add(1);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -57,20 +58,27 @@ impl Reset for AlignedMemory<{ HOST_ALIGN }> {
     }
 }
 
+// Cache size for stack/heap reuse; independent of instruction stack depth.
+const MEMORY_POOL_SIZE: usize = 64;
+
 pub struct VmMemoryPool {
-    stack: Pool<AlignedMemory<{ HOST_ALIGN }>, MAX_INSTRUCTION_STACK_DEPTH>,
-    heap: Pool<AlignedMemory<{ HOST_ALIGN }>, MAX_INSTRUCTION_STACK_DEPTH>,
+    stack: Pool<AlignedMemory<{ HOST_ALIGN }>>,
+    heap: Pool<AlignedMemory<{ HOST_ALIGN }>>,
 }
 
 impl VmMemoryPool {
     pub fn new() -> Self {
         Self {
-            stack: Pool::new(array::from_fn(|_| {
-                AlignedMemory::zero_filled(STACK_FRAME_SIZE * MAX_CALL_DEPTH)
-            })),
-            heap: Pool::new(array::from_fn(|_| {
-                AlignedMemory::zero_filled(MAX_HEAP_FRAME_BYTES as usize)
-            })),
+            stack: Pool::new(
+                (0..MEMORY_POOL_SIZE)
+                    .map(|_| AlignedMemory::zero_filled(STACK_FRAME_SIZE * MAX_CALL_DEPTH))
+                    .collect(),
+            ),
+            heap: Pool::new(
+                (0..MEMORY_POOL_SIZE)
+                    .map(|_| AlignedMemory::zero_filled(MAX_HEAP_FRAME_BYTES as usize))
+                    .collect(),
+            ),
         }
     }
 

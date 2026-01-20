@@ -29,6 +29,7 @@ use {
     solana_loader_v4_interface::instruction as loader_v4_instruction,
     solana_message::{inner_instruction::InnerInstruction, Message, SanitizedMessage},
     solana_program_runtime::invoke_context::mock_process_instruction,
+    solana_program_runtime::execution_budget::MAX_COMPUTE_UNIT_LIMIT,
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_runtime::{
@@ -5125,7 +5126,7 @@ fn test_stack_heap_zeroed() {
 
         let message = Message::new(
             &[
-                ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+                ComputeBudgetInstruction::set_compute_unit_limit(MAX_COMPUTE_UNIT_LIMIT),
                 ComputeBudgetInstruction::request_heap_frame(heap_len as u32),
                 instruction,
             ],

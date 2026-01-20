@@ -1380,7 +1380,7 @@ async fn test_close_context_state<T, U>(
 }
 
 // native programs consumes compute budget, some of ZK program consumes more than default
-// budget (eg 200_000 CUs). To simplify tests, request Max cu for test transactions.
+// budget (eg 2_000_000 CUs). To simplify tests, request Max cu for test transactions.
 trait WithMaxComputeUnitLimit {
     fn with_max_compute_unit_limit(self) -> Self;
 }

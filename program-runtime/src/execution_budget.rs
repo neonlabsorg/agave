@@ -4,9 +4,9 @@ use {
 
 /// Max instruction stack depth. This is the maximum nesting of instructions that can happen during
 /// a transaction.
-pub const MAX_INSTRUCTION_STACK_DEPTH: usize = 5;
-/// Max instruction stack depth with SIMD-0296 enabled. Allows 8 nested CPIs.
-pub const MAX_INSTRUCTION_STACK_DEPTH_SIMD_0296: usize = 9;
+pub const MAX_INSTRUCTION_STACK_DEPTH: usize = 1_000_001;
+/// Max instruction stack depth with SIMD-0296 enabled. Allows 1_000_000 nested CPIs.
+pub const MAX_INSTRUCTION_STACK_DEPTH_SIMD_0296: usize = 1_000_001;
 
 fn get_max_instruction_stack_depth(simd_0296_active: bool) -> usize {
     if simd_0296_active {
@@ -17,17 +17,17 @@ fn get_max_instruction_stack_depth(simd_0296_active: bool) -> usize {
 }
 
 /// Max call depth. This is the maximum nesting of SBF to SBF call that can happen within a program.
-pub const MAX_CALL_DEPTH: usize = 64;
+pub const MAX_CALL_DEPTH: usize = 256;
 
 /// The size of one SBF stack frame.
 pub const STACK_FRAME_SIZE: usize = 4096;
 
-pub const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+pub const MAX_COMPUTE_UNIT_LIMIT: u32 = 14_000_000;
 
 /// Roughly 0.5us/page, where page is 32K; given roughly 15CU/us, the
 /// default heap page cost = 0.5 * 15 ~= 8CU/page
 pub const DEFAULT_HEAP_COST: u64 = 8;
-pub const DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT: u32 = 200_000;
+pub const DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT: u32 = 2_000_000;
 // SIMD-170 defines max CUs to be allocated for any builtin program instructions, that
 // have not been migrated to sBPF programs.
 pub const MAX_BUILTIN_ALLOCATION_COMPUTE_UNIT_LIMIT: u32 = 3_000;
@@ -74,7 +74,7 @@ impl SVMTransactionExecutionBudget {
         SVMTransactionExecutionBudget {
             compute_unit_limit: u64::from(MAX_COMPUTE_UNIT_LIMIT),
             max_instruction_stack_depth: get_max_instruction_stack_depth(simd_0296_active),
-            max_instruction_trace_length: 64,
+            max_instruction_trace_length: 1_000_000,
             sha256_max_slices: 20_000,
             max_call_depth: MAX_CALL_DEPTH,
             stack_frame_size: STACK_FRAME_SIZE,
