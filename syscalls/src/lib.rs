@@ -13,6 +13,7 @@ pub use self::{
 #[allow(deprecated)]
 use {
     crate::mem_ops::is_nonoverlapping,
+    solana_account::{ReadableAccount, WritableAccount},
     solana_account_info::AccountInfo,
     solana_big_mod_exp::{big_mod_exp, BigModExpParams},
     solana_blake3_hasher as blake3,
@@ -282,6 +283,18 @@ fn consume_compute_meter(invoke_context: &InvokeContext, amount: u64) -> Result<
     Ok(())
 }
 
+fn get_dynamic_account_index(
+    invoke_context: &InvokeContext,
+    account_index: u64,
+) -> Result<IndexOfAccount, Error> {
+    let index = IndexOfAccount::try_from(account_index)
+        .map_err(|_| InstructionError::InvalidArgument)?;
+    if !invoke_context.transaction_context.is_dynamic_account(index)? {
+        return Err(Box::new(InstructionError::MissingAccount));
+    }
+    Ok(index)
+}
+
 macro_rules! register_feature_gated_function {
     ($result:expr, $is_feature_active:expr, $name:expr, $call:expr $(,)?) => {
         if $is_feature_active {
@@ -451,6 +464,13 @@ pub fn create_program_runtime_environment_v1<'a>(
     // Return data
     result.register_function("sol_set_return_data", SyscallSetReturnData::vm)?;
     result.register_function("sol_get_return_data", SyscallGetReturnData::vm)?;
+
+    // Dynamic account loading
+    result.register_function("sol_load_account", SyscallLoadAccount::vm)?;
+    result.register_function("sol_account_data_read", SyscallAccountDataRead::vm)?;
+    result.register_function("sol_account_data_write", SyscallAccountDataWrite::vm)?;
+    result.register_function("sol_account_lamports_get", SyscallAccountLamportsGet::vm)?;
+    result.register_function("sol_account_lamports_set", SyscallAccountLamportsSet::vm)?;
 
     // Cross-program invocation
     result.register_function("sol_invoke_signed_c", SyscallInvokeSignedC::vm)?;
@@ -1518,6 +1538,254 @@ declare_builtin_function!(
 );
 
 declare_builtin_function!(
+    /// Load an account into the transaction context
+    SyscallLoadAccount,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        pubkey_addr: u64,
+        is_writable: u64,
+        out_index_addr: u64,
+        _arg4: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        let syscall_base_cost = execution_cost.syscall_base_cost;
+        let cpi_bytes_per_unit = execution_cost.cpi_bytes_per_unit;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+
+        let pubkey = translate_type::<Pubkey>(
+            memory_mapping,
+            pubkey_addr,
+            invoke_context.get_check_aligned(),
+        )?;
+        let is_writable = is_writable != 0;
+
+        let index = if let Some(index) = invoke_context
+            .transaction_context
+            .find_index_of_account(pubkey)
+        {
+            invoke_context
+                .transaction_context
+                .mark_dynamic_account(index, is_writable)?;
+            index
+        } else {
+            let (account, _slot) = invoke_context
+                .get_account_shared_data(pubkey)
+                .ok_or(InstructionError::MissingAccount)?;
+            let data_len_cost = (account.data().len() as u64)
+                .checked_div(cpi_bytes_per_unit)
+                .unwrap_or(u64::MAX);
+            consume_compute_meter(invoke_context, data_len_cost)?;
+            invoke_context
+                .transaction_context
+                .add_account(*pubkey, account, is_writable)?
+        };
+
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let out_index: &mut u64 = map(out_index_addr)?;
+        );
+        *out_index = index as u64;
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Read account data from a dynamically loaded account
+    SyscallAccountDataRead,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        account_index: u64,
+        offset: u64,
+        dst_addr: u64,
+        len: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
+
+        let index = get_dynamic_account_index(invoke_context, account_index)?;
+        let offset = usize::try_from(offset).map_err(|_| InstructionError::InvalidArgument)?;
+        let len = usize::try_from(len).map_err(|_| InstructionError::InvalidArgument)?;
+
+        let account = invoke_context
+            .transaction_context
+            .accounts()
+            .try_borrow(index)?;
+        let data = account
+            .data()
+            .get(offset..offset.saturating_add(len))
+            .ok_or(InstructionError::AccountDataTooSmall)?;
+
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let dst: &mut [u8] = map(dst_addr, len as u64)?;
+        );
+        dst.copy_from_slice(data);
+
+        let data_len_cost = (len as u64)
+            .checked_div(execution_cost.cpi_bytes_per_unit)
+            .unwrap_or(u64::MAX);
+        consume_compute_meter(invoke_context, data_len_cost)?;
+
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Write account data to a dynamically loaded account
+    SyscallAccountDataWrite,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        account_index: u64,
+        offset: u64,
+        src_addr: u64,
+        len: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
+
+        let index = get_dynamic_account_index(invoke_context, account_index)?;
+        if !invoke_context
+            .transaction_context
+            .is_dynamic_account_writable(index)?
+        {
+            return Err(Box::new(InstructionError::ReadonlyDataModified));
+        }
+
+        let offset = usize::try_from(offset).map_err(|_| InstructionError::InvalidArgument)?;
+        let len = usize::try_from(len).map_err(|_| InstructionError::InvalidArgument)?;
+
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_current_instruction_context()?;
+        let program_id = instruction_context.get_program_key()?;
+
+        let mut account = invoke_context
+            .transaction_context
+            .accounts()
+            .try_borrow_mut(index)?;
+        if account.owner() != program_id {
+            return Err(Box::new(InstructionError::ExternalAccountDataModified));
+        }
+
+        let data = account.data_as_mut_slice();
+        let end = offset.saturating_add(len);
+        if end > data.len() {
+            return Err(Box::new(InstructionError::AccountDataTooSmall));
+        }
+
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let src: &mut [u8] = map(src_addr, len as u64)?;
+        );
+        data[offset..end].copy_from_slice(src);
+
+        invoke_context
+            .transaction_context
+            .accounts()
+            .touch(index)?;
+
+        let data_len_cost = (len as u64)
+            .checked_div(execution_cost.cpi_bytes_per_unit)
+            .unwrap_or(u64::MAX);
+        consume_compute_meter(invoke_context, data_len_cost)?;
+
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Get lamports for a dynamically loaded account
+    SyscallAccountLamportsGet,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        account_index: u64,
+        out_lamports_addr: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
+
+        let index = get_dynamic_account_index(invoke_context, account_index)?;
+        let account = invoke_context
+            .transaction_context
+            .accounts()
+            .try_borrow(index)?;
+
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let out_lamports: &mut u64 = map(out_lamports_addr)?;
+        );
+        *out_lamports = account.lamports();
+
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Set lamports for a dynamically loaded account
+    SyscallAccountLamportsSet,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        account_index: u64,
+        lamports: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+        _memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
+
+        let index = get_dynamic_account_index(invoke_context, account_index)?;
+        if !invoke_context
+            .transaction_context
+            .is_dynamic_account_writable(index)?
+        {
+            return Err(Box::new(InstructionError::ReadonlyLamportChange));
+        }
+
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_current_instruction_context()?;
+        let program_id = instruction_context.get_program_key()?;
+
+        let mut account = invoke_context
+            .transaction_context
+            .accounts()
+            .try_borrow_mut(index)?;
+        let old_lamports = account.lamports();
+        if account.owner() != program_id && lamports < old_lamports {
+            return Err(Box::new(InstructionError::ExternalAccountLamportSpend));
+        }
+
+        if old_lamports != lamports {
+            let delta = (lamports as i128).saturating_sub(old_lamports as i128);
+            invoke_context.transaction_context.add_lamports_delta(delta)?;
+            invoke_context
+                .transaction_context
+                .accounts()
+                .touch(index)?;
+            account.set_lamports(lamports);
+        }
+
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
     /// Get a processed sigling instruction
     SyscallGetProcessedSiblingInstruction,
     fn rust(
@@ -2152,7 +2420,7 @@ mod tests {
         assert_matches::assert_matches,
         core::slice,
         solana_account::{create_account_shared_data_for_test, AccountSharedData},
-        solana_clock::Clock,
+        solana_clock::{Clock, Slot},
         solana_epoch_rewards::EpochRewards,
         solana_epoch_schedule::EpochSchedule,
         solana_fee_calculator::FeeCalculator,
@@ -2179,6 +2447,7 @@ mod tests {
         solana_stable_layout::stable_instruction::StableInstruction,
         solana_stake_interface::stake_history::{self, StakeHistory, StakeHistoryEntry},
         solana_sysvar_id::SysvarId,
+        solana_svm_callback::TransactionProcessingCallback,
         solana_transaction_context::InstructionAccount,
         std::{
             hash::{DefaultHasher, Hash, Hasher},
@@ -4850,7 +5119,13 @@ mod tests {
         const EXPECTED_TOTAL_STAKE: u64 = 200_000_000_000_000;
 
         struct MockCallback {}
-        impl InvokeContextCallback for MockCallback {
+        impl TransactionProcessingCallback for MockCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, Slot)> {
+                None
+            }
             fn get_epoch_stake(&self) -> u64 {
                 EXPECTED_TOTAL_STAKE
             }
@@ -4905,7 +5180,13 @@ mod tests {
         const EXPECTED_EPOCH_STAKE: u64 = 55_000_000_000;
 
         struct MockCallback {}
-        impl InvokeContextCallback for MockCallback {
+        impl TransactionProcessingCallback for MockCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, Slot)> {
+                None
+            }
             // Total stake is not needed for this test.
             fn get_epoch_stake_for_vote_account(&self, vote_address: &Pubkey) -> u64 {
                 if *vote_address == TARGET_VOTE_ADDRESS {

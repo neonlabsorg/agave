@@ -87,6 +87,7 @@ mod tests {
             DUMMY_INHERITABLE_ACCOUNT_FIELDS,
         },
         solana_ed25519_program::new_ed25519_instruction_with_signature,
+        solana_clock::Slot,
         solana_hash::Hash,
         solana_instruction::{error::InstructionError, AccountMeta, Instruction},
         solana_message::{AccountKeys, Message, SanitizedMessage},
@@ -105,14 +106,18 @@ mod tests {
             eth_address_from_pubkey, new_secp256k1_instruction_with_signature,
         },
         solana_secp256r1_program::{new_secp256r1_instruction_with_signature, sign_message},
-        solana_svm_callback::InvokeContextCallback,
+        solana_svm_callback::TransactionProcessingCallback,
         solana_svm_feature_set::SVMFeatureSet,
         solana_transaction_context::TransactionContext,
         std::{collections::HashSet, sync::Arc},
     };
 
     struct MockCallback {}
-    impl InvokeContextCallback for MockCallback {}
+    impl TransactionProcessingCallback for MockCallback {
+        fn get_account_shared_data(&self, _pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
+            None
+        }
+    }
 
     fn create_loadable_account_for_test(name: &str) -> AccountSharedData {
         let (lamports, rent_epoch) = DUMMY_INHERITABLE_ACCOUNT_FIELDS;
@@ -658,7 +663,14 @@ mod tests {
         );
 
         struct MockCallback {}
-        impl InvokeContextCallback for MockCallback {
+        impl TransactionProcessingCallback for MockCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, Slot)> {
+                None
+            }
+
             fn is_precompile(&self, program_id: &Pubkey) -> bool {
                 program_id == &secp256k1_program::id()
                     || program_id == &ed25519_program::id()

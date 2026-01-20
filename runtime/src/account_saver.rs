@@ -127,6 +127,17 @@ fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
                 .push(transaction_ref.expect("transaction ref must exist if collecting"));
         }
     }
+
+    for (address, account) in transaction_accounts
+        .iter()
+        .skip(transaction.account_keys().len())
+    {
+        collected_accounts.push((address, account));
+        if let Some(collected_account_transactions) = collected_account_transactions {
+            collected_account_transactions
+                .push(transaction_ref.expect("transaction ref must exist if collecting"));
+        }
+    }
 }
 
 fn collect_accounts_for_failed_tx<'a>(

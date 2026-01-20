@@ -15,7 +15,6 @@ use {
     std::{
         cell::{Cell, Ref, RefCell, RefMut},
         collections::HashSet,
-        pin::Pin,
         rc::Rc,
     },
 };
@@ -106,18 +105,24 @@ impl InstructionAccount {
 /// An account key and the matching account
 pub type TransactionAccount = (Pubkey, AccountSharedData);
 
+#[derive(Clone, Copy, Debug, Default)]
+struct DynamicAccountMeta {
+    is_dynamic: bool,
+    is_writable: bool,
+}
+
 #[derive(Debug)]
 pub struct TransactionAccounts {
-    accounts: Vec<RefCell<AccountSharedData>>,
-    touched_flags: RefCell<Box<[bool]>>,
+    accounts: Vec<Box<RefCell<AccountSharedData>>>,
+    touched_flags: RefCell<Vec<bool>>,
     resize_delta: Cell<i64>,
     lamports_delta: Cell<i128>,
 }
 
 impl TransactionAccounts {
     #[cfg(not(target_os = "solana"))]
-    fn new(accounts: Vec<RefCell<AccountSharedData>>) -> TransactionAccounts {
-        let touched_flags = vec![false; accounts.len()].into_boxed_slice();
+    fn new(accounts: Vec<Box<RefCell<AccountSharedData>>>) -> TransactionAccounts {
+        let touched_flags = vec![false; accounts.len()];
         TransactionAccounts {
             accounts,
             touched_flags: RefCell::new(touched_flags),
@@ -168,7 +173,7 @@ impl TransactionAccounts {
     }
 
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-    fn try_borrow_mut(
+    pub fn try_borrow_mut(
         &self,
         index: IndexOfAccount,
     ) -> Result<RefMut<'_, AccountSharedData>, InstructionError> {
@@ -203,6 +208,14 @@ impl TransactionAccounts {
     fn get_lamports_delta(&self) -> i128 {
         self.lamports_delta.get()
     }
+
+    #[cfg(not(target_os = "solana"))]
+    fn add_account(&mut self, account: AccountSharedData) -> IndexOfAccount {
+        let index = self.accounts.len() as IndexOfAccount;
+        self.accounts.push(Box::new(RefCell::new(account)));
+        self.touched_flags.borrow_mut().push(false);
+        index
+    }
 }
 
 /// Loaded transaction shared between runtime and programs.
@@ -210,8 +223,9 @@ impl TransactionAccounts {
 /// This context is valid for the entire duration of a transaction being processed.
 #[derive(Debug)]
 pub struct TransactionContext {
-    account_keys: Pin<Box<[Pubkey]>>,
+    account_keys: Vec<Pubkey>,
     accounts: Rc<TransactionAccounts>,
+    dynamic_account_metas: Vec<DynamicAccountMeta>,
     instruction_stack_capacity: usize,
     instruction_trace_capacity: usize,
     instruction_stack: Vec<usize>,
@@ -233,11 +247,13 @@ impl TransactionContext {
     ) -> Self {
         let (account_keys, accounts): (Vec<_>, Vec<_>) = transaction_accounts
             .into_iter()
-            .map(|(key, account)| (key, RefCell::new(account)))
+            .map(|(key, account)| (key, Box::new(RefCell::new(account))))
             .unzip();
+        let num_accounts = account_keys.len();
         Self {
-            account_keys: Pin::new(account_keys.into_boxed_slice()),
+            account_keys,
             accounts: Rc::new(TransactionAccounts::new(accounts)),
+            dynamic_account_metas: vec![DynamicAccountMeta::default(); num_accounts],
             instruction_stack_capacity,
             instruction_trace_capacity,
             instruction_stack: Vec::with_capacity(instruction_stack_capacity),
@@ -259,13 +275,18 @@ impl TransactionContext {
             .expect("transaction_context.accounts has unexpected outstanding refs")
             .accounts
             .into_iter()
-            .map(RefCell::into_inner)
+            .map(|account| RefCell::into_inner(*account))
             .collect())
     }
 
     #[cfg(not(target_os = "solana"))]
     pub fn accounts(&self) -> &Rc<TransactionAccounts> {
         &self.accounts
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn add_lamports_delta(&self, balance: i128) -> Result<(), InstructionError> {
+        self.accounts.add_lamports_delta(balance)
     }
 
     /// Returns the total number of accounts loaded in this Transaction
@@ -289,6 +310,69 @@ impl TransactionContext {
             .iter()
             .position(|key| key == pubkey)
             .map(|index| index as IndexOfAccount)
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn add_account(
+        &mut self,
+        pubkey: Pubkey,
+        account: AccountSharedData,
+        is_writable: bool,
+    ) -> Result<IndexOfAccount, InstructionError> {
+        if let Some(index) = self.find_index_of_account(&pubkey) {
+            self.mark_dynamic_account(index, is_writable)?;
+            return Ok(index);
+        }
+        if self.account_keys.len() >= MAX_ACCOUNTS_PER_TRANSACTION {
+            return Err(InstructionError::MaxAccountsExceeded);
+        }
+
+        let accounts = Rc::get_mut(&mut self.accounts)
+            .ok_or(InstructionError::AccountBorrowFailed)?;
+        let index = accounts.add_account(account);
+        self.account_keys.push(pubkey);
+        self.dynamic_account_metas.push(DynamicAccountMeta {
+            is_dynamic: true,
+            is_writable,
+        });
+        Ok(index)
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn mark_dynamic_account(
+        &mut self,
+        index: IndexOfAccount,
+        is_writable: bool,
+    ) -> Result<(), InstructionError> {
+        let meta = self
+            .dynamic_account_metas
+            .get_mut(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        meta.is_dynamic = true;
+        meta.is_writable = meta.is_writable || is_writable;
+        Ok(())
+    }
+
+    pub fn is_dynamic_account(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<bool, InstructionError> {
+        Ok(self
+            .dynamic_account_metas
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?
+            .is_dynamic)
+    }
+
+    pub fn is_dynamic_account_writable(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<bool, InstructionError> {
+        let meta = self
+            .dynamic_account_metas
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        Ok(meta.is_dynamic && meta.is_writable)
     }
 
     /// Gets the max length of the instruction trace
@@ -1173,9 +1257,10 @@ impl From<TransactionContext> for ExecutionRecord {
             ..
         } = Rc::try_unwrap(context.accounts)
             .expect("transaction_context.accounts has unexpected outstanding refs");
-        let accounts = Vec::from(Pin::into_inner(context.account_keys))
+        let accounts = context
+            .account_keys
             .into_iter()
-            .zip(accounts.into_iter().map(RefCell::into_inner))
+            .zip(accounts.into_iter().map(|account| RefCell::into_inner(*account)))
             .collect();
         let touched_account_count = touched_flags
             .borrow()

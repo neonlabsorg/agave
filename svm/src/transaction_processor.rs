@@ -1131,7 +1131,7 @@ mod tests {
         solana_rent::Rent,
         solana_sdk_ids::{bpf_loader, loader_v4, system_program, sysvar},
         solana_signature::Signature,
-        solana_svm_callback::{AccountState, InvokeContextCallback},
+        solana_svm_callback::{AccountState, InvokeContextCallback, TransactionProcessingCallback},
         solana_transaction::{sanitized::SanitizedTransaction, Transaction},
         solana_transaction_context::TransactionContext,
         solana_transaction_error::{TransactionError, TransactionError::DuplicateInstruction},
