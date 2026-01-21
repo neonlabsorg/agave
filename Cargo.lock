@@ -446,6 +446,7 @@ version = "3.0.12"
 dependencies = [
  "agave-geyser-plugin-interface",
  "assert_cmd",
+ "base64 0.22.1",
  "chrono",
  "clap 2.33.3",
  "console 0.16.0",

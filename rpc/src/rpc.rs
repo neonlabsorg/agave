@@ -16,6 +16,7 @@ use {
         BoxFuture, Error, Metadata, Result,
     },
     jsonrpc_derive::rpc,
+    serde::Deserialize,
     solana_account::{AccountSharedData, ReadableAccount},
     solana_account_decoder::{
         encode_ui_account,
@@ -255,8 +256,145 @@ pub struct JsonRpcRequestProcessor {
     max_complete_transaction_status_slot: Arc<AtomicU64>,
     prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     runtime: Arc<Runtime>,
+    finalize_history_sender: Option<Sender<ExternalFinalizeRequest>>,
 }
 impl Metadata for JsonRpcRequestProcessor {}
+
+#[derive(Clone)]
+pub struct ExternalAccountPatch {
+    pub pubkey: Pubkey,
+    pub lamports: Option<u64>,
+    pub owner: Option<Pubkey>,
+    pub data: Option<Vec<u8>>,
+    pub data_patch: Option<ExternalAccountDataPatch>,
+    pub data_splice: Option<ExternalAccountDataSplice>,
+    pub executable: Option<bool>,
+    pub rent_epoch: Option<u64>,
+}
+
+#[derive(Clone)]
+pub struct ExternalAccountDataPatch {
+    pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub struct ExternalAccountDataSplice {
+    pub offset: u64,
+    pub delete_len: u64,
+    pub insert_data: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub struct ExternalFinalizeRequest {
+    pub slot: Slot,
+    pub patches: Vec<ExternalAccountPatch>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+pub struct RpcExternalAccountPatch {
+    pub pubkey: String,
+    #[serde(default)]
+    pub lamports: Option<u64>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub data: Option<String>,
+    #[serde(default)]
+    pub data_patch: Option<RpcExternalAccountDataPatch>,
+    #[serde(default)]
+    pub data_splice: Option<RpcExternalAccountDataSplice>,
+    #[serde(default)]
+    pub executable: Option<bool>,
+    #[serde(default)]
+    pub rent_epoch: Option<u64>,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+pub struct RpcExternalAccountDataPatch {
+    pub offset: u64,
+    pub data: String,
+}
+
+#[derive(Deserialize, serde::Serialize)]
+pub struct RpcExternalAccountDataSplice {
+    pub offset: u64,
+    pub delete_len: u64,
+    pub insert_data: String,
+}
+
+fn decode_external_account_patch(patch: RpcExternalAccountPatch) -> Result<ExternalAccountPatch> {
+    let pubkey = Pubkey::from_str(&patch.pubkey).map_err(|err| {
+        Error::invalid_params(format!("Invalid pubkey {}: {err}", patch.pubkey))
+    })?;
+    let owner = match patch.owner {
+        Some(owner) => Some(Pubkey::from_str(&owner).map_err(|err| {
+            Error::invalid_params(format!("Invalid owner {owner}: {err}"))
+        })?),
+        None => None,
+    };
+    let data = match patch.data {
+        Some(data) => Some(BASE64_STANDARD.decode(data.as_bytes()).map_err(|err| {
+            Error::invalid_params(format!("Invalid base64 data for {pubkey}: {err}"))
+        })?),
+        None => None,
+    };
+    let data_patch = match patch.data_patch {
+        Some(patch) => Some(ExternalAccountDataPatch {
+            offset: patch.offset,
+            data: BASE64_STANDARD.decode(patch.data.as_bytes()).map_err(|err| {
+                Error::invalid_params(format!("Invalid base64 data patch for {pubkey}: {err}"))
+            })?,
+        }),
+        None => None,
+    };
+    let data_splice = match patch.data_splice {
+        Some(patch) => Some(ExternalAccountDataSplice {
+            offset: patch.offset,
+            delete_len: patch.delete_len,
+            insert_data: BASE64_STANDARD
+                .decode(patch.insert_data.as_bytes())
+                .map_err(|err| {
+                    Error::invalid_params(format!(
+                        "Invalid base64 data splice for {pubkey}: {err}"
+                    ))
+                })?,
+        }),
+        None => None,
+    };
+    if data_patch.is_some() && data_splice.is_some() {
+        return Err(Error::invalid_params(format!(
+            "data_patch and data_splice are mutually exclusive for {pubkey}"
+        )));
+    }
+    Ok(ExternalAccountPatch {
+        pubkey,
+        lamports: patch.lamports,
+        owner,
+        data,
+        data_patch,
+        data_splice,
+        executable: patch.executable,
+        rent_epoch: patch.rent_epoch,
+    })
+}
+
+fn enqueue_finalize_history_request(
+    meta: &JsonRpcRequestProcessor,
+    slot: Slot,
+    patches: Vec<ExternalAccountPatch>,
+) -> Result<bool> {
+    if let Some(sender) = meta.finalize_history_sender.as_ref() {
+        let request = ExternalFinalizeRequest { slot, patches };
+        sender.send(request).map_err(|err| {
+            warn!("finalize_history failed to enqueue: {err}");
+            Error::internal_error()
+        })?;
+        Ok(true)
+    } else {
+        Err(Error::invalid_request())
+    }
+}
 
 impl JsonRpcRequestProcessor {
     pub fn clone_without_bigtable(&self) -> JsonRpcRequestProcessor {
@@ -418,6 +556,7 @@ impl JsonRpcRequestProcessor {
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         runtime: Arc<Runtime>,
+        finalize_history_sender: Option<Sender<ExternalFinalizeRequest>>,
     ) -> (Self, Receiver<TransactionInfo>) {
         let (transaction_sender, transaction_receiver) = unbounded();
         (
@@ -440,6 +579,7 @@ impl JsonRpcRequestProcessor {
                 max_complete_transaction_status_slot,
                 prioritization_fee_cache,
                 runtime,
+                finalize_history_sender,
             },
             transaction_receiver,
         )
@@ -527,6 +667,7 @@ impl JsonRpcRequestProcessor {
             max_complete_transaction_status_slot: Arc::new(AtomicU64::default()),
             prioritization_fee_cache: Arc::new(PrioritizationFeeCache::default()),
             runtime,
+            finalize_history_sender: None,
         }
     }
 
@@ -3612,6 +3753,17 @@ pub mod rpc_full {
             meta: Self::Metadata,
             pubkey_strs: Option<Vec<String>>,
         ) -> Result<Vec<RpcPrioritizationFee>>;
+
+        #[rpc(meta, name = "finalizeHistory")]
+        fn finalize_history(&self, meta: Self::Metadata, slot: Slot) -> Result<bool>;
+
+        #[rpc(meta, name = "finalizeHistoryWithPatches")]
+        fn finalize_history_with_patches(
+            &self,
+            meta: Self::Metadata,
+            slot: Slot,
+            patches: Vec<RpcExternalAccountPatch>,
+        ) -> Result<bool>;
     }
 
     pub struct FullImpl;
@@ -3706,6 +3858,23 @@ pub mod rpc_full {
                     }
                 })
                 .collect())
+        }
+
+        fn finalize_history(&self, meta: Self::Metadata, slot: Slot) -> Result<bool> {
+            enqueue_finalize_history_request(&meta, slot, Vec::new())
+        }
+
+        fn finalize_history_with_patches(
+            &self,
+            meta: Self::Metadata,
+            slot: Slot,
+            patches: Vec<RpcExternalAccountPatch>,
+        ) -> Result<bool> {
+            let mut decoded = Vec::with_capacity(patches.len());
+            for patch in patches {
+                decoded.push(decode_external_account_patch(patch)?);
+            }
+            enqueue_finalize_history_request(&meta, slot, decoded)
         }
 
         fn get_signature_statuses(
@@ -4301,6 +4470,48 @@ pub mod rpc_full {
     }
 }
 
+pub mod rpc_finalize_history {
+    use {super::*, jsonrpc_derive::rpc};
+
+    #[rpc]
+    pub trait FinalizeHistory {
+        type Metadata;
+
+        #[rpc(meta, name = "finalizeHistory")]
+        fn finalize_history(&self, meta: Self::Metadata, slot: Slot) -> Result<bool>;
+
+        #[rpc(meta, name = "finalizeHistoryWithPatches")]
+        fn finalize_history_with_patches(
+            &self,
+            meta: Self::Metadata,
+            slot: Slot,
+            patches: Vec<RpcExternalAccountPatch>,
+        ) -> Result<bool>;
+    }
+
+    pub struct FinalizeHistoryImpl;
+    impl FinalizeHistory for FinalizeHistoryImpl {
+        type Metadata = JsonRpcRequestProcessor;
+
+        fn finalize_history(&self, meta: Self::Metadata, slot: Slot) -> Result<bool> {
+            enqueue_finalize_history_request(&meta, slot, Vec::new())
+        }
+
+        fn finalize_history_with_patches(
+            &self,
+            meta: Self::Metadata,
+            slot: Slot,
+            patches: Vec<RpcExternalAccountPatch>,
+        ) -> Result<bool> {
+            let mut decoded = Vec::with_capacity(patches.len());
+            for patch in patches {
+                decoded.push(decode_external_account_patch(patch)?);
+            }
+            enqueue_finalize_history_request(&meta, slot, decoded)
+        }
+    }
+}
+
 fn rpc_perf_sample_from_perf_sample(slot: u64, sample: PerfSample) -> RpcPerfSample {
     match sample {
         PerfSample::V1(PerfSampleV1 {
@@ -4823,6 +5034,7 @@ pub mod tests {
                 max_complete_transaction_status_slot.clone(),
                 Arc::new(PrioritizationFeeCache::default()),
                 service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj),
+                None,
             )
             .0;
 
@@ -6863,6 +7075,7 @@ pub mod tests {
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
             runtime.clone(),
+            None,
         );
 
         let client = Client::create_client(Some(runtime.handle().clone()), my_tpu_address, None, 1);
@@ -7166,6 +7379,7 @@ pub mod tests {
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
             runtime,
+            None,
         );
 
         SendTransactionService::new_with_client(
@@ -8868,6 +9082,7 @@ pub mod tests {
             max_complete_transaction_status_slot,
             Arc::new(PrioritizationFeeCache::default()),
             service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj),
+            None,
         );
 
         let mut io = MetaIoHandler::default();

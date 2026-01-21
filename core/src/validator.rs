@@ -93,10 +93,10 @@ use {
             BankNotificationSenderConfig, OptimisticallyConfirmedBank,
             OptimisticallyConfirmedBankTracker,
         },
-        rpc::JsonRpcConfig,
+        rpc::{ExternalFinalizeRequest, JsonRpcConfig},
         rpc_completed_slots_service::RpcCompletedSlotsService,
         rpc_pubsub_service::{PubSubConfig, PubSubService},
-        rpc_service::{ClientOption, JsonRpcService, JsonRpcServiceConfig},
+        rpc_service::{ClientOption, JsonRpcService, JsonRpcServiceConfig, RpcApi},
         rpc_subscriptions::RpcSubscriptions,
         transaction_notifier_interface::TransactionNotifierArc,
         transaction_status_service::TransactionStatusService,
@@ -302,6 +302,9 @@ pub struct ValidatorConfig {
     pub use_tpu_client_next: bool,
     pub retransmit_xdp: Option<XdpConfig>,
     pub repair_handler_type: RepairHandlerType,
+    pub external_finalize_timeout: Duration,
+    pub finalize_history_rpc_addr: Option<SocketAddr>,
+    pub finalize_history_rpc_max_request_body_size: usize,
 }
 
 impl ValidatorConfig {
@@ -383,6 +386,9 @@ impl ValidatorConfig {
             use_tpu_client_next: true,
             retransmit_xdp: None,
             repair_handler_type: RepairHandlerType::default(),
+            external_finalize_timeout: Duration::from_secs(60 * 60),
+            finalize_history_rpc_addr: None,
+            finalize_history_rpc_max_request_body_size: solana_rpc::rpc::MAX_REQUEST_BODY_SIZE,
         }
     }
 
@@ -528,6 +534,7 @@ impl ValidatorTpuConfig {
 pub struct Validator {
     validator_exit: Arc<RwLock<Exit>>,
     json_rpc_service: Option<JsonRpcService>,
+    finalize_history_rpc_service: Option<JsonRpcService>,
     pubsub_service: Option<PubSubService>,
     rpc_completed_slots_service: Option<JoinHandle<()>>,
     optimistically_confirmed_bank_tracker: Option<OptimisticallyConfirmedBankTracker>,
@@ -1123,8 +1130,11 @@ impl Validator {
 
         let rpc_override_health_check =
             Arc::new(AtomicBool::new(config.rpc_config.disable_health_check));
+        let (finalize_history_sender, finalize_history_receiver) =
+            unbounded::<ExternalFinalizeRequest>();
         let (
             json_rpc_service,
+            finalize_history_rpc_service,
             rpc_subscriptions,
             pubsub_service,
             completed_data_sets_sender,
@@ -1146,26 +1156,50 @@ impl Validator {
                 None
             };
 
-            let client_option = if config.use_tpu_client_next {
+            let (client_option, finalize_client_option) = if config.use_tpu_client_next {
                 let runtime_handle = tpu_client_next_runtime
                     .as_ref()
                     .map(TokioRuntime::handle)
                     .unwrap_or_else(|| current_runtime_handle.as_ref().unwrap());
-                ClientOption::TpuClientNext(
+                let rpc_sts_client = node.sockets.rpc_sts_client;
+                let finalize_rpc_sts_client = if config.finalize_history_rpc_addr.is_some() {
+                    Some(rpc_sts_client.try_clone().map_err(|err| {
+                        ValidatorError::Other(format!(
+                            "Failed to clone rpc sts client socket: {err}"
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                let client_option = ClientOption::TpuClientNext(
                     Arc::as_ref(&identity_keypair),
-                    node.sockets.rpc_sts_client,
+                    rpc_sts_client,
                     runtime_handle.clone(),
                     cancel_tpu_client_next.clone(),
-                )
+                );
+                let finalize_client_option = finalize_rpc_sts_client.map(|socket| {
+                    ClientOption::TpuClientNext(
+                        Arc::as_ref(&identity_keypair),
+                        socket,
+                        runtime_handle.clone(),
+                        cancel_tpu_client_next.clone(),
+                    )
+                });
+                (client_option, finalize_client_option)
             } else {
                 let Some(connection_cache) = &connection_cache else {
                     panic!("ConnectionCache should exist by construction.");
                 };
-                ClientOption::ConnectionCache(connection_cache.clone())
+                let client_option = ClientOption::ConnectionCache(connection_cache.clone());
+                let finalize_client_option = config
+                    .finalize_history_rpc_addr
+                    .map(|_| ClientOption::ConnectionCache(connection_cache.clone()));
+                (client_option, finalize_client_option)
             };
             let rpc_svc_config = JsonRpcServiceConfig {
                 rpc_addr,
                 rpc_config: config.rpc_config.clone(),
+                rpc_api: RpcApi::Full,
                 snapshot_config: Some(snapshot_controller.snapshot_config().clone()),
                 bank_forks: bank_forks.clone(),
                 block_commitment_cache: block_commitment_cache.clone(),
@@ -1177,7 +1211,7 @@ impl Validator {
                 validator_exit: config.validator_exit.clone(),
                 exit: exit.clone(),
                 override_health_check: rpc_override_health_check.clone(),
-                startup_verification_complete,
+                startup_verification_complete: startup_verification_complete.clone(),
                 optimistically_confirmed_bank: optimistically_confirmed_bank.clone(),
                 send_transaction_service_config: config.send_transaction_service_config.clone(),
                 max_slots: max_slots.clone(),
@@ -1185,9 +1219,58 @@ impl Validator {
                 max_complete_transaction_status_slot: max_complete_transaction_status_slot.clone(),
                 prioritization_fee_cache: prioritization_fee_cache.clone(),
                 client_option,
+                finalize_history_sender: Some(finalize_history_sender.clone()),
             };
             let json_rpc_service =
                 JsonRpcService::new_with_config(rpc_svc_config).map_err(ValidatorError::Other)?;
+            let finalize_history_rpc_service = if let Some(rpc_addr) =
+                config.finalize_history_rpc_addr
+            {
+                let finalize_client_option = finalize_client_option.ok_or_else(|| {
+                    ValidatorError::Other(
+                        "Missing finalize-history client option".to_string(),
+                    )
+                })?;
+                let rpc_config = JsonRpcConfig {
+                    max_request_body_size: Some(
+                        config.finalize_history_rpc_max_request_body_size,
+                    ),
+                    full_api: false,
+                    ..config.rpc_config.clone()
+                };
+                let finalize_history_config = JsonRpcServiceConfig {
+                    rpc_addr,
+                    rpc_config,
+                    rpc_api: RpcApi::FinalizeHistory,
+                    snapshot_config: Some(snapshot_controller.snapshot_config().clone()),
+                    bank_forks: bank_forks.clone(),
+                    block_commitment_cache: block_commitment_cache.clone(),
+                    blockstore: blockstore.clone(),
+                    cluster_info: cluster_info.clone(),
+                    poh_recorder: Some(poh_recorder.clone()),
+                    genesis_hash: genesis_config.hash(),
+                    ledger_path: ledger_path.to_path_buf(),
+                    validator_exit: config.validator_exit.clone(),
+                    exit: exit.clone(),
+                    override_health_check: rpc_override_health_check.clone(),
+                    startup_verification_complete: startup_verification_complete.clone(),
+                    optimistically_confirmed_bank: optimistically_confirmed_bank.clone(),
+                    send_transaction_service_config: config.send_transaction_service_config.clone(),
+                    max_slots: max_slots.clone(),
+                    leader_schedule_cache: leader_schedule_cache.clone(),
+                    max_complete_transaction_status_slot: max_complete_transaction_status_slot
+                        .clone(),
+                    prioritization_fee_cache: prioritization_fee_cache.clone(),
+                    client_option: finalize_client_option,
+                    finalize_history_sender: Some(finalize_history_sender.clone()),
+                };
+                Some(
+                    JsonRpcService::new_with_config(finalize_history_config)
+                        .map_err(ValidatorError::Other)?,
+                )
+            } else {
+                None
+            };
             let rpc_subscriptions = Arc::new(RpcSubscriptions::new_with_config(
                 exit.clone(),
                 max_complete_transaction_status_slot,
@@ -1271,6 +1354,7 @@ impl Validator {
             });
             (
                 Some(json_rpc_service),
+                finalize_history_rpc_service,
                 Some(rpc_subscriptions),
                 pubsub_service,
                 completed_data_sets_sender,
@@ -1280,7 +1364,7 @@ impl Validator {
                 bank_notification_sender_config,
             )
         } else {
-            (None, None, None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None, None)
         };
 
         if config.halt_at_slot.is_some() {
@@ -1366,7 +1450,6 @@ impl Validator {
         let (verified_vote_sender, verified_vote_receiver) = unbounded();
         let (gossip_verified_vote_hash_sender, gossip_verified_vote_hash_receiver) = unbounded();
         let (duplicate_confirmed_slot_sender, duplicate_confirmed_slots_receiver) = unbounded();
-
         let entry_notification_sender = entry_notifier_service
             .as_ref()
             .map(|service| service.sender_cloned());
@@ -1577,6 +1660,9 @@ impl Validator {
             wen_restart_repair_slots.clone(),
             slot_status_notifier,
             vote_connection_cache,
+            finalize_history_receiver,
+            blockstore_process_options.clone(),
+            config.external_finalize_timeout,
         )
         .map_err(ValidatorError::Other)?;
 
@@ -1690,6 +1776,12 @@ impl Validator {
                     json_rpc_service.get_client_key_updater(),
                 );
             }
+            if let Some(finalize_history_rpc_service) = &finalize_history_rpc_service {
+                key_notifiers.write().unwrap().add(
+                    KeyUpdaterType::RpcService,
+                    finalize_history_rpc_service.get_client_key_updater(),
+                );
+            }
             // note, that we don't need to add ConnectionClient to key_notifiers
             // because it is added inside Tpu.
         }
@@ -1711,6 +1803,7 @@ impl Validator {
             gossip_service,
             serve_repair_service,
             json_rpc_service,
+            finalize_history_rpc_service,
             pubsub_service,
             rpc_completed_slots_service,
             optimistically_confirmed_bank_tracker,
@@ -1790,6 +1883,11 @@ impl Validator {
 
         if let Some(json_rpc_service) = self.json_rpc_service {
             json_rpc_service.join().expect("rpc_service");
+        }
+        if let Some(finalize_history_rpc_service) = self.finalize_history_rpc_service {
+            finalize_history_rpc_service
+                .join()
+                .expect("finalize_history_rpc_service");
         }
 
         if let Some(pubsub_service) = self.pubsub_service {

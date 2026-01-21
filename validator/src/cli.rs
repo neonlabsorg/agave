@@ -268,6 +268,7 @@ pub struct DefaultArgs {
     pub rpc_bigtable_app_profile_id: String,
     pub rpc_bigtable_max_message_size: String,
     pub rpc_max_request_body_size: String,
+    pub finalize_history_rpc_max_request_body_size: String,
     pub rpc_pubsub_worker_threads: String,
     pub rpc_pubsub_notification_threads: String,
 
@@ -403,6 +404,7 @@ impl DefaultArgs {
             tpu_max_streams_per_ms: DEFAULT_MAX_STREAMS_PER_MS.to_string(),
             num_quic_endpoints: DEFAULT_QUIC_ENDPOINTS.to_string(),
             rpc_max_request_body_size: MAX_REQUEST_BODY_SIZE.to_string(),
+            finalize_history_rpc_max_request_body_size: (100 * (1 << 20)).to_string(),
             banking_trace_dir_byte_limit: BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT.to_string(),
             wen_restart_path: "wen_restart_progress.proto".to_string(),
             thread_args: DefaultThreadArgs::default(),

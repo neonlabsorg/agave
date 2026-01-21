@@ -35,6 +35,7 @@ use {
     agave_votor::root_utils,
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender},
     rayon::{prelude::*, ThreadPool},
+    solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_accounts_db::contains::Contains,
     solana_clock::{BankId, Slot, NUM_CONSECUTIVE_LEADER_SLOTS},
     solana_entry::entry::VerifyRecyclers,
@@ -47,7 +48,7 @@ use {
         blockstore::Blockstore,
         blockstore_processor::{
             self, BlockstoreProcessorError, ConfirmationProgress, ExecuteBatchesInternalMetrics,
-            ReplaySlotStats, TransactionStatusSender,
+            ProcessOptions, ReplaySlotStats, TransactionStatusSender,
         },
         entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
@@ -58,6 +59,10 @@ use {
     solana_pubkey::Pubkey,
     solana_rpc::{
         optimistically_confirmed_bank_tracker::{BankNotification, BankNotificationSenderConfig},
+        rpc::{
+            ExternalAccountDataPatch, ExternalAccountDataSplice, ExternalAccountPatch,
+            ExternalFinalizeRequest,
+        },
         rpc_subscriptions::RpcSubscriptions,
         slot_status_notifier::SlotStatusNotifier,
     },
@@ -71,6 +76,7 @@ use {
         snapshot_controller::SnapshotController,
         vote_sender_types::ReplayVoteSender,
     },
+    solana_sdk_ids::system_program::id as system_program_id,
     solana_signer::Signer,
     solana_svm_timings::ExecuteTimings,
     solana_time_utils::timestamp,
@@ -286,6 +292,9 @@ pub struct ReplayStageConfig {
     pub prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     pub banking_tracer: Arc<BankingTracer>,
     pub snapshot_controller: Option<Arc<SnapshotController>>,
+    pub external_finalize_enabled: bool,
+    pub external_finalize_timeout: Duration,
+    pub replay_process_options: ProcessOptions,
 }
 
 pub struct ReplaySenders {
@@ -312,6 +321,7 @@ pub struct ReplayReceivers {
     pub duplicate_confirmed_slots_receiver: Receiver<Vec<(u64, Hash)>>,
     pub gossip_verified_vote_hash_receiver: Receiver<(Pubkey, u64, Hash)>,
     pub popular_pruned_forks_receiver: Receiver<Vec<u64>>,
+    pub finalize_history_receiver: Receiver<ExternalFinalizeRequest>,
 }
 
 /// Timing information for the ReplayStage main processing loop
@@ -586,6 +596,9 @@ impl ReplayStage {
             prioritization_fee_cache,
             banking_tracer,
             snapshot_controller,
+            external_finalize_enabled,
+            external_finalize_timeout,
+            replay_process_options,
         } = config;
 
         let ReplaySenders {
@@ -612,6 +625,7 @@ impl ReplayStage {
             duplicate_confirmed_slots_receiver,
             gossip_verified_vote_hash_receiver,
             popular_pruned_forks_receiver,
+            finalize_history_receiver,
         } = receivers;
 
         trace!("replay stage");
@@ -675,6 +689,7 @@ impl ReplayStage {
                 last_refresh_time: Instant::now(),
                 last_print_time: Instant::now(),
             };
+            let mut last_external_finalize = Instant::now();
             let mut tbft_structs = TowerBFTStructures {
                 heaviest_subtree_fork_choice,
                 duplicate_slots_tracker,
@@ -720,6 +735,57 @@ impl ReplayStage {
                 // Stop getting entries if we get exit signal
                 if exit.load(Ordering::Relaxed) {
                     break;
+                }
+
+                let mut requested_finalize = None;
+                while let Ok(request) = finalize_history_receiver.try_recv() {
+                    requested_finalize = Some(request);
+                }
+                if requested_finalize.is_none()
+                    && external_finalize_enabled
+                    && last_external_finalize.elapsed() >= external_finalize_timeout
+                {
+                    requested_finalize = Self::select_finalize_slot_for_timeout(&bank_forks).map(
+                        |slot| ExternalFinalizeRequest {
+                            slot,
+                            patches: Vec::new(),
+                        },
+                    );
+                }
+                if let Some(request) = requested_finalize {
+                    let target_slot = request.slot;
+                    let patches = request.patches.as_slice();
+                    match Self::finalize_history_with_replay(
+                        target_slot,
+                        &bank_forks,
+                        &blockstore,
+                        &leader_schedule_cache,
+                        snapshot_controller.as_deref(),
+                        &replay_process_options,
+                        transaction_status_sender.as_ref(),
+                        entry_notification_sender.as_ref(),
+                        &poh_recorder,
+                        &my_pubkey,
+                        &vote_account,
+                        &mut progress,
+                        &mut tbft_structs,
+                        &mut tracked_vote_transactions,
+                        &drop_bank_sender,
+                        patches,
+                    ) {
+                        Ok(()) => {
+                            last_external_finalize = Instant::now();
+                            current_leader = None;
+                            last_reset = Hash::default();
+                            last_reset_bank_descendants.clear();
+                            has_new_vote_been_rooted = !wait_for_vote_to_start_leader;
+                            latest_validator_votes_for_frozen_banks =
+                                LatestValidatorVotesForFrozenBanks::default();
+                        }
+                        Err(err) => {
+                            warn!("external finalize failed for slot {target_slot}: {err}");
+                        }
+                    }
                 }
 
                 let mut generate_new_bank_forks_time =
@@ -1015,6 +1081,7 @@ impl ReplayStage {
                         &voting_sender,
                         &drop_bank_sender,
                         wait_to_vote_slot,
+                        external_finalize_enabled,
                         &mut tbft_structs,
                     ) {
                         error!("Unable to set root: {e}");
@@ -2392,6 +2459,7 @@ impl ReplayStage {
         voting_sender: &Sender<VoteOp>,
         drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
         wait_to_vote_slot: Option<Slot>,
+        external_finalize_enabled: bool,
         tbft_structs: &mut TowerBFTStructures,
     ) -> Result<(), SetRootError> {
         if bank.is_empty() {
@@ -2400,30 +2468,32 @@ impl ReplayStage {
         trace!("handle votable bank {}", bank.slot());
         let new_root = tower.record_bank_vote(bank);
 
-        if let Some(new_root) = new_root {
-            let highest_super_majority_root = Some(
-                block_commitment_cache
-                    .read()
-                    .unwrap()
-                    .highest_super_majority_root(),
-            );
-            Self::check_and_handle_new_root(
-                &identity_keypair.pubkey(),
-                bank.parent_slot(),
-                new_root,
-                bank_forks,
-                progress,
-                blockstore,
-                leader_schedule_cache,
-                snapshot_controller,
-                rpc_subscriptions,
-                highest_super_majority_root,
-                bank_notification_sender,
-                has_new_vote_been_rooted,
-                tracked_vote_transactions,
-                drop_bank_sender,
-                tbft_structs,
-            )?;
+        if !external_finalize_enabled {
+            if let Some(new_root) = new_root {
+                let highest_super_majority_root = Some(
+                    block_commitment_cache
+                        .read()
+                        .unwrap()
+                        .highest_super_majority_root(),
+                );
+                Self::check_and_handle_new_root(
+                    &identity_keypair.pubkey(),
+                    bank.parent_slot(),
+                    new_root,
+                    bank_forks,
+                    progress,
+                    blockstore,
+                    leader_schedule_cache,
+                    snapshot_controller,
+                    rpc_subscriptions,
+                    highest_super_majority_root,
+                    bank_notification_sender,
+                    has_new_vote_been_rooted,
+                    tracked_vote_transactions,
+                    drop_bank_sender,
+                    tbft_structs,
+                )?;
+            }
         }
 
         let mut update_commitment_cache_time = Measure::start("update_commitment_cache");
@@ -4100,6 +4170,206 @@ impl ReplayStage {
                 )
             },
         )?;
+        Ok(())
+    }
+
+    fn select_finalize_slot_for_timeout(bank_forks: &RwLock<BankForks>) -> Option<Slot> {
+        let bank_forks = bank_forks.read().unwrap();
+        let root_slot = bank_forks.root();
+        let candidate = bank_forks
+            .frozen_banks()
+            .map(|(slot, _)| slot)
+            .max()
+            .unwrap_or(root_slot);
+        if candidate > root_slot {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_history_with_replay(
+        target_slot: Slot,
+        bank_forks: &Arc<RwLock<BankForks>>,
+        blockstore: &Blockstore,
+        leader_schedule_cache: &Arc<LeaderScheduleCache>,
+        snapshot_controller: Option<&SnapshotController>,
+        process_options: &ProcessOptions,
+        transaction_status_sender: Option<&TransactionStatusSender>,
+        entry_notification_sender: Option<&EntryNotifierSender>,
+        poh_recorder: &Arc<RwLock<PohRecorder>>,
+        identity_pubkey: &Pubkey,
+        vote_account: &Pubkey,
+        progress: &mut ProgressMap,
+        tbft_structs: &mut TowerBFTStructures,
+        tracked_vote_transactions: &mut Vec<TrackedVoteTransaction>,
+        drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
+        external_account_patches: &[ExternalAccountPatch],
+    ) -> Result<(), String> {
+        let root_slot = bank_forks.read().unwrap().root();
+        if target_slot <= root_slot {
+            return Err(format!(
+                "finalize target {target_slot} is not above current root {root_slot}"
+            ));
+        }
+
+        let target_bank = bank_forks
+            .read()
+            .unwrap()
+            .get(target_slot)
+            .ok_or_else(|| format!("finalize target {target_slot} not found in bank forks"))?;
+        if !target_bank.is_frozen() {
+            return Err(format!("finalize target {target_slot} is not frozen"));
+        }
+
+        {
+            let mut bank_forks = bank_forks.write().unwrap();
+            let removed_banks = bank_forks
+                .set_root(root_slot, snapshot_controller, None)
+                .map_err(|err| format!("failed to reset root {root_slot}: {err}"))?;
+            let _ = drop_bank_sender.send(removed_banks);
+        }
+
+        if bank_forks.read().unwrap().len() != 1 {
+            return Err("bank forks not reset to a single root bank".to_string());
+        }
+
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        Self::apply_external_state_override(&root_bank, external_account_patches)?;
+
+        let mut replay_options = process_options.clone();
+        replay_options.halt_at_slot = Some(target_slot);
+        blockstore_processor::process_blockstore_from_root(
+            blockstore,
+            bank_forks,
+            leader_schedule_cache,
+            &replay_options,
+            transaction_status_sender,
+            entry_notification_sender,
+            snapshot_controller,
+        )
+        .map_err(|err| format!("failed to replay history to {target_slot}: {err:?}"))?;
+
+        {
+            let mut bank_forks = bank_forks.write().unwrap();
+            let removed_banks = bank_forks
+                .set_root(target_slot, snapshot_controller, None)
+                .map_err(|err| format!("failed to set root {target_slot}: {err}"))?;
+            let _ = drop_bank_sender.send(removed_banks);
+        }
+
+        let (new_progress, new_fork_choice) =
+            Self::initialize_progress_and_fork_choice_with_locked_bank_forks(
+                bank_forks,
+                identity_pubkey,
+                vote_account,
+                blockstore,
+            );
+        *progress = new_progress;
+        tbft_structs.heaviest_subtree_fork_choice = new_fork_choice;
+        tbft_structs.duplicate_slots_tracker = DuplicateSlotsTracker::default();
+        tbft_structs.duplicate_confirmed_slots = DuplicateConfirmedSlots::default();
+        tbft_structs.unfrozen_gossip_verified_vote_hashes =
+            UnfrozenGossipVerifiedVoteHashes::default();
+        tbft_structs.epoch_slots_frozen_slots = EpochSlotsFrozenSlots::default();
+        tracked_vote_transactions.clear();
+
+        let working_bank = bank_forks.read().unwrap().working_bank();
+        Self::reset_poh_recorder(
+            identity_pubkey,
+            blockstore,
+            working_bank,
+            poh_recorder,
+            leader_schedule_cache,
+        );
+
+        Ok(())
+    }
+
+    fn apply_external_state_override(
+        bank: &Arc<Bank>,
+        external_account_patches: &[ExternalAccountPatch],
+    ) -> Result<(), String> {
+        if external_account_patches.is_empty() {
+            return Ok(());
+        }
+        for patch in external_account_patches {
+            let existing = bank.get_account(&patch.pubkey);
+            let (lamports, owner, mut data, executable, rent_epoch) =
+                if let Some(account) = existing {
+                    let owner = patch.owner.unwrap_or(*account.owner());
+                    let data = match patch.data.as_ref() {
+                        Some(data) => data.clone(),
+                        None => account.data().to_vec(),
+                    };
+                    (
+                        patch.lamports.unwrap_or(account.lamports()),
+                        owner,
+                        data,
+                        patch.executable.unwrap_or(account.executable()),
+                        patch.rent_epoch.unwrap_or(account.rent_epoch()),
+                    )
+                } else {
+                    let data = patch.data.clone().unwrap_or_default();
+                    (
+                        patch.lamports.unwrap_or(0),
+                        patch.owner.unwrap_or_else(system_program_id),
+                        data,
+                        patch.executable.unwrap_or(false),
+                        patch.rent_epoch.unwrap_or(0),
+                    )
+                };
+            if let Some(data_patch) = patch.data_patch.as_ref() {
+                Self::apply_data_patch(&mut data, data_patch, &patch.pubkey)?;
+            }
+            if let Some(data_splice) = patch.data_splice.as_ref() {
+                Self::apply_data_splice(&mut data, data_splice, &patch.pubkey)?;
+            }
+            let mut account = AccountSharedData::new(lamports, data.len(), &owner);
+            account.set_data(data);
+            account.set_executable(executable);
+            account.set_rent_epoch(rent_epoch);
+            bank.store_account(&patch.pubkey, &account);
+        }
+        bank.rehash();
+        Ok(())
+    }
+
+    fn apply_data_patch(
+        data: &mut Vec<u8>,
+        patch: &ExternalAccountDataPatch,
+        pubkey: &Pubkey,
+    ) -> Result<(), String> {
+        let offset = usize::try_from(patch.offset)
+            .map_err(|_| format!("data_patch offset too large for account {pubkey}"))?;
+        let end = offset
+            .checked_add(patch.data.len())
+            .ok_or_else(|| format!("data_patch range overflow for account {pubkey}"))?;
+        if data.len() < end {
+            data.resize(end, 0);
+        }
+        if data.len() < offset {
+            data.resize(offset, 0);
+        }
+        data[offset..end].copy_from_slice(&patch.data);
+        Ok(())
+    }
+
+    fn apply_data_splice(
+        data: &mut Vec<u8>,
+        patch: &ExternalAccountDataSplice,
+        pubkey: &Pubkey,
+    ) -> Result<(), String> {
+        let offset = usize::try_from(patch.offset)
+            .map_err(|_| format!("data_splice offset too large for account {pubkey}"))?;
+        let delete_len = usize::try_from(patch.delete_len)
+            .map_err(|_| format!("data_splice delete_len too large for account {pubkey}"))?;
+        if data.len() < offset {
+            data.resize(offset, 0);
+        }
+        let delete_end = offset.saturating_add(delete_len).min(data.len());
+        data.splice(offset..delete_end, patch.insert_data.iter().copied());
         Ok(())
     }
 
