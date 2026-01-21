@@ -143,6 +143,39 @@ impl BankForks {
         bank_forks
     }
 
+    pub fn reset_to_root_only(&mut self) -> Vec<BankWithScheduler> {
+        let banks_len_before = self.banks.len();
+        let descendants_len_before = self.descendants.len();
+        let root_slot = self.root();
+        let root_bank = self.root_bank.load();
+        let mut removed = Vec::new();
+        let mut root_entry = None;
+        for (slot, bank) in self.banks.drain() {
+            if slot == root_slot {
+                root_entry = Some(bank);
+            } else {
+                removed.push(bank);
+            }
+        }
+
+        let root_entry = root_entry.unwrap_or_else(|| {
+            BankWithScheduler::new_without_scheduler(Arc::clone(&root_bank))
+        });
+        self.banks.insert(root_slot, root_entry);
+        self.descendants.clear();
+        self.descendants.entry(root_slot).or_default();
+        self.root.store(root_slot, Ordering::Release);
+        self.root_bank.store(root_bank);
+        info!(
+            "[FINALIZE_DIAG] bank_forks reset_to_root_only: root_slot={} banks_len_before={} descendants_len_before={} removed_banks_len={}",
+            root_slot,
+            banks_len_before,
+            descendants_len_before,
+            removed.len()
+        );
+        removed
+    }
+
     pub fn banks(&self) -> &HashMap<Slot, BankWithScheduler> {
         &self.banks
     }
@@ -451,6 +484,7 @@ impl BankForks {
         snapshot_controller: Option<&SnapshotController>,
         highest_super_majority_root: Option<Slot>,
     ) -> Result<Vec<BankWithScheduler>, SetRootError> {
+        let prev_root = self.root();
         let program_cache_prune_start = Instant::now();
         let set_root_start = Instant::now();
         let (removed_banks, set_root_metrics) = self.do_set_root_return_metrics(
@@ -458,6 +492,15 @@ impl BankForks {
             snapshot_controller,
             highest_super_majority_root,
         )?;
+        let working_slot = self.working_bank().slot();
+        info!(
+            "[FINALIZE_DIAG] bank_forks set_root: prev_root={} new_root={} working_slot={} total_banks={} removed_banks_len={}",
+            prev_root,
+            root,
+            working_slot,
+            self.banks.len(),
+            removed_banks.len()
+        );
         datapoint_info!(
             "bank-forks_set_root",
             (

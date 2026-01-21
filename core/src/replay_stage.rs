@@ -47,7 +47,7 @@ use {
         blockstore::Blockstore,
         blockstore_processor::{
             self, BlockstoreProcessorError, ConfirmationProgress, ExecuteBatchesInternalMetrics,
-            ReplaySlotStats, TransactionStatusSender,
+            ProcessOptions, ReplaySlotStats, TransactionStatusSender,
         },
         entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
@@ -58,6 +58,7 @@ use {
     solana_pubkey::Pubkey,
     solana_rpc::{
         optimistically_confirmed_bank_tracker::{BankNotification, BankNotificationSenderConfig},
+        rpc::{ExternalFinalizeMode, ExternalFinalizeRequest},
         rpc_subscriptions::RpcSubscriptions,
         slot_status_notifier::SlotStatusNotifier,
     },
@@ -71,10 +72,11 @@ use {
         snapshot_controller::SnapshotController,
         vote_sender_types::ReplayVoteSender,
     },
+    solana_signature::Signature,
     solana_signer::Signer,
     solana_svm_timings::ExecuteTimings,
     solana_time_utils::timestamp,
-    solana_transaction::Transaction,
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
     solana_vote::vote_transaction::VoteTransaction,
     std::{
         collections::{HashMap, HashSet},
@@ -286,6 +288,9 @@ pub struct ReplayStageConfig {
     pub prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     pub banking_tracer: Arc<BankingTracer>,
     pub snapshot_controller: Option<Arc<SnapshotController>>,
+    pub external_finalize_enabled: bool,
+    pub external_finalize_timeout: Duration,
+    pub replay_process_options: ProcessOptions,
 }
 
 pub struct ReplaySenders {
@@ -312,6 +317,7 @@ pub struct ReplayReceivers {
     pub duplicate_confirmed_slots_receiver: Receiver<Vec<(u64, Hash)>>,
     pub gossip_verified_vote_hash_receiver: Receiver<(Pubkey, u64, Hash)>,
     pub popular_pruned_forks_receiver: Receiver<Vec<u64>>,
+    pub finalize_history_receiver: Receiver<ExternalFinalizeRequest>,
 }
 
 /// Timing information for the ReplayStage main processing loop
@@ -586,6 +592,9 @@ impl ReplayStage {
             prioritization_fee_cache,
             banking_tracer,
             snapshot_controller,
+            external_finalize_enabled,
+            external_finalize_timeout,
+            replay_process_options,
         } = config;
 
         let ReplaySenders {
@@ -612,6 +621,7 @@ impl ReplayStage {
             duplicate_confirmed_slots_receiver,
             gossip_verified_vote_hash_receiver,
             popular_pruned_forks_receiver,
+            finalize_history_receiver,
         } = receivers;
 
         trace!("replay stage");
@@ -675,6 +685,7 @@ impl ReplayStage {
                 last_refresh_time: Instant::now(),
                 last_print_time: Instant::now(),
             };
+            let mut last_external_finalize = Instant::now();
             let mut tbft_structs = TowerBFTStructures {
                 heaviest_subtree_fork_choice,
                 duplicate_slots_tracker,
@@ -720,6 +731,151 @@ impl ReplayStage {
                 // Stop getting entries if we get exit signal
                 if exit.load(Ordering::Relaxed) {
                     break;
+                }
+
+                let mut requested_finalize = None;
+                while let Ok(request) = finalize_history_receiver.try_recv() {
+                    requested_finalize = Some(request);
+                }
+                if requested_finalize.is_none()
+                    && external_finalize_enabled
+                    && last_external_finalize.elapsed() >= external_finalize_timeout
+                {
+                    requested_finalize = Some(ExternalFinalizeRequest {
+                        slot: 0,
+                        mode: ExternalFinalizeMode::FinalizeOnly,
+                        exclude_signatures: None,
+                        prepend_transactions: None,
+                    });
+                }
+                if let Some(request) = requested_finalize {
+                    let requested_slot = request.slot;
+                    let target_slot = Self::select_finalize_slot_for_external(
+                        &bank_forks,
+                        &tbft_structs.heaviest_subtree_fork_choice,
+                        &tower,
+                        requested_slot,
+                    );
+                    let Some(target_slot) = target_slot else {
+                        warn!(
+                            "[FINALIZE_DIAG] external finalize skipped: requested_slot={} reason=no_valid_fork_choice",
+                            requested_slot
+                        );
+                        continue;
+                    };
+                    if requested_slot != 0 && requested_slot != target_slot {
+                        info!(
+                            "[FINALIZE_DIAG] external finalize override: requested_slot={} target_slot={}",
+                            requested_slot,
+                            target_slot
+                        );
+                    }
+                    let exclude_signatures = request.exclude_signatures.as_ref();
+                    let prepend_transactions = request.prepend_transactions.as_ref();
+                    let finalize_result = match request.mode {
+                        ExternalFinalizeMode::Replay => Self::finalize_history_with_replay(
+                            target_slot,
+                            &bank_forks,
+                            &blockstore,
+                            &leader_schedule_cache,
+                            snapshot_controller.as_deref(),
+                            &replay_process_options,
+                            transaction_status_sender.as_ref(),
+                            entry_notification_sender.as_ref(),
+                            &poh_recorder,
+                            &my_pubkey,
+                            &vote_account,
+                            &mut progress,
+                            &mut tbft_structs,
+                            &mut tracked_vote_transactions,
+                            &mut has_new_vote_been_rooted,
+                            &drop_bank_sender,
+                            exclude_signatures,
+                            prepend_transactions,
+                        ),
+                        ExternalFinalizeMode::FinalizeOnly => {
+                            if exclude_signatures.is_some() {
+                                Err("finalizeHistory does not accept excluded signatures"
+                                    .to_string())
+                            } else if prepend_transactions.is_some() {
+                                Err("finalizeHistory does not accept prepend transactions"
+                                    .to_string())
+                            } else {
+                                let (root_before, working_before, forks_len_before) = {
+                                    let forks = bank_forks.read().unwrap();
+                                    (forks.root(), forks.working_bank().slot(), forks.len())
+                                };
+                                info!(
+                                    "[FINALIZE_DIAG] external finalize start: mode=FinalizeOnly target_slot={} root_before={} working_before={} forks_len_before={}",
+                                    target_slot,
+                                    root_before,
+                                    working_before,
+                                    forks_len_before
+                                );
+                                Self::finalize_history_with_replay(
+                                    target_slot,
+                                    &bank_forks,
+                                    &blockstore,
+                                    &leader_schedule_cache,
+                                    snapshot_controller.as_deref(),
+                                    &replay_process_options,
+                                    transaction_status_sender.as_ref(),
+                                    entry_notification_sender.as_ref(),
+                                    &poh_recorder,
+                                    &my_pubkey,
+                                    &vote_account,
+                                    &mut progress,
+                                    &mut tbft_structs,
+                                    &mut tracked_vote_transactions,
+                                    &mut has_new_vote_been_rooted,
+                                    &drop_bank_sender,
+                                    None,
+                                    None,
+                                )
+                            }
+                        }
+                    };
+                    match finalize_result {
+                        Ok(()) => {
+                            last_external_finalize = Instant::now();
+                            current_leader = None;
+                            last_reset = Hash::default();
+                            last_reset_bank_descendants.clear();
+                            has_new_vote_been_rooted = !wait_for_vote_to_start_leader;
+                            latest_validator_votes_for_frozen_banks =
+                                LatestValidatorVotesForFrozenBanks::default();
+                            if matches!(request.mode, ExternalFinalizeMode::FinalizeOnly) {
+                                let working_bank = bank_forks.read().unwrap().working_bank();
+                                let root_slot = bank_forks.read().unwrap().root();
+                                let forks_len_after = bank_forks.read().unwrap().len();
+                                info!(
+                                    "[FINALIZE_DIAG] external finalize finalized_only: target_slot={} root_slot={} working_bank_slot={}",
+                                    target_slot,
+                                    root_slot,
+                                    working_bank.slot()
+                                );
+                                info!(
+                                    "[FINALIZE_DIAG] external finalize end: mode=FinalizeOnly target_slot={} root_after={} working_after={} forks_len_after={}",
+                                    target_slot,
+                                    root_slot,
+                                    working_bank.slot(),
+                                    forks_len_after
+                                );
+                                Self::reset_poh_recorder(
+                                    &my_pubkey,
+                                    &blockstore,
+                                    working_bank,
+                                    &poh_recorder,
+                                    &leader_schedule_cache,
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            warn!("external finalize failed for slot {target_slot}: {err}");
+                            // Avoid tight retry loops on failure; reset the timeout window.
+                            last_external_finalize = Instant::now();
+                        }
+                    }
                 }
 
                 let mut generate_new_bank_forks_time =
@@ -1015,6 +1171,7 @@ impl ReplayStage {
                         &voting_sender,
                         &drop_bank_sender,
                         wait_to_vote_slot,
+                        external_finalize_enabled,
                         &mut tbft_structs,
                     ) {
                         error!("Unable to set root: {e}");
@@ -2245,6 +2402,8 @@ impl ReplayStage {
             false,
             log_messages_bytes_limit,
             prioritization_fee_cache,
+            None,
+            None,
         )?;
         let tx_count_after = w_replay_progress.num_txs;
         let tx_count = tx_count_after - tx_count_before;
@@ -2392,6 +2551,7 @@ impl ReplayStage {
         voting_sender: &Sender<VoteOp>,
         drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
         wait_to_vote_slot: Option<Slot>,
+        external_finalize_enabled: bool,
         tbft_structs: &mut TowerBFTStructures,
     ) -> Result<(), SetRootError> {
         if bank.is_empty() {
@@ -2400,30 +2560,32 @@ impl ReplayStage {
         trace!("handle votable bank {}", bank.slot());
         let new_root = tower.record_bank_vote(bank);
 
-        if let Some(new_root) = new_root {
-            let highest_super_majority_root = Some(
-                block_commitment_cache
-                    .read()
-                    .unwrap()
-                    .highest_super_majority_root(),
-            );
-            Self::check_and_handle_new_root(
-                &identity_keypair.pubkey(),
-                bank.parent_slot(),
-                new_root,
-                bank_forks,
-                progress,
-                blockstore,
-                leader_schedule_cache,
-                snapshot_controller,
-                rpc_subscriptions,
-                highest_super_majority_root,
-                bank_notification_sender,
-                has_new_vote_been_rooted,
-                tracked_vote_transactions,
-                drop_bank_sender,
-                tbft_structs,
-            )?;
+        if !external_finalize_enabled {
+            if let Some(new_root) = new_root {
+                let highest_super_majority_root = Some(
+                    block_commitment_cache
+                        .read()
+                        .unwrap()
+                        .highest_super_majority_root(),
+                );
+                Self::check_and_handle_new_root(
+                    &identity_keypair.pubkey(),
+                    bank.parent_slot(),
+                    new_root,
+                    bank_forks,
+                    progress,
+                    blockstore,
+                    leader_schedule_cache,
+                    snapshot_controller,
+                    rpc_subscriptions,
+                    highest_super_majority_root,
+                    bank_notification_sender,
+                    has_new_vote_been_rooted,
+                    tracked_vote_transactions,
+                    drop_bank_sender,
+                    tbft_structs,
+                )?;
+            }
         }
 
         let mut update_commitment_cache_time = Measure::start("update_commitment_cache");
@@ -4100,6 +4262,414 @@ impl ReplayStage {
                 )
             },
         )?;
+        Ok(())
+    }
+
+    fn select_finalize_slot_for_external(
+        bank_forks: &RwLock<BankForks>,
+        fork_choice: &HeaviestSubtreeForkChoice,
+        tower: &Tower,
+        requested_slot: Slot,
+    ) -> Option<Slot> {
+        let bank_forks = bank_forks.read().unwrap();
+        let root_slot = bank_forks.root();
+        let best_overall = fork_choice.best_overall_slot().0;
+        let same_voted_fork = fork_choice
+            .heaviest_slot_on_same_voted_fork(tower)
+            .map(|key| key.0);
+        info!(
+            "[FINALIZE_DIAG] select finalize: requested_slot={} root_slot={} best_overall={} same_voted_fork={:?}",
+            requested_slot, root_slot, best_overall, same_voted_fork
+        );
+        let is_frozen = |slot: Slot| -> bool {
+            bank_forks
+                .get(slot)
+                .map(|b| b.is_frozen())
+                .unwrap_or(false)
+        };
+        let mut base_target = None;
+        if let Some(same_voted_fork) = same_voted_fork {
+            if same_voted_fork > root_slot && is_frozen(same_voted_fork) {
+                base_target = Some(same_voted_fork);
+            } else {
+                info!(
+                    "[FINALIZE_DIAG] select finalize: same_voted_fork not usable (same_voted_fork={} root_slot={} frozen={})",
+                    same_voted_fork,
+                    root_slot,
+                    is_frozen(same_voted_fork)
+                );
+            }
+        }
+        if base_target.is_none() && best_overall > root_slot && is_frozen(best_overall) {
+            base_target = Some(best_overall);
+        }
+        let Some(base_target) = base_target else {
+            warn!(
+                "[FINALIZE_DIAG] select finalize: no valid target (root_slot={} best_overall={} same_voted_fork={:?})",
+                root_slot, best_overall, same_voted_fork
+            );
+            return None;
+        };
+        if requested_slot == 0 {
+            info!(
+                "[FINALIZE_DIAG] select finalize: using base_target for requested_slot=0 (target_slot={})",
+                base_target
+            );
+            return Some(base_target);
+        }
+        if requested_slot <= root_slot {
+            info!(
+                "[FINALIZE_DIAG] select finalize: requested_slot<=root (requested_slot={} root_slot={} target_slot={})",
+                requested_slot, root_slot, base_target
+            );
+            return Some(base_target);
+        }
+        if !is_frozen(requested_slot) {
+            info!(
+                "[FINALIZE_DIAG] select finalize: requested_slot not frozen (requested_slot={} target_slot={})",
+                requested_slot, base_target
+            );
+            return Some(base_target);
+        }
+        let ancestors = bank_forks.ancestors();
+        let is_ancestor = ancestors
+            .get(&base_target)
+            .map(|a| a.contains(&requested_slot))
+            .unwrap_or(false);
+        info!(
+            "[FINALIZE_DIAG] select finalize: requested_slot_ancestor_of_target={} (requested_slot={} target_slot={})",
+            is_ancestor, requested_slot, base_target
+        );
+        if is_ancestor {
+            Some(requested_slot)
+        } else {
+            Some(base_target)
+        }
+    }
+
+    fn validate_replay_path_from_root(
+        blockstore: &Blockstore,
+        root_slot: Slot,
+        target_slot: Slot,
+    ) -> Result<(), String> {
+        let mut current = target_slot;
+        let mut steps = 0usize;
+        let mut logged = 0usize;
+        const MAX_STEPS: usize = 2_000_000;
+        while current > root_slot {
+            if steps >= MAX_STEPS {
+                return Err(format!(
+                    "replay path validation exceeded max steps ({MAX_STEPS}) from target {target_slot} to root {root_slot}"
+                ));
+            }
+            let meta = blockstore
+                .meta(current)
+                .map_err(|err| format!("failed to read blockstore meta for slot {current}: {err}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "missing blockstore meta on replay path at slot {current} (target={target_slot} root={root_slot})"
+                    )
+                })?;
+            if blockstore.is_dead(current) {
+                return Err(format!(
+                    "slot {current} is marked dead on replay path (target={target_slot} root={root_slot})"
+                ));
+            }
+            let parent = meta.parent_slot.ok_or_else(|| {
+                format!(
+                    "slot {current} has no parent on replay path (target={target_slot} root={root_slot})"
+                )
+            })?;
+            if logged < 20 {
+                info!(
+                    "[FINALIZE_DIAG] replay path step: slot={} parent={} is_full={} next_slots_len={}",
+                    current,
+                    parent,
+                    meta.is_full(),
+                    meta.next_slots.len()
+                );
+                logged += 1;
+            } else if logged == 20 {
+                info!("[FINALIZE_DIAG] replay path step: truncated at 20 entries");
+                logged += 1;
+            }
+            if parent >= current {
+                return Err(format!(
+                    "invalid parent relation on replay path: slot {current} parent {parent}"
+                ));
+            }
+            current = parent;
+            steps += 1;
+        }
+        if current != root_slot {
+            return Err(format!(
+                "target {target_slot} is not descended from root {root_slot}; stopped at ancestor {current}"
+            ));
+        }
+        info!(
+            "[FINALIZE_DIAG] replay path validated: root_slot={} target_slot={} steps={}",
+            root_slot, target_slot, steps
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_history_with_replay(
+        target_slot: Slot,
+        bank_forks: &Arc<RwLock<BankForks>>,
+        blockstore: &Blockstore,
+        leader_schedule_cache: &Arc<LeaderScheduleCache>,
+        snapshot_controller: Option<&SnapshotController>,
+        process_options: &ProcessOptions,
+        transaction_status_sender: Option<&TransactionStatusSender>,
+        entry_notification_sender: Option<&EntryNotifierSender>,
+        poh_recorder: &Arc<RwLock<PohRecorder>>,
+        identity_pubkey: &Pubkey,
+        _vote_account: &Pubkey,
+        progress: &mut ProgressMap,
+        tbft_structs: &mut TowerBFTStructures,
+        tracked_vote_transactions: &mut Vec<TrackedVoteTransaction>,
+        has_new_vote_been_rooted: &mut bool,
+        drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
+        exclude_signatures: Option<&HashSet<Signature>>,
+        prepend_transactions: Option<&HashMap<Slot, Vec<VersionedTransaction>>>,
+    ) -> Result<(), String> {
+        if target_slot == 0 {
+            return Ok(());
+        }
+        let root_slot = bank_forks.read().unwrap().root();
+        if target_slot <= root_slot {
+            return Err(format!(
+                "finalize target {target_slot} is not above current root {root_slot}"
+            ));
+        }
+
+        let target_bank = bank_forks
+            .read()
+            .unwrap()
+            .get(target_slot)
+            .ok_or_else(|| format!("finalize target {target_slot} not found in bank forks"))?;
+        if !target_bank.is_frozen() {
+            return Err(format!("finalize target {target_slot} is not frozen"));
+        }
+        Self::validate_replay_path_from_root(blockstore, root_slot, target_slot)?;
+
+        {
+            let (banks_len_before, root_before, working_before) = {
+                let forks = bank_forks.read().unwrap();
+                (forks.len(), forks.root(), forks.working_bank().slot())
+            };
+            info!(
+                "[FINALIZE_DIAG] finalize replay reset: target_slot={} root_before={} working_before={} banks_len_before={}",
+                target_slot,
+                root_before,
+                working_before,
+                banks_len_before
+            );
+            let mut bank_forks = bank_forks.write().unwrap();
+            let removed_banks = bank_forks.reset_to_root_only();
+            let _ = drop_bank_sender.send(removed_banks);
+        }
+
+        {
+            let forks = bank_forks.read().unwrap();
+            let banks_len_after = forks.len();
+            let root_after = forks.root();
+            let working_after = forks.working_bank().slot();
+            info!(
+                "[FINALIZE_DIAG] finalize replay reset done: target_slot={} root_after={} working_after={} banks_len_after={}",
+                target_slot,
+                root_after,
+                working_after,
+                banks_len_after
+            );
+            if banks_len_after != 1 {
+                return Err("bank forks not reset to a single root bank".to_string());
+            }
+        }
+
+        match blockstore.meta(root_slot) {
+            Ok(Some(meta)) => {
+                info!(
+                    "[FINALIZE_DIAG] root meta: slot={} parent={:?} next_slots_len={} is_full={} is_connected={} max_root={}",
+                    root_slot,
+                    meta.parent_slot,
+                    meta.next_slots.len(),
+                    meta.is_full(),
+                    meta.is_connected(),
+                    blockstore.max_root()
+                );
+                let mut logged = 0usize;
+                for next_slot in &meta.next_slots {
+                    if logged >= 20 {
+                        info!(
+                            "[FINALIZE_DIAG] root meta next_slots: truncated at 20 entries"
+                        );
+                        break;
+                    }
+                    let is_dead = blockstore.is_dead(*next_slot);
+                    let (has_meta, is_full) = match blockstore.meta(*next_slot) {
+                        Ok(Some(next_meta)) => (true, next_meta.is_full()),
+                        Ok(None) => (false, false),
+                        Err(_) => (false, false),
+                    };
+                    info!(
+                        "[FINALIZE_DIAG] root child slot: slot={} has_meta={} is_full={} is_dead={}",
+                        next_slot,
+                        has_meta,
+                        is_full,
+                        is_dead
+                    );
+                    logged += 1;
+                }
+            }
+            Ok(None) => {
+                return Err(format!(
+                    "root slot {root_slot} not found in blockstore; cannot replay history"
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to read blockstore meta for root slot {root_slot}: {err}"
+                ));
+            }
+        }
+
+        if let Some(prepend_transactions) = prepend_transactions {
+            for slot in prepend_transactions.keys() {
+                if *slot <= root_slot || *slot > target_slot {
+                    return Err(format!(
+                        "prepend transaction slot {slot} is outside replay range ({}, {}]",
+                        root_slot, target_slot
+                    ));
+                }
+            }
+        }
+
+        let mut replay_options = process_options.clone();
+        replay_options.halt_at_slot = Some(target_slot);
+        replay_options.abort_on_invalid_block = true;
+        replay_options.exclude_signatures = exclude_signatures.cloned();
+        replay_options.prepend_transactions = prepend_transactions.cloned();
+        if let Some(prepend_transactions) = prepend_transactions {
+            if !prepend_transactions.is_empty() {
+                replay_options.run_verification = false;
+            }
+        }
+        let replay_result = blockstore_processor::process_blockstore_from_root(
+            blockstore,
+            bank_forks,
+            leader_schedule_cache,
+            &replay_options,
+            transaction_status_sender,
+            entry_notification_sender,
+            snapshot_controller,
+        );
+        if let Err(err) = &replay_result {
+            warn!(
+                "[FINALIZE_DIAG] replay failed: target_slot={} err={err:?}",
+                target_slot
+            );
+        }
+        replay_result.map_err(|err| format!("failed to replay history to {target_slot}: {err:?}"))?;
+        info!(
+            "[FINALIZE_DIAG] replay post banks_len={} root={}",
+            bank_forks.read().unwrap().len(),
+            bank_forks.read().unwrap().root()
+        );
+        info!(
+            "[FINALIZE_DIAG] finalize replay completed: target_slot={} banks_len={} root_slot={}",
+            target_slot,
+            bank_forks.read().unwrap().len(),
+            bank_forks.read().unwrap().root()
+        );
+
+        {
+            let forks = bank_forks.read().unwrap();
+            let target_bank = forks.get(target_slot);
+            let target_frozen = target_bank.as_ref().map(|b| b.is_frozen()).unwrap_or(false);
+            if target_bank.is_none() {
+                return Err(format!(
+                    "replay did not produce target bank {target_slot} (banks_len={}, root={})",
+                    forks.len(),
+                    forks.root()
+                ));
+            }
+            if !target_frozen {
+                return Err(format!(
+                    "replay produced target bank {target_slot} but it is not frozen"
+                ));
+            }
+        }
+
+        Self::handle_new_root(
+            target_slot,
+            bank_forks,
+            progress,
+            snapshot_controller,
+            None,
+            has_new_vote_been_rooted,
+            tracked_vote_transactions,
+            drop_bank_sender,
+            tbft_structs,
+        )
+        .map_err(|err| format!("failed to set root {target_slot}: {err}"))?;
+
+        let working_bank = bank_forks.read().unwrap().working_bank();
+        Self::reset_poh_recorder(
+            identity_pubkey,
+            blockstore,
+            working_bank,
+            poh_recorder,
+            leader_schedule_cache,
+        );
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn finalize_history_without_replay(
+        target_slot: Slot,
+        bank_forks: &Arc<RwLock<BankForks>>,
+        snapshot_controller: Option<&SnapshotController>,
+        progress: &mut ProgressMap,
+        tbft_structs: &mut TowerBFTStructures,
+        tracked_vote_transactions: &mut Vec<TrackedVoteTransaction>,
+        has_new_vote_been_rooted: &mut bool,
+        drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
+    ) -> Result<(), String> {
+        if target_slot == 0 {
+            return Ok(());
+        }
+        let root_slot = bank_forks.read().unwrap().root();
+        if target_slot <= root_slot {
+            return Err(format!(
+                "finalize target {target_slot} is not above current root {root_slot}"
+            ));
+        }
+
+        let target_bank = bank_forks
+            .read()
+            .unwrap()
+            .get(target_slot)
+            .ok_or_else(|| format!("finalize target {target_slot} not found in bank forks"))?;
+        if !target_bank.is_frozen() {
+            return Err(format!("finalize target {target_slot} is not frozen"));
+        }
+
+        Self::handle_new_root(
+            target_slot,
+            bank_forks,
+            progress,
+            snapshot_controller,
+            None,
+            has_new_vote_been_rooted,
+            tracked_vote_transactions,
+            drop_bank_sender,
+            tbft_structs,
+        )
+        .map_err(|err| format!("failed to set root {target_slot}: {err}"))?;
+
         Ok(())
     }
 

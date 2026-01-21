@@ -672,7 +672,15 @@ impl AncestorHashesService {
         popular_pruned_slot_pool: &mut HashSet<Slot>,
         request_throttle: &mut Vec<u64>,
     ) {
-        let root_bank = repair_info.bank_forks.read().unwrap().root_bank();
+        let root_bank = match repair_info.bank_forks.read() {
+            Ok(guard) => guard.root_bank(),
+            Err(err) => {
+                warn!(
+                    "ancestor_hashes_service: bank_forks lock poisoned: {err:?}"
+                );
+                return;
+            }
+        };
         let cluster_type = root_bank.cluster_type();
         for (slot, request_type) in retryable_slots_receiver.try_iter() {
             datapoint_info!("ancestor-repair-retry", ("slot", slot, i64));

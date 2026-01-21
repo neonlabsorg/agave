@@ -32,14 +32,16 @@ use {
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore::Blockstore, blockstore_cleanup_service::BlockstoreCleanupService,
-        blockstore_processor::TransactionStatusSender, entry_notifier_service::EntryNotifierSender,
-        leader_schedule_cache::LeaderScheduleCache,
+        blockstore_processor::{ProcessOptions, TransactionStatusSender},
+        entry_notifier_service::EntryNotifierSender, leader_schedule_cache::LeaderScheduleCache,
     },
     solana_poh::poh_recorder::PohRecorder,
     solana_pubkey::Pubkey,
     solana_rpc::{
         max_slots::MaxSlots, optimistically_confirmed_bank_tracker::BankNotificationSenderConfig,
-        rpc_subscriptions::RpcSubscriptions, slot_status_notifier::SlotStatusNotifier,
+        rpc::ExternalFinalizeRequest,
+        rpc_subscriptions::RpcSubscriptions,
+        slot_status_notifier::SlotStatusNotifier,
     },
     solana_runtime::{
         bank_forks::BankForks, commitment::BlockCommitmentCache,
@@ -54,6 +56,7 @@ use {
         num::NonZeroUsize,
         sync::{atomic::AtomicBool, Arc, RwLock},
         thread::{self, JoinHandle},
+        time::Duration,
     },
     tokio::sync::mpsc::Sender as AsyncSender,
 };
@@ -173,6 +176,9 @@ impl Tvu {
         wen_restart_repair_slots: Option<Arc<RwLock<Vec<Slot>>>>,
         slot_status_notifier: Option<SlotStatusNotifier>,
         vote_connection_cache: Arc<ConnectionCache>,
+        finalize_history_receiver: Receiver<ExternalFinalizeRequest>,
+        replay_process_options: ProcessOptions,
+        external_finalize_timeout: Duration,
     ) -> Result<Self, String> {
         let in_wen_restart = wen_restart_repair_slots.is_some();
 
@@ -320,6 +326,7 @@ impl Tvu {
             duplicate_confirmed_slots_receiver,
             gossip_verified_vote_hash_receiver,
             popular_pruned_forks_receiver,
+            finalize_history_receiver,
         };
 
         let replay_stage_config = ReplayStageConfig {
@@ -344,6 +351,9 @@ impl Tvu {
             prioritization_fee_cache: prioritization_fee_cache.clone(),
             banking_tracer,
             snapshot_controller,
+            external_finalize_enabled: true,
+            external_finalize_timeout,
+            replay_process_options,
         };
 
         let voting_service = VotingService::new(
@@ -525,6 +535,8 @@ pub mod tests {
         let (_verified_vote_sender, verified_vote_receiver) = unbounded();
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let (_, gossip_confirmed_slots_receiver) = unbounded();
+        let (_finalize_history_sender, finalize_history_receiver) =
+            unbounded::<ExternalFinalizeRequest>();
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
         let ignored_prioritization_fee_cache = Arc::new(PrioritizationFeeCache::new(0u64));
         let outstanding_repair_requests = Arc::<RwLock<OutstandingShredRepairs>>::default();
@@ -606,6 +618,10 @@ pub mod tests {
             wen_restart_repair_slots,
             None,
             Arc::new(connection_cache),
+            finalize_history_receiver,
+            ProcessOptions::default(),
+            Duration::from_secs(60 * 60),
+            Arc::new(Vec::new()),
         )
         .expect("assume success");
         if enable_wen_restart {

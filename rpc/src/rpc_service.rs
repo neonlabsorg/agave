@@ -5,11 +5,15 @@ use {
         cluster_tpu_info::ClusterTpuInfo,
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
-        rpc::{rpc_accounts::*, rpc_accounts_scan::*, rpc_bank::*, rpc_full::*, rpc_minimal::*, *},
+        rpc::{
+            rpc_accounts::*, rpc_accounts_scan::*, rpc_bank::*,
+            rpc_finalize_history::{FinalizeHistory, FinalizeHistoryImpl},
+            rpc_full::*, rpc_minimal::*, *,
+        },
         rpc_cache::LargestAccountsCache,
         rpc_health::*,
     },
-    crossbeam_channel::unbounded,
+    crossbeam_channel::{unbounded, Sender},
     jsonrpc_core::{futures::prelude::*, MetaIoHandler},
     jsonrpc_http_server::{
         hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
@@ -57,7 +61,7 @@ use {
         },
         task::{Context, Poll},
         thread::{self, Builder, JoinHandle},
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
     tokio::runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime},
     tokio_util::{
@@ -131,6 +135,8 @@ struct RpcRequestMiddleware {
     snapshot_config: Option<SnapshotConfig>,
     bank_forks: Arc<RwLock<BankForks>>,
     health: Arc<RpcHealth>,
+    last_request_ms: Arc<AtomicU64>,
+    total_requests: Arc<AtomicU64>,
 }
 
 impl RpcRequestMiddleware {
@@ -139,6 +145,8 @@ impl RpcRequestMiddleware {
         snapshot_config: Option<SnapshotConfig>,
         bank_forks: Arc<RwLock<BankForks>>,
         health: Arc<RpcHealth>,
+        last_request_ms: Arc<AtomicU64>,
+        total_requests: Arc<AtomicU64>,
     ) -> Self {
         Self {
             ledger_path,
@@ -153,6 +161,8 @@ impl RpcRequestMiddleware {
             snapshot_config,
             bank_forks,
             health,
+            last_request_ms,
+            total_requests,
         }
     }
 
@@ -342,11 +352,30 @@ impl RpcRequestMiddleware {
 
 impl RequestMiddleware for RpcRequestMiddleware {
     fn on_request(&self, request: hyper::Request<hyper::Body>) -> RequestMiddlewareAction {
-        trace!("request uri: {}", request.uri());
+        let request_method = request.method().as_str();
+        let request_path = request.uri().path();
+        let content_length = request
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        if request_path == "/" {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.total_requests.fetch_add(1, Ordering::Relaxed);
+            self.last_request_ms.store(now_ms, Ordering::Relaxed);
+            info!(
+                "[RPC_DIAG] incoming rpc request: method={request_method} path={request_path} content_length={content_length}"
+            );
+        } else {
+            trace!("request uri: {}", request.uri());
+        }
 
         if let Some(ref snapshot_config) = self.snapshot_config {
-            if request.uri().path() == FULL_SNAPSHOT_REQUEST_PATH
-                || request.uri().path() == INCREMENTAL_SNAPSHOT_REQUEST_PATH
+            if request_path == FULL_SNAPSHOT_REQUEST_PATH
+                || request_path == INCREMENTAL_SNAPSHOT_REQUEST_PATH
             {
                 // Convenience redirect to the latest snapshot
                 let full_snapshot_archive_info =
@@ -355,7 +384,7 @@ impl RequestMiddleware for RpcRequestMiddleware {
                     );
                 let snapshot_archive_info =
                     if let Some(full_snapshot_archive_info) = full_snapshot_archive_info {
-                        if request.uri().path() == FULL_SNAPSHOT_REQUEST_PATH {
+                        if request_path == FULL_SNAPSHOT_REQUEST_PATH {
                             Some(full_snapshot_archive_info.snapshot_archive_info().clone())
                         } else {
                             snapshot_utils::get_highest_incremental_snapshot_archive_info(
@@ -388,11 +417,11 @@ impl RequestMiddleware for RpcRequestMiddleware {
             }
         }
 
-        if let Some(path) = match_supply_path(request.uri().path()) {
+        if let Some(path) = match_supply_path(request_path) {
             process_rest(&self.bank_forks, path)
-        } else if self.is_file_get_path(request.uri().path()) {
-            self.process_file_get(request.uri().path())
-        } else if request.uri().path() == "/health" {
+        } else if self.is_file_get_path(request_path) {
+            self.process_file_get(request_path)
+        } else if request_path == "/health" {
             hyper::Response::builder()
                 .status(hyper::StatusCode::OK)
                 .body(hyper::Body::from(self.health_check()))
@@ -472,6 +501,7 @@ fn process_rest(bank_forks: &Arc<RwLock<BankForks>>, path: &str) -> RequestMiddl
 pub struct JsonRpcServiceConfig<'a> {
     pub rpc_addr: SocketAddr,
     pub rpc_config: JsonRpcConfig,
+    pub rpc_api: RpcApi,
     pub snapshot_config: Option<SnapshotConfig>,
     pub bank_forks: Arc<RwLock<BankForks>>,
     pub block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
@@ -491,6 +521,7 @@ pub struct JsonRpcServiceConfig<'a> {
     pub max_complete_transaction_status_slot: Arc<AtomicU64>,
     pub prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     pub client_option: ClientOption<'a>,
+    pub finalize_history_sender: Option<Sender<ExternalFinalizeRequest>>,
 }
 
 /// [`ClientOption`] enum represents the available client types for TPU
@@ -502,6 +533,12 @@ pub struct JsonRpcServiceConfig<'a> {
 pub enum ClientOption<'a> {
     ConnectionCache(Arc<ConnectionCache>),
     TpuClientNext(&'a Keypair, UdpSocket, RuntimeHandle, CancellationToken),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum RpcApi {
+    Full,
+    FinalizeHistory,
 }
 
 impl JsonRpcService {
@@ -535,6 +572,7 @@ impl JsonRpcService {
                 let json_rpc_service = Self::new_with_client(
                     config.rpc_addr,
                     config.rpc_config,
+                    config.rpc_api,
                     config.snapshot_config,
                     config.bank_forks,
                     config.block_commitment_cache,
@@ -554,6 +592,7 @@ impl JsonRpcService {
                     config.max_complete_transaction_status_slot,
                     config.prioritization_fee_cache,
                     runtime,
+                    config.finalize_history_sender.clone(),
                 )?;
                 Ok(json_rpc_service)
             }
@@ -585,6 +624,7 @@ impl JsonRpcService {
                 let json_rpc_service = Self::new_with_client(
                     config.rpc_addr,
                     config.rpc_config.clone(),
+                    config.rpc_api,
                     config.snapshot_config,
                     config.bank_forks.clone(),
                     config.block_commitment_cache.clone(),
@@ -604,6 +644,7 @@ impl JsonRpcService {
                     config.max_complete_transaction_status_slot,
                     config.prioritization_fee_cache,
                     runtime,
+                    config.finalize_history_sender.clone(),
                 )?;
                 Ok(json_rpc_service)
             }
@@ -614,6 +655,7 @@ impl JsonRpcService {
     pub fn new(
         rpc_addr: SocketAddr,
         config: JsonRpcConfig,
+        rpc_api: RpcApi,
         snapshot_config: Option<SnapshotConfig>,
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
@@ -633,6 +675,7 @@ impl JsonRpcService {
         connection_cache: Arc<ConnectionCache>,
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+        finalize_history_sender: Option<Sender<ExternalFinalizeRequest>>,
     ) -> Result<Self, String> {
         let runtime = service_runtime(
             config.rpc_threads,
@@ -662,6 +705,7 @@ impl JsonRpcService {
         let json_rpc_service = Self::new_with_client(
             rpc_addr,
             config,
+            rpc_api,
             snapshot_config,
             bank_forks,
             block_commitment_cache,
@@ -681,6 +725,7 @@ impl JsonRpcService {
             max_complete_transaction_status_slot,
             prioritization_fee_cache,
             runtime,
+            finalize_history_sender,
         )?;
         Ok(json_rpc_service)
     }
@@ -696,6 +741,7 @@ impl JsonRpcService {
     >(
         rpc_addr: SocketAddr,
         config: JsonRpcConfig,
+        rpc_api: RpcApi,
         snapshot_config: Option<SnapshotConfig>,
         bank_forks: Arc<RwLock<BankForks>>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
@@ -715,6 +761,7 @@ impl JsonRpcService {
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         runtime: Arc<TokioRuntime>,
+        finalize_history_sender: Option<Sender<ExternalFinalizeRequest>>,
     ) -> Result<Self, String> {
         info!("rpc bound to {rpc_addr:?}");
         info!("rpc configuration: {config:?}");
@@ -807,6 +854,7 @@ impl JsonRpcService {
             max_complete_transaction_status_slot,
             prioritization_fee_cache,
             Arc::clone(&runtime),
+            finalize_history_sender,
         );
 
         let _send_transaction_service = Arc::new(SendTransactionService::new_with_client(
@@ -830,19 +878,32 @@ impl JsonRpcService {
 
                 let mut io = MetaIoHandler::default();
 
-                io.extend_with(rpc_minimal::MinimalImpl.to_delegate());
-                if full_api {
-                    io.extend_with(rpc_bank::BankDataImpl.to_delegate());
-                    io.extend_with(rpc_accounts::AccountsDataImpl.to_delegate());
-                    io.extend_with(rpc_accounts_scan::AccountsScanImpl.to_delegate());
-                    io.extend_with(rpc_full::FullImpl.to_delegate());
+                match rpc_api {
+                    RpcApi::Full => {
+                        io.extend_with(rpc_minimal::MinimalImpl.to_delegate());
+                        if full_api {
+                            io.extend_with(rpc_bank::BankDataImpl.to_delegate());
+                            io.extend_with(rpc_accounts::AccountsDataImpl.to_delegate());
+                            io.extend_with(rpc_accounts_scan::AccountsScanImpl.to_delegate());
+                            io.extend_with(rpc_full::FullImpl.to_delegate());
+                        }
+                    }
+                    RpcApi::FinalizeHistory => {
+                        io.extend_with(FinalizeHistoryImpl.to_delegate());
+                    }
                 }
+
+                let last_request_ms = Arc::new(AtomicU64::new(0));
+                let total_requests = Arc::new(AtomicU64::new(0));
+                let rpc_exit_flag = Arc::new(AtomicBool::new(false));
 
                 let request_middleware = RpcRequestMiddleware::new(
                     ledger_path,
                     snapshot_config,
                     bank_forks.clone(),
                     health.clone(),
+                    Arc::clone(&last_request_ms),
+                    Arc::clone(&total_requests),
                 );
                 let server = ServerBuilder::with_meta_extractor(
                     io,
@@ -876,8 +937,39 @@ impl JsonRpcService {
                 }
 
                 let server = server.unwrap();
+                info!(
+                    "[RPC_DIAG] rpc server started: addr={rpc_addr} api={rpc_api:?} full_api={full_api} max_body={max_request_body_size}"
+                );
                 close_handle_sender.send(Ok(server.close_handle())).unwrap();
+                {
+                    let last_request_ms = Arc::clone(&last_request_ms);
+                    let total_requests = Arc::clone(&total_requests);
+                    let rpc_exit_flag = Arc::clone(&rpc_exit_flag);
+                    thread::spawn(move || {
+                        while !rpc_exit_flag.load(Ordering::Relaxed) {
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            let last_ms = last_request_ms.load(Ordering::Relaxed);
+                            let seen_request = last_ms != 0;
+                            let last_age_ms = if seen_request {
+                                now_ms.saturating_sub(last_ms)
+                            } else {
+                                0
+                            };
+                            let total = total_requests.load(Ordering::Relaxed);
+                            info!(
+                                "[RPC_DIAG] rpc watchdog: total_requests={total} last_request_age_ms={last_age_ms} seen_request={seen_request}"
+                            );
+                            thread::sleep(Duration::from_secs(5));
+                        }
+                        info!("[RPC_DIAG] rpc watchdog exiting");
+                    });
+                }
                 server.wait();
+                rpc_exit_flag.store(true, Ordering::Relaxed);
+                info!("[RPC_DIAG] rpc server exiting: addr={rpc_addr} api={rpc_api:?}");
                 exit_bigtable_ledger_upload_service.store(true, Ordering::Relaxed);
             })
             .unwrap();
@@ -888,6 +980,9 @@ impl JsonRpcService {
             .write()
             .unwrap()
             .register_exit(Box::new(move || {
+                info!(
+                    "[RPC_DIAG] validator_exit triggered, closing rpc server: api={rpc_api:?}"
+                );
                 close_handle_.close();
             }));
         Ok(Self {
@@ -901,11 +996,13 @@ impl JsonRpcService {
 
     pub fn exit(&mut self) {
         if let Some(c) = self.close_handle.take() {
+            info!("[RPC_DIAG] RpcService.exit called, closing rpc server");
             c.close()
         }
     }
 
     pub fn join(mut self) -> thread::Result<()> {
+        info!("[RPC_DIAG] RpcService.join called");
         self.exit();
         self.thread_hdl.join()
     }
@@ -999,6 +1096,7 @@ mod tests {
         let mut rpc_service = JsonRpcService::new(
             rpc_addr,
             JsonRpcConfig::default(),
+            RpcApi::Full,
             None,
             bank_forks,
             block_commitment_cache,
@@ -1022,6 +1120,7 @@ mod tests {
             connection_cache,
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
+            None,
         )
         .expect("assume successful JsonRpcService start");
         let thread = rpc_service.thread_hdl.thread();

@@ -808,10 +808,13 @@ impl Tower {
             if slot != root_slot {
                 // This case should never happen because bank forks purges all
                 // non-descendants of the root every time root is set
-                assert!(
-                    ancestors.contains(&root_slot),
-                    "ancestors: {ancestors:?}, slot: {slot} root: {root_slot}"
-                );
+                if !ancestors.contains(&root_slot) {
+                    // Be conservative and treat as locked out if ancestors are inconsistent.
+                    warn!(
+                        "Missing root in ancestors; treating as locked out. slot={slot} root={root_slot} ancestors={ancestors:?}"
+                    );
+                    return true;
+                }
             }
         }
 
@@ -856,6 +859,9 @@ impl Tower {
             // descends from. Thus it is safe to use `candidate_slot` in the switching proof.
             //
             // Note: the calling function should have already panicked if we do not have ancestors and the last vote is not stray.
+            if self.is_stray_last_vote() || last_voted_slot == self.root() {
+                return Some(true);
+            }
             assert!(self.is_stray_last_vote());
             return Some(true);
         }

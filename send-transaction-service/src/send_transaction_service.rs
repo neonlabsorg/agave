@@ -264,6 +264,7 @@ impl SendTransactionService {
                         let mut retry_transactions = retry_transactions.lock().unwrap();
                         let mut transactions_to_retry: usize = 0;
                         let mut transactions_added_to_retry = Saturating::<usize>(0);
+                        let retry_len_before = retry_transactions.len();
                         for (signature, mut transaction_info) in transactions.drain() {
                             // drop transactions with 0 max retries
                             let max_retries = transaction_info
@@ -277,6 +278,10 @@ impl SendTransactionService {
                             let entry = retry_transactions.entry(signature);
                             if let Entry::Vacant(_) = entry {
                                 if retry_len >= retry_pool_max_size {
+                                    info!(
+                                        "[TX_DIAG] retry pool full: retry_pool_len={} max_len={}",
+                                        retry_len, retry_pool_max_size
+                                    );
                                     break;
                                 } else {
                                     transaction_info.last_sent_time = Some(last_sent_time);
@@ -293,6 +298,13 @@ impl SendTransactionService {
                         stats
                             .retry_queue_size
                             .store(retry_transactions.len() as u64, Ordering::Relaxed);
+                        info!(
+                            "[TX_DIAG] send batch: batch_len={} retry_pool_len_before={} retry_pool_len_after={} retry_overflow={}",
+                            transactions_to_retry,
+                            retry_len_before,
+                            retry_transactions.len(),
+                            retry_queue_overflow
+                        );
                     }
                     last_batch_sent = Instant::now();
                 }
@@ -391,6 +403,15 @@ impl SendTransactionService {
                 )
                 .is_some()
             {
+                info!(
+                    "[TX_DIAG] drop rooted: signature={} root_slot={} working_slot={} root_block_height={} working_block_height={} last_valid_block_height={}",
+                    signature,
+                    root_bank.slot(),
+                    working_bank.slot(),
+                    root_bank.block_height(),
+                    working_bank.block_height(),
+                    transaction_info.last_valid_block_height
+                );
                 info!("Transaction is rooted: {signature}");
                 result.rooted += 1;
                 stats.rooted_transactions.fetch_add(1, Ordering::Relaxed);
@@ -411,6 +432,15 @@ impl SendTransactionService {
                 let verify_nonce_account =
                     nonce_account::verify_nonce_account(&nonce_account, &durable_nonce);
                 if verify_nonce_account.is_none() && signature_status.is_none() && expired {
+                    info!(
+                        "[TX_DIAG] drop expired durable-nonce: signature={} root_slot={} working_slot={} root_block_height={} working_block_height={} last_valid_block_height={}",
+                        signature,
+                        root_bank.slot(),
+                        working_bank.slot(),
+                        root_bank.block_height(),
+                        working_bank.block_height(),
+                        transaction_info.last_valid_block_height
+                    );
                     info!("Dropping expired durable-nonce transaction: {signature}");
                     result.expired += 1;
                     stats.expired_transactions.fetch_add(1, Ordering::Relaxed);
@@ -418,6 +448,15 @@ impl SendTransactionService {
                 }
             }
             if transaction_info.last_valid_block_height < root_bank.block_height() {
+                info!(
+                    "[TX_DIAG] drop expired: signature={} root_slot={} working_slot={} root_block_height={} working_block_height={} last_valid_block_height={}",
+                    signature,
+                    root_bank.slot(),
+                    working_bank.slot(),
+                    root_bank.block_height(),
+                    working_bank.block_height(),
+                    transaction_info.last_valid_block_height
+                );
                 info!("Dropping expired transaction: {signature}");
                 result.expired += 1;
                 stats.expired_transactions.fetch_add(1, Ordering::Relaxed);
@@ -429,6 +468,14 @@ impl SendTransactionService {
 
             if let Some(max_retries) = max_retries {
                 if transaction_info.retries >= max_retries {
+                    info!(
+                        "[TX_DIAG] drop max retries: signature={} retries={} max_retries={} root_slot={} working_slot={}",
+                        signature,
+                        transaction_info.retries,
+                        max_retries,
+                        root_bank.slot(),
+                        working_bank.slot()
+                    );
                     info!("Dropping transaction due to max retries: {signature}");
                     result.max_retries_elapsed += 1;
                     stats
@@ -451,6 +498,16 @@ impl SendTransactionService {
                             // Transaction sent before is unknown to the working bank, it might have been
                             // dropped or landed in another fork. Re-send it.
 
+                            info!(
+                                "[TX_DIAG] retrying: signature={} retries={} root_slot={} working_slot={} root_block_height={} working_block_height={} last_valid_block_height={}",
+                                signature,
+                                transaction_info.retries + 1,
+                                root_bank.slot(),
+                                working_bank.slot(),
+                                root_bank.block_height(),
+                                working_bank.block_height(),
+                                transaction_info.last_valid_block_height
+                            );
                             info!("Retrying transaction: {signature}");
                             result.retried += 1;
                             transaction_info.retries += 1;

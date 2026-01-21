@@ -854,6 +854,8 @@ pub struct ProcessOptions {
     pub hash_overrides: Option<HashOverrides>,
     pub abort_on_invalid_block: bool,
     pub no_block_cost_limits: bool,
+    pub exclude_signatures: Option<HashSet<Signature>>,
+    pub prepend_transactions: Option<HashMap<Slot, Vec<VersionedTransaction>>>,
 }
 
 pub fn test_process_blockstore(
@@ -1159,6 +1161,8 @@ fn confirm_full_slot(
         opts.allow_dead_slots,
         opts.runtime_config.log_messages_bytes_limit,
         &ignored_prioritization_fee_cache,
+        opts.exclude_signatures.as_ref(),
+        opts.prepend_transactions.as_ref(),
     )?;
 
     timing.accumulate(&confirmation_timing.batch_execute.totals);
@@ -1498,6 +1502,8 @@ pub fn confirm_slot(
     allow_dead_slots: bool,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: &PrioritizationFeeCache,
+    exclude_signatures: Option<&HashSet<Signature>>,
+    prepend_transactions: Option<&HashMap<Slot, Vec<VersionedTransaction>>>,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let slot = bank.slot();
 
@@ -1528,6 +1534,8 @@ pub fn confirm_slot(
         recyclers,
         log_messages_bytes_limit,
         prioritization_fee_cache,
+        exclude_signatures,
+        prepend_transactions,
     )
 }
 
@@ -1545,6 +1553,8 @@ fn confirm_slot_entries(
     recyclers: &VerifyRecyclers,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: &PrioritizationFeeCache,
+    exclude_signatures: Option<&HashSet<Signature>>,
+    prepend_transactions: Option<&HashMap<Slot, Vec<VersionedTransaction>>>,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let ConfirmationTiming {
         confirmation_elapsed,
@@ -1561,11 +1571,29 @@ fn confirm_slot_entries(
     };
 
     let slot = bank.slot();
+    let is_slot_0 = slot == 0;
     let (entries, num_shreds, slot_full) = slot_entries_load_result;
+    let entries = if let Some(prepend_transactions) = prepend_transactions {
+        if !is_slot_0 {
+            if let Some(transactions) = prepend_transactions.get(&slot) {
+                if !transactions.is_empty() {
+                    prepend_transactions_to_entries(entries, transactions, progress.last_entry)
+                } else {
+                    entries
+                }
+            } else {
+                entries
+            }
+        } else {
+            entries
+        }
+    } else {
+        entries
+    };
     let num_entries = entries.len();
-    let mut entry_tx_starting_indexes = Vec::with_capacity(num_entries);
-    let mut entry_tx_starting_index = progress.num_txs;
-    let num_txs = entries
+    let mut entry_tx_starting_indexes_unfiltered = Vec::with_capacity(num_entries);
+    let mut entry_tx_starting_index_unfiltered = progress.num_txs;
+    let num_txs_unfiltered = entries
         .iter()
         .enumerate()
         .map(|(i, entry)| {
@@ -1575,7 +1603,7 @@ fn confirm_slot_entries(
                     slot,
                     index: entry_index,
                     entry: entry.into(),
-                    starting_transaction_index: entry_tx_starting_index,
+                    starting_transaction_index: entry_tx_starting_index_unfiltered,
                 }) {
                     warn!(
                         "Slot {slot}, entry {entry_index} entry_notification_sender send failed: \
@@ -1584,16 +1612,27 @@ fn confirm_slot_entries(
                 }
             }
             let num_txs = entry.transactions.len();
-            let next_tx_starting_index = entry_tx_starting_index.saturating_add(num_txs);
-            entry_tx_starting_indexes.push(entry_tx_starting_index);
-            entry_tx_starting_index = next_tx_starting_index;
+            let next_tx_starting_index =
+                entry_tx_starting_index_unfiltered.saturating_add(num_txs);
+            entry_tx_starting_indexes_unfiltered.push(entry_tx_starting_index_unfiltered);
+            entry_tx_starting_index_unfiltered = next_tx_starting_index;
             num_txs
         })
         .sum::<usize>();
     trace!(
         "Fetched entries for slot {slot}, num_entries: {num_entries}, num_shreds: {num_shreds}, \
-         num_txs: {num_txs}, slot_full: {slot_full}",
+         num_txs: {num_txs_unfiltered}, slot_full: {slot_full}",
     );
+    if slot == 0 {
+        info!(
+            "slot0 entries: len={}, num_shreds={}, slot_full={}, last_entry_hash={:?}, bank_last_blockhash={}",
+            num_entries,
+            num_shreds,
+            slot_full,
+            entries.last().map(|e| e.hash),
+            bank.last_blockhash(),
+        );
+    }
 
     if !skip_verification {
         let tick_hash_count = &mut progress.tick_hash_count;
@@ -1661,9 +1700,33 @@ fn confirm_slot_entries(
         }
     };
 
-    let entries = transaction_verification_result
+    let mut entries = transaction_verification_result
         .entries()
         .expect("Transaction verification generates entries");
+
+    if !is_slot_0 {
+        if let Some(exclude_signatures) = exclude_signatures {
+            if !exclude_signatures.is_empty() {
+                entries = filter_replay_entries_by_signatures(entries, exclude_signatures);
+            }
+        }
+    }
+
+    let mut entry_tx_starting_indexes = Vec::with_capacity(entries.len());
+    let mut entry_tx_starting_index = progress.num_txs;
+    let num_txs = entries
+        .iter()
+        .map(|entry| match entry {
+            EntryType::Tick(_) => 0,
+            EntryType::Transactions(transactions) => {
+                let num_txs = transactions.len();
+                let next_tx_starting_index = entry_tx_starting_index.saturating_add(num_txs);
+                entry_tx_starting_indexes.push(entry_tx_starting_index);
+                entry_tx_starting_index = next_tx_starting_index;
+                num_txs
+            }
+        })
+        .sum::<usize>();
 
     let mut replay_timer = Measure::start("replay_elapsed");
     let replay_entries: Vec<_> = entries
@@ -1730,6 +1793,49 @@ fn confirm_slot_entries(
     Ok(())
 }
 
+fn prepend_transactions_to_entries(
+    entries: Vec<Entry>,
+    prepend: &[VersionedTransaction],
+    prev_hash: Hash,
+) -> Vec<Entry> {
+    let mut rebuilt = Vec::with_capacity(entries.len().saturating_add(1));
+    let mut hash = prev_hash;
+    let prepend_entry = entry::next_versioned_entry(&hash, 1, prepend.to_vec());
+    hash = prepend_entry.hash;
+    rebuilt.push(prepend_entry);
+    for entry in entries {
+        let rebuilt_entry = entry::next_versioned_entry(&hash, entry.num_hashes, entry.transactions);
+        hash = rebuilt_entry.hash;
+        rebuilt.push(rebuilt_entry);
+    }
+    rebuilt
+}
+
+fn filter_replay_entries_by_signatures(
+    entries: Vec<EntryType<RuntimeTransaction<SanitizedTransaction>>>,
+    exclude_signatures: &HashSet<Signature>,
+) -> Vec<EntryType<RuntimeTransaction<SanitizedTransaction>>> {
+    entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            EntryType::Tick(hash) => Some(EntryType::Tick(hash)),
+            EntryType::Transactions(transactions) => {
+                let filtered = transactions
+                    .into_iter()
+                    .filter(|transaction| {
+                        !exclude_signatures.contains(transaction.signature())
+                    })
+                    .collect::<Vec<_>>();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some(EntryType::Transactions(filtered))
+                }
+            }
+        })
+        .collect()
+}
+
 // Special handling required for processing the entries in slot 0
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 fn process_bank_0(
@@ -1755,7 +1861,10 @@ fn process_bank_0(
         None,
         &mut ExecuteTimings::default(),
     )
-    .map_err(|_| BlockstoreProcessorError::FailedToReplayBank0)?;
+    .map_err(|err| {
+        error!("process_bank_0: confirm_full_slot failed: {err:?}");
+        BlockstoreProcessorError::FailedToReplayBank0
+    })?;
     if let Some((result, _timings)) = bank0.wait_for_completed_scheduler() {
         result.unwrap();
     }
@@ -1784,6 +1893,11 @@ fn process_next_slots(
     if meta.next_slots.is_empty() {
         return Ok(());
     }
+    let pending_len_before = pending_slots.len();
+    let mut skipped_halt = 0usize;
+    let mut skipped_dead = 0usize;
+    let mut skipped_missing_meta = 0usize;
+    let mut skipped_not_full = 0usize;
 
     // This is a fork point if there are multiple children, create a new child bank for each fork
     for next_slot in &meta.next_slots {
@@ -1791,19 +1905,24 @@ fn process_next_slots(
             .halt_at_slot
             .is_some_and(|halt_at_slot| *next_slot > halt_at_slot)
         {
+            skipped_halt += 1;
             continue;
         }
         if !opts.allow_dead_slots && blockstore.is_dead(*next_slot) {
+            skipped_dead += 1;
             continue;
         }
 
-        let next_meta = blockstore
+        let Some(next_meta) = blockstore
             .meta(*next_slot)
             .map_err(|err| {
                 warn!("Failed to load meta for slot {next_slot}: {err:?}");
                 BlockstoreProcessorError::FailedToLoadMeta
             })?
-            .unwrap();
+        else {
+            skipped_missing_meta += 1;
+            continue;
+        };
 
         // Only process full slots in blockstore_processor, replay_stage
         // handles any partials
@@ -1822,7 +1941,24 @@ fn process_next_slots(
                 bank.slot(),
             );
             pending_slots.push((next_meta, next_bank, bank.last_blockhash()));
+        } else {
+            skipped_not_full += 1;
         }
+    }
+
+    if opts.halt_at_slot.is_some() {
+        let added = pending_slots.len().saturating_sub(pending_len_before);
+        info!(
+            "[FINALIZE_DIAG] process_next_slots: parent_slot={} children_total={} added={} skipped_halt={} skipped_dead={} skipped_missing_meta={} skipped_not_full={} halt_at_slot={:?}",
+            bank.slot(),
+            meta.next_slots.len(),
+            added,
+            skipped_halt,
+            skipped_dead,
+            skipped_missing_meta,
+            skipped_not_full,
+            opts.halt_at_slot
+        );
     }
 
     // Reverse sort by slot, so the next slot to be processed can be popped
@@ -1995,6 +2131,35 @@ fn load_frozen_forks(
                 None,
                 timing,
             ) {
+                let slot_meta_diag = blockstore.meta(slot).ok().flatten();
+                let (consumed, received, last_index, is_full, parent_slot, next_slots_len, is_dead) =
+                    if let Some(slot_meta) = slot_meta_diag {
+                        (
+                            slot_meta.consumed,
+                            slot_meta.received,
+                            slot_meta.last_index,
+                            slot_meta.is_full(),
+                            slot_meta.parent_slot,
+                            slot_meta.next_slots.len(),
+                            blockstore.is_dead(slot),
+                        )
+                    } else {
+                        (0, 0, None, false, None, 0, false)
+                    };
+                warn!(
+                    "[FINALIZE_DIAG] process_single_slot failed: slot={} parent={} err={:?} consumed={} received={} last_index={:?} is_full={} is_dead={} parent_slot={:?} next_slots_len={} abort_on_invalid_block={}",
+                    slot,
+                    bank.parent_slot(),
+                    error,
+                    consumed,
+                    received,
+                    last_index,
+                    is_full,
+                    is_dead,
+                    parent_slot,
+                    next_slots_len,
+                    opts.abort_on_invalid_block
+                );
                 assert!(bank_forks.write().unwrap().remove(bank.slot()).is_some());
                 if opts.abort_on_invalid_block {
                     Err(error)?
