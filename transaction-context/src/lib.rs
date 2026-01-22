@@ -113,7 +113,7 @@ struct DynamicAccountMeta {
 
 #[derive(Debug)]
 pub struct TransactionAccounts {
-    accounts: Vec<Box<RefCell<AccountSharedData>>>,
+    accounts: RefCell<Vec<Rc<RefCell<AccountSharedData>>>>,
     touched_flags: RefCell<Vec<bool>>,
     resize_delta: Cell<i64>,
     lamports_delta: Cell<i128>,
@@ -122,9 +122,11 @@ pub struct TransactionAccounts {
 impl TransactionAccounts {
     #[cfg(not(target_os = "solana"))]
     fn new(accounts: Vec<Box<RefCell<AccountSharedData>>>) -> TransactionAccounts {
+        let accounts: Vec<Rc<RefCell<AccountSharedData>>> =
+            accounts.into_iter().map(Rc::from).collect();
         let touched_flags = vec![false; accounts.len()];
         TransactionAccounts {
-            accounts,
+            accounts: RefCell::new(accounts),
             touched_flags: RefCell::new(touched_flags),
             resize_delta: Cell::new(0),
             lamports_delta: Cell::new(0),
@@ -132,7 +134,7 @@ impl TransactionAccounts {
     }
 
     fn len(&self) -> usize {
-        self.accounts.len()
+        self.accounts.borrow().len()
     }
 
     #[cfg(not(target_os = "solana"))]
@@ -177,9 +179,13 @@ impl TransactionAccounts {
         &self,
         index: IndexOfAccount,
     ) -> Result<RefMut<'_, AccountSharedData>, InstructionError> {
-        self.accounts
+        let account = self
+            .accounts
+            .borrow()
             .get(index as usize)
-            .ok_or(InstructionError::MissingAccount)?
+            .cloned()
+            .ok_or(InstructionError::MissingAccount)?;
+        account
             .try_borrow_mut()
             .map_err(|_| InstructionError::AccountBorrowFailed)
     }
@@ -188,9 +194,13 @@ impl TransactionAccounts {
         &self,
         index: IndexOfAccount,
     ) -> Result<Ref<'_, AccountSharedData>, InstructionError> {
-        self.accounts
+        let account = self
+            .accounts
+            .borrow()
             .get(index as usize)
-            .ok_or(InstructionError::MissingAccount)?
+            .cloned()
+            .ok_or(InstructionError::MissingAccount)?;
+        account
             .try_borrow()
             .map_err(|_| InstructionError::AccountBorrowFailed)
     }
@@ -210,9 +220,10 @@ impl TransactionAccounts {
     }
 
     #[cfg(not(target_os = "solana"))]
-    fn add_account(&mut self, account: AccountSharedData) -> IndexOfAccount {
-        let index = self.accounts.len() as IndexOfAccount;
-        self.accounts.push(Box::new(RefCell::new(account)));
+    fn add_account(&self, account: AccountSharedData) -> IndexOfAccount {
+        let mut accounts = self.accounts.borrow_mut();
+        let index = accounts.len() as IndexOfAccount;
+        accounts.push(Rc::new(RefCell::new(account)));
         self.touched_flags.borrow_mut().push(false);
         index
     }
@@ -274,8 +285,14 @@ impl TransactionContext {
         Ok(Rc::try_unwrap(self.accounts)
             .expect("transaction_context.accounts has unexpected outstanding refs")
             .accounts
+            .into_inner()
             .into_iter()
-            .map(|account| RefCell::into_inner(*account))
+            .map(|account| {
+                RefCell::into_inner(
+                    Rc::try_unwrap(account)
+                        .expect("transaction_context.accounts has unexpected outstanding refs"),
+                )
+            })
             .collect())
     }
 
@@ -327,9 +344,7 @@ impl TransactionContext {
             return Err(InstructionError::MaxAccountsExceeded);
         }
 
-        let accounts = Rc::get_mut(&mut self.accounts)
-            .ok_or(InstructionError::AccountBorrowFailed)?;
-        let index = accounts.add_account(account);
+        let index = self.accounts.add_account(account);
         self.account_keys.push(pubkey);
         self.dynamic_account_metas.push(DynamicAccountMeta {
             is_dynamic: true,
@@ -1260,7 +1275,12 @@ impl From<TransactionContext> for ExecutionRecord {
         let accounts = context
             .account_keys
             .into_iter()
-            .zip(accounts.into_iter().map(|account| RefCell::into_inner(*account)))
+            .zip(accounts.into_inner().into_iter().map(|account| {
+                RefCell::into_inner(
+                    Rc::try_unwrap(account)
+                        .expect("transaction_context.accounts has unexpected outstanding refs"),
+                )
+            }))
             .collect();
         let touched_account_count = touched_flags
             .borrow()
