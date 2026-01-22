@@ -50,6 +50,8 @@ const DEFAULT_LOADER_COMPUTE_UNITS: u64 = 570;
 const DEPRECATED_LOADER_COMPUTE_UNITS: u64 = 1_140;
 #[cfg_attr(feature = "svm-internal", qualifiers(pub))]
 const UPGRADEABLE_LOADER_COMPUTE_UNITS: u64 = 2_370;
+const DYNAMIC_ACCOUNT_WINDOW_START: u64 = ebpf::MM_REGION_SIZE.saturating_mul(5);
+static DYNAMIC_ACCOUNT_WINDOW_STUB: [u8; 1] = [0];
 
 thread_local! {
     pub static MEMORY_POOL: RefCell<VmMemoryPool> = RefCell::new(VmMemoryPool::new());
@@ -327,7 +329,7 @@ fn create_memory_mapping<'a, 'b, C: ContextObject>(
 ) -> Result<MemoryMapping<'a>, Box<dyn std::error::Error>> {
     let config = executable.get_config();
     let sbpf_version = executable.get_sbpf_version();
-    let regions: Vec<MemoryRegion> = vec![
+    let mut regions: Vec<MemoryRegion> = vec![
         executable.get_ro_region(),
         MemoryRegion::new_writable_gapped(
             stack,
@@ -343,6 +345,10 @@ fn create_memory_mapping<'a, 'b, C: ContextObject>(
     .into_iter()
     .chain(additional_regions)
     .collect();
+    regions.push(MemoryRegion::new_readonly(
+        &DYNAMIC_ACCOUNT_WINDOW_STUB,
+        DYNAMIC_ACCOUNT_WINDOW_START,
+    ));
 
     Ok(MemoryMapping::new_with_access_violation_handler(
         regions,

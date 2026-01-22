@@ -36,7 +36,8 @@ use {
     solana_pubkey::{Pubkey, PubkeyError, MAX_SEEDS, MAX_SEED_LEN, PUBKEY_BYTES},
     solana_sbpf::{
         declare_builtin_function,
-        memory_region::{AccessType, MemoryMapping},
+        ebpf,
+        memory_region::{AccessType, MemoryMapping, MemoryRegion},
         program::{BuiltinProgram, SBPFVersion},
         vm::Config,
     },
@@ -68,6 +69,7 @@ mod sysvar;
 
 /// Maximum signers
 const MAX_SIGNERS: usize = 16;
+const DYNAMIC_ACCOUNT_WINDOW_START: u64 = ebpf::MM_REGION_SIZE * 5;
 
 /// Error definitions
 #[derive(Debug, ThisError, PartialEq, Eq)]
@@ -468,7 +470,9 @@ pub fn create_program_runtime_environment_v1<'a>(
     // Dynamic account loading
     result.register_function("sol_load_account", SyscallLoadAccount::vm)?;
     result.register_function("sol_account_data_read", SyscallAccountDataRead::vm)?;
+    result.register_function("sol_account_data_slice", SyscallAccountDataSlice::vm)?;
     result.register_function("sol_account_data_write", SyscallAccountDataWrite::vm)?;
+    result.register_function("sol_account_data_len", SyscallAccountDataLen::vm)?;
     result.register_function("sol_account_lamports_get", SyscallAccountLamportsGet::vm)?;
     result.register_function("sol_account_lamports_set", SyscallAccountLamportsSet::vm)?;
     result.register_function("sol_account_realloc", SyscallAccountRealloc::vm)?;
@@ -1638,6 +1642,98 @@ declare_builtin_function!(
 );
 
 declare_builtin_function!(
+    /// Map a window of account data into program memory
+    SyscallAccountDataSlice,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        account_index: u64,
+        offset: u64,
+        len: u64,
+        is_writable: u64,
+        out_addr: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
+
+        let index = get_dynamic_account_index(invoke_context, account_index)?;
+        let offset = usize::try_from(offset).map_err(|_| InstructionError::InvalidArgument)?;
+        let len = usize::try_from(len).map_err(|_| InstructionError::InvalidArgument)?;
+        if len == 0 {
+            return Err(Box::new(InstructionError::InvalidArgument));
+        }
+
+        let is_writable = is_writable != 0;
+        if is_writable
+            && !invoke_context
+                .transaction_context
+                .is_dynamic_account_writable(index)?
+        {
+            return Err(Box::new(InstructionError::ReadonlyDataModified));
+        }
+
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_current_instruction_context()?;
+        let program_id = instruction_context.get_program_key()?;
+
+        let end = offset.saturating_add(len);
+        let region = if is_writable {
+            let mut account = invoke_context
+                .transaction_context
+                .accounts()
+                .try_borrow_mut(index)?;
+            if account.owner() != program_id {
+                return Err(Box::new(InstructionError::ExternalAccountDataModified));
+            }
+            let data = account.data_as_mut_slice();
+            if end > data.len() {
+                return Err(Box::new(InstructionError::AccountDataTooSmall));
+            }
+            MemoryRegion::new_writable(&mut data[offset..end], DYNAMIC_ACCOUNT_WINDOW_START)
+        } else {
+            let account = invoke_context
+                .transaction_context
+                .accounts()
+                .try_borrow(index)?;
+            let data = account.data();
+            if end > data.len() {
+                return Err(Box::new(InstructionError::AccountDataTooSmall));
+            }
+            MemoryRegion::new_readonly(&data[offset..end], DYNAMIC_ACCOUNT_WINDOW_START)
+        };
+
+        let (region_index, _) = memory_mapping
+            .find_region(DYNAMIC_ACCOUNT_WINDOW_START)
+            .ok_or_else(|| Box::new(InstructionError::InvalidArgument) as Error)?;
+        memory_mapping
+            .replace_region(region_index, region)
+            .map_err(|_| Box::new(InstructionError::InvalidArgument) as Error)?;
+
+        if is_writable {
+            invoke_context
+                .transaction_context
+                .accounts()
+                .touch(index)?;
+        }
+
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let out_addr_ref: &mut u64 = map(out_addr)?;
+        );
+        *out_addr_ref = DYNAMIC_ACCOUNT_WINDOW_START;
+
+        let data_len_cost = (len as u64)
+            .checked_div(execution_cost.cpi_bytes_per_unit)
+            .unwrap_or(u64::MAX);
+        consume_compute_meter(invoke_context, data_len_cost)?;
+
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
     /// Write account data to a dynamically loaded account
     SyscallAccountDataWrite,
     fn rust(
@@ -1698,6 +1794,38 @@ declare_builtin_function!(
             .checked_div(execution_cost.cpi_bytes_per_unit)
             .unwrap_or(u64::MAX);
         consume_compute_meter(invoke_context, data_len_cost)?;
+
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Get account data length for a dynamically loaded account
+    SyscallAccountDataLen,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        account_index: u64,
+        out_len_addr: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
+
+        let index = get_dynamic_account_index(invoke_context, account_index)?;
+        let account = invoke_context
+            .transaction_context
+            .accounts()
+            .try_borrow(index)?;
+
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let out_len: &mut u64 = map(out_len_addr)?;
+        );
+        *out_len = account.data().len() as u64;
 
         Ok(SUCCESS)
     }
