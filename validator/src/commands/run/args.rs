@@ -288,7 +288,7 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .validator(port_validator)
             .help(
                 "Enable a finalize-history-only JSON RPC listener on this port (finalizeHistory \
-                 methods only)",
+                 and replayHistory methods only)",
             ),
     )
     .arg(
@@ -897,7 +897,10 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .takes_value(true)
             .default_value("3600")
             .validator(is_parsable::<u64>)
-            .help("Seconds before forcing external finalize replay if no finalizeHistory call."),
+            .help(
+                "Seconds before forcing external finalize replay if no replayHistory or \
+                 finalizeHistory call.",
+            ),
     )
     .arg(
         Arg::with_name("tpu_connection_pool_size")

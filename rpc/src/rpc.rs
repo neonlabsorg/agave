@@ -285,10 +285,17 @@ pub struct ExternalAccountDataSplice {
     pub insert_data: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ExternalFinalizeMode {
+    Replay,
+    FinalizeOnly,
+}
+
 #[derive(Clone)]
 pub struct ExternalFinalizeRequest {
     pub slot: Slot,
     pub patches: Vec<ExternalAccountPatch>,
+    pub mode: ExternalFinalizeMode,
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -379,13 +386,47 @@ fn decode_external_account_patch(patch: RpcExternalAccountPatch) -> Result<Exter
     })
 }
 
+fn select_finalize_slot_for_request(bank_forks: &RwLock<BankForks>) -> Option<Slot> {
+    let bank_forks = bank_forks.read().unwrap();
+    let root_slot = bank_forks.root();
+    let candidate = bank_forks
+        .frozen_banks()
+        .map(|(slot, _)| slot)
+        .max()
+        .unwrap_or(root_slot);
+    if candidate > root_slot {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn resolve_finalize_history_slot(
+    meta: &JsonRpcRequestProcessor,
+    slot: Option<Slot>,
+) -> Result<Slot> {
+    let slot = slot.unwrap_or(0);
+    if slot != 0 {
+        return Ok(slot);
+    }
+    select_finalize_slot_for_request(&meta.bank_forks).ok_or_else(|| {
+        Error::invalid_params("No frozen slot above current root to finalize")
+    })
+}
+
 fn enqueue_finalize_history_request(
     meta: &JsonRpcRequestProcessor,
-    slot: Slot,
+    slot: Option<Slot>,
     patches: Vec<ExternalAccountPatch>,
+    mode: ExternalFinalizeMode,
 ) -> Result<bool> {
     if let Some(sender) = meta.finalize_history_sender.as_ref() {
-        let request = ExternalFinalizeRequest { slot, patches };
+        let slot = resolve_finalize_history_slot(meta, slot)?;
+        let request = ExternalFinalizeRequest {
+            slot,
+            patches,
+            mode,
+        };
         sender.send(request).map_err(|err| {
             warn!("finalize_history failed to enqueue: {err}");
             Error::internal_error()
@@ -3755,14 +3796,14 @@ pub mod rpc_full {
         ) -> Result<Vec<RpcPrioritizationFee>>;
 
         #[rpc(meta, name = "finalizeHistory")]
-        fn finalize_history(&self, meta: Self::Metadata, slot: Slot) -> Result<bool>;
+        fn finalize_history(&self, meta: Self::Metadata, slot: Option<Slot>) -> Result<bool>;
 
-        #[rpc(meta, name = "finalizeHistoryWithPatches")]
-        fn finalize_history_with_patches(
+        #[rpc(meta, name = "replayHistory")]
+        fn replay_history(
             &self,
             meta: Self::Metadata,
-            slot: Slot,
-            patches: Vec<RpcExternalAccountPatch>,
+            slot: Option<Slot>,
+            patches: Option<Vec<RpcExternalAccountPatch>>,
         ) -> Result<bool>;
     }
 
@@ -3860,21 +3901,29 @@ pub mod rpc_full {
                 .collect())
         }
 
-        fn finalize_history(&self, meta: Self::Metadata, slot: Slot) -> Result<bool> {
-            enqueue_finalize_history_request(&meta, slot, Vec::new())
+        fn finalize_history(&self, meta: Self::Metadata, slot: Option<Slot>) -> Result<bool> {
+            enqueue_finalize_history_request(
+                &meta,
+                slot,
+                Vec::new(),
+                ExternalFinalizeMode::FinalizeOnly,
+            )
         }
 
-        fn finalize_history_with_patches(
+        fn replay_history(
             &self,
             meta: Self::Metadata,
-            slot: Slot,
-            patches: Vec<RpcExternalAccountPatch>,
+            slot: Option<Slot>,
+            patches: Option<Vec<RpcExternalAccountPatch>>,
         ) -> Result<bool> {
-            let mut decoded = Vec::with_capacity(patches.len());
-            for patch in patches {
-                decoded.push(decode_external_account_patch(patch)?);
+            let mut decoded = Vec::new();
+            if let Some(patches) = patches {
+                decoded.reserve(patches.len());
+                for patch in patches {
+                    decoded.push(decode_external_account_patch(patch)?);
+                }
             }
-            enqueue_finalize_history_request(&meta, slot, decoded)
+            enqueue_finalize_history_request(&meta, slot, decoded, ExternalFinalizeMode::Replay)
         }
 
         fn get_signature_statuses(
@@ -4478,14 +4527,14 @@ pub mod rpc_finalize_history {
         type Metadata;
 
         #[rpc(meta, name = "finalizeHistory")]
-        fn finalize_history(&self, meta: Self::Metadata, slot: Slot) -> Result<bool>;
+        fn finalize_history(&self, meta: Self::Metadata, slot: Option<Slot>) -> Result<bool>;
 
-        #[rpc(meta, name = "finalizeHistoryWithPatches")]
-        fn finalize_history_with_patches(
+        #[rpc(meta, name = "replayHistory")]
+        fn replay_history(
             &self,
             meta: Self::Metadata,
-            slot: Slot,
-            patches: Vec<RpcExternalAccountPatch>,
+            slot: Option<Slot>,
+            patches: Option<Vec<RpcExternalAccountPatch>>,
         ) -> Result<bool>;
     }
 
@@ -4493,21 +4542,29 @@ pub mod rpc_finalize_history {
     impl FinalizeHistory for FinalizeHistoryImpl {
         type Metadata = JsonRpcRequestProcessor;
 
-        fn finalize_history(&self, meta: Self::Metadata, slot: Slot) -> Result<bool> {
-            enqueue_finalize_history_request(&meta, slot, Vec::new())
+        fn finalize_history(&self, meta: Self::Metadata, slot: Option<Slot>) -> Result<bool> {
+            enqueue_finalize_history_request(
+                &meta,
+                slot,
+                Vec::new(),
+                ExternalFinalizeMode::FinalizeOnly,
+            )
         }
 
-        fn finalize_history_with_patches(
+        fn replay_history(
             &self,
             meta: Self::Metadata,
-            slot: Slot,
-            patches: Vec<RpcExternalAccountPatch>,
+            slot: Option<Slot>,
+            patches: Option<Vec<RpcExternalAccountPatch>>,
         ) -> Result<bool> {
-            let mut decoded = Vec::with_capacity(patches.len());
-            for patch in patches {
-                decoded.push(decode_external_account_patch(patch)?);
+            let mut decoded = Vec::new();
+            if let Some(patches) = patches {
+                decoded.reserve(patches.len());
+                for patch in patches {
+                    decoded.push(decode_external_account_patch(patch)?);
+                }
             }
-            enqueue_finalize_history_request(&meta, slot, decoded)
+            enqueue_finalize_history_request(&meta, slot, decoded, ExternalFinalizeMode::Replay)
         }
     }
 }

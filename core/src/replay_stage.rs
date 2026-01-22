@@ -61,7 +61,7 @@ use {
         optimistically_confirmed_bank_tracker::{BankNotification, BankNotificationSenderConfig},
         rpc::{
             ExternalAccountDataPatch, ExternalAccountDataSplice, ExternalAccountPatch,
-            ExternalFinalizeRequest,
+            ExternalFinalizeMode, ExternalFinalizeRequest,
         },
         rpc_subscriptions::RpcSubscriptions,
         slot_status_notifier::SlotStatusNotifier,
@@ -749,30 +749,50 @@ impl ReplayStage {
                         |slot| ExternalFinalizeRequest {
                             slot,
                             patches: Vec::new(),
+                            mode: ExternalFinalizeMode::Replay,
                         },
                     );
                 }
                 if let Some(request) = requested_finalize {
                     let target_slot = request.slot;
                     let patches = request.patches.as_slice();
-                    match Self::finalize_history_with_replay(
-                        target_slot,
-                        &bank_forks,
-                        &blockstore,
-                        &leader_schedule_cache,
-                        snapshot_controller.as_deref(),
-                        &replay_process_options,
-                        transaction_status_sender.as_ref(),
-                        entry_notification_sender.as_ref(),
-                        &poh_recorder,
-                        &my_pubkey,
-                        &vote_account,
-                        &mut progress,
-                        &mut tbft_structs,
-                        &mut tracked_vote_transactions,
-                        &drop_bank_sender,
-                        patches,
-                    ) {
+                    let finalize_result = match request.mode {
+                        ExternalFinalizeMode::Replay => Self::finalize_history_with_replay(
+                            target_slot,
+                            &bank_forks,
+                            &blockstore,
+                            &leader_schedule_cache,
+                            snapshot_controller.as_deref(),
+                            &replay_process_options,
+                            transaction_status_sender.as_ref(),
+                            entry_notification_sender.as_ref(),
+                            &poh_recorder,
+                            &my_pubkey,
+                            &vote_account,
+                            &mut progress,
+                            &mut tbft_structs,
+                            &mut tracked_vote_transactions,
+                            &drop_bank_sender,
+                            patches,
+                        ),
+                        ExternalFinalizeMode::FinalizeOnly => {
+                            if !patches.is_empty() {
+                                Err("finalizeHistory does not accept patches".to_string())
+                            } else {
+                                Self::finalize_history_without_replay(
+                                    target_slot,
+                                    &bank_forks,
+                                    snapshot_controller.as_deref(),
+                                    &mut progress,
+                                    &mut tbft_structs,
+                                    &mut tracked_vote_transactions,
+                                    &mut has_new_vote_been_rooted,
+                                    &drop_bank_sender,
+                                )
+                            }
+                        }
+                    };
+                    match finalize_result {
                         Ok(()) => {
                             last_external_finalize = Instant::now();
                             current_leader = None;
@@ -4283,6 +4303,48 @@ impl ReplayStage {
             poh_recorder,
             leader_schedule_cache,
         );
+
+        Ok(())
+    }
+
+    fn finalize_history_without_replay(
+        target_slot: Slot,
+        bank_forks: &Arc<RwLock<BankForks>>,
+        snapshot_controller: Option<&SnapshotController>,
+        progress: &mut ProgressMap,
+        tbft_structs: &mut TowerBFTStructures,
+        tracked_vote_transactions: &mut Vec<TrackedVoteTransaction>,
+        has_new_vote_been_rooted: &mut bool,
+        drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
+    ) -> Result<(), String> {
+        let root_slot = bank_forks.read().unwrap().root();
+        if target_slot <= root_slot {
+            return Err(format!(
+                "finalize target {target_slot} is not above current root {root_slot}"
+            ));
+        }
+
+        let target_bank = bank_forks
+            .read()
+            .unwrap()
+            .get(target_slot)
+            .ok_or_else(|| format!("finalize target {target_slot} not found in bank forks"))?;
+        if !target_bank.is_frozen() {
+            return Err(format!("finalize target {target_slot} is not frozen"));
+        }
+
+        Self::handle_new_root(
+            target_slot,
+            bank_forks,
+            progress,
+            snapshot_controller,
+            None,
+            has_new_vote_been_rooted,
+            tracked_vote_transactions,
+            drop_bank_sender,
+            tbft_structs,
+        )
+        .map_err(|err| format!("failed to set root {target_slot}: {err}"))?;
 
         Ok(())
     }
