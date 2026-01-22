@@ -961,6 +961,8 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             None
         };
 
+        let dynamic_accounts_lamports_sum =
+            transaction_context.accounts().get_dynamic_accounts_lamports_sum();
         let ExecutionRecord {
             accounts,
             return_data,
@@ -970,7 +972,11 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
         if status.is_ok()
             && transaction_accounts_lamports_sum(&accounts)
-                .filter(|lamports_after_tx| lamports_before_tx == *lamports_after_tx)
+                .filter(|lamports_after_tx| {
+                    lamports_before_tx
+                        .saturating_add(dynamic_accounts_lamports_sum)
+                        == *lamports_after_tx
+                })
                 .is_none()
         {
             status = Err(TransactionError::UnbalancedTransaction);

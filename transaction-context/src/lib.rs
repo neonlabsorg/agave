@@ -117,6 +117,7 @@ pub struct TransactionAccounts {
     touched_flags: RefCell<Vec<bool>>,
     resize_delta: Cell<i64>,
     lamports_delta: Cell<i128>,
+    dynamic_accounts_lamports_sum: Cell<u128>,
 }
 
 impl TransactionAccounts {
@@ -128,6 +129,7 @@ impl TransactionAccounts {
             touched_flags: RefCell::new(touched_flags),
             resize_delta: Cell::new(0),
             lamports_delta: Cell::new(0),
+            dynamic_accounts_lamports_sum: Cell::new(0),
         }
     }
 
@@ -217,12 +219,19 @@ impl TransactionAccounts {
         self.lamports_delta.get()
     }
 
+    pub fn get_dynamic_accounts_lamports_sum(&self) -> u128 {
+        self.dynamic_accounts_lamports_sum.get()
+    }
+
     #[cfg(not(target_os = "solana"))]
     fn add_account(&self, account: AccountSharedData) -> IndexOfAccount {
+        let lamports = account.lamports();
         let mut accounts = self.accounts.borrow_mut();
         let index = accounts.len() as IndexOfAccount;
         accounts.push(Box::new(RefCell::new(account)));
         self.touched_flags.borrow_mut().push(false);
+        self.dynamic_accounts_lamports_sum
+            .set(self.dynamic_accounts_lamports_sum.get().saturating_add(lamports as u128));
         index
     }
 }
