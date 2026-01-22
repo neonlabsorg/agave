@@ -425,6 +425,7 @@ solana-epoch-info = "3.0.0"
 solana-epoch-rewards = "3.0.0"
 solana-epoch-rewards-hasher = "3.0.0"
 solana-epoch-schedule = "3.0.0"
+solana-epoch-stake = "3.0.0"
 solana-example-mocks = "3.0.0"
 solana-faucet = { path = "faucet", version = "=3.0.12" }
 solana-feature-gate-interface = "3.0.0"
@@ -681,9 +682,12 @@ quinn-proto = { git = "https://github.com/anza-xyz/quinn", rev = "fc4decb0cf79b1
 # comments and the overrides in sync.
 solana-curve25519 = { path = "curves/curve25519" }
 solana-clock = { path = "neon/solana-sdk/clock" }
+solana-account-info = { path = "neon/solana-sdk/account-info" }
 solana-sdk-macro = { path = "neon/solana-sdk/sdk-macro" }
 solana-sysvar = { path = "neon/solana-sdk/sysvar" }
 solana-rent = { path = "neon/solana-sdk/rent" }
 solana-rent-collector = { path = "neon/solana-sdk/rent-collector" }
 solana-fee-calculator = { path = "neon/solana-sdk/fee-calculator" }
 solana-fee-structure = { path = "neon/solana-sdk/fee-structure" }
+solana-define-syscall = { path = "neon/solana-sdk/define-syscall" }
+solana-program = { path = "neon/solana-sdk/program" }

@@ -6975,11 +6975,10 @@ dependencies = [
 [[package]]
 name = "solana-account-info"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82f4691b69b172c687d218dd2f1f23fc7ea5e9aa79df9ac26dab3d8dd829ce48"
 dependencies = [
  "bincode",
  "serde",
+ "solana-define-syscall 3.0.0",
  "solana-program-error",
  "solana-program-memory",
  "solana-pubkey",
@@ -8335,8 +8334,6 @@ checksum = "2ae3e2abcf541c8122eafe9a625d4d194b4023c20adde1e251f94e056bb1aee2"
 [[package]]
 name = "solana-define-syscall"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9697086a4e102d28a156b8d6b521730335d6951bd39a5e766512bbe09007cee"
 
 [[package]]
 name = "solana-derivation-path"
@@ -9616,8 +9613,6 @@ dependencies = [
 [[package]]
 name = "solana-program"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91b12305dd81045d705f427acd0435a2e46444b65367d7179d7bdcfc3bc5f5eb"
 dependencies = [
  "memoffset 0.9.1",
  "solana-account-info",
