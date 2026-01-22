@@ -113,7 +113,7 @@ struct DynamicAccountMeta {
 
 #[derive(Debug)]
 pub struct TransactionAccounts {
-    accounts: RefCell<Vec<Rc<RefCell<AccountSharedData>>>>,
+    accounts: RefCell<Vec<Box<RefCell<AccountSharedData>>>>,
     touched_flags: RefCell<Vec<bool>>,
     resize_delta: Cell<i64>,
     lamports_delta: Cell<i128>,
@@ -122,8 +122,6 @@ pub struct TransactionAccounts {
 impl TransactionAccounts {
     #[cfg(not(target_os = "solana"))]
     fn new(accounts: Vec<Box<RefCell<AccountSharedData>>>) -> TransactionAccounts {
-        let accounts: Vec<Rc<RefCell<AccountSharedData>>> =
-            accounts.into_iter().map(Rc::from).collect();
         let touched_flags = vec![false; accounts.len()];
         TransactionAccounts {
             accounts: RefCell::new(accounts),
@@ -179,14 +177,14 @@ impl TransactionAccounts {
         &self,
         index: IndexOfAccount,
     ) -> Result<RefMut<'_, AccountSharedData>, InstructionError> {
-        let account = self
-            .accounts
-            .borrow()
+        let accounts = self.accounts.borrow();
+        let account_cell = accounts
             .get(index as usize)
-            .cloned()
             .ok_or(InstructionError::MissingAccount)?;
-        account
-            .try_borrow_mut()
+        let account_ptr: *const RefCell<AccountSharedData> = &**account_cell;
+        drop(accounts);
+        // Safe: the account is boxed, so its address is stable even if the vec moves.
+        unsafe { (&*account_ptr).try_borrow_mut() }
             .map_err(|_| InstructionError::AccountBorrowFailed)
     }
 
@@ -194,14 +192,14 @@ impl TransactionAccounts {
         &self,
         index: IndexOfAccount,
     ) -> Result<Ref<'_, AccountSharedData>, InstructionError> {
-        let account = self
-            .accounts
-            .borrow()
+        let accounts = self.accounts.borrow();
+        let account_cell = accounts
             .get(index as usize)
-            .cloned()
             .ok_or(InstructionError::MissingAccount)?;
-        account
-            .try_borrow()
+        let account_ptr: *const RefCell<AccountSharedData> = &**account_cell;
+        drop(accounts);
+        // Safe: the account is boxed, so its address is stable even if the vec moves.
+        unsafe { (&*account_ptr).try_borrow() }
             .map_err(|_| InstructionError::AccountBorrowFailed)
     }
 
@@ -223,7 +221,7 @@ impl TransactionAccounts {
     fn add_account(&self, account: AccountSharedData) -> IndexOfAccount {
         let mut accounts = self.accounts.borrow_mut();
         let index = accounts.len() as IndexOfAccount;
-        accounts.push(Rc::new(RefCell::new(account)));
+        accounts.push(Box::new(RefCell::new(account)));
         self.touched_flags.borrow_mut().push(false);
         index
     }
@@ -287,12 +285,7 @@ impl TransactionContext {
             .accounts
             .into_inner()
             .into_iter()
-            .map(|account| {
-                RefCell::into_inner(
-                    Rc::try_unwrap(account)
-                        .expect("transaction_context.accounts has unexpected outstanding refs"),
-                )
-            })
+            .map(|account| RefCell::into_inner(*account))
             .collect())
     }
 
@@ -1275,12 +1268,7 @@ impl From<TransactionContext> for ExecutionRecord {
         let accounts = context
             .account_keys
             .into_iter()
-            .zip(accounts.into_inner().into_iter().map(|account| {
-                RefCell::into_inner(
-                    Rc::try_unwrap(account)
-                        .expect("transaction_context.accounts has unexpected outstanding refs"),
-                )
-            }))
+            .zip(accounts.into_inner().into_iter().map(|account| RefCell::into_inner(*account)))
             .collect();
         let touched_account_count = touched_flags
             .borrow()
