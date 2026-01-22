@@ -77,6 +77,7 @@ use {
         vote_sender_types::ReplayVoteSender,
     },
     solana_sdk_ids::system_program::id as system_program_id,
+    solana_signature::Signature,
     solana_signer::Signer,
     solana_svm_timings::ExecuteTimings,
     solana_time_utils::timestamp,
@@ -750,12 +751,14 @@ impl ReplayStage {
                             slot,
                             patches: Vec::new(),
                             mode: ExternalFinalizeMode::Replay,
+                            exclude_signatures: None,
                         },
                     );
                 }
                 if let Some(request) = requested_finalize {
                     let target_slot = request.slot;
                     let patches = request.patches.as_slice();
+                    let exclude_signatures = request.exclude_signatures.as_ref();
                     let finalize_result = match request.mode {
                         ExternalFinalizeMode::Replay => Self::finalize_history_with_replay(
                             target_slot,
@@ -774,10 +777,14 @@ impl ReplayStage {
                             &mut tracked_vote_transactions,
                             &drop_bank_sender,
                             patches,
+                            exclude_signatures,
                         ),
                         ExternalFinalizeMode::FinalizeOnly => {
                             if !patches.is_empty() {
                                 Err("finalizeHistory does not accept patches".to_string())
+                            } else if exclude_signatures.is_some() {
+                                Err("finalizeHistory does not accept excluded signatures"
+                                    .to_string())
                             } else {
                                 Self::finalize_history_without_replay(
                                     target_slot,
@@ -2332,6 +2339,7 @@ impl ReplayStage {
             false,
             log_messages_bytes_limit,
             prioritization_fee_cache,
+            None,
         )?;
         let tx_count_after = w_replay_progress.num_txs;
         let tx_count = tx_count_after - tx_count_before;
@@ -4226,6 +4234,7 @@ impl ReplayStage {
         tracked_vote_transactions: &mut Vec<TrackedVoteTransaction>,
         drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
         external_account_patches: &[ExternalAccountPatch],
+        exclude_signatures: Option<&HashSet<Signature>>,
     ) -> Result<(), String> {
         let root_slot = bank_forks.read().unwrap().root();
         if target_slot <= root_slot {
@@ -4260,6 +4269,7 @@ impl ReplayStage {
 
         let mut replay_options = process_options.clone();
         replay_options.halt_at_slot = Some(target_slot);
+        replay_options.exclude_signatures = exclude_signatures.cloned();
         blockstore_processor::process_blockstore_from_root(
             blockstore,
             bank_forks,

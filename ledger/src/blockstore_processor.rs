@@ -854,6 +854,7 @@ pub struct ProcessOptions {
     pub hash_overrides: Option<HashOverrides>,
     pub abort_on_invalid_block: bool,
     pub no_block_cost_limits: bool,
+    pub exclude_signatures: Option<HashSet<Signature>>,
 }
 
 pub fn test_process_blockstore(
@@ -1159,6 +1160,7 @@ fn confirm_full_slot(
         opts.allow_dead_slots,
         opts.runtime_config.log_messages_bytes_limit,
         &ignored_prioritization_fee_cache,
+        opts.exclude_signatures.as_ref(),
     )?;
 
     timing.accumulate(&confirmation_timing.batch_execute.totals);
@@ -1498,6 +1500,7 @@ pub fn confirm_slot(
     allow_dead_slots: bool,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: &PrioritizationFeeCache,
+    exclude_signatures: Option<&HashSet<Signature>>,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let slot = bank.slot();
 
@@ -1528,6 +1531,7 @@ pub fn confirm_slot(
         recyclers,
         log_messages_bytes_limit,
         prioritization_fee_cache,
+        exclude_signatures,
     )
 }
 
@@ -1545,6 +1549,7 @@ fn confirm_slot_entries(
     recyclers: &VerifyRecyclers,
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: &PrioritizationFeeCache,
+    exclude_signatures: Option<&HashSet<Signature>>,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let ConfirmationTiming {
         confirmation_elapsed,
@@ -1563,9 +1568,9 @@ fn confirm_slot_entries(
     let slot = bank.slot();
     let (entries, num_shreds, slot_full) = slot_entries_load_result;
     let num_entries = entries.len();
-    let mut entry_tx_starting_indexes = Vec::with_capacity(num_entries);
-    let mut entry_tx_starting_index = progress.num_txs;
-    let num_txs = entries
+    let mut entry_tx_starting_indexes_unfiltered = Vec::with_capacity(num_entries);
+    let mut entry_tx_starting_index_unfiltered = progress.num_txs;
+    let num_txs_unfiltered = entries
         .iter()
         .enumerate()
         .map(|(i, entry)| {
@@ -1575,7 +1580,7 @@ fn confirm_slot_entries(
                     slot,
                     index: entry_index,
                     entry: entry.into(),
-                    starting_transaction_index: entry_tx_starting_index,
+                    starting_transaction_index: entry_tx_starting_index_unfiltered,
                 }) {
                     warn!(
                         "Slot {slot}, entry {entry_index} entry_notification_sender send failed: \
@@ -1584,15 +1589,16 @@ fn confirm_slot_entries(
                 }
             }
             let num_txs = entry.transactions.len();
-            let next_tx_starting_index = entry_tx_starting_index.saturating_add(num_txs);
-            entry_tx_starting_indexes.push(entry_tx_starting_index);
-            entry_tx_starting_index = next_tx_starting_index;
+            let next_tx_starting_index =
+                entry_tx_starting_index_unfiltered.saturating_add(num_txs);
+            entry_tx_starting_indexes_unfiltered.push(entry_tx_starting_index_unfiltered);
+            entry_tx_starting_index_unfiltered = next_tx_starting_index;
             num_txs
         })
         .sum::<usize>();
     trace!(
         "Fetched entries for slot {slot}, num_entries: {num_entries}, num_shreds: {num_shreds}, \
-         num_txs: {num_txs}, slot_full: {slot_full}",
+         num_txs: {num_txs_unfiltered}, slot_full: {slot_full}",
     );
 
     if !skip_verification {
@@ -1661,9 +1667,31 @@ fn confirm_slot_entries(
         }
     };
 
-    let entries = transaction_verification_result
+    let mut entries = transaction_verification_result
         .entries()
         .expect("Transaction verification generates entries");
+
+    if let Some(exclude_signatures) = exclude_signatures {
+        if !exclude_signatures.is_empty() {
+            entries = filter_replay_entries_by_signatures(entries, exclude_signatures);
+        }
+    }
+
+    let mut entry_tx_starting_indexes = Vec::with_capacity(entries.len());
+    let mut entry_tx_starting_index = progress.num_txs;
+    let num_txs = entries
+        .iter()
+        .map(|entry| match entry {
+            EntryType::Tick(_) => 0,
+            EntryType::Transactions(transactions) => {
+                let num_txs = transactions.len();
+                let next_tx_starting_index = entry_tx_starting_index.saturating_add(num_txs);
+                entry_tx_starting_indexes.push(entry_tx_starting_index);
+                entry_tx_starting_index = next_tx_starting_index;
+                num_txs
+            }
+        })
+        .sum::<usize>();
 
     let mut replay_timer = Measure::start("replay_elapsed");
     let replay_entries: Vec<_> = entries
@@ -1728,6 +1756,31 @@ fn confirm_slot_entries(
     }
 
     Ok(())
+}
+
+fn filter_replay_entries_by_signatures(
+    entries: Vec<EntryType<RuntimeTransaction<SanitizedTransaction>>>,
+    exclude_signatures: &HashSet<Signature>,
+) -> Vec<EntryType<RuntimeTransaction<SanitizedTransaction>>> {
+    entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            EntryType::Tick(hash) => Some(EntryType::Tick(hash)),
+            EntryType::Transactions(transactions) => {
+                let filtered = transactions
+                    .into_iter()
+                    .filter(|transaction| {
+                        !exclude_signatures.contains(transaction.signature())
+                    })
+                    .collect::<Vec<_>>();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some(EntryType::Transactions(filtered))
+                }
+            }
+        })
+        .collect()
 }
 
 // Special handling required for processing the entries in slot 0

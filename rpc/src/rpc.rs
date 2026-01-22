@@ -296,6 +296,7 @@ pub struct ExternalFinalizeRequest {
     pub slot: Slot,
     pub patches: Vec<ExternalAccountPatch>,
     pub mode: ExternalFinalizeMode,
+    pub exclude_signatures: Option<HashSet<Signature>>,
 }
 
 #[derive(Deserialize, serde::Serialize)]
@@ -386,6 +387,26 @@ fn decode_external_account_patch(patch: RpcExternalAccountPatch) -> Result<Exter
     })
 }
 
+fn decode_exclude_signatures(
+    exclude_signatures: Option<Vec<String>>,
+) -> Result<Option<HashSet<Signature>>> {
+    let exclude_signatures = match exclude_signatures {
+        Some(exclude_signatures) => exclude_signatures,
+        None => return Ok(None),
+    };
+    if exclude_signatures.is_empty() {
+        return Ok(Some(HashSet::new()));
+    }
+    let mut decoded = HashSet::with_capacity(exclude_signatures.len());
+    for signature_str in exclude_signatures {
+        let signature = Signature::from_str(&signature_str).map_err(|err| {
+            Error::invalid_params(format!("Invalid signature {signature_str}: {err}"))
+        })?;
+        decoded.insert(signature);
+    }
+    Ok(Some(decoded))
+}
+
 fn select_finalize_slot_for_request(bank_forks: &RwLock<BankForks>) -> Option<Slot> {
     let bank_forks = bank_forks.read().unwrap();
     let root_slot = bank_forks.root();
@@ -419,6 +440,7 @@ fn enqueue_finalize_history_request(
     slot: Option<Slot>,
     patches: Vec<ExternalAccountPatch>,
     mode: ExternalFinalizeMode,
+    exclude_signatures: Option<HashSet<Signature>>,
 ) -> Result<bool> {
     if let Some(sender) = meta.finalize_history_sender.as_ref() {
         let slot = resolve_finalize_history_slot(meta, slot)?;
@@ -426,6 +448,7 @@ fn enqueue_finalize_history_request(
             slot,
             patches,
             mode,
+            exclude_signatures,
         };
         sender.send(request).map_err(|err| {
             warn!("finalize_history failed to enqueue: {err}");
@@ -3804,6 +3827,7 @@ pub mod rpc_full {
             meta: Self::Metadata,
             slot: Option<Slot>,
             patches: Option<Vec<RpcExternalAccountPatch>>,
+            exclude_signatures: Option<Vec<String>>,
         ) -> Result<bool>;
     }
 
@@ -3907,6 +3931,7 @@ pub mod rpc_full {
                 slot,
                 Vec::new(),
                 ExternalFinalizeMode::FinalizeOnly,
+                None,
             )
         }
 
@@ -3915,6 +3940,7 @@ pub mod rpc_full {
             meta: Self::Metadata,
             slot: Option<Slot>,
             patches: Option<Vec<RpcExternalAccountPatch>>,
+            exclude_signatures: Option<Vec<String>>,
         ) -> Result<bool> {
             let mut decoded = Vec::new();
             if let Some(patches) = patches {
@@ -3923,7 +3949,14 @@ pub mod rpc_full {
                     decoded.push(decode_external_account_patch(patch)?);
                 }
             }
-            enqueue_finalize_history_request(&meta, slot, decoded, ExternalFinalizeMode::Replay)
+            let exclude_signatures = decode_exclude_signatures(exclude_signatures)?;
+            enqueue_finalize_history_request(
+                &meta,
+                slot,
+                decoded,
+                ExternalFinalizeMode::Replay,
+                exclude_signatures,
+            )
         }
 
         fn get_signature_statuses(
@@ -4535,6 +4568,7 @@ pub mod rpc_finalize_history {
             meta: Self::Metadata,
             slot: Option<Slot>,
             patches: Option<Vec<RpcExternalAccountPatch>>,
+            exclude_signatures: Option<Vec<String>>,
         ) -> Result<bool>;
     }
 
@@ -4548,6 +4582,7 @@ pub mod rpc_finalize_history {
                 slot,
                 Vec::new(),
                 ExternalFinalizeMode::FinalizeOnly,
+                None,
             )
         }
 
@@ -4556,6 +4591,7 @@ pub mod rpc_finalize_history {
             meta: Self::Metadata,
             slot: Option<Slot>,
             patches: Option<Vec<RpcExternalAccountPatch>>,
+            exclude_signatures: Option<Vec<String>>,
         ) -> Result<bool> {
             let mut decoded = Vec::new();
             if let Some(patches) = patches {
@@ -4564,7 +4600,14 @@ pub mod rpc_finalize_history {
                     decoded.push(decode_external_account_patch(patch)?);
                 }
             }
-            enqueue_finalize_history_request(&meta, slot, decoded, ExternalFinalizeMode::Replay)
+            let exclude_signatures = decode_exclude_signatures(exclude_signatures)?;
+            enqueue_finalize_history_request(
+                &meta,
+                slot,
+                decoded,
+                ExternalFinalizeMode::Replay,
+                exclude_signatures,
+            )
         }
     }
 }
