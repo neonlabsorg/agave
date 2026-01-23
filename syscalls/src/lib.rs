@@ -1673,9 +1673,18 @@ declare_builtin_function!(
             }
         }
 
-        invoke_context
+        if let Err(err) = invoke_context
             .transaction_context
-            .add_account_to_current_instruction(index, is_signer, is_writable)?;
+            .add_account_to_current_instruction(index, is_signer, is_writable)
+        {
+            ic_msg!(
+                invoke_context,
+                "cpi_load_account: add_account_to_current_instruction failed index={} err={:?}",
+                index,
+                err
+            );
+            return Err(Box::new(err));
+        }
 
         translate_mut!(
             memory_mapping,
@@ -1765,9 +1774,18 @@ declare_builtin_function!(
                 }
             }
 
-            invoke_context
+            if let Err(err) = invoke_context
                 .transaction_context
-                .add_account_to_current_instruction(index, is_signer, is_writable)?;
+                .add_account_to_current_instruction(index, is_signer, is_writable)
+            {
+                ic_msg!(
+                    invoke_context,
+                    "cpi_load_accounts: add_account_to_current_instruction failed index={} err={:?}",
+                    index,
+                    err
+                );
+                return Err(Box::new(err));
+            }
 
             out_indices[i] = index as u64;
         }
