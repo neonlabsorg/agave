@@ -38,6 +38,7 @@ jobs:
             -f docker/Dockerfile.ubuntu24-build \
             --target artifacts \
             --output type=local,dest=./bin \
+            --build-arg AGAVE_REF=$(git rev-parse --abbrev-ref HEAD) \
             --no-cache \
             .
 
