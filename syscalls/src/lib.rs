@@ -69,6 +69,8 @@ mod sysvar;
 
 /// Maximum signers
 const MAX_SIGNERS: usize = 16;
+const DYNAMIC_ACCOUNT_WINDOW_COUNT: u64 = 10;
+const DYNAMIC_ACCOUNT_WINDOW_STRIDE: u64 = ebpf::MM_REGION_SIZE;
 const DYNAMIC_ACCOUNT_WINDOW_START: u64 = ebpf::MM_REGION_SIZE * 5;
 
 /// Error definitions
@@ -471,6 +473,10 @@ pub fn create_program_runtime_environment_v1<'a>(
     result.register_function("sol_load_account", SyscallLoadAccount::vm)?;
     result.register_function("sol_account_data_read", SyscallAccountDataRead::vm)?;
     result.register_function("sol_account_data_slice", SyscallAccountDataSlice::vm)?;
+    result.register_function(
+        "sol_account_data_slice_window",
+        SyscallAccountDataSliceWindow::vm,
+    )?;
     result.register_function("sol_account_data_write", SyscallAccountDataWrite::vm)?;
     result.register_function("sol_account_data_len", SyscallAccountDataLen::vm)?;
     result.register_function("sol_account_lamports_get", SyscallAccountLamportsGet::vm)?;
@@ -1641,6 +1647,97 @@ declare_builtin_function!(
     }
 );
 
+fn dynamic_account_window_start(window_id: u64) -> Result<u64, InstructionError> {
+    if window_id >= DYNAMIC_ACCOUNT_WINDOW_COUNT {
+        return Err(InstructionError::InvalidArgument);
+    }
+
+    let offset = window_id
+        .checked_mul(DYNAMIC_ACCOUNT_WINDOW_STRIDE)
+        .ok_or(InstructionError::InvalidArgument)?;
+    DYNAMIC_ACCOUNT_WINDOW_START
+        .checked_add(offset)
+        .ok_or(InstructionError::InvalidArgument)
+}
+
+fn map_dynamic_account_window(
+    invoke_context: &mut InvokeContext,
+    memory_mapping: &mut MemoryMapping,
+    account_index: u64,
+    offset: u64,
+    len: u64,
+    is_writable: bool,
+    window_id: u64,
+    enforce_window_size: bool,
+) -> Result<u64, Error> {
+    let index = get_dynamic_account_index(invoke_context, account_index)?;
+    let offset = usize::try_from(offset).map_err(|_| InstructionError::InvalidArgument)?;
+    let len = usize::try_from(len).map_err(|_| InstructionError::InvalidArgument)?;
+    if len == 0 {
+        return Err(Box::new(InstructionError::InvalidArgument));
+    }
+    if enforce_window_size && (len as u64) > DYNAMIC_ACCOUNT_WINDOW_STRIDE {
+        return Err(Box::new(InstructionError::InvalidArgument));
+    }
+
+    if is_writable
+        && !invoke_context
+            .transaction_context
+            .is_dynamic_account_writable(index)?
+    {
+        return Err(Box::new(InstructionError::ReadonlyDataModified));
+    }
+
+    let instruction_context = invoke_context
+        .transaction_context
+        .get_current_instruction_context()?;
+    let program_id = instruction_context.get_program_key()?;
+
+    let end = offset.saturating_add(len);
+    let window_start =
+        dynamic_account_window_start(window_id).map_err(|err| Box::new(err) as Error)?;
+    let region = if is_writable {
+        let mut account = invoke_context
+            .transaction_context
+            .accounts()
+            .try_borrow_mut(index)?;
+        if account.owner() != program_id {
+            return Err(Box::new(InstructionError::ExternalAccountDataModified));
+        }
+        let data = account.data_as_mut_slice();
+        if end > data.len() {
+            return Err(Box::new(InstructionError::AccountDataTooSmall));
+        }
+        MemoryRegion::new_writable(&mut data[offset..end], window_start)
+    } else {
+        let account = invoke_context
+            .transaction_context
+            .accounts()
+            .try_borrow(index)?;
+        let data = account.data();
+        if end > data.len() {
+            return Err(Box::new(InstructionError::AccountDataTooSmall));
+        }
+        MemoryRegion::new_readonly(&data[offset..end], window_start)
+    };
+
+    let (region_index, _) = memory_mapping
+        .find_region(window_start)
+        .ok_or_else(|| Box::new(InstructionError::InvalidArgument) as Error)?;
+    memory_mapping
+        .replace_region(region_index, region)
+        .map_err(|_| Box::new(InstructionError::InvalidArgument) as Error)?;
+
+    if is_writable {
+        invoke_context
+            .transaction_context
+            .accounts()
+            .touch(index)?;
+    }
+
+    Ok(window_start)
+}
+
 declare_builtin_function!(
     /// Map a window of account data into program memory
     SyscallAccountDataSlice,
@@ -1656,73 +1753,68 @@ declare_builtin_function!(
         let execution_cost = invoke_context.get_execution_cost();
         consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
 
-        let index = get_dynamic_account_index(invoke_context, account_index)?;
-        let offset = usize::try_from(offset).map_err(|_| InstructionError::InvalidArgument)?;
-        let len = usize::try_from(len).map_err(|_| InstructionError::InvalidArgument)?;
-        if len == 0 {
-            return Err(Box::new(InstructionError::InvalidArgument));
-        }
-
         let is_writable = is_writable != 0;
-        if is_writable
-            && !invoke_context
-                .transaction_context
-                .is_dynamic_account_writable(index)?
-        {
-            return Err(Box::new(InstructionError::ReadonlyDataModified));
-        }
-
-        let instruction_context = invoke_context
-            .transaction_context
-            .get_current_instruction_context()?;
-        let program_id = instruction_context.get_program_key()?;
-
-        let end = offset.saturating_add(len);
-        let region = if is_writable {
-            let mut account = invoke_context
-                .transaction_context
-                .accounts()
-                .try_borrow_mut(index)?;
-            if account.owner() != program_id {
-                return Err(Box::new(InstructionError::ExternalAccountDataModified));
-            }
-            let data = account.data_as_mut_slice();
-            if end > data.len() {
-                return Err(Box::new(InstructionError::AccountDataTooSmall));
-            }
-            MemoryRegion::new_writable(&mut data[offset..end], DYNAMIC_ACCOUNT_WINDOW_START)
-        } else {
-            let account = invoke_context
-                .transaction_context
-                .accounts()
-                .try_borrow(index)?;
-            let data = account.data();
-            if end > data.len() {
-                return Err(Box::new(InstructionError::AccountDataTooSmall));
-            }
-            MemoryRegion::new_readonly(&data[offset..end], DYNAMIC_ACCOUNT_WINDOW_START)
-        };
-
-        let (region_index, _) = memory_mapping
-            .find_region(DYNAMIC_ACCOUNT_WINDOW_START)
-            .ok_or_else(|| Box::new(InstructionError::InvalidArgument) as Error)?;
-        memory_mapping
-            .replace_region(region_index, region)
-            .map_err(|_| Box::new(InstructionError::InvalidArgument) as Error)?;
-
-        if is_writable {
-            invoke_context
-                .transaction_context
-                .accounts()
-                .touch(index)?;
-        }
+        let window_start = map_dynamic_account_window(
+            invoke_context,
+            memory_mapping,
+            account_index,
+            offset,
+            len,
+            is_writable,
+            0,
+            false,
+        )?;
 
         translate_mut!(
             memory_mapping,
             invoke_context.get_check_aligned(),
             let out_addr_ref: &mut u64 = map(out_addr)?;
         );
-        *out_addr_ref = DYNAMIC_ACCOUNT_WINDOW_START;
+        *out_addr_ref = window_start;
+
+        let data_len_cost = (len as u64)
+            .checked_div(execution_cost.cpi_bytes_per_unit)
+            .unwrap_or(u64::MAX);
+        consume_compute_meter(invoke_context, data_len_cost)?;
+
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Map a window of account data into a selected program memory region
+    SyscallAccountDataSliceWindow,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        account_index: u64,
+        offset: u64,
+        len: u64,
+        flags: u64,
+        out_addr: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
+
+        let is_writable = (flags & 1) != 0;
+        let window_id = flags >> 1;
+        let window_start = map_dynamic_account_window(
+            invoke_context,
+            memory_mapping,
+            account_index,
+            offset,
+            len,
+            is_writable,
+            window_id,
+            true,
+        )?;
+
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let out_addr_ref: &mut u64 = map(out_addr)?;
+        );
+        *out_addr_ref = window_start;
 
         let data_len_cost = (len as u64)
             .checked_div(execution_cost.cpi_bytes_per_unit)

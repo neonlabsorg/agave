@@ -50,6 +50,8 @@ const DEFAULT_LOADER_COMPUTE_UNITS: u64 = 570;
 const DEPRECATED_LOADER_COMPUTE_UNITS: u64 = 1_140;
 #[cfg_attr(feature = "svm-internal", qualifiers(pub))]
 const UPGRADEABLE_LOADER_COMPUTE_UNITS: u64 = 2_370;
+const DYNAMIC_ACCOUNT_WINDOW_COUNT: u64 = 10;
+const DYNAMIC_ACCOUNT_WINDOW_STRIDE: u64 = ebpf::MM_REGION_SIZE;
 const DYNAMIC_ACCOUNT_WINDOW_START: u64 = ebpf::MM_REGION_SIZE.saturating_mul(5);
 static DYNAMIC_ACCOUNT_WINDOW_STUB: [u8; 1] = [0];
 
@@ -345,10 +347,14 @@ fn create_memory_mapping<'a, 'b, C: ContextObject>(
     .into_iter()
     .chain(additional_regions)
     .collect();
-    regions.push(MemoryRegion::new_readonly(
-        &DYNAMIC_ACCOUNT_WINDOW_STUB,
-        DYNAMIC_ACCOUNT_WINDOW_START,
-    ));
+    for window_id in 0..DYNAMIC_ACCOUNT_WINDOW_COUNT {
+        let start = DYNAMIC_ACCOUNT_WINDOW_START
+            .saturating_add(window_id.saturating_mul(DYNAMIC_ACCOUNT_WINDOW_STRIDE));
+        regions.push(MemoryRegion::new_readonly(
+            &DYNAMIC_ACCOUNT_WINDOW_STUB,
+            start,
+        ));
+    }
 
     Ok(MemoryMapping::new_with_access_violation_handler(
         regions,
