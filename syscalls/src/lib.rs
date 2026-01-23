@@ -30,7 +30,7 @@ use {
     solana_program_entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, SUCCESS},
     solana_program_runtime::{
         execution_budget::{SVMTransactionExecutionBudget, SVMTransactionExecutionCost},
-        invoke_context::InvokeContext,
+        invoke_context::{DynamicCpiAccount, InvokeContext},
         stable_log,
     },
     solana_pubkey::{Pubkey, PubkeyError, MAX_SEEDS, MAX_SEED_LEN, PUBKEY_BYTES},
@@ -69,7 +69,8 @@ mod sysvar;
 
 /// Maximum signers
 const MAX_SIGNERS: usize = 16;
-const DYNAMIC_ACCOUNT_WINDOW_COUNT: u64 = 10;
+const MAX_DYNAMIC_CPI_ACCOUNTS: usize = 256;
+const DYNAMIC_ACCOUNT_WINDOW_COUNT: u64 = 32;
 const DYNAMIC_ACCOUNT_WINDOW_STRIDE: u64 = ebpf::MM_REGION_SIZE;
 const DYNAMIC_ACCOUNT_WINDOW_START: u64 = ebpf::MM_REGION_SIZE * 5;
 
@@ -471,6 +472,8 @@ pub fn create_program_runtime_environment_v1<'a>(
 
     // Dynamic account loading
     result.register_function("sol_load_account", SyscallLoadAccount::vm)?;
+    result.register_function("sol_cpi_load_account", SyscallCpiLoadAccount::vm)?;
+    result.register_function("sol_cpi_load_accounts", SyscallCpiLoadAccounts::vm)?;
     result.register_function("sol_account_data_read", SyscallAccountDataRead::vm)?;
     result.register_function("sol_account_data_slice", SyscallAccountDataSlice::vm)?;
     result.register_function(
@@ -1599,6 +1602,183 @@ declare_builtin_function!(
             let out_index: &mut u64 = map(out_index_addr)?;
         );
         *out_index = index as u64;
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Load an account into the transaction context for CPI usage
+    SyscallCpiLoadAccount,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        pubkey_addr: u64,
+        is_writable: u64,
+        is_signer: u64,
+        out_index_addr: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        let syscall_base_cost = execution_cost.syscall_base_cost;
+        let cpi_bytes_per_unit = execution_cost.cpi_bytes_per_unit;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+
+        let pubkey = translate_type::<Pubkey>(
+            memory_mapping,
+            pubkey_addr,
+            invoke_context.get_check_aligned(),
+        )?;
+        let is_writable = is_writable != 0;
+        let is_signer = is_signer != 0;
+
+        let index = if let Some(index) = invoke_context
+            .transaction_context
+            .find_index_of_account(pubkey)
+        {
+            invoke_context
+                .transaction_context
+                .mark_dynamic_account(index, is_writable)?;
+            index
+        } else {
+            let (account, _slot) = invoke_context
+                .get_account_shared_data(pubkey)
+                .ok_or(InstructionError::MissingAccount)?;
+            let data_len_cost = (account.data().len() as u64)
+                .checked_div(cpi_bytes_per_unit)
+                .unwrap_or(u64::MAX);
+            consume_compute_meter(invoke_context, data_len_cost)?;
+            invoke_context
+                .transaction_context
+                .add_account(*pubkey, account, is_writable)?
+        };
+
+        {
+            let syscall_context = invoke_context.get_syscall_context_mut()?;
+            if let Some(entry) = syscall_context
+                .dynamic_cpi_accounts
+                .iter_mut()
+                .find(|entry| entry.index_in_transaction == index)
+            {
+                entry.is_writable |= is_writable;
+                entry.is_signer |= is_signer;
+            } else {
+                if syscall_context.dynamic_cpi_accounts.len() >= MAX_DYNAMIC_CPI_ACCOUNTS {
+                    return Err(Box::new(InstructionError::InvalidArgument));
+                }
+                syscall_context.dynamic_cpi_accounts.push(DynamicCpiAccount {
+                    index_in_transaction: index,
+                    is_writable,
+                    is_signer,
+                });
+            }
+        }
+
+        invoke_context
+            .transaction_context
+            .add_account_to_current_instruction(index, is_signer, is_writable)?;
+
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let out_index: &mut u64 = map(out_index_addr)?;
+        );
+        *out_index = index as u64;
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Load multiple accounts into the transaction context for CPI usage
+    SyscallCpiLoadAccounts,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        pubkeys_addr: u64,
+        count: u64,
+        is_writable: u64,
+        is_signer: u64,
+        out_indices_addr: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        let syscall_base_cost = execution_cost.syscall_base_cost;
+        let cpi_bytes_per_unit = execution_cost.cpi_bytes_per_unit;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+
+        let count = usize::try_from(count).map_err(|_| InstructionError::InvalidArgument)?;
+        if count == 0 {
+            return Err(Box::new(InstructionError::InvalidArgument));
+        }
+
+        let pubkeys = translate_slice::<Pubkey>(
+            memory_mapping,
+            pubkeys_addr,
+            count as u64,
+            invoke_context.get_check_aligned(),
+        )?
+        .to_vec();
+        let is_writable = is_writable != 0;
+        let is_signer = is_signer != 0;
+        let mut out_indices = vec![0u64; count];
+
+        for i in 0..count {
+            let pubkey = &pubkeys[i];
+
+            let index = if let Some(index) = invoke_context
+                .transaction_context
+                .find_index_of_account(pubkey)
+            {
+                invoke_context
+                    .transaction_context
+                    .mark_dynamic_account(index, is_writable)?;
+                index
+            } else {
+                let (account, _slot) = invoke_context
+                    .get_account_shared_data(pubkey)
+                    .ok_or(InstructionError::MissingAccount)?;
+                let data_len_cost = (account.data().len() as u64)
+                    .checked_div(cpi_bytes_per_unit)
+                    .unwrap_or(u64::MAX);
+                consume_compute_meter(invoke_context, data_len_cost)?;
+                invoke_context
+                    .transaction_context
+                    .add_account(*pubkey, account, is_writable)?
+            };
+
+            {
+                let syscall_context = invoke_context.get_syscall_context_mut()?;
+                if let Some(entry) = syscall_context
+                    .dynamic_cpi_accounts
+                    .iter_mut()
+                    .find(|entry| entry.index_in_transaction == index)
+                {
+                    entry.is_writable |= is_writable;
+                    entry.is_signer |= is_signer;
+                } else {
+                    if syscall_context.dynamic_cpi_accounts.len() >= MAX_DYNAMIC_CPI_ACCOUNTS {
+                        return Err(Box::new(InstructionError::InvalidArgument));
+                    }
+                    syscall_context.dynamic_cpi_accounts.push(DynamicCpiAccount {
+                        index_in_transaction: index,
+                        is_writable,
+                        is_signer,
+                    });
+                }
+            }
+
+            invoke_context
+                .transaction_context
+                .add_account_to_current_instruction(index, is_signer, is_writable)?;
+
+            out_indices[i] = index as u64;
+        }
+
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let out_indices_dst: &mut [u64] = map(out_indices_addr, count as u64)?;
+        );
+        out_indices_dst.copy_from_slice(&out_indices);
+
         Ok(SUCCESS)
     }
 );
@@ -3182,6 +3362,7 @@ mod tests {
                     allocator: BpfAllocator::new(solana_program_entrypoint::HEAP_LENGTH as u64),
                     accounts_metadata: Vec::new(),
                     trace_log: Vec::new(),
+                    dynamic_cpi_accounts: Vec::new(),
                 })
                 .unwrap();
             let config = Config {

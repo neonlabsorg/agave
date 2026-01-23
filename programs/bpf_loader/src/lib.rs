@@ -50,7 +50,7 @@ const DEFAULT_LOADER_COMPUTE_UNITS: u64 = 570;
 const DEPRECATED_LOADER_COMPUTE_UNITS: u64 = 1_140;
 #[cfg_attr(feature = "svm-internal", qualifiers(pub))]
 const UPGRADEABLE_LOADER_COMPUTE_UNITS: u64 = 2_370;
-const DYNAMIC_ACCOUNT_WINDOW_COUNT: u64 = 10;
+const DYNAMIC_ACCOUNT_WINDOW_COUNT: u64 = 32;
 const DYNAMIC_ACCOUNT_WINDOW_STRIDE: u64 = ebpf::MM_REGION_SIZE;
 const DYNAMIC_ACCOUNT_WINDOW_START: u64 = ebpf::MM_REGION_SIZE.saturating_mul(5);
 static DYNAMIC_ACCOUNT_WINDOW_STUB: [u8; 1] = [0];
@@ -278,6 +278,7 @@ fn create_vm<'a, 'b>(
         allocator: BpfAllocator::new(heap_size as u64),
         accounts_metadata,
         trace_log: Vec::new(),
+        dynamic_cpi_accounts: Vec::new(),
     })?;
     Ok(EbpfVm::new(
         program.get_loader().clone(),

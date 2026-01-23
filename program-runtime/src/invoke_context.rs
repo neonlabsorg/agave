@@ -174,6 +174,14 @@ pub struct SyscallContext {
     pub allocator: BpfAllocator,
     pub accounts_metadata: Vec<SerializedAccountMetadata>,
     pub trace_log: Vec<[u64; 12]>,
+    pub dynamic_cpi_accounts: Vec<DynamicCpiAccount>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DynamicCpiAccount {
+    pub index_in_transaction: IndexOfAccount,
+    pub is_signer: bool,
+    pub is_writable: bool,
 }
 
 #[derive(Debug, Clone)]

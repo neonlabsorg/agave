@@ -516,6 +516,53 @@ impl TransactionContext {
         )
     }
 
+    pub fn add_account_to_current_instruction(
+        &mut self,
+        index_in_transaction: IndexOfAccount,
+        is_signer: bool,
+        is_writable: bool,
+    ) -> Result<(), InstructionError> {
+        let index_in_trace = self
+            .instruction_trace
+            .len()
+            .checked_sub(1)
+            .ok_or(InstructionError::CallDepth)?;
+        let instruction = self
+            .instruction_trace
+            .get_mut(index_in_trace)
+            .ok_or(InstructionError::CallDepth)?;
+
+        if index_in_transaction as usize >= instruction.dedup_map.len() {
+            return Err(InstructionError::InvalidArgument);
+        }
+
+        let dedup_index = instruction.dedup_map[index_in_transaction as usize] as usize;
+        if dedup_index < instruction.instruction_accounts.len() {
+            let account = instruction
+                .instruction_accounts
+                .get_mut(dedup_index)
+                .ok_or(InstructionError::InvalidArgument)?;
+            account.set_is_signer(account.is_signer() || is_signer);
+            account.set_is_writable(account.is_writable() || is_writable);
+            return Ok(());
+        }
+
+        if instruction.instruction_accounts.len() >= MAX_ACCOUNTS_PER_INSTRUCTION {
+            return Err(InstructionError::InvalidArgument);
+        }
+
+        let index_in_instruction = instruction.instruction_accounts.len() as u8;
+        instruction
+            .instruction_accounts
+            .push(InstructionAccount::new(
+                index_in_transaction,
+                is_signer,
+                is_writable,
+            ));
+        instruction.dedup_map[index_in_transaction as usize] = index_in_instruction;
+        Ok(())
+    }
+
     /// Pushes the next instruction
     #[cfg(not(target_os = "solana"))]
     pub fn push(&mut self) -> Result<(), InstructionError> {
