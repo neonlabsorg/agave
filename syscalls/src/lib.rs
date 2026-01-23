@@ -474,6 +474,8 @@ pub fn create_program_runtime_environment_v1<'a>(
     result.register_function("sol_load_account", SyscallLoadAccount::vm)?;
     result.register_function("sol_cpi_load_account", SyscallCpiLoadAccount::vm)?;
     result.register_function("sol_cpi_load_accounts", SyscallCpiLoadAccounts::vm)?;
+    result.register_function("sol_cpi_unload_account", SyscallCpiUnloadAccount::vm)?;
+    result.register_function("sol_cpi_clear_accounts", SyscallCpiClearAccounts::vm)?;
     result.register_function("sol_account_data_read", SyscallAccountDataRead::vm)?;
     result.register_function("sol_account_data_slice", SyscallAccountDataSlice::vm)?;
     result.register_function(
@@ -1796,6 +1798,102 @@ declare_builtin_function!(
             let out_indices_dst: &mut [u64] = map(out_indices_addr, count as u64)?;
         );
         out_indices_dst.copy_from_slice(&out_indices);
+
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Remove a dynamically loaded CPI account from the current instruction
+    SyscallCpiUnloadAccount,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        pubkey_addr: u64,
+        _arg1: u64,
+        _arg2: u64,
+        _arg3: u64,
+        _arg4: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
+
+        let pubkey = translate_type::<Pubkey>(
+            memory_mapping,
+            pubkey_addr,
+            invoke_context.get_check_aligned(),
+        )?;
+        let index = invoke_context
+            .transaction_context
+            .find_index_of_account(pubkey)
+            .ok_or(InstructionError::MissingAccount)?;
+
+        let syscall_context = invoke_context.get_syscall_context_mut()?;
+        let before_len = syscall_context.dynamic_cpi_accounts.len();
+        syscall_context
+            .dynamic_cpi_accounts
+            .retain(|entry| entry.index_in_transaction != index);
+        if syscall_context.dynamic_cpi_accounts.len() == before_len {
+            return Err(Box::new(InstructionError::InvalidArgument));
+        }
+
+        if let Err(err) = invoke_context
+            .transaction_context
+            .remove_account_from_current_instruction(index)
+        {
+            ic_msg!(
+                invoke_context,
+                "cpi_unload_account: remove_account_from_current_instruction failed index={} err={:?}",
+                index,
+                err
+            );
+            return Err(Box::new(err));
+        }
+
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Clear all dynamically loaded CPI accounts from the current instruction
+    SyscallCpiClearAccounts,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        _arg0: u64,
+        _arg1: u64,
+        _arg2: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
+
+        let indices = {
+            let syscall_context = invoke_context.get_syscall_context_mut()?;
+            let indices = syscall_context
+                .dynamic_cpi_accounts
+                .iter()
+                .map(|entry| entry.index_in_transaction)
+                .collect::<Vec<_>>();
+            syscall_context.dynamic_cpi_accounts.clear();
+            indices
+        };
+
+        for index in indices {
+            if let Err(err) = invoke_context
+                .transaction_context
+                .remove_account_from_current_instruction(index)
+            {
+                ic_msg!(
+                    invoke_context,
+                    "cpi_clear_accounts: remove_account_from_current_instruction failed index={} err={:?}",
+                    index,
+                    err
+                );
+                return Err(Box::new(err));
+            }
+        }
 
         Ok(SUCCESS)
     }

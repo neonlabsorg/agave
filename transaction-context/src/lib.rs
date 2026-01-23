@@ -562,6 +562,45 @@ impl TransactionContext {
         Ok(())
     }
 
+    pub fn remove_account_from_current_instruction(
+        &mut self,
+        index_in_transaction: IndexOfAccount,
+    ) -> Result<(), InstructionError> {
+        let index_in_trace = *self
+            .instruction_stack
+            .last()
+            .ok_or(InstructionError::CallDepth)?;
+        let instruction = self
+            .instruction_trace
+            .get_mut(index_in_trace)
+            .ok_or(InstructionError::CallDepth)?;
+
+        if index_in_transaction as usize >= instruction.dedup_map.len() {
+            return Err(InstructionError::InvalidArgument);
+        }
+
+        let original_len = instruction.instruction_accounts.len();
+        instruction
+            .instruction_accounts
+            .retain(|account| account.index_in_transaction != index_in_transaction);
+        if instruction.instruction_accounts.len() == original_len {
+            return Err(InstructionError::InvalidArgument);
+        }
+
+        instruction.dedup_map.fill(u8::MAX);
+        for (idx, account) in instruction.instruction_accounts.iter().enumerate() {
+            let index_in_instruction = instruction
+                .dedup_map
+                .get_mut(account.index_in_transaction as usize)
+                .ok_or(InstructionError::InvalidArgument)?;
+            if *index_in_instruction == u8::MAX {
+                *index_in_instruction = idx as u8;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Pushes the next instruction
     #[cfg(not(target_os = "solana"))]
     pub fn push(&mut self) -> Result<(), InstructionError> {
