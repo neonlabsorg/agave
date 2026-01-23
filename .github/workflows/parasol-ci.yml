@@ -1,6 +1,9 @@
 name: Parasol ci
 
 on:
+  push:
+    branches:
+      - parasol-ci
   workflow_dispatch:
     inputs:
       tag:
