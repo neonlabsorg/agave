@@ -1616,7 +1616,9 @@ declare_builtin_function!(
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
         let execution_cost = invoke_context.get_execution_cost();
-        consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
+        let syscall_base_cost = execution_cost.syscall_base_cost;
+        let cpi_bytes_per_unit = execution_cost.cpi_bytes_per_unit;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
 
         let index = get_dynamic_account_index(invoke_context, account_index)?;
         let offset = usize::try_from(offset).map_err(|_| InstructionError::InvalidArgument)?;
@@ -1639,7 +1641,7 @@ declare_builtin_function!(
         dst.copy_from_slice(data);
 
         let data_len_cost = (len as u64)
-            .checked_div(execution_cost.cpi_bytes_per_unit)
+            .checked_div(cpi_bytes_per_unit)
             .unwrap_or(u64::MAX);
         consume_compute_meter(invoke_context, data_len_cost)?;
 
@@ -1751,7 +1753,9 @@ declare_builtin_function!(
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
         let execution_cost = invoke_context.get_execution_cost();
-        consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
+        let syscall_base_cost = execution_cost.syscall_base_cost;
+        let cpi_bytes_per_unit = execution_cost.cpi_bytes_per_unit;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
 
         let is_writable = is_writable != 0;
         let window_start = map_dynamic_account_window(
@@ -1773,7 +1777,7 @@ declare_builtin_function!(
         *out_addr_ref = window_start;
 
         let data_len_cost = (len as u64)
-            .checked_div(execution_cost.cpi_bytes_per_unit)
+            .checked_div(cpi_bytes_per_unit)
             .unwrap_or(u64::MAX);
         consume_compute_meter(invoke_context, data_len_cost)?;
 
@@ -1794,7 +1798,9 @@ declare_builtin_function!(
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
         let execution_cost = invoke_context.get_execution_cost();
-        consume_compute_meter(invoke_context, execution_cost.syscall_base_cost)?;
+        let syscall_base_cost = execution_cost.syscall_base_cost;
+        let cpi_bytes_per_unit = execution_cost.cpi_bytes_per_unit;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
 
         let is_writable = (flags & 1) != 0;
         let window_id = flags >> 1;
@@ -1817,7 +1823,7 @@ declare_builtin_function!(
         *out_addr_ref = window_start;
 
         let data_len_cost = (len as u64)
-            .checked_div(execution_cost.cpi_bytes_per_unit)
+            .checked_div(cpi_bytes_per_unit)
             .unwrap_or(u64::MAX);
         consume_compute_meter(invoke_context, data_len_cost)?;
 
