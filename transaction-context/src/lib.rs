@@ -522,10 +522,9 @@ impl TransactionContext {
         is_signer: bool,
         is_writable: bool,
     ) -> Result<(), InstructionError> {
-        let index_in_trace = self
-            .instruction_trace
-            .len()
-            .checked_sub(1)
+        let index_in_trace = *self
+            .instruction_stack
+            .last()
             .ok_or(InstructionError::CallDepth)?;
         let instruction = self
             .instruction_trace
