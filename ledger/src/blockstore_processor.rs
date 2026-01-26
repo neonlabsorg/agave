@@ -855,6 +855,7 @@ pub struct ProcessOptions {
     pub abort_on_invalid_block: bool,
     pub no_block_cost_limits: bool,
     pub exclude_signatures: Option<HashSet<Signature>>,
+    pub prepend_transactions: Option<HashMap<Slot, Vec<VersionedTransaction>>>,
 }
 
 pub fn test_process_blockstore(
@@ -1161,6 +1162,7 @@ fn confirm_full_slot(
         opts.runtime_config.log_messages_bytes_limit,
         &ignored_prioritization_fee_cache,
         opts.exclude_signatures.as_ref(),
+        opts.prepend_transactions.as_ref(),
     )?;
 
     timing.accumulate(&confirmation_timing.batch_execute.totals);
@@ -1501,6 +1503,7 @@ pub fn confirm_slot(
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: &PrioritizationFeeCache,
     exclude_signatures: Option<&HashSet<Signature>>,
+    prepend_transactions: Option<&HashMap<Slot, Vec<VersionedTransaction>>>,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let slot = bank.slot();
 
@@ -1532,6 +1535,7 @@ pub fn confirm_slot(
         log_messages_bytes_limit,
         prioritization_fee_cache,
         exclude_signatures,
+        prepend_transactions,
     )
 }
 
@@ -1550,6 +1554,7 @@ fn confirm_slot_entries(
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: &PrioritizationFeeCache,
     exclude_signatures: Option<&HashSet<Signature>>,
+    prepend_transactions: Option<&HashMap<Slot, Vec<VersionedTransaction>>>,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let ConfirmationTiming {
         confirmation_elapsed,
@@ -1567,6 +1572,19 @@ fn confirm_slot_entries(
 
     let slot = bank.slot();
     let (entries, num_shreds, slot_full) = slot_entries_load_result;
+    let entries = if let Some(prepend_transactions) = prepend_transactions {
+        if let Some(transactions) = prepend_transactions.get(&slot) {
+            if !transactions.is_empty() {
+                prepend_transactions_to_entries(entries, transactions, progress.last_entry)
+            } else {
+                entries
+            }
+        } else {
+            entries
+        }
+    } else {
+        entries
+    };
     let num_entries = entries.len();
     let mut entry_tx_starting_indexes_unfiltered = Vec::with_capacity(num_entries);
     let mut entry_tx_starting_index_unfiltered = progress.num_txs;
@@ -1756,6 +1774,24 @@ fn confirm_slot_entries(
     }
 
     Ok(())
+}
+
+fn prepend_transactions_to_entries(
+    entries: Vec<Entry>,
+    prepend: &[VersionedTransaction],
+    prev_hash: Hash,
+) -> Vec<Entry> {
+    let mut rebuilt = Vec::with_capacity(entries.len().saturating_add(1));
+    let mut hash = prev_hash;
+    let prepend_entry = entry::next_versioned_entry(&hash, 1, prepend.to_vec());
+    hash = prepend_entry.hash;
+    rebuilt.push(prepend_entry);
+    for entry in entries {
+        let rebuilt_entry = entry::next_versioned_entry(&hash, entry.num_hashes, entry.transactions);
+        hash = rebuilt_entry.hash;
+        rebuilt.push(rebuilt_entry);
+    }
+    rebuilt
 }
 
 fn filter_replay_entries_by_signatures(

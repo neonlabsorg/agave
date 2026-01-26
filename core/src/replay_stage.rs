@@ -35,7 +35,6 @@ use {
     agave_votor::root_utils,
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender},
     rayon::{prelude::*, ThreadPool},
-    solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_accounts_db::contains::Contains,
     solana_clock::{BankId, Slot, NUM_CONSECUTIVE_LEADER_SLOTS},
     solana_entry::entry::VerifyRecyclers,
@@ -59,10 +58,7 @@ use {
     solana_pubkey::Pubkey,
     solana_rpc::{
         optimistically_confirmed_bank_tracker::{BankNotification, BankNotificationSenderConfig},
-        rpc::{
-            ExternalAccountDataPatch, ExternalAccountDataSplice, ExternalAccountPatch,
-            ExternalFinalizeMode, ExternalFinalizeRequest,
-        },
+        rpc::{ExternalFinalizeMode, ExternalFinalizeRequest},
         rpc_subscriptions::RpcSubscriptions,
         slot_status_notifier::SlotStatusNotifier,
     },
@@ -76,12 +72,11 @@ use {
         snapshot_controller::SnapshotController,
         vote_sender_types::ReplayVoteSender,
     },
-    solana_sdk_ids::system_program::id as system_program_id,
     solana_signature::Signature,
     solana_signer::Signer,
     solana_svm_timings::ExecuteTimings,
     solana_time_utils::timestamp,
-    solana_transaction::Transaction,
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
     solana_vote::vote_transaction::VoteTransaction,
     std::{
         collections::{HashMap, HashSet},
@@ -749,16 +744,16 @@ impl ReplayStage {
                     requested_finalize = Self::select_finalize_slot_for_timeout(&bank_forks).map(
                         |slot| ExternalFinalizeRequest {
                             slot,
-                            patches: Vec::new(),
                             mode: ExternalFinalizeMode::Replay,
                             exclude_signatures: None,
+                            prepend_transactions: None,
                         },
                     );
                 }
                 if let Some(request) = requested_finalize {
                     let target_slot = request.slot;
-                    let patches = request.patches.as_slice();
                     let exclude_signatures = request.exclude_signatures.as_ref();
+                    let prepend_transactions = request.prepend_transactions.as_ref();
                     let finalize_result = match request.mode {
                         ExternalFinalizeMode::Replay => Self::finalize_history_with_replay(
                             target_slot,
@@ -776,14 +771,15 @@ impl ReplayStage {
                             &mut tbft_structs,
                             &mut tracked_vote_transactions,
                             &drop_bank_sender,
-                            patches,
                             exclude_signatures,
+                            prepend_transactions,
                         ),
                         ExternalFinalizeMode::FinalizeOnly => {
-                            if !patches.is_empty() {
-                                Err("finalizeHistory does not accept patches".to_string())
-                            } else if exclude_signatures.is_some() {
+                            if exclude_signatures.is_some() {
                                 Err("finalizeHistory does not accept excluded signatures"
+                                    .to_string())
+                            } else if prepend_transactions.is_some() {
+                                Err("finalizeHistory does not accept prepend transactions"
                                     .to_string())
                             } else {
                                 Self::finalize_history_without_replay(
@@ -2339,6 +2335,7 @@ impl ReplayStage {
             false,
             log_messages_bytes_limit,
             prioritization_fee_cache,
+            None,
             None,
         )?;
         let tx_count_after = w_replay_progress.num_txs;
@@ -4233,8 +4230,8 @@ impl ReplayStage {
         tbft_structs: &mut TowerBFTStructures,
         tracked_vote_transactions: &mut Vec<TrackedVoteTransaction>,
         drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
-        external_account_patches: &[ExternalAccountPatch],
         exclude_signatures: Option<&HashSet<Signature>>,
+        prepend_transactions: Option<&HashMap<Slot, Vec<VersionedTransaction>>>,
     ) -> Result<(), String> {
         let root_slot = bank_forks.read().unwrap().root();
         if target_slot <= root_slot {
@@ -4264,12 +4261,26 @@ impl ReplayStage {
             return Err("bank forks not reset to a single root bank".to_string());
         }
 
-        let root_bank = bank_forks.read().unwrap().root_bank();
-        Self::apply_external_state_override(&root_bank, external_account_patches)?;
+        if let Some(prepend_transactions) = prepend_transactions {
+            for slot in prepend_transactions.keys() {
+                if *slot <= root_slot || *slot > target_slot {
+                    return Err(format!(
+                        "prepend transaction slot {slot} is outside replay range ({}, {}]",
+                        root_slot, target_slot
+                    ));
+                }
+            }
+        }
 
         let mut replay_options = process_options.clone();
         replay_options.halt_at_slot = Some(target_slot);
         replay_options.exclude_signatures = exclude_signatures.cloned();
+        replay_options.prepend_transactions = prepend_transactions.cloned();
+        if let Some(prepend_transactions) = prepend_transactions {
+            if !prepend_transactions.is_empty() {
+                replay_options.run_verification = false;
+            }
+        }
         blockstore_processor::process_blockstore_from_root(
             blockstore,
             bank_forks,
@@ -4356,92 +4367,6 @@ impl ReplayStage {
         )
         .map_err(|err| format!("failed to set root {target_slot}: {err}"))?;
 
-        Ok(())
-    }
-
-    fn apply_external_state_override(
-        bank: &Arc<Bank>,
-        external_account_patches: &[ExternalAccountPatch],
-    ) -> Result<(), String> {
-        if external_account_patches.is_empty() {
-            return Ok(());
-        }
-        for patch in external_account_patches {
-            let existing = bank.get_account(&patch.pubkey);
-            let (lamports, owner, mut data, executable, rent_epoch) =
-                if let Some(account) = existing {
-                    let owner = patch.owner.unwrap_or(*account.owner());
-                    let data = match patch.data.as_ref() {
-                        Some(data) => data.clone(),
-                        None => account.data().to_vec(),
-                    };
-                    (
-                        patch.lamports.unwrap_or(account.lamports()),
-                        owner,
-                        data,
-                        patch.executable.unwrap_or(account.executable()),
-                        patch.rent_epoch.unwrap_or(account.rent_epoch()),
-                    )
-                } else {
-                    let data = patch.data.clone().unwrap_or_default();
-                    (
-                        patch.lamports.unwrap_or(0),
-                        patch.owner.unwrap_or_else(system_program_id),
-                        data,
-                        patch.executable.unwrap_or(false),
-                        patch.rent_epoch.unwrap_or(0),
-                    )
-                };
-            if let Some(data_patch) = patch.data_patch.as_ref() {
-                Self::apply_data_patch(&mut data, data_patch, &patch.pubkey)?;
-            }
-            if let Some(data_splice) = patch.data_splice.as_ref() {
-                Self::apply_data_splice(&mut data, data_splice, &patch.pubkey)?;
-            }
-            let mut account = AccountSharedData::new(lamports, data.len(), &owner);
-            account.set_data(data);
-            account.set_executable(executable);
-            account.set_rent_epoch(rent_epoch);
-            bank.store_account(&patch.pubkey, &account);
-        }
-        bank.rehash();
-        Ok(())
-    }
-
-    fn apply_data_patch(
-        data: &mut Vec<u8>,
-        patch: &ExternalAccountDataPatch,
-        pubkey: &Pubkey,
-    ) -> Result<(), String> {
-        let offset = usize::try_from(patch.offset)
-            .map_err(|_| format!("data_patch offset too large for account {pubkey}"))?;
-        let end = offset
-            .checked_add(patch.data.len())
-            .ok_or_else(|| format!("data_patch range overflow for account {pubkey}"))?;
-        if data.len() < end {
-            data.resize(end, 0);
-        }
-        if data.len() < offset {
-            data.resize(offset, 0);
-        }
-        data[offset..end].copy_from_slice(&patch.data);
-        Ok(())
-    }
-
-    fn apply_data_splice(
-        data: &mut Vec<u8>,
-        patch: &ExternalAccountDataSplice,
-        pubkey: &Pubkey,
-    ) -> Result<(), String> {
-        let offset = usize::try_from(patch.offset)
-            .map_err(|_| format!("data_splice offset too large for account {pubkey}"))?;
-        let delete_len = usize::try_from(patch.delete_len)
-            .map_err(|_| format!("data_splice delete_len too large for account {pubkey}"))?;
-        if data.len() < offset {
-            data.resize(offset, 0);
-        }
-        let delete_end = offset.saturating_add(delete_len).min(data.len());
-        data.splice(offset..delete_end, patch.insert_data.iter().copied());
         Ok(())
     }
 

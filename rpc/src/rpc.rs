@@ -16,7 +16,6 @@ use {
         BoxFuture, Error, Metadata, Result,
     },
     jsonrpc_derive::rpc,
-    serde::Deserialize,
     solana_account::{AccountSharedData, ReadableAccount},
     solana_account_decoder::{
         encode_ui_account,
@@ -260,31 +259,6 @@ pub struct JsonRpcRequestProcessor {
 }
 impl Metadata for JsonRpcRequestProcessor {}
 
-#[derive(Clone)]
-pub struct ExternalAccountPatch {
-    pub pubkey: Pubkey,
-    pub lamports: Option<u64>,
-    pub owner: Option<Pubkey>,
-    pub data: Option<Vec<u8>>,
-    pub data_patch: Option<ExternalAccountDataPatch>,
-    pub data_splice: Option<ExternalAccountDataSplice>,
-    pub executable: Option<bool>,
-    pub rent_epoch: Option<u64>,
-}
-
-#[derive(Clone)]
-pub struct ExternalAccountDataPatch {
-    pub offset: u64,
-    pub data: Vec<u8>,
-}
-
-#[derive(Clone)]
-pub struct ExternalAccountDataSplice {
-    pub offset: u64,
-    pub delete_len: u64,
-    pub insert_data: Vec<u8>,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum ExternalFinalizeMode {
     Replay,
@@ -294,97 +268,9 @@ pub enum ExternalFinalizeMode {
 #[derive(Clone)]
 pub struct ExternalFinalizeRequest {
     pub slot: Slot,
-    pub patches: Vec<ExternalAccountPatch>,
     pub mode: ExternalFinalizeMode,
     pub exclude_signatures: Option<HashSet<Signature>>,
-}
-
-#[derive(Deserialize, serde::Serialize)]
-pub struct RpcExternalAccountPatch {
-    pub pubkey: String,
-    #[serde(default)]
-    pub lamports: Option<u64>,
-    #[serde(default)]
-    pub owner: Option<String>,
-    #[serde(default)]
-    pub data: Option<String>,
-    #[serde(default)]
-    pub data_patch: Option<RpcExternalAccountDataPatch>,
-    #[serde(default)]
-    pub data_splice: Option<RpcExternalAccountDataSplice>,
-    #[serde(default)]
-    pub executable: Option<bool>,
-    #[serde(default)]
-    pub rent_epoch: Option<u64>,
-}
-
-#[derive(Deserialize, serde::Serialize)]
-pub struct RpcExternalAccountDataPatch {
-    pub offset: u64,
-    pub data: String,
-}
-
-#[derive(Deserialize, serde::Serialize)]
-pub struct RpcExternalAccountDataSplice {
-    pub offset: u64,
-    pub delete_len: u64,
-    pub insert_data: String,
-}
-
-fn decode_external_account_patch(patch: RpcExternalAccountPatch) -> Result<ExternalAccountPatch> {
-    let pubkey = Pubkey::from_str(&patch.pubkey).map_err(|err| {
-        Error::invalid_params(format!("Invalid pubkey {}: {err}", patch.pubkey))
-    })?;
-    let owner = match patch.owner {
-        Some(owner) => Some(Pubkey::from_str(&owner).map_err(|err| {
-            Error::invalid_params(format!("Invalid owner {owner}: {err}"))
-        })?),
-        None => None,
-    };
-    let data = match patch.data {
-        Some(data) => Some(BASE64_STANDARD.decode(data.as_bytes()).map_err(|err| {
-            Error::invalid_params(format!("Invalid base64 data for {pubkey}: {err}"))
-        })?),
-        None => None,
-    };
-    let data_patch = match patch.data_patch {
-        Some(patch) => Some(ExternalAccountDataPatch {
-            offset: patch.offset,
-            data: BASE64_STANDARD.decode(patch.data.as_bytes()).map_err(|err| {
-                Error::invalid_params(format!("Invalid base64 data patch for {pubkey}: {err}"))
-            })?,
-        }),
-        None => None,
-    };
-    let data_splice = match patch.data_splice {
-        Some(patch) => Some(ExternalAccountDataSplice {
-            offset: patch.offset,
-            delete_len: patch.delete_len,
-            insert_data: BASE64_STANDARD
-                .decode(patch.insert_data.as_bytes())
-                .map_err(|err| {
-                    Error::invalid_params(format!(
-                        "Invalid base64 data splice for {pubkey}: {err}"
-                    ))
-                })?,
-        }),
-        None => None,
-    };
-    if data_patch.is_some() && data_splice.is_some() {
-        return Err(Error::invalid_params(format!(
-            "data_patch and data_splice are mutually exclusive for {pubkey}"
-        )));
-    }
-    Ok(ExternalAccountPatch {
-        pubkey,
-        lamports: patch.lamports,
-        owner,
-        data,
-        data_patch,
-        data_splice,
-        executable: patch.executable,
-        rent_epoch: patch.rent_epoch,
-    })
+    pub prepend_transactions: Option<HashMap<Slot, Vec<VersionedTransaction>>>,
 }
 
 fn decode_exclude_signatures(
@@ -403,6 +289,37 @@ fn decode_exclude_signatures(
             Error::invalid_params(format!("Invalid signature {signature_str}: {err}"))
         })?;
         decoded.insert(signature);
+    }
+    Ok(Some(decoded))
+}
+
+fn decode_prepend_transactions(
+    prepend_transactions: Option<HashMap<String, Vec<String>>>,
+) -> Result<Option<HashMap<Slot, Vec<VersionedTransaction>>>> {
+    let prepend_transactions = match prepend_transactions {
+        Some(prepend_transactions) => prepend_transactions,
+        None => return Ok(None),
+    };
+    if prepend_transactions.is_empty() {
+        return Ok(Some(HashMap::new()));
+    }
+    let mut decoded = HashMap::with_capacity(prepend_transactions.len());
+    for (slot_str, transactions) in prepend_transactions {
+        let slot = slot_str.parse::<Slot>().map_err(|err| {
+            Error::invalid_params(format!("Invalid slot {slot_str}: {err}"))
+        })?;
+        if slot == 0 {
+            return Err(Error::invalid_params(
+                "Invalid slot 0 in prepend_transactions".to_string(),
+            ));
+        }
+        let mut decoded_txs = Vec::with_capacity(transactions.len());
+        for tx in transactions {
+            let (_, versioned_tx) =
+                decode_and_deserialize::<VersionedTransaction>(tx, TransactionBinaryEncoding::Base64)?;
+            decoded_txs.push(versioned_tx);
+        }
+        decoded.insert(slot, decoded_txs);
     }
     Ok(Some(decoded))
 }
@@ -438,17 +355,17 @@ fn resolve_finalize_history_slot(
 fn enqueue_finalize_history_request(
     meta: &JsonRpcRequestProcessor,
     slot: Option<Slot>,
-    patches: Vec<ExternalAccountPatch>,
     mode: ExternalFinalizeMode,
     exclude_signatures: Option<HashSet<Signature>>,
+    prepend_transactions: Option<HashMap<Slot, Vec<VersionedTransaction>>>,
 ) -> Result<bool> {
     if let Some(sender) = meta.finalize_history_sender.as_ref() {
         let slot = resolve_finalize_history_slot(meta, slot)?;
         let request = ExternalFinalizeRequest {
             slot,
-            patches,
             mode,
             exclude_signatures,
+            prepend_transactions,
         };
         sender.send(request).map_err(|err| {
             warn!("finalize_history failed to enqueue: {err}");
@@ -3826,8 +3743,8 @@ pub mod rpc_full {
             &self,
             meta: Self::Metadata,
             slot: Option<Slot>,
-            patches: Option<Vec<RpcExternalAccountPatch>>,
             exclude_signatures: Option<Vec<String>>,
+            prepend_transactions: Option<HashMap<String, Vec<String>>>,
         ) -> Result<bool>;
     }
 
@@ -3929,8 +3846,8 @@ pub mod rpc_full {
             enqueue_finalize_history_request(
                 &meta,
                 slot,
-                Vec::new(),
                 ExternalFinalizeMode::FinalizeOnly,
+                None,
                 None,
             )
         }
@@ -3939,23 +3856,17 @@ pub mod rpc_full {
             &self,
             meta: Self::Metadata,
             slot: Option<Slot>,
-            patches: Option<Vec<RpcExternalAccountPatch>>,
             exclude_signatures: Option<Vec<String>>,
+            prepend_transactions: Option<HashMap<String, Vec<String>>>,
         ) -> Result<bool> {
-            let mut decoded = Vec::new();
-            if let Some(patches) = patches {
-                decoded.reserve(patches.len());
-                for patch in patches {
-                    decoded.push(decode_external_account_patch(patch)?);
-                }
-            }
             let exclude_signatures = decode_exclude_signatures(exclude_signatures)?;
+            let prepend_transactions = decode_prepend_transactions(prepend_transactions)?;
             enqueue_finalize_history_request(
                 &meta,
                 slot,
-                decoded,
                 ExternalFinalizeMode::Replay,
                 exclude_signatures,
+                prepend_transactions,
             )
         }
 
@@ -4567,8 +4478,8 @@ pub mod rpc_finalize_history {
             &self,
             meta: Self::Metadata,
             slot: Option<Slot>,
-            patches: Option<Vec<RpcExternalAccountPatch>>,
             exclude_signatures: Option<Vec<String>>,
+            prepend_transactions: Option<HashMap<String, Vec<String>>>,
         ) -> Result<bool>;
     }
 
@@ -4580,8 +4491,8 @@ pub mod rpc_finalize_history {
             enqueue_finalize_history_request(
                 &meta,
                 slot,
-                Vec::new(),
                 ExternalFinalizeMode::FinalizeOnly,
+                None,
                 None,
             )
         }
@@ -4590,23 +4501,17 @@ pub mod rpc_finalize_history {
             &self,
             meta: Self::Metadata,
             slot: Option<Slot>,
-            patches: Option<Vec<RpcExternalAccountPatch>>,
             exclude_signatures: Option<Vec<String>>,
+            prepend_transactions: Option<HashMap<String, Vec<String>>>,
         ) -> Result<bool> {
-            let mut decoded = Vec::new();
-            if let Some(patches) = patches {
-                decoded.reserve(patches.len());
-                for patch in patches {
-                    decoded.push(decode_external_account_patch(patch)?);
-                }
-            }
             let exclude_signatures = decode_exclude_signatures(exclude_signatures)?;
+            let prepend_transactions = decode_prepend_transactions(prepend_transactions)?;
             enqueue_finalize_history_request(
                 &meta,
                 slot,
-                decoded,
                 ExternalFinalizeMode::Replay,
                 exclude_signatures,
+                prepend_transactions,
             )
         }
     }
