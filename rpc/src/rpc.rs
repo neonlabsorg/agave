@@ -352,6 +352,17 @@ fn resolve_finalize_history_slot(
     })
 }
 
+fn recent_blockhash_commitment_override(
+    meta: &JsonRpcRequestProcessor,
+    commitment: Option<CommitmentConfig>,
+) -> Option<CommitmentConfig> {
+    if commitment.is_none() && meta.finalize_history_sender.is_some() {
+        Some(CommitmentConfig::processed())
+    } else {
+        commitment
+    }
+}
+
 fn enqueue_finalize_history_request(
     meta: &JsonRpcRequestProcessor,
     slot: Option<Slot>,
@@ -2475,7 +2486,10 @@ impl JsonRpcRequestProcessor {
     }
 
     fn get_latest_blockhash(&self, config: RpcContextConfig) -> Result<RpcResponse<RpcBlockhash>> {
-        let bank = self.get_bank_with_config(config)?;
+        let bank = self.get_bank_with_config(RpcContextConfig {
+            commitment: recent_blockhash_commitment_override(self, config.commitment),
+            min_context_slot: config.min_context_slot,
+        })?;
         let blockhash = bank.last_blockhash();
         let last_valid_block_height = bank
             .get_blockhash_last_valid_block_height(&blockhash)
@@ -3926,7 +3940,8 @@ pub mod rpc_full {
             let pubkey = verify_pubkey(&pubkey_str)?;
 
             let config = config.unwrap_or_default();
-            let bank = meta.bank(config.commitment);
+            let commitment = recent_blockhash_commitment_override(&meta, config.commitment);
+            let bank = meta.bank(commitment);
 
             let blockhash = if let Some(blockhash) = config.recent_blockhash {
                 verify_hash(&blockhash)?
@@ -3997,6 +4012,8 @@ pub mod rpc_full {
             } else {
                 preflight_commitment.map(|commitment| CommitmentConfig { commitment })
             };
+            let preflight_commitment =
+                recent_blockhash_commitment_override(&meta, preflight_commitment);
             let preflight_bank = &*meta.get_bank_with_config(RpcContextConfig {
                 commitment: preflight_commitment,
                 min_context_slot,
@@ -4133,7 +4150,7 @@ pub mod rpc_full {
                 decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
 
             let bank = &*meta.get_bank_with_config(RpcContextConfig {
-                commitment,
+                commitment: recent_blockhash_commitment_override(&meta, commitment),
                 min_context_slot,
             })?;
             let mut blockhash: Option<RpcBlockhash> = None;
