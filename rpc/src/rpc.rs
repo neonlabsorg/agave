@@ -488,41 +488,31 @@ impl JsonRpcRequestProcessor {
             return bank;
         }
 
-        let slot = self
-            .block_commitment_cache
-            .read()
-            .unwrap()
-            .slot_with_commitment(commitment.commitment);
-
         match commitment.commitment {
             CommitmentLevel::Processed => {
-                debug!("RPC using the heaviest slot: {slot:?}");
+                let bank = self.bank_forks.read().unwrap().working_bank();
+                debug!("RPC using the working bank slot: {:?}", bank.slot());
+                return bank;
             }
             CommitmentLevel::Finalized => {
+                let slot = self
+                    .block_commitment_cache
+                    .read()
+                    .unwrap()
+                    .slot_with_commitment(commitment.commitment);
                 debug!("RPC using block: {slot:?}");
+                let r_bank_forks = self.bank_forks.read().unwrap();
+                return r_bank_forks.get(slot).unwrap_or_else(|| {
+                    warn!(
+                        "Bank with {:?} not found at slot: {:?}",
+                        commitment.commitment, slot
+                    );
+                    r_bank_forks.root_bank()
+                });
             }
             CommitmentLevel::Confirmed => unreachable!(), // SingleGossip variant is deprecated
         };
-
-        let r_bank_forks = self.bank_forks.read().unwrap();
-        r_bank_forks.get(slot).unwrap_or_else(|| {
-            // We log a warning instead of returning an error, because all known error cases
-            // are due to known bugs that should be fixed instead.
-            //
-            // The slot may not be found as a result of a known bug in snapshot creation, where
-            // the bank at the given slot was not included in the snapshot.
-            // Also, it may occur after an old bank has been purged from BankForks and a new
-            // BlockCommitmentCache has not yet arrived. To make this case impossible,
-            // BlockCommitmentCache should hold an `Arc<Bank>` everywhere it currently holds
-            // a slot.
-            //
-            // For more information, see https://github.com/solana-labs/solana/issues/11078
-            warn!(
-                "Bank with {:?} not found at slot: {:?}",
-                commitment.commitment, slot
-            );
-            r_bank_forks.root_bank()
-        })
+        unreachable!("commitment level should be handled above");
     }
 
     fn genesis_creation_time(&self) -> UnixTimestamp {
