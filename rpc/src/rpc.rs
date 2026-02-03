@@ -3943,6 +3943,8 @@ pub mod rpc_full {
 
             let blockhash = if let Some(blockhash) = config.recent_blockhash {
                 verify_hash(&blockhash)?
+            } else if meta.finalize_history_sender.is_some() {
+                meta.bank_forks.read().unwrap().working_bank().last_blockhash()
             } else if commitment.map(|c| c.is_processed()).unwrap_or(false) {
                 bank.last_blockhash()
             } else {
