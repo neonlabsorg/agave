@@ -2496,10 +2496,23 @@ impl JsonRpcRequestProcessor {
     }
 
     fn get_latest_blockhash(&self, config: RpcContextConfig) -> Result<RpcResponse<RpcBlockhash>> {
-        let bank = self.get_bank_with_config(RpcContextConfig {
-            commitment: recent_blockhash_commitment_override(self, config.commitment),
-            min_context_slot: config.min_context_slot,
-        })?;
+        let bank = if self.finalize_history_sender.is_some() {
+            let root_bank = self.bank_forks.read().unwrap().root_bank();
+            if let Some(min_context_slot) = config.min_context_slot {
+                if root_bank.slot() < min_context_slot {
+                    return Err(RpcCustomError::MinContextSlotNotReached {
+                        context_slot: root_bank.slot(),
+                    }
+                    .into());
+                }
+            }
+            root_bank
+        } else {
+            self.get_bank_with_config(RpcContextConfig {
+                commitment: recent_blockhash_commitment_override(self, config.commitment),
+                min_context_slot: config.min_context_slot,
+            })?
+        };
         let blockhash = bank.last_blockhash();
         let last_valid_block_height = bank
             .get_blockhash_last_valid_block_height(&blockhash)
@@ -3964,9 +3977,10 @@ pub mod rpc_full {
                         .unwrap_or(0);
                     (blockhash, last_valid_block_height)
                 } else if meta.finalize_history_sender.is_some() {
-                    let working_bank = meta.bank_forks.read().unwrap().working_bank();
-                    let blockhash = working_bank.last_blockhash();
-                    let last_valid_block_height = working_bank
+                    // In external finalize mode, keep RPC blockhash aligned with the rooted bank.
+                    let root_bank = meta.bank_forks.read().unwrap().root_bank();
+                    let blockhash = root_bank.last_blockhash();
+                    let last_valid_block_height = root_bank
                         .get_blockhash_last_valid_block_height(&blockhash)
                         .unwrap_or(0);
                     (blockhash, last_valid_block_height)
@@ -4192,11 +4206,16 @@ pub mod rpc_full {
                         "sigVerify may not be used with replaceRecentBlockhash",
                     ));
                 }
-                let recent_blockhash = bank.last_blockhash();
+                let blockhash_bank = if meta.finalize_history_sender.is_some() {
+                    meta.bank_forks.read().unwrap().root_bank()
+                } else {
+                    bank.clone()
+                };
+                let recent_blockhash = blockhash_bank.last_blockhash();
                 unsanitized_tx
                     .message
                     .set_recent_blockhash(recent_blockhash);
-                let last_valid_block_height = bank
+                let last_valid_block_height = blockhash_bank
                     .get_blockhash_last_valid_block_height(&recent_blockhash)
                     .expect("bank blockhash queue should contain blockhash");
                 blockhash.replace(RpcBlockhash {
