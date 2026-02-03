@@ -808,10 +808,13 @@ impl Tower {
             if slot != root_slot {
                 // This case should never happen because bank forks purges all
                 // non-descendants of the root every time root is set
-                assert!(
-                    ancestors.contains(&root_slot),
-                    "ancestors: {ancestors:?}, slot: {slot} root: {root_slot}"
-                );
+                if !ancestors.contains(&root_slot) {
+                    // Be conservative and treat as locked out if ancestors are inconsistent.
+                    warn!(
+                        "Missing root in ancestors; treating as locked out. slot={slot} root={root_slot} ancestors={ancestors:?}"
+                    );
+                    return true;
+                }
             }
         }
 
