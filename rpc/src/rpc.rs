@@ -478,6 +478,14 @@ impl JsonRpcRequestProcessor {
 
         let commitment = commitment.unwrap_or_default();
         if commitment.is_confirmed() {
+            if self.finalize_history_sender.is_some() {
+                let bank = self.bank_forks.read().unwrap().root_bank();
+                debug!(
+                    "RPC using root bank slot (external finalize): {:?}",
+                    bank.slot()
+                );
+                return bank;
+            }
             let bank = self
                 .optimistically_confirmed_bank
                 .read()
