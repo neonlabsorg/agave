@@ -3941,18 +3941,33 @@ pub mod rpc_full {
             let commitment = recent_blockhash_commitment_override(&meta, config.commitment);
             let bank = meta.bank(commitment);
 
-            let blockhash = if let Some(blockhash) = config.recent_blockhash {
-                verify_hash(&blockhash)?
-            } else if meta.finalize_history_sender.is_some() {
-                meta.bank_forks.read().unwrap().working_bank().last_blockhash()
-            } else if commitment.map(|c| c.is_processed()).unwrap_or(false) {
-                bank.last_blockhash()
-            } else {
-                bank.confirmed_last_blockhash()
-            };
-            let last_valid_block_height = bank
-                .get_blockhash_last_valid_block_height(&blockhash)
-                .unwrap_or(0);
+            let (blockhash, last_valid_block_height) =
+                if let Some(blockhash) = config.recent_blockhash {
+                    let blockhash = verify_hash(&blockhash)?;
+                    let last_valid_block_height = bank
+                        .get_blockhash_last_valid_block_height(&blockhash)
+                        .unwrap_or(0);
+                    (blockhash, last_valid_block_height)
+                } else if meta.finalize_history_sender.is_some() {
+                    let working_bank = meta.bank_forks.read().unwrap().working_bank();
+                    let blockhash = working_bank.last_blockhash();
+                    let last_valid_block_height = working_bank
+                        .get_blockhash_last_valid_block_height(&blockhash)
+                        .unwrap_or(0);
+                    (blockhash, last_valid_block_height)
+                } else if commitment.map(|c| c.is_processed()).unwrap_or(false) {
+                    let blockhash = bank.last_blockhash();
+                    let last_valid_block_height = bank
+                        .get_blockhash_last_valid_block_height(&blockhash)
+                        .unwrap_or(0);
+                    (blockhash, last_valid_block_height)
+                } else {
+                    let blockhash = bank.confirmed_last_blockhash();
+                    let last_valid_block_height = bank
+                        .get_blockhash_last_valid_block_height(&blockhash)
+                        .unwrap_or(0);
+                    (blockhash, last_valid_block_height)
+                };
 
             let transaction =
                 request_airdrop_transaction(&faucet_addr, &pubkey, lamports, blockhash).map_err(
