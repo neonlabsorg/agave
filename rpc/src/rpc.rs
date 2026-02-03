@@ -356,8 +356,12 @@ fn recent_blockhash_commitment_override(
     meta: &JsonRpcRequestProcessor,
     commitment: Option<CommitmentConfig>,
 ) -> Option<CommitmentConfig> {
-    if commitment.is_none() && meta.finalize_history_sender.is_some() {
-        Some(CommitmentConfig::processed())
+    if meta.finalize_history_sender.is_some() {
+        match commitment {
+            None => Some(CommitmentConfig::processed()),
+            Some(c) if !c.is_processed() => Some(CommitmentConfig::processed()),
+            Some(_) => commitment,
+        }
     } else {
         commitment
     }
@@ -503,6 +507,14 @@ impl JsonRpcRequestProcessor {
                 return bank;
             }
             CommitmentLevel::Finalized => {
+                if self.finalize_history_sender.is_some() {
+                    let bank = self.bank_forks.read().unwrap().root_bank();
+                    debug!(
+                        "RPC using root bank slot (external finalize, finalized): {:?}",
+                        bank.slot()
+                    );
+                    return bank;
+                }
                 let slot = self
                     .block_commitment_cache
                     .read()
@@ -2506,7 +2518,10 @@ impl JsonRpcRequestProcessor {
         blockhash: &Hash,
         config: RpcContextConfig,
     ) -> Result<RpcResponse<bool>> {
-        let bank = self.get_bank_with_config(config)?;
+        let bank = self.get_bank_with_config(RpcContextConfig {
+            commitment: recent_blockhash_commitment_override(self, config.commitment),
+            min_context_slot: config.min_context_slot,
+        })?;
         let is_valid = bank.is_blockhash_valid(blockhash);
         Ok(new_response(&bank, is_valid))
     }
@@ -4449,7 +4464,11 @@ pub mod rpc_full {
                 data,
                 TransactionBinaryEncoding::Base64,
             )?;
-            let bank = &*meta.get_bank_with_config(config.unwrap_or_default())?;
+            let config = config.unwrap_or_default();
+            let bank = &*meta.get_bank_with_config(RpcContextConfig {
+                commitment: recent_blockhash_commitment_override(&meta, config.commitment),
+                min_context_slot: config.min_context_slot,
+            })?;
             let sanitized_versioned_message = SanitizedVersionedMessage::try_from(message)
                 .map_err(|err| {
                     Error::invalid_params(format!("invalid transaction message: {err}"))
