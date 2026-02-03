@@ -532,7 +532,6 @@ impl JsonRpcRequestProcessor {
             }
             CommitmentLevel::Confirmed => unreachable!(), // SingleGossip variant is deprecated
         };
-        unreachable!("commitment level should be handled above");
     }
 
     fn genesis_creation_time(&self) -> UnixTimestamp {
@@ -4206,18 +4205,24 @@ pub mod rpc_full {
                         "sigVerify may not be used with replaceRecentBlockhash",
                     ));
                 }
-                let blockhash_bank = if meta.finalize_history_sender.is_some() {
-                    meta.bank_forks.read().unwrap().root_bank()
-                } else {
-                    bank.clone()
-                };
-                let recent_blockhash = blockhash_bank.last_blockhash();
+                let (recent_blockhash, last_valid_block_height) =
+                    if meta.finalize_history_sender.is_some() {
+                        let root_bank = meta.bank_forks.read().unwrap().root_bank();
+                        let recent_blockhash = root_bank.last_blockhash();
+                        let last_valid_block_height = root_bank
+                            .get_blockhash_last_valid_block_height(&recent_blockhash)
+                            .expect("bank blockhash queue should contain blockhash");
+                        (recent_blockhash, last_valid_block_height)
+                    } else {
+                        let recent_blockhash = bank.last_blockhash();
+                        let last_valid_block_height = bank
+                            .get_blockhash_last_valid_block_height(&recent_blockhash)
+                            .expect("bank blockhash queue should contain blockhash");
+                        (recent_blockhash, last_valid_block_height)
+                    };
                 unsanitized_tx
                     .message
                     .set_recent_blockhash(recent_blockhash);
-                let last_valid_block_height = blockhash_bank
-                    .get_blockhash_last_valid_block_height(&recent_blockhash)
-                    .expect("bank blockhash queue should contain blockhash");
                 blockhash.replace(RpcBlockhash {
                     blockhash: recent_blockhash.to_string(),
                     last_valid_block_height,
