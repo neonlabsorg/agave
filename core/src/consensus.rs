@@ -856,6 +856,9 @@ impl Tower {
             // descends from. Thus it is safe to use `candidate_slot` in the switching proof.
             //
             // Note: the calling function should have already panicked if we do not have ancestors and the last vote is not stray.
+            if self.is_stray_last_vote() || last_voted_slot == self.root() {
+                return Some(true);
+            }
             assert!(self.is_stray_last_vote());
             return Some(true);
         }
