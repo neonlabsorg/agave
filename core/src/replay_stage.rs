@@ -806,6 +806,13 @@ impl ReplayStage {
                                 LatestValidatorVotesForFrozenBanks::default();
                             if matches!(request.mode, ExternalFinalizeMode::FinalizeOnly) {
                                 let working_bank = bank_forks.read().unwrap().working_bank();
+                                let root_slot = bank_forks.read().unwrap().root();
+                                info!(
+                                    "[FINALIZE_DIAG] external finalize finalized_only: target_slot={} root_slot={} working_bank_slot={}",
+                                    target_slot,
+                                    root_slot,
+                                    working_bank.slot()
+                                );
                                 Self::reset_poh_recorder(
                                     &my_pubkey,
                                     &blockstore,
