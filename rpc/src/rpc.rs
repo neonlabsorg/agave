@@ -324,18 +324,32 @@ fn decode_prepend_transactions(
     Ok(Some(decoded))
 }
 
-fn select_finalize_slot_for_request(bank_forks: &RwLock<BankForks>) -> Option<Slot> {
+fn select_finalize_slot_for_request(
+    bank_forks: &RwLock<BankForks>,
+    requested_slot: Option<Slot>,
+) -> Option<Slot> {
     let bank_forks = bank_forks.read().unwrap();
     let root_slot = bank_forks.root();
-    let candidate = bank_forks
+    let mut frozen_slots: Vec<Slot> = bank_forks
         .frozen_banks()
         .map(|(slot, _)| slot)
-        .max()
-        .unwrap_or(root_slot);
-    if candidate > root_slot {
-        Some(candidate)
-    } else {
-        None
+        .filter(|slot| *slot > root_slot)
+        .collect();
+    if frozen_slots.is_empty() {
+        return None;
+    }
+    frozen_slots.sort_unstable();
+
+    match requested_slot {
+        None | Some(0) => frozen_slots.last().copied(),
+        Some(target) => {
+            // Prefer the closest frozen slot <= target; if none, fall back to the smallest > target.
+            if let Some(&slot) = frozen_slots.iter().rev().find(|&&s| s <= target) {
+                Some(slot)
+            } else {
+                frozen_slots.into_iter().find(|s| *s > target)
+            }
+        }
     }
 }
 
@@ -343,11 +357,17 @@ fn resolve_finalize_history_slot(
     meta: &JsonRpcRequestProcessor,
     slot: Option<Slot>,
 ) -> Result<Slot> {
-    let slot = slot.unwrap_or(0);
-    if slot != 0 {
-        return Ok(slot);
+    let requested_slot = slot.unwrap_or(0);
+    if requested_slot != 0 {
+        let bank_forks = meta.bank_forks.read().unwrap();
+        if let Some(bank) = bank_forks.get(requested_slot) {
+            if bank.is_frozen() {
+                return Ok(requested_slot);
+            }
+        }
     }
-    select_finalize_slot_for_request(&meta.bank_forks).ok_or_else(|| {
+
+    select_finalize_slot_for_request(&meta.bank_forks, Some(requested_slot)).ok_or_else(|| {
         Error::invalid_params("No frozen slot above current root to finalize")
     })
 }
@@ -2495,23 +2515,10 @@ impl JsonRpcRequestProcessor {
     }
 
     fn get_latest_blockhash(&self, config: RpcContextConfig) -> Result<RpcResponse<RpcBlockhash>> {
-        let bank = if self.finalize_history_sender.is_some() {
-            let root_bank = self.bank_forks.read().unwrap().root_bank();
-            if let Some(min_context_slot) = config.min_context_slot {
-                if root_bank.slot() < min_context_slot {
-                    return Err(RpcCustomError::MinContextSlotNotReached {
-                        context_slot: root_bank.slot(),
-                    }
-                    .into());
-                }
-            }
-            root_bank
-        } else {
-            self.get_bank_with_config(RpcContextConfig {
-                commitment: recent_blockhash_commitment_override(self, config.commitment),
-                min_context_slot: config.min_context_slot,
-            })?
-        };
+        let bank = self.get_bank_with_config(RpcContextConfig {
+            commitment: recent_blockhash_commitment_override(self, config.commitment),
+            min_context_slot: config.min_context_slot,
+        })?;
         let blockhash = bank.last_blockhash();
         let last_valid_block_height = bank
             .get_blockhash_last_valid_block_height(&blockhash)
@@ -3975,14 +3982,6 @@ pub mod rpc_full {
                         .get_blockhash_last_valid_block_height(&blockhash)
                         .unwrap_or(0);
                     (blockhash, last_valid_block_height)
-                } else if meta.finalize_history_sender.is_some() {
-                    // In external finalize mode, keep RPC blockhash aligned with the rooted bank.
-                    let root_bank = meta.bank_forks.read().unwrap().root_bank();
-                    let blockhash = root_bank.last_blockhash();
-                    let last_valid_block_height = root_bank
-                        .get_blockhash_last_valid_block_height(&blockhash)
-                        .unwrap_or(0);
-                    (blockhash, last_valid_block_height)
                 } else if commitment.map(|c| c.is_processed()).unwrap_or(false) {
                     let blockhash = bank.last_blockhash();
                     let last_valid_block_height = bank
@@ -4205,21 +4204,10 @@ pub mod rpc_full {
                         "sigVerify may not be used with replaceRecentBlockhash",
                     ));
                 }
-                let (recent_blockhash, last_valid_block_height) =
-                    if meta.finalize_history_sender.is_some() {
-                        let root_bank = meta.bank_forks.read().unwrap().root_bank();
-                        let recent_blockhash = root_bank.last_blockhash();
-                        let last_valid_block_height = root_bank
-                            .get_blockhash_last_valid_block_height(&recent_blockhash)
-                            .expect("bank blockhash queue should contain blockhash");
-                        (recent_blockhash, last_valid_block_height)
-                    } else {
-                        let recent_blockhash = bank.last_blockhash();
-                        let last_valid_block_height = bank
-                            .get_blockhash_last_valid_block_height(&recent_blockhash)
-                            .expect("bank blockhash queue should contain blockhash");
-                        (recent_blockhash, last_valid_block_height)
-                    };
+                let recent_blockhash = bank.last_blockhash();
+                let last_valid_block_height = bank
+                    .get_blockhash_last_valid_block_height(&recent_blockhash)
+                    .expect("bank blockhash queue should contain blockhash");
                 unsanitized_tx
                     .message
                     .set_recent_blockhash(recent_blockhash);
