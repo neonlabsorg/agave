@@ -804,6 +804,16 @@ impl ReplayStage {
                             has_new_vote_been_rooted = !wait_for_vote_to_start_leader;
                             latest_validator_votes_for_frozen_banks =
                                 LatestValidatorVotesForFrozenBanks::default();
+                            if matches!(request.mode, ExternalFinalizeMode::FinalizeOnly) {
+                                let working_bank = bank_forks.read().unwrap().working_bank();
+                                Self::reset_poh_recorder(
+                                    &my_pubkey,
+                                    &blockstore,
+                                    working_bank,
+                                    &poh_recorder,
+                                    &leader_schedule_cache,
+                                );
+                            }
                         }
                         Err(err) => {
                             warn!("external finalize failed for slot {target_slot}: {err}");
