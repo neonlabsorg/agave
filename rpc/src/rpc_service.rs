@@ -346,11 +346,24 @@ impl RpcRequestMiddleware {
 
 impl RequestMiddleware for RpcRequestMiddleware {
     fn on_request(&self, request: hyper::Request<hyper::Body>) -> RequestMiddlewareAction {
-        trace!("request uri: {}", request.uri());
+        let request_method = request.method().as_str();
+        let request_path = request.uri().path();
+        let content_length = request
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        if request_path == "/" {
+            info!(
+                "[RPC_DIAG] incoming rpc request: method={request_method} path={request_path} content_length={content_length}"
+            );
+        } else {
+            trace!("request uri: {}", request.uri());
+        }
 
         if let Some(ref snapshot_config) = self.snapshot_config {
-            if request.uri().path() == FULL_SNAPSHOT_REQUEST_PATH
-                || request.uri().path() == INCREMENTAL_SNAPSHOT_REQUEST_PATH
+            if request_path == FULL_SNAPSHOT_REQUEST_PATH
+                || request_path == INCREMENTAL_SNAPSHOT_REQUEST_PATH
             {
                 // Convenience redirect to the latest snapshot
                 let full_snapshot_archive_info =
@@ -359,7 +372,7 @@ impl RequestMiddleware for RpcRequestMiddleware {
                     );
                 let snapshot_archive_info =
                     if let Some(full_snapshot_archive_info) = full_snapshot_archive_info {
-                        if request.uri().path() == FULL_SNAPSHOT_REQUEST_PATH {
+                        if request_path == FULL_SNAPSHOT_REQUEST_PATH {
                             Some(full_snapshot_archive_info.snapshot_archive_info().clone())
                         } else {
                             snapshot_utils::get_highest_incremental_snapshot_archive_info(
@@ -392,11 +405,11 @@ impl RequestMiddleware for RpcRequestMiddleware {
             }
         }
 
-        if let Some(path) = match_supply_path(request.uri().path()) {
+        if let Some(path) = match_supply_path(request_path) {
             process_rest(&self.bank_forks, path)
-        } else if self.is_file_get_path(request.uri().path()) {
-            self.process_file_get(request.uri().path())
-        } else if request.uri().path() == "/health" {
+        } else if self.is_file_get_path(request_path) {
+            self.process_file_get(request_path)
+        } else if request_path == "/health" {
             hyper::Response::builder()
                 .status(hyper::StatusCode::OK)
                 .body(hyper::Body::from(self.health_check()))
@@ -906,8 +919,12 @@ impl JsonRpcService {
                 }
 
                 let server = server.unwrap();
+                info!(
+                    "[RPC_DIAG] rpc server started: addr={rpc_addr} api={rpc_api:?} full_api={full_api} max_body={max_request_body_size}"
+                );
                 close_handle_sender.send(Ok(server.close_handle())).unwrap();
                 server.wait();
+                info!("[RPC_DIAG] rpc server exiting: addr={rpc_addr} api={rpc_api:?}");
                 exit_bigtable_ledger_upload_service.store(true, Ordering::Relaxed);
             })
             .unwrap();

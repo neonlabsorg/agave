@@ -3998,6 +3998,11 @@ pub mod rpc_full {
             let config = config.unwrap_or_default();
             let commitment = recent_blockhash_commitment_override(&meta, config.commitment);
             let bank = meta.bank(commitment);
+            let root_slot = meta.bank_forks.read().unwrap().root_bank().slot();
+            info!(
+                "[RPC_DIAG] request_airdrop: pubkey={pubkey_str} lamports={lamports} commitment={commitment:?} bank_slot={} root_slot={root_slot}",
+                bank.slot()
+            );
 
             let (blockhash, last_valid_block_height) =
                 if let Some(blockhash) = config.recent_blockhash {
@@ -4019,6 +4024,10 @@ pub mod rpc_full {
                         .unwrap_or(0);
                     (blockhash, last_valid_block_height)
                 };
+            info!(
+                "[RPC_DIAG] request_airdrop blockhash: bank_slot={} last_valid_block_height={last_valid_block_height} blockhash={blockhash}",
+                bank.slot()
+            );
 
             let transaction =
                 request_airdrop_transaction(&faucet_addr, &pubkey, lamports, blockhash).map_err(
