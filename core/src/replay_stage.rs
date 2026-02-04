@@ -744,7 +744,7 @@ impl ReplayStage {
                     requested_finalize = Self::select_finalize_slot_for_timeout(&bank_forks).map(
                         |slot| ExternalFinalizeRequest {
                             slot,
-                            mode: ExternalFinalizeMode::Replay,
+                            mode: ExternalFinalizeMode::FinalizeOnly,
                             exclude_signatures: None,
                             prepend_transactions: None,
                         },
@@ -824,6 +824,8 @@ impl ReplayStage {
                         }
                         Err(err) => {
                             warn!("external finalize failed for slot {target_slot}: {err}");
+                            // Avoid tight retry loops on failure; reset the timeout window.
+                            last_external_finalize = Instant::now();
                         }
                     }
                 }

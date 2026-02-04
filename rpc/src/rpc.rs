@@ -395,7 +395,21 @@ fn enqueue_finalize_history_request(
     prepend_transactions: Option<HashMap<Slot, Vec<VersionedTransaction>>>,
 ) -> Result<bool> {
     if let Some(sender) = meta.finalize_history_sender.as_ref() {
+        let requested_slot = slot.unwrap_or(0);
         let slot = resolve_finalize_history_slot(meta, slot)?;
+        let (root_slot, working_slot, forks_len) = {
+            let bank_forks = meta.bank_forks.read().unwrap();
+            (bank_forks.root(), bank_forks.working_bank().slot(), bank_forks.len())
+        };
+        info!(
+            "[FINALIZE_DIAG] enqueue finalize: mode={:?} requested_slot={} resolved_slot={} root={} working={} forks_len={}",
+            mode,
+            requested_slot,
+            slot,
+            root_slot,
+            working_slot,
+            forks_len
+        );
         let request = ExternalFinalizeRequest {
             slot,
             mode,
