@@ -29,12 +29,13 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- --profile minimal --component rustfmt --component clippy -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-WORKDIR /opt
-
-# Clone source; defaults to HTTPS. To use SSH, pass --build-arg AGAVE_REPO=git@github.com:... and --ssh default.
-COPY . /opt/agave
-
 WORKDIR /opt/agave
+
+# Copy source code
+COPY . .
+
+# Initialize submodules
+RUN git submodule update --init --recursive
 
 # Release build
 RUN cargo build --release
