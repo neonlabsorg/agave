@@ -1,0 +1,113 @@
+name: Parasol CI
+run-name: "CI / ${{ github.event_name == 'workflow_dispatch' && inputs.evm_tag || github.event_name == 'pull_request' && github.event.pull_request.title || 'build' }} / ${{ github.event_name }}"
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review]
+  push:
+    branches:
+      - parasol-dev
+      - '[vt][0-9].[0-9]+.[0-9x]+*'
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: neonlabsorg/parasol-node
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: gha-runner-scale-set-large
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ci/Dockerfile
+          tags: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          outputs: type=local,dest=./bin
+          push: true
+
+  prepare-infrastructure:
+    needs: build
+    runs-on: gha-runner-scale-set
+    timeout-minutes: 25
+    if: always()
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.CI_AWS_ACCESS_KEY_ID }}
+      AWS_DEFAULT_REGION: eu-central-1
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.CI_AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout dynamic-ci-cd workflows
+        uses: actions/checkout@v4
+        with:
+          repository: neonlabsorg/dynamic-ci-cd
+          ref: main
+          token: ${{ secrets.GHTOKEN }}
+          path: ./dynamic-ci-cd/.github/workflows
+
+      - name: Create instance
+        uses: ./dynamic-ci-cd/.github/workflows/actions/create-instance
+        id: create-instance
+        with:
+          project-repository: ${{ github.event.repository.name }}
+          run-id: ${{ github.run_id }}
+          cpu: 16
+          memory: 32
+          hcloud-token: ${{ secrets.HCLOUD_TOKEN }}
+
+      - name: Install Docker on instance
+        uses: ./dynamic-ci-cd/.github/workflows/actions/prepare-docker-instance
+        id: prepare-docker-instance
+        with:
+          host: ${{ steps.create-instance.outputs.public-ip-v4 }}
+          ssh-user: ${{ steps.create-instance.outputs.ssh-user }}
+          ssh-key: ${{ steps.create-instance.outputs.ssh-key }}
+
+      - name: Install envsubst
+        run: sudo apt-get update && sudo apt-get install -y gettext
+        shell: bash
+
+      - name: Render docker-compose.yml with envsubst
+        id: read_compose_file
+        run: |
+          rendered=$(envsubst < ./ci/docker-compose.yml)
+          echo "value<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$rendered" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+    outputs:
+      parasol_node_ip: ${{ steps.create-instance.outputs.public-ip-v4 }}
+
+  run_tests:
+    needs: prepare-infrastructure
+    runs-on: gha-runner-scale-set-large
+    env:
+      PARASOL_NODE_IP: ${{ needs.prepare-infrastructure.outputs.parasol_node_ip }}
+      PARASOL_NODE_IMAGE: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+    steps:
+      - name: Run CI tests
+        run: |
+          curl --location "http://${{ env.PARASOL_NODE_IP }}:8899" \
+            --header "Content-Type: application/json" \
+            --data '{"jsonrpc": "2.0", "id":1, "method": "getSlot", "params": [] }'
