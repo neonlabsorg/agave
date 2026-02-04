@@ -1834,10 +1834,29 @@ impl JsonRpcRequestProcessor {
         }
 
         let bank = self.bank(Some(CommitmentConfig::processed()));
+        let root_slot = self.bank_forks.read().unwrap().root_bank().slot();
+        let hsm_root = self
+            .block_commitment_cache
+            .read()
+            .unwrap()
+            .highest_super_majority_root();
+        info!(
+            "[RPC_DIAG] get_signature_statuses: signatures={} search_history={} bank_slot={} root_slot={} hsm_root={}",
+            signatures.len(),
+            search_transaction_history,
+            bank.slot(),
+            root_slot,
+            hsm_root
+        );
         let mut statuses: Vec<Option<TransactionStatus>> = vec![];
+        let mut found_bank = 0usize;
+        let mut found_blockstore = 0usize;
+        let mut found_bigtable = 0usize;
+        let mut missing = 0usize;
 
         for signature in signatures {
             let status = if let Some(status) = self.get_transaction_status(signature, &bank) {
+                found_bank += 1;
                 Some(status)
             } else if search_transaction_history {
                 if let Some(status) = self
@@ -1862,21 +1881,34 @@ impl JsonRpcRequestProcessor {
                         }
                     })
                 {
+                    found_blockstore += 1;
                     Some(status)
                 } else if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
-                    bigtable_ledger_storage
-                        .get_signature_status(&signature)
-                        .await
-                        .map(Some)
-                        .unwrap_or(None)
+                    match bigtable_ledger_storage.get_signature_status(&signature).await {
+                        Ok(status) => {
+                            found_bigtable += 1;
+                            Some(status)
+                        }
+                        Err(_) => None,
+                    }
                 } else {
                     None
                 }
             } else {
                 None
             };
+            if status.is_none() {
+                missing += 1;
+            }
             statuses.push(status);
         }
+        info!(
+            "[RPC_DIAG] get_signature_statuses result: found_bank={} found_blockstore={} found_bigtable={} missing={}",
+            found_bank,
+            found_blockstore,
+            found_bigtable,
+            missing
+        );
         Ok(new_response(&bank, statuses))
     }
 
@@ -3010,7 +3042,9 @@ pub mod rpc_minimal {
         }
 
         fn get_health(&self, meta: Self::Metadata) -> Result<String> {
-            match meta.health.check() {
+            let status = meta.health.check();
+            info!("[RPC_DIAG] get_health: status={status:?}");
+            match status {
                 RpcHealthStatus::Ok => Ok("ok".to_string()),
                 RpcHealthStatus::Unknown => Err(RpcCustomError::NodeUnhealthy {
                     num_slots_behind: None,
@@ -3946,9 +3980,14 @@ pub mod rpc_full {
             signature_strs: Vec<String>,
             config: Option<RpcSignatureStatusConfig>,
         ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>> {
-            debug!(
-                "get_signature_statuses rpc request received: {:?}",
-                signature_strs.len()
+            let search_transaction_history = config
+                .as_ref()
+                .map(|c| c.search_transaction_history)
+                .unwrap_or(false);
+            info!(
+                "[RPC_DIAG] get_signature_statuses request: items={} search_history={}",
+                signature_strs.len(),
+                search_transaction_history
             );
             if signature_strs.len() > MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS {
                 return Box::pin(future::err(Error::invalid_params(format!(
