@@ -523,7 +523,7 @@ impl JsonRpcRequestProcessor {
         match commitment.commitment {
             CommitmentLevel::Processed => {
                 let bank = self.bank_forks.read().unwrap().working_bank();
-                debug!(
+                info!(
                     "[FINALIZE_DIAG] RPC working bank slot: {:?}, root: {:?}",
                     bank.slot(),
                     self.bank_forks.read().unwrap().root()
@@ -2527,7 +2527,7 @@ impl JsonRpcRequestProcessor {
         let last_valid_block_height = bank
             .get_blockhash_last_valid_block_height(&blockhash)
             .expect("bank blockhash queue should contain blockhash");
-        debug!(
+        info!(
             "[FINALIZE_DIAG] get_latest_blockhash slot={} root={} commitment={:?}",
             bank.slot(),
             self.bank_forks.read().unwrap().root(),
