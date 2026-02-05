@@ -773,6 +773,10 @@ impl ReplayStage {
                             &drop_bank_sender,
                             exclude_signatures,
                             prepend_transactions,
+                            &bank_notification_sender,
+                            &block_metadata_notifier,
+                            rpc_subscriptions.as_deref(),
+                            &slot_status_notifier,
                         ),
                         ExternalFinalizeMode::FinalizeOnly => {
                             if exclude_signatures.is_some() {
@@ -791,6 +795,11 @@ impl ReplayStage {
                                     &mut tracked_vote_transactions,
                                     &mut has_new_vote_been_rooted,
                                     &drop_bank_sender,
+                                    &bank_notification_sender,
+                                    &blockstore,
+                                    &leader_schedule_cache,
+                                    rpc_subscriptions.as_deref(),
+                                    &my_pubkey,
                                 )
                             }
                         }
@@ -4251,6 +4260,10 @@ impl ReplayStage {
         drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
         exclude_signatures: Option<&HashSet<Signature>>,
         prepend_transactions: Option<&HashMap<Slot, Vec<VersionedTransaction>>>,
+        bank_notification_sender: &Option<BankNotificationSenderConfig>,
+        block_metadata_notifier: &Option<BlockMetadataNotifierArc>,
+        rpc_subscriptions: Option<&RpcSubscriptions>,
+        slot_status_notifier: &Option<SlotStatusNotifier>,
     ) -> Result<(), String> {
         let root_slot = bank_forks.read().unwrap().root();
         if target_slot <= root_slot {
@@ -4311,13 +4324,79 @@ impl ReplayStage {
         )
         .map_err(|err| format!("failed to replay history to {target_slot}: {err:?}"))?;
 
+        // Emit per-slot Geyser notifications for all replayed frozen banks.
+        // process_blockstore_from_root was originally written for startup replay where
+        // Geyser plugins are not yet listening, so these notifications were intentionally
+        // omitted there.  Emit them here now that we are in the live-finalization path.
         {
-            let mut bank_forks = bank_forks.write().unwrap();
-            let removed_banks = bank_forks
-                .set_root(target_slot, snapshot_controller, None)
-                .map_err(|err| format!("failed to set root {target_slot}: {err}"))?;
-            let _ = drop_bank_sender.send(removed_banks);
+            let r_bank_forks = bank_forks.read().unwrap();
+            let mut frozen: Vec<_> = r_bank_forks
+                .frozen_banks()
+                .filter(|(slot, _)| *slot > root_slot)
+                .collect();
+            frozen.sort_unstable_by_key(|(slot, _)| *slot);
+            for (slot, bank) in &frozen {
+                if let Some(notifier) = slot_status_notifier {
+                    notifier
+                        .read()
+                        .unwrap()
+                        .notify_created_bank(*slot, bank.parent_slot());
+                }
+                if let Some(sender) = bank_notification_sender {
+                    let dependency_work = sender
+                        .dependency_tracker
+                        .as_ref()
+                        .map(|s| s.get_current_declared_work());
+                    sender
+                        .sender
+                        .send((BankNotification::Frozen(bank.clone()), dependency_work))
+                        .unwrap_or_else(|err| warn!("bank_notification_sender failed: {err:?}"));
+                }
+                if let Some(notifier) = block_metadata_notifier {
+                    let parent_blockhash = bank
+                        .parent()
+                        .map(|p| p.last_blockhash())
+                        .unwrap_or_default();
+                    let entry_count = blockstore
+                        .get_slot_entries(*slot, 0)
+                        .unwrap_or_default()
+                        .len() as u64;
+                    notifier.notify_block_metadata(
+                        bank.parent_slot(),
+                        &parent_blockhash.to_string(),
+                        *slot,
+                        &bank.last_blockhash().to_string(),
+                        &bank.get_rewards_and_num_partitions(),
+                        Some(bank.clock().unix_timestamp),
+                        Some(bank.block_height()),
+                        bank.executed_transaction_count(),
+                        entry_count,
+                    );
+                }
+            }
         }
+
+        let target_parent_slot = bank_forks
+            .read()
+            .unwrap()
+            .get(target_slot)
+            .unwrap()
+            .parent_slot();
+        root_utils::check_and_handle_new_root(
+            target_parent_slot,
+            target_slot,
+            snapshot_controller,
+            None,
+            bank_notification_sender,
+            drop_bank_sender,
+            blockstore,
+            leader_schedule_cache,
+            bank_forks,
+            rpc_subscriptions,
+            identity_pubkey,
+            |_| {},
+        )
+        .map_err(|err| format!("failed to set root {target_slot}: {err}"))?;
 
         let (new_progress, new_fork_choice) =
             Self::initialize_progress_and_fork_choice_with_locked_bank_forks(
@@ -4347,6 +4426,7 @@ impl ReplayStage {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finalize_history_without_replay(
         target_slot: Slot,
         bank_forks: &Arc<RwLock<BankForks>>,
@@ -4356,6 +4436,11 @@ impl ReplayStage {
         tracked_vote_transactions: &mut Vec<TrackedVoteTransaction>,
         has_new_vote_been_rooted: &mut bool,
         drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
+        bank_notification_sender: &Option<BankNotificationSenderConfig>,
+        blockstore: &Blockstore,
+        leader_schedule_cache: &Arc<LeaderScheduleCache>,
+        rpc_subscriptions: Option<&RpcSubscriptions>,
+        my_pubkey: &Pubkey,
     ) -> Result<(), String> {
         let root_slot = bank_forks.read().unwrap().root();
         if target_slot <= root_slot {
@@ -4372,13 +4457,20 @@ impl ReplayStage {
         if !target_bank.is_frozen() {
             return Err(format!("finalize target {target_slot} is not frozen"));
         }
+        let parent_slot = target_bank.parent_slot();
 
-        Self::handle_new_root(
+        Self::check_and_handle_new_root(
+            my_pubkey,
+            parent_slot,
             target_slot,
             bank_forks,
             progress,
+            blockstore,
+            leader_schedule_cache,
             snapshot_controller,
+            rpc_subscriptions,
             None,
+            bank_notification_sender,
             has_new_vote_been_rooted,
             tracked_vote_transactions,
             drop_bank_sender,
