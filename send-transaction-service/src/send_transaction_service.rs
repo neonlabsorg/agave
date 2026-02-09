@@ -391,7 +391,12 @@ impl SendTransactionService {
                 )
                 .is_some()
             {
-                info!("Transaction is rooted: {signature}");
+                info!(
+                    "Transaction is rooted: {signature} root_height={} working_height={} last_valid_block_height={}",
+                    root_bank.block_height(),
+                    working_bank.block_height(),
+                    transaction_info.last_valid_block_height,
+                );
                 result.rooted += 1;
                 stats.rooted_transactions.fetch_add(1, Ordering::Relaxed);
                 return false;
@@ -418,7 +423,11 @@ impl SendTransactionService {
                 }
             }
             if transaction_info.last_valid_block_height < root_bank.block_height() {
-                info!("Dropping expired transaction: {signature}");
+                info!(
+                    "Dropping expired transaction: {signature} root_height={} last_valid_block_height={}",
+                    root_bank.block_height(),
+                    transaction_info.last_valid_block_height,
+                );
                 result.expired += 1;
                 stats.expired_transactions.fetch_add(1, Ordering::Relaxed);
                 return false;
@@ -429,7 +438,11 @@ impl SendTransactionService {
 
             if let Some(max_retries) = max_retries {
                 if transaction_info.retries >= max_retries {
-                    info!("Dropping transaction due to max retries: {signature}");
+                    info!(
+                        "Dropping transaction due to max retries: {signature} retries={} max_retries={}",
+                        transaction_info.retries,
+                        max_retries,
+                    );
                     result.max_retries_elapsed += 1;
                     stats
                         .transactions_exceeding_max_retries
@@ -451,7 +464,12 @@ impl SendTransactionService {
                             // Transaction sent before is unknown to the working bank, it might have been
                             // dropped or landed in another fork. Re-send it.
 
-                            info!("Retrying transaction: {signature}");
+                            info!(
+                                "Retrying transaction: {signature} root_height={} working_height={} last_valid_block_height={}",
+                                root_bank.block_height(),
+                                working_bank.block_height(),
+                                transaction_info.last_valid_block_height,
+                            );
                             result.retried += 1;
                             transaction_info.retries += 1;
                         }

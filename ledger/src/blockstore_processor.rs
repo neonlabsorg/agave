@@ -1594,6 +1594,16 @@ fn confirm_slot_entries(
         "Fetched entries for slot {slot}, num_entries: {num_entries}, num_shreds: {num_shreds}, \
          num_txs: {num_txs}, slot_full: {slot_full}",
     );
+    if slot == 0 {
+        info!(
+            "slot=0 load: entries_len={} num_shreds={} slot_full={} last_entry_hash={:?} bank_last_blockhash={}",
+            num_entries,
+            num_shreds,
+            slot_full,
+            entries.last().map(|entry| entry.hash),
+            bank.last_blockhash(),
+        );
+    }
 
     if !skip_verification {
         let tick_hash_count = &mut progress.tick_hash_count;
