@@ -111,7 +111,7 @@ jobs:
           echo "$rendered" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
         env:
-          PARASOL_NODE_IMAGE: ${{ env.IMAGE_NAME }}:PRS-35-create-ci
+          PARASOL_NODE_IMAGE: ${{ env.IMAGE_NAME }}:${{github.sha}}
 
       - name: Debug
         shell: bash
