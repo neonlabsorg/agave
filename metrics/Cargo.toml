@@ -19,9 +19,11 @@ name = "solana_metrics"
 crossbeam-channel = { workspace = true }
 gethostname = { workspace = true }
 log = { workspace = true }
+prometheus = "0.13.4"
 reqwest = { workspace = true, features = ["blocking", "brotli", "deflate", "gzip", "rustls-tls", "json"] }
 solana-cluster-type = { workspace = true }
 solana-sha256-hasher = { workspace = true }
+solana-signature = { workspace = true }
 solana-time-utils = { workspace = true }
 thiserror = { workspace = true }
 

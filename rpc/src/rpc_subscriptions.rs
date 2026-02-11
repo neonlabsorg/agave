@@ -6,6 +6,7 @@ use {
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         parsed_token_accounts::{get_parsed_token_account, get_parsed_token_accounts},
         rpc_pubsub_service::PubSubConfig,
+        signature_metrics_tracker,
         rpc_subscription_tracker::{
             AccountSubscriptionParams, BlockSubscriptionKind, BlockSubscriptionParams,
             LogsSubscriptionKind, LogsSubscriptionParams, ProgramSubscriptionParams,
@@ -839,6 +840,12 @@ impl RpcSubscriptions {
                             }
                         }
                         NotificationEntry::Bank(commitment_slots) => {
+                            signature_metrics_tracker::mark_confirmed_up_to_slot(
+                                commitment_slots.highest_confirmed_slot,
+                            );
+                            signature_metrics_tracker::mark_finalized_up_to_slot(
+                                commitment_slots.highest_super_majority_root,
+                            );
                             const SOURCE: &str = "bank";
                             RpcSubscriptions::notify_watchers(
                                 max_complete_transaction_status_slot.clone(),
@@ -851,6 +858,7 @@ impl RpcSubscriptions {
                             );
                         }
                         NotificationEntry::Gossip(slot) => {
+                            signature_metrics_tracker::mark_confirmed_up_to_slot(slot);
                             let commitment_slots = CommitmentSlots {
                                 highest_confirmed_slot: slot,
                                 ..CommitmentSlots::default()
@@ -896,6 +904,9 @@ impl RpcSubscriptions {
                     }
                     stats.notification_entry_processing_time_us +=
                         queued_at.elapsed().as_micros() as u64;
+                    solana_metrics::custom_metrics::observe_state_update_notification_latency_us(
+                        queued_at.elapsed().as_micros() as u64,
+                    );
                     stats.notification_entry_processing_count += 1;
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -1113,6 +1124,13 @@ impl RpcSubscriptions {
 
                         if notified {
                             num_signatures_notified.fetch_add(1, Ordering::Relaxed);
+                            if params.commitment.is_finalized() {
+                                signature_metrics_tracker::mark_finalized(&params.signature);
+                            } else if params.commitment.is_confirmed() {
+                                signature_metrics_tracker::mark_confirmed(&params.signature);
+                            } else if params.commitment.is_processed() {
+                                signature_metrics_tracker::mark_processed(&params.signature);
+                            }
                         }
                     }
                 }

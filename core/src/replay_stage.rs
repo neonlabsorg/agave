@@ -1897,6 +1897,7 @@ impl ReplayStage {
                     // Already processed this signal
                     continue;
                 }
+                solana_metrics::custom_metrics::inc_duplicate_confirmed_blocks(1);
 
                 let duplicate_confirmed_state = DuplicateConfirmedState::new_from_state(
                     duplicate_confirmed_hash,
@@ -4237,6 +4238,9 @@ impl ReplayStage {
         heaviest_bank: &Arc<Bank>,
         last_threshold_failure_slot: &mut Slot,
     ) {
+        if !heaviest_fork_failures.is_empty() {
+            solana_metrics::custom_metrics::inc_fork_rate(heaviest_fork_failures.len() as u64);
+        }
         info!(
             "Couldn't vote on heaviest fork: {:?}, heaviest_fork_failures: {:?}",
             heaviest_bank.slot(),

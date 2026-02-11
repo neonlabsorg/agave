@@ -29,6 +29,7 @@ use {
     solana_cost_model::cost_model::CostModel,
     solana_fee_structure::FeeBudgetLimits,
     solana_measure::measure_us,
+    solana_metrics::custom_metrics,
     solana_message::v0::MessageAddressTableLookup,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_runtime_transaction::{
@@ -347,6 +348,9 @@ impl SanitizedTransactionReceiveAndBuffer {
 
                 let (priority, cost) =
                     calculate_priority_and_cost(&transaction, &fee_budget_limits, &working_bank);
+                custom_metrics::observe_avg_locked_accounts_per_tx(
+                    transaction.message().account_keys().len() as u64,
+                );
                 num_buffered += 1;
                 if container.insert_new_transaction(transaction, max_age, priority, cost) {
                     num_dropped_on_capacity += 1;

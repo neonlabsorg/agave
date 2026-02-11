@@ -1,8 +1,13 @@
 use {
     crate::commands::{FromClapArgMatches, Result},
     clap::{value_t, ArgMatches},
+    serde::Deserialize,
     solana_accounts_db::accounts_index::AccountSecondaryIndexes,
-    solana_rpc::rpc::{JsonRpcConfig, RpcBigtableConfig},
+    solana_rpc::{
+        rpc::{JsonRpcConfig, RpcBigtableConfig},
+        tx_type_rules::{anchor_discriminator_from_method_name, parse_discriminator, RpcTxTypeRule},
+    },
+    std::{fs, str::FromStr},
 };
 
 impl FromClapArgMatches for JsonRpcConfig {
@@ -14,6 +19,7 @@ impl FromClapArgMatches for JsonRpcConfig {
         } else {
             None
         };
+        let tx_type_rules = load_tx_type_rules(matches)?;
 
         Ok(JsonRpcConfig {
             enable_rpc_transaction_history: matches.is_present("enable_rpc_transaction_history"),
@@ -40,9 +46,152 @@ impl FromClapArgMatches for JsonRpcConfig {
             full_api: matches.is_present("full_rpc_api"),
             rpc_scan_and_fix_roots: matches.is_present("rpc_scan_and_fix_roots"),
             max_request_body_size: Some(value_t!(matches, "rpc_max_request_body_size", usize)?),
+            tx_type_rules,
             disable_health_check: false,
         })
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DiscriminatorInput {
+    String(String),
+    Number(u64),
+}
+
+impl DiscriminatorInput {
+    fn as_text(&self) -> String {
+        match self {
+            Self::String(value) => value.clone(),
+            Self::Number(value) => value.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcTxTypeRuleSerde {
+    program_id: String,
+    discriminator: Option<DiscriminatorInput>,
+    method_name: Option<String>,
+    tx_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcTxTypeRuleFile {
+    rules: Vec<RpcTxTypeRuleSerde>,
+}
+
+fn parse_tx_type_rule(
+    program_id: &str,
+    discriminator_input: Option<&str>,
+    method_name: Option<&str>,
+    tx_type: &str,
+) -> Result<RpcTxTypeRule> {
+    let program_id = solana_pubkey::Pubkey::from_str(program_id).map_err(|err| {
+        crate::commands::Error::Dynamic(Box::<dyn std::error::Error>::from(format!(
+            "invalid program_id `{program_id}` in tx type rule: {err}"
+        )))
+    })?;
+    let discriminator = if let Some(method_name) = method_name {
+        anchor_discriminator_from_method_name(method_name)
+    } else if let Some(discriminator_input) = discriminator_input {
+        parse_discriminator(discriminator_input).map_err(|err| {
+            crate::commands::Error::Dynamic(Box::<dyn std::error::Error>::from(format!(
+                "invalid discriminator `{discriminator_input}` in tx type rule: {err}"
+            )))
+        })?
+    } else {
+        return Err(crate::commands::Error::Dynamic(
+            Box::<dyn std::error::Error>::from(
+                "tx type rule must provide either `method_name` or `discriminator`".to_string(),
+            ),
+        ));
+    };
+    Ok(RpcTxTypeRule {
+        program_id,
+        discriminator,
+        tx_type: tx_type.to_string(),
+    })
+}
+
+fn parse_inline_rule(rule: &str) -> Result<RpcTxTypeRule> {
+    let mut parts = rule.splitn(3, ':');
+    let Some(program_id) = parts.next() else {
+        unreachable!();
+    };
+    let Some(method_or_discriminator) = parts.next() else {
+        return Err(crate::commands::Error::Dynamic(
+            Box::<dyn std::error::Error>::from(format!(
+                "invalid `--rpc-tx-type-map-rule` format `{rule}`; expected PROGRAM_ID:METHOD_NAME|DISCRIMINATOR_HEX|DISCRIMINATOR_U64:TX_TYPE"
+            )),
+        ));
+    };
+    let Some(tx_type) = parts.next() else {
+        return Err(crate::commands::Error::Dynamic(
+            Box::<dyn std::error::Error>::from(format!(
+                "invalid `--rpc-tx-type-map-rule` format `{rule}`; expected PROGRAM_ID:METHOD_NAME|DISCRIMINATOR_HEX|DISCRIMINATOR_U64:TX_TYPE"
+            )),
+        ));
+    };
+    let method_name = if parse_discriminator(method_or_discriminator).is_err() {
+        Some(method_or_discriminator)
+    } else {
+        None
+    };
+    let discriminator_input = if method_name.is_none() {
+        Some(method_or_discriminator)
+    } else {
+        None
+    };
+    parse_tx_type_rule(program_id, discriminator_input, method_name, tx_type)
+}
+
+pub fn load_tx_type_rules(matches: &ArgMatches) -> Result<Vec<RpcTxTypeRule>> {
+    let mut rules = Vec::new();
+
+    if let Some(path) = matches.value_of("rpc_tx_type_map_config") {
+        let content = fs::read_to_string(path).map_err(|err| {
+            crate::commands::Error::Dynamic(Box::<dyn std::error::Error>::from(format!(
+                "failed to read --rpc-tx-type-map-config `{path}`: {err}"
+            )))
+        })?;
+
+        if let Ok(file) = serde_yaml::from_str::<RpcTxTypeRuleFile>(&content) {
+            for rule in file.rules {
+                let discriminator_text = rule.discriminator.as_ref().map(DiscriminatorInput::as_text);
+                rules.push(parse_tx_type_rule(
+                    &rule.program_id,
+                    discriminator_text.as_deref(),
+                    rule.method_name.as_deref(),
+                    &rule.tx_type,
+                )?);
+            }
+        } else if let Ok(file_rules) = serde_yaml::from_str::<Vec<RpcTxTypeRuleSerde>>(&content) {
+            for rule in file_rules {
+                let discriminator_text = rule.discriminator.as_ref().map(DiscriminatorInput::as_text);
+                rules.push(parse_tx_type_rule(
+                    &rule.program_id,
+                    discriminator_text.as_deref(),
+                    rule.method_name.as_deref(),
+                    &rule.tx_type,
+                )?);
+            }
+        } else {
+            return Err(crate::commands::Error::Dynamic(
+                Box::<dyn std::error::Error>::from(format!(
+                    "failed to parse --rpc-tx-type-map-config `{path}`; expected YAML/JSON list of rules or {{rules: [...]}}"
+                )),
+            ));
+        }
+    }
+
+    if let Some(values) = matches.values_of("rpc_tx_type_map_rule") {
+        for value in values {
+            rules.push(parse_inline_rule(value)?);
+        }
+    }
+
+    Ok(rules)
 }
 
 #[cfg(test)]

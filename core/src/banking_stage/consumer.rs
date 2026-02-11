@@ -10,6 +10,7 @@ use {
     solana_fee::FeeFeatures,
     solana_fee_structure::FeeBudgetLimits,
     solana_measure::measure_us,
+    solana_metrics::custom_metrics,
     solana_poh::{
         poh_recorder::PohRecorderError,
         transaction_recorder::{
@@ -256,6 +257,8 @@ impl Consumer {
                 // following are retryable errors
                 Err(TransactionError::AccountInUse) => {
                     error_counters.account_in_use += 1;
+                    custom_metrics::inc_account_lock_conflict_rate(1);
+                    custom_metrics::inc_retry_due_to_account_in_use_rate(1);
                     Some(index)
                 }
                 Err(TransactionError::WouldExceedMaxBlockCostLimit) => {

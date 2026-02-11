@@ -324,6 +324,17 @@ where
                 receive_time_us: _,
                 buffer_time_us: _,
             } = &receiving_stats;
+            let total_dropped = *num_dropped_without_buffering
+                + *num_dropped_on_parsing_and_sanitization
+                + *num_dropped_on_lock_validation
+                + *num_dropped_on_compute_budget
+                + *num_dropped_on_age
+                + *num_dropped_on_already_processed
+                + *num_dropped_on_fee_payer
+                + *num_dropped_on_capacity;
+            if total_dropped > 0 {
+                solana_metrics::custom_metrics::inc_tx_dropped_total(total_dropped as u64);
+            }
 
             count_metrics.num_received += *num_received;
             count_metrics.num_dropped_on_receive += *num_dropped_without_buffering;
