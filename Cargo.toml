@@ -687,3 +687,6 @@ solana-rent = { path = "neon/solana-sdk/rent" }
 solana-rent-collector = { path = "neon/solana-sdk/rent-collector" }
 solana-fee-calculator = { path = "neon/solana-sdk/fee-calculator" }
 solana-fee-structure = { path = "neon/solana-sdk/fee-structure" }
+solana-system-interface = { path = "neon/solana-sdk/system-interface" }
+solana-account-info = { path = "neon/solana-sdk/account-info" }
+solana-compute-budget-interface = { path = "neon/solana-sdk/compute-budget-interface" }

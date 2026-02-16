@@ -6975,8 +6975,6 @@ dependencies = [
 [[package]]
 name = "solana-account-info"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82f4691b69b172c687d218dd2f1f23fc7ea5e9aa79df9ac26dab3d8dd829ce48"
 dependencies = [
  "bincode",
  "serde",
@@ -8014,8 +8012,6 @@ dependencies = [
 [[package]]
 name = "solana-compute-budget-interface"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8292c436b269ad23cecc8b24f7da3ab07ca111661e25e00ce0e1d22771951ab9"
 dependencies = [
  "borsh",
  "solana-instruction",
@@ -11036,8 +11032,6 @@ dependencies = [
 [[package]]
 name = "solana-system-interface"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e1790547bfc3061f1ee68ea9d8dc6c973c02a163697b24263a8e9f2e6d4afa2"
 dependencies = [
  "num-traits",
  "serde",
