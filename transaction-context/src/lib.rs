@@ -30,7 +30,7 @@ pub const MAX_ACCOUNT_DATA_LEN: u64 = 32 * 1024 * 1024;
 // faster than they intend to, because the AccessViolationHandler might grow
 // an account up to MAX_ACCOUNT_DATA_GROWTH_PER_INSTRUCTION at once.
 pub const MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION: i64 = MAX_ACCOUNT_DATA_LEN as i64 * 2;
-pub const MAX_ACCOUNT_DATA_GROWTH_PER_INSTRUCTION: usize = 10 * 10 * 1_024;
+pub const MAX_ACCOUNT_DATA_GROWTH_PER_INSTRUCTION: usize = 10 * 1_024;
 
 #[cfg(test)]
 static_assertions::const_assert_eq!(
