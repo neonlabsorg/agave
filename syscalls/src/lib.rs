@@ -1629,26 +1629,17 @@ declare_builtin_function!(
         let is_writable = is_writable != 0;
         let is_signer = is_signer != 0;
 
-        match cpi_load_account(invoke_context, pubkey, is_writable, is_signer)? {
-            CpiLoadAccountResult::Success => {
-                translate_mut!(
-                    memory_mapping,
-                    invoke_context.get_check_aligned(),
-                    let out_index: &mut u64 = map(out_index_addr)?;
-                );
-                *out_index = u64::MAX;
-                Ok(SUCCESS)
-            }
-            CpiLoadAccountResult::AccountAlreadyLoaded { instruction_index } => {
-                translate_mut!(
-                    memory_mapping,
-                    invoke_context.get_check_aligned(),
-                    let out_index: &mut u64 = map(out_index_addr)?;
-                );
-                *out_index = instruction_index;
-                Err(Box::new(InstructionError::DuplicateAccountIndex))
-            }
-        }
+        let index = match cpi_load_account(invoke_context, pubkey, is_writable, is_signer)? {
+            CpiLoadAccountResult::Success => u64::MAX,
+            CpiLoadAccountResult::AccountAlreadyLoaded { instruction_index } => instruction_index,
+        };
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let out_index: &mut u64 = map(out_index_addr)?;
+        );
+        *out_index = index;
+        Ok(SUCCESS)
     }
 );
 
@@ -1673,8 +1664,6 @@ declare_builtin_function!(
             return Err(Box::new(InstructionError::InvalidArgument));
         }
 
-        let mut already_loaded_count = 0usize;
-
         let pubkeys = translate_slice::<Pubkey>(
             memory_mapping,
             pubkeys_addr,
@@ -1688,15 +1677,11 @@ declare_builtin_function!(
         for i in 0..count {
             let pubkey = &pubkeys[i];
 
-            match cpi_load_account(invoke_context, pubkey, is_writable, is_signer)? {
-                CpiLoadAccountResult::Success => {
-                    out_indices[i] = u64::MAX;
-                }
-                CpiLoadAccountResult::AccountAlreadyLoaded { instruction_index } => {
-                    out_indices[i] = instruction_index;
-                    already_loaded_count = already_loaded_count.saturating_add(1);
-                }
-            }
+            let index = match cpi_load_account(invoke_context, pubkey, is_writable, is_signer)? {
+                CpiLoadAccountResult::Success => u64::MAX,
+                CpiLoadAccountResult::AccountAlreadyLoaded { instruction_index } => instruction_index,
+            };
+            out_indices[i] = index;
         }
 
         translate_mut!(
@@ -1706,11 +1691,7 @@ declare_builtin_function!(
         );
         out_indices_dst.copy_from_slice(&out_indices);
 
-        if already_loaded_count == 0 {
-            Ok(SUCCESS)
-        } else {
-            Err(Box::new(InstructionError::DuplicateAccountIndex))
-        }
+        Ok(SUCCESS)
     }
 );
 
