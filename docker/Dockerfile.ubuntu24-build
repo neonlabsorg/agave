@@ -47,7 +47,6 @@ RUN cargo build --release
 # Collect binaries in a clean location for copying out of the image
 FROM scratch AS artifacts
 COPY --from=builder /opt/agave/target/release/solana-* /out/
-COPY --from=builder /opt/agave/platform-tools-sdk/sbf/syscalls.txt /out/
 
 # Minimal runtime image with the compiled binaries
 FROM ubuntu:24.04 AS runtime
