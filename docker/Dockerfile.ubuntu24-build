@@ -63,7 +63,6 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/agave/target/release/solana-* /usr/local/bin/
-COPY --from=builder /opt/agave/platform-tools-sdk/sbf/syscalls.txt /usr/local/bin/
 
 # Default to showing available binaries; override entrypoint/command as needed
 CMD ["solana-validator", "--version"]
