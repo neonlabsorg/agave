@@ -24,7 +24,7 @@ use {
     solana_sdk_ids::{
         bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4, native_loader, sysvar,
     },
-    solana_svm_callback::InvokeContextCallback,
+    solana_svm_callback::TransactionProcessingCallback,
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_log_collector::{ic_msg, LogCollector},
     solana_svm_measure::measure::Measure,
@@ -146,7 +146,7 @@ pub struct EnvironmentConfig<'a> {
     pub blockhash: Hash,
     pub blockhash_lamports_per_signature: u64,
     pub disable_program_deployment: bool,
-    epoch_stake_callback: &'a dyn InvokeContextCallback,
+    transaction_processing_callback: &'a dyn TransactionProcessingCallback,
     feature_set: &'a SVMFeatureSet,
     sysvar_cache: &'a SysvarCache,
 }
@@ -155,7 +155,7 @@ impl<'a> EnvironmentConfig<'a> {
         blockhash: Hash,
         blockhash_lamports_per_signature: u64,
         disable_program_deployment: bool,
-        epoch_stake_callback: &'a dyn InvokeContextCallback,
+        transaction_processing_callback: &'a dyn TransactionProcessingCallback,
         feature_set: &'a SVMFeatureSet,
         sysvar_cache: &'a SysvarCache,
     ) -> Self {
@@ -163,7 +163,7 @@ impl<'a> EnvironmentConfig<'a> {
             blockhash,
             blockhash_lamports_per_signature,
             disable_program_deployment,
-            epoch_stake_callback,
+            transaction_processing_callback,
             feature_set,
             sysvar_cache,
         }
@@ -174,6 +174,14 @@ pub struct SyscallContext {
     pub allocator: BpfAllocator,
     pub accounts_metadata: Vec<SerializedAccountMetadata>,
     pub trace_log: Vec<[u64; 12]>,
+    pub dynamic_cpi_accounts: Vec<DynamicCpiAccount>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DynamicCpiAccount {
+    pub index_in_transaction: IndexOfAccount,
+    pub is_signer: bool,
+    pub is_writable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -514,7 +522,7 @@ impl<'a> InvokeContext<'a> {
         self.push()?;
         let instruction_datas: Vec<_> = message_instruction_datas_iter.collect();
         self.environment_config
-            .epoch_stake_callback
+            .transaction_processing_callback
             .process_precompile(program_id, instruction_data, instruction_datas)
             .map_err(InstructionError::from)
             .and(self.pop())
@@ -676,21 +684,30 @@ impl<'a> InvokeContext<'a> {
     /// Get cached epoch total stake.
     pub fn get_epoch_stake(&self) -> u64 {
         self.environment_config
-            .epoch_stake_callback
+            .transaction_processing_callback
             .get_epoch_stake()
     }
 
     /// Get cached stake for the epoch vote account.
     pub fn get_epoch_stake_for_vote_account(&self, pubkey: &'a Pubkey) -> u64 {
         self.environment_config
-            .epoch_stake_callback
+            .transaction_processing_callback
             .get_epoch_stake_for_vote_account(pubkey)
     }
 
     pub fn is_precompile(&self, pubkey: &Pubkey) -> bool {
         self.environment_config
-            .epoch_stake_callback
+            .transaction_processing_callback
             .is_precompile(pubkey)
+    }
+
+    pub fn get_account_shared_data(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<(AccountSharedData, Slot)> {
+        self.environment_config
+            .transaction_processing_callback
+            .get_account_shared_data(pubkey)
     }
 
     // Should alignment be enforced during user pointer translation
@@ -749,7 +766,10 @@ macro_rules! with_mock_invoke_context_with_feature_set {
         $transaction_accounts:expr $(,)?
     ) => {
         use {
-            solana_svm_callback::InvokeContextCallback,
+            solana_account::AccountSharedData,
+            solana_clock::Slot,
+            solana_pubkey::Pubkey,
+            solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
             solana_svm_log_collector::LogCollector,
             $crate::{
                 __private::{Hash, ReadableAccount, Rent, TransactionContext},
@@ -762,6 +782,11 @@ macro_rules! with_mock_invoke_context_with_feature_set {
 
         struct MockInvokeContextCallback {}
         impl InvokeContextCallback for MockInvokeContextCallback {}
+        impl TransactionProcessingCallback for MockInvokeContextCallback {
+            fn get_account_shared_data(&self, _pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
+                None
+            }
+        }
 
         let compute_budget = SVMTransactionExecutionBudget::new_with_defaults(
             $feature_set.raise_cpi_nesting_limit_to_8,

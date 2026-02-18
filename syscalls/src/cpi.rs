@@ -878,6 +878,8 @@ where
                 update_caller_account_region: instruction_account.is_writable() || update_caller,
                 update_caller_account_info: instruction_account.is_writable(),
             });
+        } else if is_dynamic_cpi_account(invoke_context, instruction_account.index_in_transaction) {
+            continue;
         } else {
             ic_msg!(
                 invoke_context,
@@ -889,6 +891,21 @@ where
     }
 
     Ok(accounts)
+}
+
+fn is_dynamic_cpi_account(
+    invoke_context: &InvokeContext,
+    index_in_transaction: IndexOfAccount,
+) -> bool {
+    // TODO: check signer and writable privileges
+    invoke_context
+        .get_syscall_context()
+        .map(|ctx| {
+            ctx.dynamic_cpi_accounts
+                .iter()
+                .any(|entry| entry.index_in_transaction == index_in_transaction)
+        })
+        .unwrap_or(false)
 }
 
 fn check_instruction_size(num_accounts: usize, data_len: usize) -> Result<(), Error> {
@@ -1897,6 +1914,7 @@ mod tests {
                 allocator: BpfAllocator::new(solana_program_entrypoint::HEAP_LENGTH as u64),
                 accounts_metadata: vec![account_metadata],
                 trace_log: Vec::new(),
+                dynamic_cpi_accounts: Vec::new(),
             })
             .unwrap();
 

@@ -274,6 +274,7 @@ fn create_vm<'a, 'b>(
         allocator: BpfAllocator::new(heap_size as u64),
         accounts_metadata,
         trace_log: Vec::new(),
+        dynamic_cpi_accounts: Vec::new(),
     })?;
     Ok(EbpfVm::new(
         program.get_loader().clone(),

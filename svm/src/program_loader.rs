@@ -259,7 +259,8 @@ mod tests {
             solana_sbpf::program::BuiltinProgram,
         },
         solana_sdk_ids::{bpf_loader, bpf_loader_upgradeable},
-        solana_svm_callback::InvokeContextCallback,
+        solana_clock::Slot,
+        solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
         std::{
             cell::RefCell,
             collections::HashMap,

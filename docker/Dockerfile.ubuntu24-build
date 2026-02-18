@@ -47,6 +47,7 @@ RUN cargo build --release
 # Collect binaries in a clean location for copying out of the image
 FROM scratch AS artifacts
 COPY --from=builder /opt/agave/target/release/solana-* /out/
+COPY --from=builder /opt/agave/platform-tools-sdk/sbf/syscalls.txt /out/
 
 # Minimal runtime image with the compiled binaries
 FROM ubuntu:24.04 AS runtime
@@ -63,6 +64,7 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/agave/target/release/solana-* /usr/local/bin/
+COPY --from=builder /opt/agave/platform-tools-sdk/sbf/syscalls.txt /usr/local/bin/
 
 # Default to showing available binaries; override entrypoint/command as needed
 CMD ["solana-validator", "--version"]

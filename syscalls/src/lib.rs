@@ -13,6 +13,7 @@ pub use self::{
 #[allow(deprecated)]
 use {
     crate::mem_ops::is_nonoverlapping,
+    solana_account::{ReadableAccount, AccountSharedData},
     solana_account_info::AccountInfo,
     solana_big_mod_exp::{big_mod_exp, BigModExpParams},
     solana_blake3_hasher as blake3,
@@ -29,7 +30,7 @@ use {
     solana_program_entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, SUCCESS},
     solana_program_runtime::{
         execution_budget::{SVMTransactionExecutionBudget, SVMTransactionExecutionCost},
-        invoke_context::InvokeContext,
+        invoke_context::{DynamicCpiAccount, InvokeContext},
         stable_log,
     },
     solana_pubkey::{Pubkey, PubkeyError, MAX_SEEDS, MAX_SEED_LEN, PUBKEY_BYTES},
@@ -67,6 +68,7 @@ mod sysvar;
 
 /// Maximum signers
 const MAX_SIGNERS: usize = 16;
+const MAX_DYNAMIC_CPI_ACCOUNTS: usize = 256;
 
 /// Error definitions
 #[derive(Debug, ThisError, PartialEq, Eq)]
@@ -451,6 +453,10 @@ pub fn create_program_runtime_environment_v1<'a>(
     // Return data
     result.register_function("sol_set_return_data", SyscallSetReturnData::vm)?;
     result.register_function("sol_get_return_data", SyscallGetReturnData::vm)?;
+
+    // Dynamic account loading
+    result.register_function("sol_cpi_load_account", SyscallCpiLoadAccount::vm)?;
+    result.register_function("sol_cpi_load_accounts", SyscallCpiLoadAccounts::vm)?;
 
     // Cross-program invocation
     result.register_function("sol_invoke_signed_c", SyscallInvokeSignedC::vm)?;
@@ -1517,6 +1523,197 @@ declare_builtin_function!(
     }
 );
 
+enum CpiLoadAccountResult {
+    Success,
+    AccountAlreadyLoaded { instruction_index: u64 },
+}
+
+fn cpi_load_account(
+    invoke_context: &mut InvokeContext,
+    pubkey: &Pubkey,
+    is_writable: bool,
+    is_signer: bool,
+) -> Result<CpiLoadAccountResult, Error> {
+    let index = if let Some(index) = invoke_context
+        .transaction_context
+        .find_index_of_account(pubkey)
+    {
+        // Check whether or not the account in the instruction
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_current_instruction_context()?;
+        if let Some((instr_index, _account)) = instruction_context
+                .instruction_accounts()
+                .iter()
+                .enumerate()
+                .find(|(_, account)| account.index_in_transaction == index)
+        {
+            // Account already in the instruction.
+            // This accounts should be passed to the nested CPI through AccountInfos
+            // and should not be added to the instruction again through cpi_load_account,
+            // otherwise it will cause data corruption.
+            return Ok(CpiLoadAccountResult::AccountAlreadyLoaded { instruction_index: instr_index as u64 });
+        }
+        index
+    } else {
+        let (account, _slot) = invoke_context
+            .get_account_shared_data(pubkey)
+            .unwrap_or((AccountSharedData::default(), 0));
+        let data_len_cost = (account.data().len() as u64)
+            .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
+            .unwrap_or(u64::MAX);
+        consume_compute_meter(invoke_context, data_len_cost)?;
+        invoke_context
+            .transaction_context
+            .add_account(*pubkey, account)?
+    };
+
+    {
+        let syscall_context = invoke_context.get_syscall_context_mut()?;
+        if let Some(entry) = syscall_context
+            .dynamic_cpi_accounts
+            .iter_mut()
+            .find(|entry| entry.index_in_transaction == index)
+        {
+            entry.is_writable |= is_writable;
+            entry.is_signer |= is_signer;
+        } else {
+            if syscall_context.dynamic_cpi_accounts.len() >= MAX_DYNAMIC_CPI_ACCOUNTS {
+                return Err(Box::new(InstructionError::MaxAccountsExceeded));
+            }
+            syscall_context.dynamic_cpi_accounts.push(DynamicCpiAccount {
+                index_in_transaction: index,
+                is_writable,
+                is_signer,
+            });
+        }
+    }
+
+    if let Err(err) = invoke_context
+        .transaction_context
+        .add_account_to_current_instruction(index, is_signer, is_writable)
+    {
+        ic_msg!(
+            invoke_context,
+            "cpi_load_account: add_account_to_current_instruction failed index={} err={:?}",
+            index,
+            err
+        );
+        return Err(Box::new(err));
+    }
+
+    Ok(CpiLoadAccountResult::Success)
+}
+
+declare_builtin_function!(
+    /// Load an account into the transaction context for CPI usage
+    SyscallCpiLoadAccount,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        pubkey_addr: u64,
+        is_writable: u64,
+        is_signer: u64,
+        out_index_addr: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        let syscall_base_cost = execution_cost.syscall_base_cost;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+
+        let pubkey = translate_type::<Pubkey>(
+            memory_mapping,
+            pubkey_addr,
+            invoke_context.get_check_aligned(),
+        )?;
+        let is_writable = is_writable != 0;
+        let is_signer = is_signer != 0;
+
+        match cpi_load_account(invoke_context, pubkey, is_writable, is_signer)? {
+            CpiLoadAccountResult::Success => {
+                translate_mut!(
+                    memory_mapping,
+                    invoke_context.get_check_aligned(),
+                    let out_index: &mut u64 = map(out_index_addr)?;
+                );
+                *out_index = u64::MAX;
+                Ok(SUCCESS)
+            }
+            CpiLoadAccountResult::AccountAlreadyLoaded { instruction_index } => {
+                translate_mut!(
+                    memory_mapping,
+                    invoke_context.get_check_aligned(),
+                    let out_index: &mut u64 = map(out_index_addr)?;
+                );
+                *out_index = instruction_index;
+                Err(Box::new(InstructionError::DuplicateAccountIndex))
+            }
+        }
+    }
+);
+
+declare_builtin_function!(
+    /// Load multiple accounts into the transaction context for CPI usage
+    SyscallCpiLoadAccounts,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        pubkeys_addr: u64,
+        count: u64,
+        is_writable: u64,
+        is_signer: u64,
+        out_indices_addr: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        let syscall_base_cost = execution_cost.syscall_base_cost;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+
+        let count = usize::try_from(count).map_err(|_| InstructionError::InvalidArgument)?;
+        if count == 0 {
+            return Err(Box::new(InstructionError::InvalidArgument));
+        }
+
+        let mut already_loaded_count = 0usize;
+
+        let pubkeys = translate_slice::<Pubkey>(
+            memory_mapping,
+            pubkeys_addr,
+            count as u64,
+            invoke_context.get_check_aligned(),
+        )?.to_vec();
+        let is_writable = is_writable != 0;
+        let is_signer = is_signer != 0;
+        let mut out_indices = vec![0u64; count];
+
+        for i in 0..count {
+            let pubkey = &pubkeys[i];
+
+            match cpi_load_account(invoke_context, pubkey, is_writable, is_signer)? {
+                CpiLoadAccountResult::Success => {
+                    out_indices[i] = u64::MAX;
+                }
+                CpiLoadAccountResult::AccountAlreadyLoaded { instruction_index } => {
+                    out_indices[i] = instruction_index;
+                    already_loaded_count = already_loaded_count.saturating_add(1);
+                }
+            }
+        }
+
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let out_indices_dst: &mut [u64] = map(out_indices_addr, count as u64)?;
+        );
+        out_indices_dst.copy_from_slice(&out_indices);
+
+        if already_loaded_count == 0 {
+            Ok(SUCCESS)
+        } else {
+            Err(Box::new(InstructionError::DuplicateAccountIndex))
+        }
+    }
+);
+
 declare_builtin_function!(
     /// Get a processed sigling instruction
     SyscallGetProcessedSiblingInstruction,
@@ -2152,7 +2349,7 @@ mod tests {
         assert_matches::assert_matches,
         core::slice,
         solana_account::{create_account_shared_data_for_test, AccountSharedData},
-        solana_clock::Clock,
+        solana_clock::{Clock, Slot},
         solana_epoch_rewards::EpochRewards,
         solana_epoch_schedule::EpochSchedule,
         solana_fee_calculator::FeeCalculator,
@@ -2179,6 +2376,7 @@ mod tests {
         solana_stable_layout::stable_instruction::StableInstruction,
         solana_stake_interface::stake_history::{self, StakeHistory, StakeHistoryEntry},
         solana_sysvar_id::SysvarId,
+        solana_svm_callback::TransactionProcessingCallback,
         solana_transaction_context::InstructionAccount,
         std::{
             hash::{DefaultHasher, Hash, Hasher},
@@ -2619,6 +2817,7 @@ mod tests {
                     allocator: BpfAllocator::new(solana_program_entrypoint::HEAP_LENGTH as u64),
                     accounts_metadata: Vec::new(),
                     trace_log: Vec::new(),
+                    dynamic_cpi_accounts: Vec::new(),
                 })
                 .unwrap();
             let config = Config {
@@ -4850,7 +5049,13 @@ mod tests {
         const EXPECTED_TOTAL_STAKE: u64 = 200_000_000_000_000;
 
         struct MockCallback {}
-        impl InvokeContextCallback for MockCallback {
+        impl TransactionProcessingCallback for MockCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, Slot)> {
+                None
+            }
             fn get_epoch_stake(&self) -> u64 {
                 EXPECTED_TOTAL_STAKE
             }
@@ -4905,7 +5110,13 @@ mod tests {
         const EXPECTED_EPOCH_STAKE: u64 = 55_000_000_000;
 
         struct MockCallback {}
-        impl InvokeContextCallback for MockCallback {
+        impl TransactionProcessingCallback for MockCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, Slot)> {
+                None
+            }
             // Total stake is not needed for this test.
             fn get_epoch_stake_for_vote_account(&self, vote_address: &Pubkey) -> u64 {
                 if *vote_address == TARGET_VOTE_ADDRESS {

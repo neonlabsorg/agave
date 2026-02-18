@@ -6,7 +6,7 @@ use {
     serde_derive::{Deserialize, Serialize},
     serde_json::Result,
     solana_account::{
-        create_account_shared_data_for_test, state_traits::StateMut, AccountSharedData,
+        create_account_shared_data_for_test, state_traits::StateMut,
     },
     solana_bpf_loader_program::{create_vm, load_program_from_bytes},
     solana_cli_output::{OutputFormat, QuietDisplay, VerboseDisplay},

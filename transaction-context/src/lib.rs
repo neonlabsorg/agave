@@ -15,7 +15,6 @@ use {
     std::{
         cell::{Cell, Ref, RefCell, RefMut},
         collections::HashSet,
-        pin::Pin,
         rc::Rc,
     },
 };
@@ -108,26 +107,30 @@ pub type TransactionAccount = (Pubkey, AccountSharedData);
 
 #[derive(Debug)]
 pub struct TransactionAccounts {
-    accounts: Vec<RefCell<AccountSharedData>>,
-    touched_flags: RefCell<Box<[bool]>>,
+    #[allow(clippy::vec_box)]
+    accounts: RefCell<Vec<Box<RefCell<AccountSharedData>>>>,
+    touched_flags: RefCell<Vec<bool>>,
     resize_delta: Cell<i64>,
     lamports_delta: Cell<i128>,
+    dynamic_accounts_lamports_sum: Cell<u128>,
 }
 
 impl TransactionAccounts {
+    #[allow(clippy::vec_box)]
     #[cfg(not(target_os = "solana"))]
-    fn new(accounts: Vec<RefCell<AccountSharedData>>) -> TransactionAccounts {
-        let touched_flags = vec![false; accounts.len()].into_boxed_slice();
+    fn new(accounts: Vec<Box<RefCell<AccountSharedData>>>) -> TransactionAccounts {
+        let touched_flags = vec![false; accounts.len()];
         TransactionAccounts {
-            accounts,
+            accounts: RefCell::new(accounts),
             touched_flags: RefCell::new(touched_flags),
             resize_delta: Cell::new(0),
             lamports_delta: Cell::new(0),
+            dynamic_accounts_lamports_sum: Cell::new(0),
         }
     }
 
     fn len(&self) -> usize {
-        self.accounts.len()
+        self.accounts.borrow().len()
     }
 
     #[cfg(not(target_os = "solana"))]
@@ -140,7 +143,7 @@ impl TransactionAccounts {
         Ok(())
     }
 
-    fn update_accounts_resize_delta(
+    pub fn update_accounts_resize_delta(
         &self,
         old_len: usize,
         new_len: usize,
@@ -152,7 +155,7 @@ impl TransactionAccounts {
         Ok(())
     }
 
-    fn can_data_be_resized(&self, old_len: usize, new_len: usize) -> Result<(), InstructionError> {
+    pub fn can_data_be_resized(&self, old_len: usize, new_len: usize) -> Result<(), InstructionError> {
         // The new length can not exceed the maximum permitted length
         if new_len > MAX_ACCOUNT_DATA_LEN as usize {
             return Err(InstructionError::InvalidRealloc);
@@ -168,14 +171,18 @@ impl TransactionAccounts {
     }
 
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-    fn try_borrow_mut(
+    pub fn try_borrow_mut(
         &self,
         index: IndexOfAccount,
     ) -> Result<RefMut<'_, AccountSharedData>, InstructionError> {
-        self.accounts
+        let accounts = self.accounts.borrow();
+        let account_cell = accounts
             .get(index as usize)
-            .ok_or(InstructionError::MissingAccount)?
-            .try_borrow_mut()
+            .ok_or(InstructionError::MissingAccount)?;
+        let account_ptr: *const RefCell<AccountSharedData> = &**account_cell;
+        drop(accounts);
+        // Safe: the account is boxed, so its address is stable even if the vec moves.
+        unsafe { (*account_ptr).try_borrow_mut() }
             .map_err(|_| InstructionError::AccountBorrowFailed)
     }
 
@@ -183,10 +190,14 @@ impl TransactionAccounts {
         &self,
         index: IndexOfAccount,
     ) -> Result<Ref<'_, AccountSharedData>, InstructionError> {
-        self.accounts
+        let accounts = self.accounts.borrow();
+        let account_cell = accounts
             .get(index as usize)
-            .ok_or(InstructionError::MissingAccount)?
-            .try_borrow()
+            .ok_or(InstructionError::MissingAccount)?;
+        let account_ptr: *const RefCell<AccountSharedData> = &**account_cell;
+        drop(accounts);
+        // Safe: the account is boxed, so its address is stable even if the vec moves.
+        unsafe { (*account_ptr).try_borrow() }
             .map_err(|_| InstructionError::AccountBorrowFailed)
     }
 
@@ -203,6 +214,22 @@ impl TransactionAccounts {
     fn get_lamports_delta(&self) -> i128 {
         self.lamports_delta.get()
     }
+
+    pub fn get_dynamic_accounts_lamports_sum(&self) -> u128 {
+        self.dynamic_accounts_lamports_sum.get()
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    fn add_account(&self, account: AccountSharedData) -> IndexOfAccount {
+        let lamports = account.lamports();
+        let mut accounts = self.accounts.borrow_mut();
+        let index = accounts.len() as IndexOfAccount;
+        accounts.push(Box::new(RefCell::new(account)));
+        self.touched_flags.borrow_mut().push(false);
+        self.dynamic_accounts_lamports_sum
+            .set(self.dynamic_accounts_lamports_sum.get().saturating_add(lamports as u128));
+        index
+    }
 }
 
 /// Loaded transaction shared between runtime and programs.
@@ -210,7 +237,7 @@ impl TransactionAccounts {
 /// This context is valid for the entire duration of a transaction being processed.
 #[derive(Debug)]
 pub struct TransactionContext {
-    account_keys: Pin<Box<[Pubkey]>>,
+    account_keys: Vec<Pubkey>,
     accounts: Rc<TransactionAccounts>,
     instruction_stack_capacity: usize,
     instruction_trace_capacity: usize,
@@ -233,10 +260,10 @@ impl TransactionContext {
     ) -> Self {
         let (account_keys, accounts): (Vec<_>, Vec<_>) = transaction_accounts
             .into_iter()
-            .map(|(key, account)| (key, RefCell::new(account)))
+            .map(|(key, account)| (key, Box::new(RefCell::new(account))))
             .unzip();
         Self {
-            account_keys: Pin::new(account_keys.into_boxed_slice()),
+            account_keys,
             accounts: Rc::new(TransactionAccounts::new(accounts)),
             instruction_stack_capacity,
             instruction_trace_capacity,
@@ -258,14 +285,20 @@ impl TransactionContext {
         Ok(Rc::try_unwrap(self.accounts)
             .expect("transaction_context.accounts has unexpected outstanding refs")
             .accounts
+            .into_inner()
             .into_iter()
-            .map(RefCell::into_inner)
+            .map(|account| RefCell::into_inner(*account))
             .collect())
     }
 
     #[cfg(not(target_os = "solana"))]
     pub fn accounts(&self) -> &Rc<TransactionAccounts> {
         &self.accounts
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn add_lamports_delta(&self, balance: i128) -> Result<(), InstructionError> {
+        self.accounts.add_lamports_delta(balance)
     }
 
     /// Returns the total number of accounts loaded in this Transaction
@@ -289,6 +322,25 @@ impl TransactionContext {
             .iter()
             .position(|key| key == pubkey)
             .map(|index| index as IndexOfAccount)
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn add_account(
+        &mut self,
+        pubkey: Pubkey,
+        account: AccountSharedData,
+        //is_writable: bool,
+    ) -> Result<IndexOfAccount, InstructionError> {
+        if let Some(_index) = self.find_index_of_account(&pubkey) {
+            return Err(InstructionError::DuplicateAccountIndex);
+        }
+        if self.account_keys.len() >= MAX_ACCOUNTS_PER_TRANSACTION {
+            return Err(InstructionError::MaxAccountsExceeded);
+        }
+
+        let index = self.accounts.add_account(account);
+        self.account_keys.push(pubkey);
+        Ok(index)
     }
 
     /// Gets the max length of the instruction trace
@@ -415,6 +467,52 @@ impl TransactionContext {
         )
     }
 
+    pub fn add_account_to_current_instruction(
+        &mut self,
+        index_in_transaction: IndexOfAccount,
+        is_signer: bool,
+        is_writable: bool,
+    ) -> Result<(), InstructionError> {
+        let index_in_trace = *self
+            .instruction_stack
+            .last()
+            .ok_or(InstructionError::CallDepth)?;
+        let instruction = self
+            .instruction_trace
+            .get_mut(index_in_trace)
+            .ok_or(InstructionError::CallDepth)?;
+
+        if index_in_transaction as usize >= instruction.dedup_map.len() {
+            return Err(InstructionError::InvalidArgument);
+        }
+
+        let dedup_index = instruction.dedup_map[index_in_transaction as usize] as usize;
+        if dedup_index < instruction.instruction_accounts.len() {
+            let account = instruction
+                .instruction_accounts
+                .get_mut(dedup_index)
+                .ok_or(InstructionError::InvalidArgument)?;
+            account.set_is_signer(account.is_signer() || is_signer);
+            account.set_is_writable(account.is_writable() || is_writable);
+            return Ok(());
+        }
+
+        if instruction.instruction_accounts.len() >= MAX_ACCOUNTS_PER_INSTRUCTION {
+            return Err(InstructionError::InvalidArgument);
+        }
+
+        let index_in_instruction = instruction.instruction_accounts.len() as u8;
+        instruction
+            .instruction_accounts
+            .push(InstructionAccount::new(
+                index_in_transaction,
+                is_signer,
+                is_writable,
+            ));
+        instruction.dedup_map[index_in_transaction as usize] = index_in_instruction;
+        Ok(())
+    }
+    
     /// Pushes the next instruction
     #[cfg(not(target_os = "solana"))]
     pub fn push(&mut self) -> Result<(), InstructionError> {
@@ -1173,9 +1271,10 @@ impl From<TransactionContext> for ExecutionRecord {
             ..
         } = Rc::try_unwrap(context.accounts)
             .expect("transaction_context.accounts has unexpected outstanding refs");
-        let accounts = Vec::from(Pin::into_inner(context.account_keys))
+        let accounts = context
+            .account_keys
             .into_iter()
-            .zip(accounts.into_iter().map(RefCell::into_inner))
+            .zip(accounts.into_inner().into_iter().map(|account| RefCell::into_inner(*account)))
             .collect();
         let touched_account_count = touched_flags
             .borrow()
