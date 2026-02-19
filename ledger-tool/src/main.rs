@@ -2342,7 +2342,7 @@ fn main() {
                                 identity_pubkey,
                                 identity_pubkey,
                                 100,
-                                VoteStateV3::get_rent_exempt_reserve(&rent).max(1),
+                                VoteStateV3::get_rent_exempt_reserve(&rent),
                             );
 
                             bank.store_account(
