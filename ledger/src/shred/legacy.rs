@@ -14,7 +14,6 @@ use {
 };
 
 const_assert_eq!(ShredData::SIZE_OF_PAYLOAD, ShredCode::SIZE_OF_PAYLOAD);
-const_assert_eq!(ShredData::SIZE_OF_PAYLOAD, 1228);
 
 const SIZE_OF_ERASURE_ENCODED_SLICE: usize =
     ShredCode::SIZE_OF_PAYLOAD - ShredCode::SIZE_OF_HEADERS;

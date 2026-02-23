@@ -14,7 +14,7 @@ use {
     static_assertions::const_assert_eq,
 };
 
-const_assert_eq!(ShredCode::SIZE_OF_PAYLOAD, 1228);
+const_assert_eq!(ShredCode::SIZE_OF_PAYLOAD, PACKET_DATA_SIZE - SIZE_OF_NONCE);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShredCode {
