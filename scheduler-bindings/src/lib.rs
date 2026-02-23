@@ -67,10 +67,7 @@
 //!
 
 /// Reference to a transaction that can shared safely across processes.
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct SharableTransactionRegion {
     /// Offset within the shared memory allocator.
@@ -80,10 +77,7 @@ pub struct SharableTransactionRegion {
 }
 
 /// Reference to an array of Pubkeys that can be shared safely across processes.
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct SharablePubkeys {
     /// Offset within the shared memory allocator.
@@ -104,8 +98,7 @@ pub struct SharablePubkeys {
 /// 4. External pack process frees all transaction memory pointed to by the
 ///    [`SharableTransactionRegion`] in the batch, then frees the memory for
 ///    the array of [`SharableTransactionRegion`].
-#[cfg_attr(feature = "dev-context-only-utils", derive(Debug, PartialEq, Eq))]
-#[derive(Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(C)]
 pub struct SharableTransactionBatchRegion {
     /// Number of transactions in the batch.
@@ -121,10 +114,7 @@ pub struct SharableTransactionBatchRegion {
 /// 2. agave sends a [`WorkerToPackMessage`] with `responses`.
 /// 3. External pack process processes the inner messages. Potentially freeing
 ///    any memory within each inner message (see [`worker_message_types`] for details).
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct TransactionResponseRegion {
     /// Tag indicating the type of message.
@@ -149,10 +139,7 @@ pub struct TransactionResponseRegion {
 /// TPU passes transactions to the external pack process.
 /// This is also a transfer of ownership of the transaction:
 ///   the external pack process is responsible for freeing the memory.
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct TpuToPackMessage {
     pub transaction: SharableTransactionRegion,
@@ -197,10 +184,7 @@ pub const IS_LEADER: u8 = LEADER_READY;
 
 /// Message: [Agave -> Pack]
 /// Agave passes leader status to the external pack process.
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct ProgressMessage {
     /// Indicates the current leader status of the node.
@@ -248,10 +232,7 @@ pub const MAX_TRANSACTIONS_PER_MESSAGE: usize = 64;
 ///
 /// These messages do not transfer ownership of the transactions.
 /// The external pack process is still responsible for freeing the memory.
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct PackToWorkerMessage {
     /// Flags on how to handle this message.
@@ -324,10 +305,7 @@ pub mod processed_codes {
 
 /// Message: [Worker -> Pack]
 /// Message from worker threads in response to a [`PackToWorkerMessage`].
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct WorkerToPackMessage {
     /// Offset and number of transactions in the batch.
@@ -354,10 +332,7 @@ pub mod worker_message_types {
     /// Response to pack for a transaction that attempted execution.
     /// This response will only be sent if the original message flags
     /// requested execution i.e. [`super::pack_message_flags::EXECUTE`].
-    #[cfg_attr(
-        feature = "dev-context-only-utils",
-        derive(Debug, Clone, Copy, PartialEq, Eq)
-    )]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(C)]
     pub struct ExecutionResponse {
         /// The slot this transaction was executed.
@@ -521,10 +496,7 @@ pub mod worker_message_types {
         pub const FAILED: u8 = 1 << 2;
     }
 
-    #[cfg_attr(
-        feature = "dev-context-only-utils",
-        derive(Debug, Clone, Copy, PartialEq, Eq)
-    )]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(C)]
     pub struct CheckResponse {
         /// See [`parsing_and_sanitization_flags`] for details.
