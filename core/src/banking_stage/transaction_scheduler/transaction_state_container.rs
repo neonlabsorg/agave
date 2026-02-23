@@ -418,6 +418,31 @@ mod tests {
     }
 
     #[test]
+    fn test_uniform_priority_capacity_keeps_oldest_transactions() {
+        let mut container = TransactionStateContainer::with_capacity(2);
+        let uniform_priority = 0;
+
+        for i in 0..3 {
+            let (transaction, max_age, _priority, cost) = test_transaction(uniform_priority);
+            let dropped =
+                container.insert_new_transaction(transaction, max_age, uniform_priority, cost);
+            if i < 2 {
+                assert!(!dropped);
+            } else {
+                assert!(dropped);
+            }
+        }
+
+        let first = container.pop().unwrap();
+        let second = container.pop().unwrap();
+        assert!(container.pop().is_none());
+
+        // Oldest two remain when capacity is exceeded under uniform priority.
+        assert_eq!(first.id, 0);
+        assert_eq!(second.id, 1);
+    }
+
+    #[test]
     fn test_get_mut_transaction_state() {
         let mut container = TransactionStateContainer::with_capacity(5);
         push_to_container(&mut container, 5);

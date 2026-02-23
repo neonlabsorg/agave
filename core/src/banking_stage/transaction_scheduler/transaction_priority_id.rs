@@ -3,12 +3,15 @@ use qualifier_attr::qualifiers;
 use {
     crate::banking_stage::scheduler_messages::TransactionId,
     prio_graph::TopLevelId,
-    std::hash::{Hash, Hasher},
+    std::{
+        cmp::Ordering,
+        hash::{Hash, Hasher},
+    },
 };
 
 /// A unique identifier tied with priority ordering for a transaction/packet:
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TransactionPriorityId {
     pub(crate) priority: u64,
     pub(crate) id: TransactionId,
@@ -23,6 +26,21 @@ impl TransactionPriorityId {
 impl Hash for TransactionPriorityId {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state)
+    }
+}
+
+impl Ord for TransactionPriorityId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Higher priority first. For equal priority, older txs first (FIFO).
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| other.id.cmp(&self.id))
+    }
+}
+
+impl PartialOrd for TransactionPriorityId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -48,14 +66,14 @@ mod tests {
             assert!(id2 >= id1);
         }
 
-        // Equal priority then compare by id
+        // Equal priority then compare by id (FIFO: older id first)
         {
             let id1 = TransactionPriorityId::new(1, 1);
             let id2 = TransactionPriorityId::new(1, 2);
-            assert!(id1 < id2);
-            assert!(id1 <= id2);
-            assert!(id2 > id1);
-            assert!(id2 >= id1);
+            assert!(id1 > id2);
+            assert!(id1 >= id2);
+            assert!(id2 < id1);
+            assert!(id2 <= id1);
         }
 
         // Equal priority and id
