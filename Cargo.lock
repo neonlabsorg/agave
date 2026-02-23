@@ -6978,6 +6978,7 @@ version = "3.0.0"
 dependencies = [
  "bincode",
  "serde",
+ "solana-define-syscall 3.0.0",
  "solana-program-error",
  "solana-program-memory",
  "solana-pubkey",
@@ -9458,8 +9459,6 @@ dependencies = [
 [[package]]
 name = "solana-packet"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6edf2f25743c95229ac0fdc32f8f5893ef738dbf332c669e9861d33ddb0f469d"
 dependencies = [
  "bincode",
  "bitflags 2.9.1",
