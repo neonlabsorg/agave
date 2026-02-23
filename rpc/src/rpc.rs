@@ -9038,12 +9038,13 @@ pub mod tests {
         );
 
         let tx64 = BASE64_STANDARD.encode(&tx_ser);
+        let tx64_len = tx64.len();
         assert_eq!(
             decode_and_deserialize::<Transaction>(tx64, TransactionBinaryEncoding::Base64)
                 .unwrap_err(),
             Error::invalid_params(format!(
-                "decoded solana_transaction::Transaction too large: {too_big} bytes (max: \
-                 {PACKET_DATA_SIZE} bytes)"
+                "base64 encoded solana_transaction::Transaction too large: {tx64_len} bytes (max: \
+                 encoded/raw {MAX_BASE64_SIZE}/{PACKET_DATA_SIZE})",
             ))
         );
 
@@ -9060,10 +9061,14 @@ pub mod tests {
         );
 
         tx64.push('!');
+        let tx64_len = tx64.len();
         assert_eq!(
             decode_and_deserialize::<Transaction>(tx64, TransactionBinaryEncoding::Base64)
                 .unwrap_err(),
-            Error::invalid_params("invalid base64 encoding: InvalidByte(1640, 33)".to_string())
+            Error::invalid_params(format!(
+                "base64 encoded solana_transaction::Transaction too large: {tx64_len} bytes (max: \
+                 encoded/raw {MAX_BASE64_SIZE}/{PACKET_DATA_SIZE})",
+            ))
         );
 
         let mut tx58 = bs58::encode(&tx_ser).into_string();
@@ -9078,13 +9083,13 @@ pub mod tests {
         );
 
         tx58.push('!');
+        let invalid_char_index = tx58.len() - 1;
         assert_eq!(
             decode_and_deserialize::<Transaction>(tx58, TransactionBinaryEncoding::Base58)
                 .unwrap_err(),
-            Error::invalid_params(
-                "invalid base58 encoding: InvalidCharacter { character: '!', index: 1680 }"
-                    .to_string(),
-            )
+            Error::invalid_params(format!(
+                "invalid base58 encoding: InvalidCharacter {{ character: '!', index: {invalid_char_index} }}",
+            ))
         );
     }
 
