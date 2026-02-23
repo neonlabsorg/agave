@@ -113,7 +113,7 @@ use {
         str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, RwLock,
+            Arc, OnceLock, RwLock,
         },
         time::Duration,
     },
@@ -4329,8 +4329,13 @@ fn rpc_perf_sample_from_perf_sample(slot: u64, sample: PerfSample) -> RpcPerfSam
     }
 }
 
-const MAX_BASE58_SIZE: usize = 1683; // Golden, bump if PACKET_DATA_SIZE changes
-const MAX_BASE64_SIZE: usize = 1644; // Golden, bump if PACKET_DATA_SIZE changes
+fn max_base58_size() -> usize {
+    static MAX_BASE58_SIZE: OnceLock<usize> = OnceLock::new();
+    *MAX_BASE58_SIZE
+        .get_or_init(|| bs58::encode(vec![0xffu8; PACKET_DATA_SIZE]).into_string().len())
+}
+
+const MAX_BASE64_SIZE: usize = (PACKET_DATA_SIZE + 2) / 3 * 4;
 fn decode_and_deserialize<T>(
     encoded: String,
     encoding: TransactionBinaryEncoding,
@@ -4341,12 +4346,13 @@ where
     let wire_output = match encoding {
         TransactionBinaryEncoding::Base58 => {
             inc_new_counter_info!("rpc-base58_encoded_tx", 1);
-            if encoded.len() > MAX_BASE58_SIZE {
+            let max_base58_size = max_base58_size();
+            if encoded.len() > max_base58_size {
                 return Err(Error::invalid_params(format!(
                     "base58 encoded {} too large: {} bytes (max: encoded/raw {}/{})",
                     type_name::<T>(),
                     encoded.len(),
-                    MAX_BASE58_SIZE,
+                    max_base58_size,
                     PACKET_DATA_SIZE,
                 )));
             }
@@ -8985,7 +8991,7 @@ pub mod tests {
     fn test_worst_case_encoded_tx_goldens() {
         let ff_tx = vec![0xffu8; PACKET_DATA_SIZE];
         let tx58 = bs58::encode(&ff_tx).into_string();
-        assert_eq!(tx58.len(), MAX_BASE58_SIZE);
+        assert_eq!(tx58.len(), max_base58_size());
         let tx64 = BASE64_STANDARD.encode(&ff_tx);
         assert_eq!(tx64.len(), MAX_BASE64_SIZE);
     }
@@ -8998,12 +9004,13 @@ pub mod tests {
 
         let tx58 = bs58::encode(&tx_ser).into_string();
         let tx58_len = tx58.len();
+        let max_base58_size = max_base58_size();
         assert_eq!(
             decode_and_deserialize::<Transaction>(tx58, TransactionBinaryEncoding::Base58)
                 .unwrap_err(),
             Error::invalid_params(format!(
                 "base58 encoded solana_transaction::Transaction too large: {tx58_len} bytes (max: \
-                 encoded/raw {MAX_BASE58_SIZE}/{PACKET_DATA_SIZE})",
+                 encoded/raw {max_base58_size}/{PACKET_DATA_SIZE})",
             ))
         );
 
