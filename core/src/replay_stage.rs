@@ -4413,6 +4413,124 @@ impl ReplayStage {
         Ok(())
     }
 
+    fn preflight_replay_target_from_root(
+        target_slot: Slot,
+        bank_forks: &Arc<RwLock<BankForks>>,
+        blockstore: &Blockstore,
+        leader_schedule_cache: &Arc<LeaderScheduleCache>,
+        process_options: &ProcessOptions,
+        exclude_signatures: Option<&HashSet<Signature>>,
+        prepend_transactions: Option<&HashMap<Slot, Vec<VersionedTransaction>>>,
+    ) -> Result<(), String> {
+        let mut replay_options = process_options.clone();
+        replay_options.halt_at_slot = Some(target_slot);
+        replay_options.abort_on_invalid_block = true;
+        replay_options.runtime_replay_from_root = true;
+        replay_options.exclude_signatures = exclude_signatures.cloned();
+        replay_options.prepend_transactions = prepend_transactions.cloned();
+        if let Some(prepend_transactions) = prepend_transactions {
+            if !prepend_transactions.is_empty() {
+                replay_options.run_verification = false;
+            }
+        }
+
+        let dry_root_bank = bank_forks.read().unwrap().root_bank();
+        let dry_bank_forks = BankForks::new_rw_arc_from_arc(dry_root_bank);
+        let preflight_result = blockstore_processor::process_blockstore_from_root(
+            blockstore,
+            &dry_bank_forks,
+            leader_schedule_cache,
+            &replay_options,
+            None,
+            None,
+            None,
+        );
+        preflight_result.map_err(|err| format!("{err:?}"))?;
+
+        let dry_forks = dry_bank_forks.read().unwrap();
+        let dry_target = dry_forks.get(target_slot);
+        let dry_target_frozen = dry_target.as_ref().map(|b| b.is_frozen()).unwrap_or(false);
+        if dry_target.is_none() || !dry_target_frozen {
+            return Err(format!(
+                "target bank {target_slot} was not produced as frozen"
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_replayable_finalize_target(
+        initial_target: Slot,
+        root_slot: Slot,
+        bank_forks: &Arc<RwLock<BankForks>>,
+        blockstore: &Blockstore,
+        leader_schedule_cache: &Arc<LeaderScheduleCache>,
+        process_options: &ProcessOptions,
+        exclude_signatures: Option<&HashSet<Signature>>,
+        prepend_transactions: Option<&HashMap<Slot, Vec<VersionedTransaction>>>,
+    ) -> Result<Slot, String> {
+        if initial_target <= root_slot {
+            return Err(format!(
+                "NoReplayableFinalizeTarget: initial_target={initial_target} is not above root={root_slot}"
+            ));
+        }
+
+        let mut current = initial_target;
+        const MAX_STEPS: usize = 2_000_000;
+        for _ in 0..MAX_STEPS {
+            if current <= root_slot {
+                break;
+            }
+
+            match Self::validate_replay_path_from_root(blockstore, root_slot, current) {
+                Ok(()) => match Self::preflight_replay_target_from_root(
+                    current,
+                    bank_forks,
+                    blockstore,
+                    leader_schedule_cache,
+                    process_options,
+                    exclude_signatures,
+                    prepend_transactions,
+                ) {
+                    Ok(()) => {
+                        info!(
+                            "[FINALIZE_DIAG] resolve replayable target: selected_slot={} initial_target={} root_slot={}",
+                            current, initial_target, root_slot
+                        );
+                        return Ok(current);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "[FINALIZE_DIAG] resolve replayable target: preflight failed for slot {}: {}",
+                            current, err
+                        );
+                    }
+                },
+                Err(err) => {
+                    warn!(
+                        "[FINALIZE_DIAG] resolve replayable target: path invalid for slot {}: {}",
+                        current, err
+                    );
+                }
+            }
+
+            let parent = blockstore
+                .meta(current)
+                .ok()
+                .flatten()
+                .and_then(|meta| meta.parent_slot);
+            match parent {
+                Some(parent) if parent > root_slot && parent < current => {
+                    current = parent;
+                }
+                _ => break,
+            }
+        }
+
+        Err(format!(
+            "NoReplayableFinalizeTarget: initial_target={initial_target} root_slot={root_slot}"
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finalize_history_with_replay(
         target_slot: Slot,
@@ -4443,16 +4561,20 @@ impl ReplayStage {
                 "finalize target {target_slot} is not above current root {root_slot}"
             ));
         }
-
-        let target_bank = bank_forks
-            .read()
-            .unwrap()
-            .get(target_slot)
-            .ok_or_else(|| format!("finalize target {target_slot} not found in bank forks"))?;
-        if !target_bank.is_frozen() {
-            return Err(format!("finalize target {target_slot} is not frozen"));
-        }
-        Self::validate_replay_path_from_root(blockstore, root_slot, target_slot)?;
+        let target_slot = Self::resolve_replayable_finalize_target(
+            target_slot,
+            root_slot,
+            bank_forks,
+            blockstore,
+            leader_schedule_cache,
+            process_options,
+            exclude_signatures,
+            prepend_transactions,
+        )?;
+        info!(
+            "[FINALIZE_DIAG] external finalize replay target resolved: root_slot={} target_slot={}",
+            root_slot, target_slot
+        );
 
         if let Some(prepend_transactions) = prepend_transactions {
             for slot in prepend_transactions.keys() {
@@ -4462,18 +4584,6 @@ impl ReplayStage {
                         root_slot, target_slot
                     ));
                 }
-            }
-        }
-
-        let mut replay_options = process_options.clone();
-        replay_options.halt_at_slot = Some(target_slot);
-        replay_options.abort_on_invalid_block = true;
-        replay_options.runtime_replay_from_root = true;
-        replay_options.exclude_signatures = exclude_signatures.cloned();
-        replay_options.prepend_transactions = prepend_transactions.cloned();
-        if let Some(prepend_transactions) = prepend_transactions {
-            if !prepend_transactions.is_empty() {
-                replay_options.run_verification = false;
             }
         }
 
@@ -4522,45 +4632,6 @@ impl ReplayStage {
                     "failed to read blockstore meta for root slot {root_slot}: {err}"
                 ));
             }
-        }
-
-        // Dry-run replay on an isolated fork state to avoid tearing down the live
-        // bank_forks when the target slot cannot be replayed from blockstore.
-        {
-            let dry_root_bank = bank_forks.read().unwrap().root_bank();
-            let dry_bank_forks = BankForks::new_rw_arc_from_arc(dry_root_bank);
-            let preflight_result = blockstore_processor::process_blockstore_from_root(
-                blockstore,
-                &dry_bank_forks,
-                leader_schedule_cache,
-                &replay_options,
-                None,
-                None,
-                None,
-            );
-            if let Err(err) = preflight_result {
-                warn!(
-                    "[FINALIZE_DIAG] preflight replay failed: target_slot={} err={err:?}",
-                    target_slot
-                );
-                return Err(format!(
-                    "preflight replay failed for slot {target_slot}: {err:?}"
-                ));
-            }
-            let dry_forks = dry_bank_forks.read().unwrap();
-            let dry_target = dry_forks.get(target_slot);
-            let dry_target_frozen = dry_target.as_ref().map(|b| b.is_frozen()).unwrap_or(false);
-            if dry_target.is_none() || !dry_target_frozen {
-                return Err(format!(
-                    "preflight replay completed but target bank {target_slot} was not produced as frozen"
-                ));
-            }
-            info!(
-                "[FINALIZE_DIAG] preflight replay succeeded: target_slot={} banks_len={} root_slot={}",
-                target_slot,
-                dry_forks.len(),
-                dry_forks.root()
-            );
         }
 
         Self::handle_new_root(
