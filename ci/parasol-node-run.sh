@@ -4,5 +4,5 @@ solana-test-validator \
   --rpc-port 8899 \
   --faucet-port 19900 \
   --gossip-port 18000 \
-  --limit-ledger-size 100000 \
+  --limit-ledger-size 1000000 \
   --log
