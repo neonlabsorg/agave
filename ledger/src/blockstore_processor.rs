@@ -854,6 +854,8 @@ pub struct ProcessOptions {
     pub hash_overrides: Option<HashOverrides>,
     pub abort_on_invalid_block: bool,
     pub no_block_cost_limits: bool,
+    /// Replay from an existing runtime root without mutating startup root/connectivity metadata.
+    pub runtime_replay_from_root: bool,
     pub exclude_signatures: Option<HashSet<Signature>>,
     pub prepend_transactions: Option<HashMap<Slot, Vec<VersionedTransaction>>>,
 }
@@ -974,15 +976,21 @@ pub fn process_blockstore_from_root(
     // Ensure start_slot is rooted for correct replay; also ensure start_slot and
     // qualifying children are marked as connected
     if blockstore.is_primary_access() {
-        blockstore
-            .mark_slots_as_if_rooted_normally_at_startup(
-                vec![(start_slot, Some(start_slot_hash))],
-                true,
-            )
-            .expect("Couldn't mark start_slot as root in startup");
-        blockstore
-            .set_and_chain_connected_on_root_and_next_slots(start_slot)
-            .expect("Couldn't mark start_slot as connected during startup")
+        if opts.runtime_replay_from_root {
+            info!(
+                "Runtime replay from existing root: skipping startup root/connectivity marking for slot {start_slot}"
+            );
+        } else {
+            blockstore
+                .mark_slots_as_if_rooted_normally_at_startup(
+                    vec![(start_slot, Some(start_slot_hash))],
+                    true,
+                )
+                .expect("Couldn't mark start_slot as root in startup");
+            blockstore
+                .set_and_chain_connected_on_root_and_next_slots(start_slot)
+                .expect("Couldn't mark start_slot as connected during startup")
+        }
     } else {
         info!(
             "Start slot {start_slot} isn't a root, and won't be updated due to secondary \

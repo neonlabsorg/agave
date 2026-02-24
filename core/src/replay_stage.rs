@@ -4549,6 +4549,7 @@ impl ReplayStage {
         let mut replay_options = process_options.clone();
         replay_options.halt_at_slot = Some(target_slot);
         replay_options.abort_on_invalid_block = true;
+        replay_options.runtime_replay_from_root = true;
         replay_options.exclude_signatures = exclude_signatures.cloned();
         replay_options.prepend_transactions = prepend_transactions.cloned();
         if let Some(prepend_transactions) = prepend_transactions {
