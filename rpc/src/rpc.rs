@@ -335,26 +335,71 @@ fn select_finalize_slot_for_request(
         .map(|(slot, _)| slot)
         .filter(|slot| *slot > root_slot)
         .collect();
-    if frozen_slots.is_empty() {
+    let (mut candidate_slots, reason_prefix): (Vec<Slot>, &'static str) = if frozen_slots.is_empty()
+    {
+        (
+            bank_forks
+                .banks()
+                .keys()
+                .copied()
+                .filter(|slot| *slot > root_slot)
+                .collect(),
+            "candidate",
+        )
+    } else {
+        (std::mem::take(&mut frozen_slots), "frozen")
+    };
+    if candidate_slots.is_empty() {
         return None;
     }
-    frozen_slots.sort_unstable();
-    let frozen_len = frozen_slots.len();
+    candidate_slots.sort_unstable();
+    let slots_len = candidate_slots.len();
 
     match requested_slot {
-        None | Some(0) => frozen_slots
+        None | Some(0) => candidate_slots
             .last()
             .copied()
-            .map(|slot| (slot, "latest_frozen", root_slot, frozen_len)),
+            .map(|slot| {
+                (
+                    slot,
+                    if reason_prefix == "frozen" {
+                        "latest_frozen"
+                    } else {
+                        "latest_candidate"
+                    },
+                    root_slot,
+                    slots_len,
+                )
+            }),
         Some(target) => {
-            // Prefer the closest frozen slot <= target; if none, fall back to the smallest > target.
-            if let Some(&slot) = frozen_slots.iter().rev().find(|&&s| s <= target) {
-                Some((slot, "closest_frozen_le_target", root_slot, frozen_len))
+            // Prefer the closest slot <= target; if none, fall back to the smallest > target.
+            if let Some(&slot) = candidate_slots.iter().rev().find(|&&s| s <= target) {
+                Some((
+                    slot,
+                    if reason_prefix == "frozen" {
+                        "closest_frozen_le_target"
+                    } else {
+                        "closest_candidate_le_target"
+                    },
+                    root_slot,
+                    slots_len,
+                ))
             } else {
-                frozen_slots
+                candidate_slots
                     .into_iter()
                     .find(|s| *s > target)
-                    .map(|slot| (slot, "smallest_frozen_gt_target", root_slot, frozen_len))
+                    .map(|slot| {
+                        (
+                            slot,
+                            if reason_prefix == "frozen" {
+                                "smallest_frozen_gt_target"
+                            } else {
+                                "smallest_candidate_gt_target"
+                            },
+                            root_slot,
+                            slots_len,
+                        )
+                    })
             }
         }
     }
