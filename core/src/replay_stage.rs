@@ -4421,8 +4421,8 @@ impl ReplayStage {
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
         snapshot_controller: Option<&SnapshotController>,
         process_options: &ProcessOptions,
-        transaction_status_sender: Option<&TransactionStatusSender>,
-        entry_notification_sender: Option<&EntryNotifierSender>,
+        _transaction_status_sender: Option<&TransactionStatusSender>,
+        _entry_notification_sender: Option<&EntryNotifierSender>,
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         identity_pubkey: &Pubkey,
         _vote_account: &Pubkey,
@@ -4454,37 +4454,26 @@ impl ReplayStage {
         }
         Self::validate_replay_path_from_root(blockstore, root_slot, target_slot)?;
 
-        {
-            let (banks_len_before, root_before, working_before) = {
-                let forks = bank_forks.read().unwrap();
-                (forks.len(), forks.root(), forks.working_bank().slot())
-            };
-            info!(
-                "[FINALIZE_DIAG] finalize replay reset: target_slot={} root_before={} working_before={} banks_len_before={}",
-                target_slot,
-                root_before,
-                working_before,
-                banks_len_before
-            );
-            let mut bank_forks = bank_forks.write().unwrap();
-            let removed_banks = bank_forks.reset_to_root_only();
-            let _ = drop_bank_sender.send(removed_banks);
+        if let Some(prepend_transactions) = prepend_transactions {
+            for slot in prepend_transactions.keys() {
+                if *slot <= root_slot || *slot > target_slot {
+                    return Err(format!(
+                        "prepend transaction slot {slot} is outside replay range ({}, {}]",
+                        root_slot, target_slot
+                    ));
+                }
+            }
         }
 
-        {
-            let forks = bank_forks.read().unwrap();
-            let banks_len_after = forks.len();
-            let root_after = forks.root();
-            let working_after = forks.working_bank().slot();
-            info!(
-                "[FINALIZE_DIAG] finalize replay reset done: target_slot={} root_after={} working_after={} banks_len_after={}",
-                target_slot,
-                root_after,
-                working_after,
-                banks_len_after
-            );
-            if banks_len_after != 1 {
-                return Err("bank forks not reset to a single root bank".to_string());
+        let mut replay_options = process_options.clone();
+        replay_options.halt_at_slot = Some(target_slot);
+        replay_options.abort_on_invalid_block = true;
+        replay_options.runtime_replay_from_root = true;
+        replay_options.exclude_signatures = exclude_signatures.cloned();
+        replay_options.prepend_transactions = prepend_transactions.cloned();
+        if let Some(prepend_transactions) = prepend_transactions {
+            if !prepend_transactions.is_empty() {
+                replay_options.run_verification = false;
             }
         }
 
@@ -4535,72 +4524,43 @@ impl ReplayStage {
             }
         }
 
-        if let Some(prepend_transactions) = prepend_transactions {
-            for slot in prepend_transactions.keys() {
-                if *slot <= root_slot || *slot > target_slot {
-                    return Err(format!(
-                        "prepend transaction slot {slot} is outside replay range ({}, {}]",
-                        root_slot, target_slot
-                    ));
-                }
-            }
-        }
-
-        let mut replay_options = process_options.clone();
-        replay_options.halt_at_slot = Some(target_slot);
-        replay_options.abort_on_invalid_block = true;
-        replay_options.runtime_replay_from_root = true;
-        replay_options.exclude_signatures = exclude_signatures.cloned();
-        replay_options.prepend_transactions = prepend_transactions.cloned();
-        if let Some(prepend_transactions) = prepend_transactions {
-            if !prepend_transactions.is_empty() {
-                replay_options.run_verification = false;
-            }
-        }
-        let replay_result = blockstore_processor::process_blockstore_from_root(
-            blockstore,
-            bank_forks,
-            leader_schedule_cache,
-            &replay_options,
-            transaction_status_sender,
-            entry_notification_sender,
-            snapshot_controller,
-        );
-        if let Err(err) = &replay_result {
-            warn!(
-                "[FINALIZE_DIAG] replay failed: target_slot={} err={err:?}",
-                target_slot
-            );
-        }
-        replay_result.map_err(|err| format!("failed to replay history to {target_slot}: {err:?}"))?;
-        info!(
-            "[FINALIZE_DIAG] replay post banks_len={} root={}",
-            bank_forks.read().unwrap().len(),
-            bank_forks.read().unwrap().root()
-        );
-        info!(
-            "[FINALIZE_DIAG] finalize replay completed: target_slot={} banks_len={} root_slot={}",
-            target_slot,
-            bank_forks.read().unwrap().len(),
-            bank_forks.read().unwrap().root()
-        );
-
+        // Dry-run replay on an isolated fork state to avoid tearing down the live
+        // bank_forks when the target slot cannot be replayed from blockstore.
         {
-            let forks = bank_forks.read().unwrap();
-            let target_bank = forks.get(target_slot);
-            let target_frozen = target_bank.as_ref().map(|b| b.is_frozen()).unwrap_or(false);
-            if target_bank.is_none() {
+            let dry_root_bank = bank_forks.read().unwrap().root_bank();
+            let dry_bank_forks = BankForks::new_rw_arc_from_arc(dry_root_bank);
+            let preflight_result = blockstore_processor::process_blockstore_from_root(
+                blockstore,
+                &dry_bank_forks,
+                leader_schedule_cache,
+                &replay_options,
+                None,
+                None,
+                None,
+            );
+            if let Err(err) = preflight_result {
+                warn!(
+                    "[FINALIZE_DIAG] preflight replay failed: target_slot={} err={err:?}",
+                    target_slot
+                );
                 return Err(format!(
-                    "replay did not produce target bank {target_slot} (banks_len={}, root={})",
-                    forks.len(),
-                    forks.root()
+                    "preflight replay failed for slot {target_slot}: {err:?}"
                 ));
             }
-            if !target_frozen {
+            let dry_forks = dry_bank_forks.read().unwrap();
+            let dry_target = dry_forks.get(target_slot);
+            let dry_target_frozen = dry_target.as_ref().map(|b| b.is_frozen()).unwrap_or(false);
+            if dry_target.is_none() || !dry_target_frozen {
                 return Err(format!(
-                    "replay produced target bank {target_slot} but it is not frozen"
+                    "preflight replay completed but target bank {target_slot} was not produced as frozen"
                 ));
             }
+            info!(
+                "[FINALIZE_DIAG] preflight replay succeeded: target_slot={} banks_len={} root_slot={}",
+                target_slot,
+                dry_forks.len(),
+                dry_forks.root()
+            );
         }
 
         Self::handle_new_root(

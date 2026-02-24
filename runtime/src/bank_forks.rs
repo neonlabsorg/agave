@@ -99,7 +99,10 @@ impl Index<u64> for BankForks {
 
 impl BankForks {
     pub fn new_rw_arc(root_bank: Bank) -> Arc<RwLock<Self>> {
-        let root_bank = Arc::new(root_bank);
+        Self::new_rw_arc_from_arc(Arc::new(root_bank))
+    }
+
+    pub fn new_rw_arc_from_arc(root_bank: Arc<Bank>) -> Arc<RwLock<Self>> {
         let root_slot = root_bank.slot();
 
         let mut banks = HashMap::new();
