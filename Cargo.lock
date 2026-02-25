@@ -6976,7 +6976,6 @@ version = "3.0.0"
 dependencies = [
  "bincode",
  "serde",
- "solana-define-syscall 3.0.0",
  "solana-program-error",
  "solana-program-memory",
  "solana-pubkey",
