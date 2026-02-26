@@ -386,7 +386,7 @@ impl ValidatorConfig {
             use_tpu_client_next: true,
             retransmit_xdp: None,
             repair_handler_type: RepairHandlerType::default(),
-            external_finalize_timeout: Duration::from_secs(60 * 60),
+            external_finalize_timeout: Duration::from_secs(20 * 60),
             finalize_history_rpc_addr: None,
             finalize_history_rpc_max_request_body_size: solana_rpc::rpc::MAX_REQUEST_BODY_SIZE,
         }

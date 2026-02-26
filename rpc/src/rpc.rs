@@ -1904,6 +1904,7 @@ impl JsonRpcRequestProcessor {
         signatures: Vec<Signature>,
         config: Option<RpcSignatureStatusConfig>,
     ) -> Result<RpcResponse<Vec<Option<TransactionStatus>>>> {
+        let external_finalize_enabled = self.finalize_history_sender.is_some();
         let search_transaction_history = config
             .map(|x| x.search_transaction_history)
             .unwrap_or(false);
@@ -1936,17 +1937,21 @@ impl JsonRpcRequestProcessor {
             let status = if let Some(status) = self.get_transaction_status(signature, &bank) {
                 found_bank += 1;
                 Some(status)
-            } else if search_transaction_history {
+            } else if search_transaction_history || external_finalize_enabled {
+                let rooted_status_limit = if external_finalize_enabled {
+                    self.bank_forks.read().unwrap().root()
+                } else {
+                    self.block_commitment_cache
+                        .read()
+                        .unwrap()
+                        .highest_super_majority_root()
+                };
                 if let Some(status) = self
                     .blockstore
                     .get_rooted_transaction_status(signature)
                     .map_err(|_| Error::internal_error())?
                     .filter(|(slot, _status_meta)| {
-                        slot <= &self
-                            .block_commitment_cache
-                            .read()
-                            .unwrap()
-                            .highest_super_majority_root()
+                        slot <= &rooted_status_limit
                     })
                     .map(|(slot, status_meta)| {
                         let err = status_meta.status.clone().err();

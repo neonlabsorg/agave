@@ -4503,6 +4503,9 @@ impl ReplayStage {
                         "[FINALIZE_DIAG] resolve replayable target: path invalid for slot {}: {}",
                         current, err
                     );
+                    if err.contains("is marked dead on replay path") {
+                        return Err(format!("DeadAncestorOnReplayPath: {err}"));
+                    }
                 }
             }
 

@@ -895,7 +895,7 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("external-finalize-timeout-secs")
             .value_name("SECS")
             .takes_value(true)
-            .default_value("3600")
+            .default_value("1200")
             .validator(is_parsable::<u64>)
             .help(
                 "Seconds before forcing external finalize replay if no replayHistory or \
