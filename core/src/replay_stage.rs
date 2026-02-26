@@ -779,6 +779,8 @@ impl ReplayStage {
                             &blockstore,
                             &leader_schedule_cache,
                             snapshot_controller.as_deref(),
+                            rpc_subscriptions.as_deref(),
+                            &bank_notification_sender,
                             &replay_process_options,
                             transaction_status_sender.as_ref(),
                             entry_notification_sender.as_ref(),
@@ -812,25 +814,20 @@ impl ReplayStage {
                                     working_before,
                                     forks_len_before
                                 );
-                                Self::finalize_history_with_replay(
+                                Self::finalize_history_without_replay(
                                     target_slot,
                                     &bank_forks,
                                     &blockstore,
                                     &leader_schedule_cache,
                                     snapshot_controller.as_deref(),
-                                    &replay_process_options,
-                                    transaction_status_sender.as_ref(),
-                                    entry_notification_sender.as_ref(),
-                                    &poh_recorder,
+                                    rpc_subscriptions.as_deref(),
+                                    &bank_notification_sender,
                                     &my_pubkey,
-                                    &vote_account,
                                     &mut progress,
                                     &mut tbft_structs,
                                     &mut tracked_vote_transactions,
                                     &mut has_new_vote_been_rooted,
                                     &drop_bank_sender,
-                                    None,
-                                    None,
                                 )
                             }
                         }
@@ -4281,12 +4278,8 @@ impl ReplayStage {
             "[FINALIZE_DIAG] select finalize: requested_slot={} root_slot={} best_overall={} same_voted_fork={:?}",
             requested_slot, root_slot, best_overall, same_voted_fork
         );
-        let is_frozen = |slot: Slot| -> bool {
-            bank_forks
-                .get(slot)
-                .map(|b| b.is_frozen())
-                .unwrap_or(false)
-        };
+        let is_frozen =
+            |slot: Slot| -> bool { bank_forks.get(slot).map(|b| b.is_frozen()).unwrap_or(false) };
         let mut base_target = None;
         if let Some(same_voted_fork) = same_voted_fork {
             if same_voted_fork > root_slot && is_frozen(same_voted_fork) {
@@ -4538,6 +4531,8 @@ impl ReplayStage {
         blockstore: &Blockstore,
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
         snapshot_controller: Option<&SnapshotController>,
+        rpc_subscriptions: Option<&RpcSubscriptions>,
+        bank_notification_sender: &Option<BankNotificationSenderConfig>,
         process_options: &ProcessOptions,
         _transaction_status_sender: Option<&TransactionStatusSender>,
         _entry_notification_sender: Option<&EntryNotifierSender>,
@@ -4601,9 +4596,7 @@ impl ReplayStage {
                 let mut logged = 0usize;
                 for next_slot in &meta.next_slots {
                     if logged >= 20 {
-                        info!(
-                            "[FINALIZE_DIAG] root meta next_slots: truncated at 20 entries"
-                        );
+                        info!("[FINALIZE_DIAG] root meta next_slots: truncated at 20 entries");
                         break;
                     }
                     let is_dead = blockstore.is_dead(*next_slot);
@@ -4634,12 +4627,24 @@ impl ReplayStage {
             }
         }
 
-        Self::handle_new_root(
+        let parent_slot = bank_forks
+            .read()
+            .unwrap()
+            .get(target_slot)
+            .ok_or_else(|| format!("finalize target {target_slot} not found in bank forks"))?
+            .parent_slot();
+        Self::check_and_handle_new_root(
+            identity_pubkey,
+            parent_slot,
             target_slot,
-            bank_forks,
+            bank_forks.as_ref(),
             progress,
+            blockstore,
+            leader_schedule_cache,
             snapshot_controller,
+            rpc_subscriptions,
             None,
+            bank_notification_sender,
             has_new_vote_been_rooted,
             tracked_vote_transactions,
             drop_bank_sender,
@@ -4663,7 +4668,12 @@ impl ReplayStage {
     fn finalize_history_without_replay(
         target_slot: Slot,
         bank_forks: &Arc<RwLock<BankForks>>,
+        blockstore: &Blockstore,
+        leader_schedule_cache: &Arc<LeaderScheduleCache>,
         snapshot_controller: Option<&SnapshotController>,
+        rpc_subscriptions: Option<&RpcSubscriptions>,
+        bank_notification_sender: &Option<BankNotificationSenderConfig>,
+        identity_pubkey: &Pubkey,
         progress: &mut ProgressMap,
         tbft_structs: &mut TowerBFTStructures,
         tracked_vote_transactions: &mut Vec<TrackedVoteTransaction>,
@@ -4679,6 +4689,16 @@ impl ReplayStage {
                 "finalize target {target_slot} is not above current root {root_slot}"
             ));
         }
+        let ancestors = bank_forks.read().unwrap().ancestors();
+        let is_descended_from_root = ancestors
+            .get(&target_slot)
+            .map(|a| a.contains(&root_slot))
+            .unwrap_or(false);
+        if !is_descended_from_root {
+            return Err(format!(
+                "finalize target {target_slot} is not descended from current root {root_slot}"
+            ));
+        }
 
         let target_bank = bank_forks
             .read()
@@ -4689,12 +4709,18 @@ impl ReplayStage {
             return Err(format!("finalize target {target_slot} is not frozen"));
         }
 
-        Self::handle_new_root(
+        Self::check_and_handle_new_root(
+            identity_pubkey,
+            target_bank.parent_slot(),
             target_slot,
-            bank_forks,
+            bank_forks.as_ref(),
             progress,
+            blockstore,
+            leader_schedule_cache,
             snapshot_controller,
+            rpc_subscriptions,
             None,
+            bank_notification_sender,
             has_new_vote_been_rooted,
             tracked_vote_transactions,
             drop_bank_sender,

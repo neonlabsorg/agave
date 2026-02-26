@@ -1180,6 +1180,7 @@ impl JsonRpcRequestProcessor {
         signature: &Signature,
         commitment: Option<CommitmentConfig>,
     ) -> Result<RpcResponse<bool>> {
+        let commitment = recent_blockhash_commitment_override(self, commitment);
         let bank = self.bank(commitment);
         let status = bank.get_signature_status(signature);
         info!(
@@ -1891,6 +1892,7 @@ impl JsonRpcRequestProcessor {
         signature: Signature,
         commitment: Option<CommitmentConfig>,
     ) -> Result<Option<transaction::Result<()>>> {
+        let commitment = recent_blockhash_commitment_override(self, commitment);
         let bank = self.bank(commitment);
         Ok(bank
             .get_signature_status_slot(&signature)
@@ -1995,7 +1997,13 @@ impl JsonRpcRequestProcessor {
     ) -> Option<TransactionStatus> {
         let (slot, status) = bank.get_signature_status_slot(&signature)?;
 
-        let optimistically_confirmed_bank = self.bank(Some(CommitmentConfig::confirmed()));
+        let optimistically_confirmed_bank = if self.finalize_history_sender.is_some() {
+            // Keep confirmation loops live for deploy/airdrop workflows while external
+            // finalize controls the root progression.
+            self.bank(Some(CommitmentConfig::processed()))
+        } else {
+            self.bank(Some(CommitmentConfig::confirmed()))
+        };
         let optimistically_confirmed =
             optimistically_confirmed_bank.get_signature_status_slot(&signature);
 
@@ -4148,6 +4156,11 @@ pub mod rpc_full {
                     let last_valid_block_height = bank
                         .get_blockhash_last_valid_block_height(&blockhash)
                         .unwrap_or(0);
+                    if last_valid_block_height == 0 {
+                        return Err(Error::invalid_params(
+                            "Provided recent_blockhash is not valid on selected bank",
+                        ));
+                    }
                     (blockhash, last_valid_block_height)
                 } else if commitment.map(|c| c.is_processed()).unwrap_or(false) {
                     let blockhash = bank.last_blockhash();
