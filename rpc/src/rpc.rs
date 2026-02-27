@@ -1182,13 +1182,21 @@ impl JsonRpcRequestProcessor {
     ) -> Result<RpcResponse<bool>> {
         let commitment = recent_blockhash_commitment_override(self, commitment);
         let bank = self.bank(commitment);
-        let status = bank.get_signature_status(signature);
+        let root_slot = self.bank_forks.read().unwrap().root();
+        let status = bank.get_signature_status(signature).or_else(|| {
+            if self.finalize_history_sender.is_some() {
+                self.get_transaction_status_from_blockstore(*signature, &bank, root_slot)
+                    .map(|status| status.status)
+            } else {
+                None
+            }
+        });
         info!(
             "[RPC_DIAG] confirm_transaction: signature={} commitment={:?} bank_slot={} root_slot={} status_present={}",
             signature,
             commitment,
             bank.slot(),
-            self.bank_forks.read().unwrap().root(),
+            root_slot,
             status.is_some()
         );
         match status {
@@ -1937,7 +1945,49 @@ impl JsonRpcRequestProcessor {
             let status = if let Some(status) = self.get_transaction_status(signature, &bank) {
                 found_bank += 1;
                 Some(status)
-            } else if search_transaction_history || external_finalize_enabled {
+            } else if external_finalize_enabled {
+                if let Some(status) =
+                    self.get_transaction_status_from_blockstore(signature, &bank, root_slot)
+                {
+                    found_blockstore += 1;
+                    Some(status)
+                } else if search_transaction_history {
+                    let rooted_status_limit = self.bank_forks.read().unwrap().root();
+                    if let Some(status) = self
+                        .blockstore
+                        .get_rooted_transaction_status(signature)
+                        .map_err(|_| Error::internal_error())?
+                        .filter(|(slot, _status_meta)| {
+                            slot <= &rooted_status_limit
+                        })
+                        .map(|(slot, status_meta)| {
+                            let err = status_meta.status.clone().err();
+                            TransactionStatus {
+                                slot,
+                                status: status_meta.status,
+                                confirmations: None,
+                                err,
+                                confirmation_status: Some(TransactionConfirmationStatus::Finalized),
+                            }
+                        })
+                    {
+                        found_blockstore += 1;
+                        Some(status)
+                    } else if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
+                        match bigtable_ledger_storage.get_signature_status(&signature).await {
+                            Ok(status) => {
+                                found_bigtable += 1;
+                                Some(status)
+                            }
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else if search_transaction_history {
                 let rooted_status_limit = if external_finalize_enabled {
                     self.bank_forks.read().unwrap().root()
                 } else {
@@ -2036,6 +2086,35 @@ impl JsonRpcRequestProcessor {
                 Some(TransactionConfirmationStatus::Processed)
             },
         })
+    }
+
+    fn get_transaction_status_from_blockstore(
+        &self,
+        signature: Signature,
+        bank: &Bank,
+        root_slot: Slot,
+    ) -> Option<TransactionStatus> {
+        let confirmed_unrooted_slots: HashSet<_> =
+            bank.status_cache_ancestors().into_iter().collect();
+        self.blockstore
+            .get_transaction_status(signature, &confirmed_unrooted_slots)
+            .ok()
+            .flatten()
+            .map(|(slot, status_meta)| {
+                let finalized = slot <= root_slot;
+                let err = status_meta.status.clone().err();
+                TransactionStatus {
+                    slot,
+                    status: status_meta.status,
+                    confirmations: if finalized { None } else { Some(0) },
+                    err,
+                    confirmation_status: Some(if finalized {
+                        TransactionConfirmationStatus::Finalized
+                    } else {
+                        TransactionConfirmationStatus::Confirmed
+                    }),
+                }
+            })
     }
 
     pub async fn get_transaction(

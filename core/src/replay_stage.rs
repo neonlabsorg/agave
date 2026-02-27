@@ -4431,6 +4431,8 @@ impl ReplayStage {
         replay_options.halt_at_slot = Some(target_slot);
         replay_options.abort_on_invalid_block = true;
         replay_options.runtime_replay_from_root = true;
+        // Preflight must not mutate ledger dead-slot metadata on failure.
+        replay_options.mark_dead_slots_on_error = Some(false);
         replay_options.exclude_signatures = exclude_signatures.cloned();
         replay_options.prepend_transactions = prepend_transactions.cloned();
         if let Some(prepend_transactions) = prepend_transactions {

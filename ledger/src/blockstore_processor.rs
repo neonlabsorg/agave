@@ -856,6 +856,9 @@ pub struct ProcessOptions {
     pub no_block_cost_limits: bool,
     /// Replay from an existing runtime root without mutating startup root/connectivity metadata.
     pub runtime_replay_from_root: bool,
+    /// Controls whether replay failures can mutate ledger metadata by marking slots dead.
+    /// Keep enabled for normal runtime replay; disable for dry-run/preflight replay probes.
+    pub mark_dead_slots_on_error: Option<bool>,
     pub exclude_signatures: Option<HashSet<Signature>>,
     pub prepend_transactions: Option<HashMap<Slot, Vec<VersionedTransaction>>>,
 }
@@ -2355,6 +2358,7 @@ pub fn process_single_slot(
     timing: &mut ExecuteTimings,
 ) -> result::Result<(), BlockstoreProcessorError> {
     let slot = bank.slot();
+    let mark_dead_slots_on_error = opts.mark_dead_slots_on_error.unwrap_or(true);
     // Mark corrupt slots as dead so validators don't replay this slot and
     // see AlreadyProcessed errors later in ReplayStage
     confirm_full_slot(
@@ -2378,13 +2382,14 @@ pub fn process_single_slot(
     })
     .map_err(|err| {
         warn!("slot {slot} failed to verify: {err}");
-        if blockstore.is_primary_access() {
+        if blockstore.is_primary_access() && mark_dead_slots_on_error {
             blockstore
                 .set_dead_slot(slot)
                 .expect("Failed to mark slot as dead in blockstore");
         } else {
             info!(
-                "Failed slot {slot} won't be marked dead due to being secondary blockstore access"
+                "Failed slot {slot} won't be marked dead (secondary_access={} mark_dead_slots_on_error={mark_dead_slots_on_error})",
+                !blockstore.is_primary_access(),
             );
         }
         err
@@ -2398,14 +2403,15 @@ pub fn process_single_slot(
         .check_last_fec_set_and_get_block_id(slot, bank.hash(), &bank.feature_set)
         .inspect_err(|err| {
             warn!("slot {slot} failed last fec set checks: {err}");
-            if blockstore.is_primary_access() {
+            if blockstore.is_primary_access() && mark_dead_slots_on_error {
                 blockstore
                     .set_dead_slot(slot)
                     .expect("Failed to mark slot as dead in blockstore");
             } else {
                 info!(
-                    "Failed last fec set checks slot {slot} won't be marked dead due to being \
-                     secondary blockstore access"
+                    "Failed last fec set checks slot {slot} won't be marked dead \
+                     (secondary_access={} mark_dead_slots_on_error={mark_dead_slots_on_error})",
+                    !blockstore.is_primary_access(),
                 );
             }
         })?;
