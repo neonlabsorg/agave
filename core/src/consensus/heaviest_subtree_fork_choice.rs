@@ -1134,7 +1134,7 @@ impl HeaviestSubtreeForkChoice {
         );
     }
 
-    fn heaviest_slot_on_same_voted_fork(&self, tower: &Tower) -> Option<SlotHashKey> {
+    pub fn heaviest_slot_on_same_voted_fork(&self, tower: &Tower) -> Option<SlotHashKey> {
         tower
             .last_voted_slot_hash()
             .and_then(|last_voted_slot_hash| {

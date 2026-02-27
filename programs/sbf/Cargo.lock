@@ -200,6 +200,7 @@ name = "agave-validator"
 version = "3.0.12"
 dependencies = [
  "agave-geyser-plugin-interface",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "console 0.16.0",

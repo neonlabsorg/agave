@@ -189,6 +189,27 @@ impl Consumer {
         let execute_and_commit_transactions_output =
             self.execute_and_commit_transactions_locked(bank, &batch);
 
+        let retryable_len = execute_and_commit_transactions_output
+            .retryable_transaction_indexes
+            .len();
+        if retryable_len > 0 || execute_and_commit_transactions_output.commit_transactions_result.is_err() {
+            let counts = &execute_and_commit_transactions_output.transaction_counts;
+            info!(
+                "[TX_DIAG] batch_result: bank_slot={} bank_block_height={} txs_len={} attempted={} processed={} success={} retryable={} commit_err={:?}",
+                bank.slot(),
+                bank.block_height(),
+                txs.len(),
+                counts.attempted_processing_count,
+                counts.processed_count,
+                counts.processed_with_successful_result_count,
+                retryable_len,
+                execute_and_commit_transactions_output
+                    .commit_transactions_result
+                    .as_ref()
+                    .err()
+            );
+        }
+
         // Once the accounts are new transactions can enter the pipeline to process them
         let (_, unlock_us) = measure_us!(drop(batch));
 

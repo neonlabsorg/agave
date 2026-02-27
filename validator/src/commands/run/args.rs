@@ -281,6 +281,17 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Enable JSON RPC on this port, and the next port for the RPC websocket"),
     )
     .arg(
+        Arg::with_name("finalize_history_rpc_port")
+            .long("finalize-history-rpc-port")
+            .value_name("PORT")
+            .takes_value(true)
+            .validator(port_validator)
+            .help(
+                "Enable a finalize-history-only JSON RPC listener on this port (finalizeHistory \
+                 and replayHistory methods only)",
+            ),
+    )
+    .arg(
         Arg::with_name("full_rpc_api")
             .long("full-rpc-api")
             .takes_value(false)
@@ -880,6 +891,18 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Milliseconds to wait in the TPU receiver for packet coalescing."),
     )
     .arg(
+        Arg::with_name("external_finalize_timeout_secs")
+            .long("external-finalize-timeout-secs")
+            .value_name("SECS")
+            .takes_value(true)
+            .default_value("1200")
+            .validator(is_parsable::<u64>)
+            .help(
+                "Seconds before forcing external finalize replay if no replayHistory or \
+                 finalizeHistory call.",
+            ),
+    )
+    .arg(
         Arg::with_name("tpu_connection_pool_size")
             .long("tpu-connection-pool-size")
             .takes_value(true)
@@ -1268,6 +1291,15 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .validator(is_parsable::<usize>)
             .default_value(&default_args.rpc_max_request_body_size)
             .help("The maximum request body size accepted by rpc service"),
+    )
+    .arg(
+        Arg::with_name("finalize_history_rpc_max_request_body_size")
+            .long("finalize-history-rpc-max-request-body-size")
+            .value_name("BYTES")
+            .takes_value(true)
+            .validator(is_parsable::<usize>)
+            .default_value(&default_args.finalize_history_rpc_max_request_body_size)
+            .help("The maximum request body size accepted by finalize-history rpc service"),
     )
     .arg(
         Arg::with_name("geyser_plugin_config")

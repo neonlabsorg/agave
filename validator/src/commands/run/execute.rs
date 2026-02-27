@@ -81,6 +81,7 @@ use {
     },
 };
 
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Operation {
     Initialize,
@@ -168,7 +169,8 @@ pub fn execute(
     let tpu_coalesce = value_t!(matches, "tpu_coalesce_ms", u64)
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_TPU_COALESCE);
-
+    let external_finalize_timeout_secs =
+        value_t_or_exit!(matches, "external_finalize_timeout_secs", u64);
     // Canonicalize ledger path to avoid issues with symlink creation
     let ledger_path = create_and_canonicalize_directory(ledger_path).map_err(|err| {
         format!(
@@ -232,6 +234,7 @@ pub fn execute(
         BindIpAddrs::new(parsed).map_err(|err| format!("invalid bind_addresses: {err}"))?
     };
 
+    let rpc_port = value_t!(matches, "rpc_port", u16).ok();
     let rpc_bind_address = if matches.is_present("rpc_bind_address") {
         solana_net_utils::parse_host(matches.value_of("rpc_bind_address").unwrap())
             .expect("invalid rpc_bind_address")
@@ -240,6 +243,18 @@ pub fn execute(
     } else {
         bind_addresses.active()
     };
+    let finalize_history_rpc_addr = if let Some(port) =
+        value_t!(matches, "finalize_history_rpc_port", u16).ok()
+    {
+        Some(SocketAddr::new(rpc_bind_address, port))
+    } else {
+        rpc_port.and_then(|port| {
+            port.checked_add(2)
+                .map(|offset| SocketAddr::new(rpc_bind_address, offset))
+        })
+    };
+    let finalize_history_rpc_max_request_body_size =
+        value_t_or_exit!(matches, "finalize_history_rpc_max_request_body_size", usize);
 
     let contact_debug_interval = value_t_or_exit!(matches, "contact_debug_interval", u64);
 
@@ -576,7 +591,7 @@ pub fn execute(
         rpc_config: run_args.json_rpc_config,
         on_start_geyser_plugin_config_files,
         geyser_plugin_always_enabled: matches.is_present("geyser_plugin_always_enabled"),
-        rpc_addrs: value_t!(matches, "rpc_port", u16).ok().map(|rpc_port| {
+        rpc_addrs: rpc_port.map(|rpc_port| {
             (
                 SocketAddr::new(rpc_bind_address, rpc_port),
                 SocketAddr::new(rpc_bind_address, rpc_port + 1),
@@ -689,6 +704,9 @@ pub fn execute(
             Arc::new(AtomicBool::new(false)),
         )]
         .into(),
+        external_finalize_timeout: Duration::from_secs(external_finalize_timeout_secs),
+        finalize_history_rpc_addr,
+        finalize_history_rpc_max_request_body_size,
     };
 
     let reserved = validator_config

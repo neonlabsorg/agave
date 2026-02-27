@@ -234,11 +234,27 @@ impl SanitizedTransactionReceiveAndBuffer {
         // Convert to Arcs
         let packets: Vec<_> = packets.into_iter().map(Arc::new).collect();
         // Sanitize packets, generate IDs, and insert into the container.
-        let (root_bank, working_bank) = {
-            let bank_forks = self.bank_forks.read().unwrap();
-            let root_bank = bank_forks.root_bank();
-            let working_bank = bank_forks.working_bank();
-            (root_bank, working_bank)
+        let (root_bank, working_bank) = match self.bank_forks.read() {
+            Ok(bank_forks) => {
+                let root_bank = bank_forks.root_bank();
+                let working_bank = bank_forks.working_bank();
+                (root_bank, working_bank)
+            }
+            Err(err) => {
+                warn!(
+                    "receive_and_buffer: bank_forks lock poisoned: {err:?}"
+                );
+                return BufferStats {
+                    num_dropped_on_sanitization: 0,
+                    num_dropped_on_lock_validation: 0,
+                    num_dropped_on_compute_budget: 0,
+                    num_dropped_on_age: 0,
+                    num_dropped_on_already_processed: 0,
+                    num_dropped_on_fee_payer: 0,
+                    num_dropped_on_capacity: 0,
+                    num_buffered: 0,
+                };
+            }
         };
         let alt_resolved_slot = root_bank.slot();
         let sanitized_epoch = root_bank.epoch();
@@ -354,6 +370,32 @@ impl SanitizedTransactionReceiveAndBuffer {
             }
         }
 
+        if num_dropped_on_sanitization > 0
+            || num_dropped_on_lock_validation > 0
+            || num_dropped_on_compute_budget > 0
+            || num_dropped_on_age > 0
+            || num_dropped_on_already_processed > 0
+            || num_dropped_on_fee_payer > 0
+            || num_dropped_on_capacity > 0
+            || num_buffered > 0
+        {
+            info!(
+                "[TX_DIAG] receive_and_buffer: root_slot={} working_slot={} root_block_height={} working_block_height={} buffered={} drop_sanitization={} drop_lock_validation={} drop_compute_budget={} drop_blockhash_not_found={} drop_already_processed={} drop_fee_payer={} drop_capacity={}",
+                root_bank.slot(),
+                working_bank.slot(),
+                root_bank.block_height(),
+                working_bank.block_height(),
+                num_buffered,
+                num_dropped_on_sanitization,
+                num_dropped_on_lock_validation,
+                num_dropped_on_compute_budget,
+                num_dropped_on_age,
+                num_dropped_on_already_processed,
+                num_dropped_on_fee_payer,
+                num_dropped_on_capacity
+            );
+        }
+
         BufferStats {
             num_dropped_on_sanitization,
             num_dropped_on_lock_validation,
@@ -382,11 +424,18 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
         container: &mut Self::Container,
         decision: &BufferedPacketsDecision,
     ) -> Result<ReceivingStats, DisconnectedError> {
-        let (root_bank, working_bank) = {
-            let bank_forks = self.bank_forks.read().unwrap();
-            let root_bank = bank_forks.root_bank();
-            let working_bank = bank_forks.working_bank();
-            (root_bank, working_bank)
+        let (root_bank, working_bank) = match self.bank_forks.read() {
+            Ok(bank_forks) => {
+                let root_bank = bank_forks.root_bank();
+                let working_bank = bank_forks.working_bank();
+                (root_bank, working_bank)
+            }
+            Err(err) => {
+                warn!(
+                    "receive_and_buffer: bank_forks lock poisoned: {err:?}"
+                );
+                return Err(DisconnectedError);
+            }
         };
 
         // Receive packet batches.

@@ -255,8 +255,244 @@ pub struct JsonRpcRequestProcessor {
     max_complete_transaction_status_slot: Arc<AtomicU64>,
     prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     runtime: Arc<Runtime>,
+    finalize_history_sender: Option<Sender<ExternalFinalizeRequest>>,
 }
 impl Metadata for JsonRpcRequestProcessor {}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ExternalFinalizeMode {
+    Replay,
+    FinalizeOnly,
+}
+
+#[derive(Clone)]
+pub struct ExternalFinalizeRequest {
+    pub slot: Slot,
+    pub mode: ExternalFinalizeMode,
+    pub exclude_signatures: Option<HashSet<Signature>>,
+    pub prepend_transactions: Option<HashMap<Slot, Vec<VersionedTransaction>>>,
+}
+
+fn decode_exclude_signatures(
+    exclude_signatures: Option<Vec<String>>,
+) -> Result<Option<HashSet<Signature>>> {
+    let exclude_signatures = match exclude_signatures {
+        Some(exclude_signatures) => exclude_signatures,
+        None => return Ok(None),
+    };
+    if exclude_signatures.is_empty() {
+        return Ok(Some(HashSet::new()));
+    }
+    let mut decoded = HashSet::with_capacity(exclude_signatures.len());
+    for signature_str in exclude_signatures {
+        let signature = Signature::from_str(&signature_str).map_err(|err| {
+            Error::invalid_params(format!("Invalid signature {signature_str}: {err}"))
+        })?;
+        decoded.insert(signature);
+    }
+    Ok(Some(decoded))
+}
+
+fn decode_prepend_transactions(
+    prepend_transactions: Option<HashMap<String, Vec<String>>>,
+) -> Result<Option<HashMap<Slot, Vec<VersionedTransaction>>>> {
+    let prepend_transactions = match prepend_transactions {
+        Some(prepend_transactions) => prepend_transactions,
+        None => return Ok(None),
+    };
+    if prepend_transactions.is_empty() {
+        return Ok(Some(HashMap::new()));
+    }
+    let mut decoded = HashMap::with_capacity(prepend_transactions.len());
+    for (slot_str, transactions) in prepend_transactions {
+        let slot = slot_str.parse::<Slot>().map_err(|err| {
+            Error::invalid_params(format!("Invalid slot {slot_str}: {err}"))
+        })?;
+        if slot == 0 {
+            return Err(Error::invalid_params(
+                "Invalid slot 0 in prepend_transactions".to_string(),
+            ));
+        }
+        let mut decoded_txs = Vec::with_capacity(transactions.len());
+        for tx in transactions {
+            let (_, versioned_tx) =
+                decode_and_deserialize::<VersionedTransaction>(tx, TransactionBinaryEncoding::Base64)?;
+            decoded_txs.push(versioned_tx);
+        }
+        decoded.insert(slot, decoded_txs);
+    }
+    Ok(Some(decoded))
+}
+
+fn select_finalize_slot_for_request(
+    bank_forks: &RwLock<BankForks>,
+    requested_slot: Option<Slot>,
+) -> Option<(Slot, &'static str, Slot, usize)> {
+    let bank_forks = bank_forks.read().unwrap();
+    let root_slot = bank_forks.root();
+    let mut frozen_slots: Vec<Slot> = bank_forks
+        .frozen_banks()
+        .map(|(slot, _)| slot)
+        .filter(|slot| *slot > root_slot)
+        .collect();
+    let (mut candidate_slots, reason_prefix): (Vec<Slot>, &'static str) = if frozen_slots.is_empty()
+    {
+        (
+            bank_forks
+                .banks()
+                .keys()
+                .copied()
+                .filter(|slot| *slot > root_slot)
+                .collect(),
+            "candidate",
+        )
+    } else {
+        (std::mem::take(&mut frozen_slots), "frozen")
+    };
+    if candidate_slots.is_empty() {
+        return None;
+    }
+    candidate_slots.sort_unstable();
+    let slots_len = candidate_slots.len();
+
+    match requested_slot {
+        None | Some(0) => candidate_slots
+            .last()
+            .copied()
+            .map(|slot| {
+                (
+                    slot,
+                    if reason_prefix == "frozen" {
+                        "latest_frozen"
+                    } else {
+                        "latest_candidate"
+                    },
+                    root_slot,
+                    slots_len,
+                )
+            }),
+        Some(target) => {
+            // Prefer the closest slot <= target; if none, fall back to the smallest > target.
+            if let Some(&slot) = candidate_slots.iter().rev().find(|&&s| s <= target) {
+                Some((
+                    slot,
+                    if reason_prefix == "frozen" {
+                        "closest_frozen_le_target"
+                    } else {
+                        "closest_candidate_le_target"
+                    },
+                    root_slot,
+                    slots_len,
+                ))
+            } else {
+                candidate_slots
+                    .into_iter()
+                    .find(|s| *s > target)
+                    .map(|slot| {
+                        (
+                            slot,
+                            if reason_prefix == "frozen" {
+                                "smallest_frozen_gt_target"
+                            } else {
+                                "smallest_candidate_gt_target"
+                            },
+                            root_slot,
+                            slots_len,
+                        )
+                    })
+            }
+        }
+    }
+}
+
+fn resolve_finalize_history_slot(
+    meta: &JsonRpcRequestProcessor,
+    slot: Option<Slot>,
+) -> Result<Slot> {
+    let requested_slot = slot.unwrap_or(0);
+    if requested_slot != 0 {
+        let bank_forks = meta.bank_forks.read().unwrap();
+        if let Some(bank) = bank_forks.get(requested_slot) {
+            if bank.is_frozen() {
+                info!(
+                    "[FINALIZE_DIAG] resolve finalize slot: requested_slot={} resolved_slot={} reason=requested_frozen root_slot={}",
+                    requested_slot,
+                    requested_slot,
+                    bank_forks.root()
+                );
+                return Ok(requested_slot);
+            }
+        }
+    }
+
+    let (resolved_slot, reason, root_slot, frozen_len) =
+        select_finalize_slot_for_request(&meta.bank_forks, Some(requested_slot)).ok_or_else(
+            || Error::invalid_params("No frozen slot above current root to finalize"),
+        )?;
+    info!(
+        "[FINALIZE_DIAG] resolve finalize slot: requested_slot={} resolved_slot={} reason={} root_slot={} frozen_slots_len={}",
+        requested_slot,
+        resolved_slot,
+        reason,
+        root_slot,
+        frozen_len
+    );
+    Ok(resolved_slot)
+}
+
+fn recent_blockhash_commitment_override(
+    meta: &JsonRpcRequestProcessor,
+    commitment: Option<CommitmentConfig>,
+) -> Option<CommitmentConfig> {
+    if meta.finalize_history_sender.is_some() {
+        match commitment {
+            None => Some(CommitmentConfig::processed()),
+            Some(c) if !c.is_processed() => Some(CommitmentConfig::processed()),
+            Some(_) => commitment,
+        }
+    } else {
+        commitment
+    }
+}
+
+fn enqueue_finalize_history_request(
+    meta: &JsonRpcRequestProcessor,
+    slot: Option<Slot>,
+    mode: ExternalFinalizeMode,
+    exclude_signatures: Option<HashSet<Signature>>,
+    prepend_transactions: Option<HashMap<Slot, Vec<VersionedTransaction>>>,
+) -> Result<bool> {
+    if let Some(sender) = meta.finalize_history_sender.as_ref() {
+        let requested_slot = slot.unwrap_or(0);
+        let slot = resolve_finalize_history_slot(meta, slot)?;
+        let (root_slot, working_slot, forks_len) = {
+            let bank_forks = meta.bank_forks.read().unwrap();
+            (bank_forks.root(), bank_forks.working_bank().slot(), bank_forks.len())
+        };
+        info!(
+            "[FINALIZE_DIAG] enqueue finalize: mode={:?} requested_slot={} resolved_slot={} root={} working={} forks_len={}",
+            mode,
+            requested_slot,
+            slot,
+            root_slot,
+            working_slot,
+            forks_len
+        );
+        let request = ExternalFinalizeRequest {
+            slot,
+            mode,
+            exclude_signatures,
+            prepend_transactions,
+        };
+        sender.send(request).map_err(|err| {
+            warn!("finalize_history failed to enqueue: {err}");
+            Error::internal_error()
+        })?;
+        Ok(true)
+    } else {
+        Err(Error::invalid_request())
+    }
+}
 
 impl JsonRpcRequestProcessor {
     pub fn clone_without_bigtable(&self) -> JsonRpcRequestProcessor {
@@ -348,6 +584,14 @@ impl JsonRpcRequestProcessor {
 
         let commitment = commitment.unwrap_or_default();
         if commitment.is_confirmed() {
+            if self.finalize_history_sender.is_some() {
+                let bank = self.bank_forks.read().unwrap().root_bank();
+                debug!(
+                    "RPC using root bank slot (external finalize): {:?}",
+                    bank.slot()
+                );
+                return bank;
+            }
             let bank = self
                 .optimistically_confirmed_bank
                 .read()
@@ -358,41 +602,42 @@ impl JsonRpcRequestProcessor {
             return bank;
         }
 
-        let slot = self
-            .block_commitment_cache
-            .read()
-            .unwrap()
-            .slot_with_commitment(commitment.commitment);
-
         match commitment.commitment {
             CommitmentLevel::Processed => {
-                debug!("RPC using the heaviest slot: {slot:?}");
+                let bank = self.bank_forks.read().unwrap().working_bank();
+                info!(
+                    "[FINALIZE_DIAG] RPC working bank slot: {:?}, root: {:?}",
+                    bank.slot(),
+                    self.bank_forks.read().unwrap().root()
+                );
+                return bank;
             }
             CommitmentLevel::Finalized => {
+                if self.finalize_history_sender.is_some() {
+                    let bank = self.bank_forks.read().unwrap().root_bank();
+                    debug!(
+                        "RPC using root bank slot (external finalize, finalized): {:?}",
+                        bank.slot()
+                    );
+                    return bank;
+                }
+                let slot = self
+                    .block_commitment_cache
+                    .read()
+                    .unwrap()
+                    .slot_with_commitment(commitment.commitment);
                 debug!("RPC using block: {slot:?}");
+                let r_bank_forks = self.bank_forks.read().unwrap();
+                return r_bank_forks.get(slot).unwrap_or_else(|| {
+                    warn!(
+                        "Bank with {:?} not found at slot: {:?}",
+                        commitment.commitment, slot
+                    );
+                    r_bank_forks.root_bank()
+                });
             }
             CommitmentLevel::Confirmed => unreachable!(), // SingleGossip variant is deprecated
         };
-
-        let r_bank_forks = self.bank_forks.read().unwrap();
-        r_bank_forks.get(slot).unwrap_or_else(|| {
-            // We log a warning instead of returning an error, because all known error cases
-            // are due to known bugs that should be fixed instead.
-            //
-            // The slot may not be found as a result of a known bug in snapshot creation, where
-            // the bank at the given slot was not included in the snapshot.
-            // Also, it may occur after an old bank has been purged from BankForks and a new
-            // BlockCommitmentCache has not yet arrived. To make this case impossible,
-            // BlockCommitmentCache should hold an `Arc<Bank>` everywhere it currently holds
-            // a slot.
-            //
-            // For more information, see https://github.com/solana-labs/solana/issues/11078
-            warn!(
-                "Bank with {:?} not found at slot: {:?}",
-                commitment.commitment, slot
-            );
-            r_bank_forks.root_bank()
-        })
     }
 
     fn genesis_creation_time(&self) -> UnixTimestamp {
@@ -418,6 +663,7 @@ impl JsonRpcRequestProcessor {
         max_complete_transaction_status_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         runtime: Arc<Runtime>,
+        finalize_history_sender: Option<Sender<ExternalFinalizeRequest>>,
     ) -> (Self, Receiver<TransactionInfo>) {
         let (transaction_sender, transaction_receiver) = unbounded();
         (
@@ -440,6 +686,7 @@ impl JsonRpcRequestProcessor {
                 max_complete_transaction_status_slot,
                 prioritization_fee_cache,
                 runtime,
+                finalize_history_sender,
             },
             transaction_receiver,
         )
@@ -527,6 +774,7 @@ impl JsonRpcRequestProcessor {
             max_complete_transaction_status_slot: Arc::new(AtomicU64::default()),
             prioritization_fee_cache: Arc::new(PrioritizationFeeCache::default()),
             runtime,
+            finalize_history_sender: None,
         }
     }
 
@@ -932,8 +1180,25 @@ impl JsonRpcRequestProcessor {
         signature: &Signature,
         commitment: Option<CommitmentConfig>,
     ) -> Result<RpcResponse<bool>> {
+        let commitment = recent_blockhash_commitment_override(self, commitment);
         let bank = self.bank(commitment);
-        let status = bank.get_signature_status(signature);
+        let root_slot = self.bank_forks.read().unwrap().root();
+        let status = bank.get_signature_status(signature).or_else(|| {
+            if self.finalize_history_sender.is_some() {
+                self.get_transaction_status_from_blockstore(*signature, &bank, root_slot)
+                    .map(|status| status.status)
+            } else {
+                None
+            }
+        });
+        info!(
+            "[RPC_DIAG] confirm_transaction: signature={} commitment={:?} bank_slot={} root_slot={} status_present={}",
+            signature,
+            commitment,
+            bank.slot(),
+            root_slot,
+            status.is_some()
+        );
         match status {
             Some(status) => Ok(new_response(&bank, status.is_ok())),
             None => Ok(new_response(&bank, false)),
@@ -1635,6 +1900,7 @@ impl JsonRpcRequestProcessor {
         signature: Signature,
         commitment: Option<CommitmentConfig>,
     ) -> Result<Option<transaction::Result<()>>> {
+        let commitment = recent_blockhash_commitment_override(self, commitment);
         let bank = self.bank(commitment);
         Ok(bank
             .get_signature_status_slot(&signature)
@@ -1646,6 +1912,7 @@ impl JsonRpcRequestProcessor {
         signatures: Vec<Signature>,
         config: Option<RpcSignatureStatusConfig>,
     ) -> Result<RpcResponse<Vec<Option<TransactionStatus>>>> {
+        let external_finalize_enabled = self.finalize_history_sender.is_some();
         let search_transaction_history = config
             .map(|x| x.search_transaction_history)
             .unwrap_or(false);
@@ -1654,22 +1921,91 @@ impl JsonRpcRequestProcessor {
         }
 
         let bank = self.bank(Some(CommitmentConfig::processed()));
+        let root_slot = self.bank_forks.read().unwrap().root_bank().slot();
+        let hsm_root = self
+            .block_commitment_cache
+            .read()
+            .unwrap()
+            .highest_super_majority_root();
+        info!(
+            "[RPC_DIAG] get_signature_statuses: signatures={} search_history={} bank_slot={} root_slot={} hsm_root={}",
+            signatures.len(),
+            search_transaction_history,
+            bank.slot(),
+            root_slot,
+            hsm_root
+        );
         let mut statuses: Vec<Option<TransactionStatus>> = vec![];
+        let mut found_bank = 0usize;
+        let mut found_blockstore = 0usize;
+        let mut found_bigtable = 0usize;
+        let mut missing = 0usize;
 
         for signature in signatures {
             let status = if let Some(status) = self.get_transaction_status(signature, &bank) {
+                found_bank += 1;
                 Some(status)
+            } else if external_finalize_enabled {
+                if let Some(status) =
+                    self.get_transaction_status_from_blockstore(signature, &bank, root_slot)
+                {
+                    found_blockstore += 1;
+                    Some(status)
+                } else {
+                    // External finalize can move roots aggressively, so widen lookup even when
+                    // client did not request full history search.
+                    let rooted_status_limit = self.bank_forks.read().unwrap().root();
+                    if let Some(status) = self
+                        .blockstore
+                        .get_rooted_transaction_status(signature)
+                        .map_err(|_| Error::internal_error())?
+                        .filter(|(slot, _status_meta)| {
+                            slot <= &rooted_status_limit
+                        })
+                        .map(|(slot, status_meta)| {
+                            let err = status_meta.status.clone().err();
+                            TransactionStatus {
+                                slot,
+                                status: status_meta.status,
+                                confirmations: None,
+                                err,
+                                confirmation_status: Some(TransactionConfirmationStatus::Finalized),
+                            }
+                        })
+                    {
+                        found_blockstore += 1;
+                        Some(status)
+                    } else if search_transaction_history {
+                        if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
+                            match bigtable_ledger_storage.get_signature_status(&signature).await {
+                                Ok(status) => {
+                                    found_bigtable += 1;
+                                    Some(status)
+                                }
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
             } else if search_transaction_history {
+                let rooted_status_limit = if external_finalize_enabled {
+                    self.bank_forks.read().unwrap().root()
+                } else {
+                    self.block_commitment_cache
+                        .read()
+                        .unwrap()
+                        .highest_super_majority_root()
+                };
                 if let Some(status) = self
                     .blockstore
                     .get_rooted_transaction_status(signature)
                     .map_err(|_| Error::internal_error())?
                     .filter(|(slot, _status_meta)| {
-                        slot <= &self
-                            .block_commitment_cache
-                            .read()
-                            .unwrap()
-                            .highest_super_majority_root()
+                        slot <= &rooted_status_limit
                     })
                     .map(|(slot, status_meta)| {
                         let err = status_meta.status.clone().err();
@@ -1682,21 +2018,34 @@ impl JsonRpcRequestProcessor {
                         }
                     })
                 {
+                    found_blockstore += 1;
                     Some(status)
                 } else if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
-                    bigtable_ledger_storage
-                        .get_signature_status(&signature)
-                        .await
-                        .map(Some)
-                        .unwrap_or(None)
+                    match bigtable_ledger_storage.get_signature_status(&signature).await {
+                        Ok(status) => {
+                            found_bigtable += 1;
+                            Some(status)
+                        }
+                        Err(_) => None,
+                    }
                 } else {
                     None
                 }
             } else {
                 None
             };
+            if status.is_none() {
+                missing += 1;
+            }
             statuses.push(status);
         }
+        info!(
+            "[RPC_DIAG] get_signature_statuses result: found_bank={} found_blockstore={} found_bigtable={} missing={}",
+            found_bank,
+            found_blockstore,
+            found_bigtable,
+            missing
+        );
         Ok(new_response(&bank, statuses))
     }
 
@@ -1707,7 +2056,13 @@ impl JsonRpcRequestProcessor {
     ) -> Option<TransactionStatus> {
         let (slot, status) = bank.get_signature_status_slot(&signature)?;
 
-        let optimistically_confirmed_bank = self.bank(Some(CommitmentConfig::confirmed()));
+        let optimistically_confirmed_bank = if self.finalize_history_sender.is_some() {
+            // Keep confirmation loops live for deploy/airdrop workflows while external
+            // finalize controls the root progression.
+            self.bank(Some(CommitmentConfig::processed()))
+        } else {
+            self.bank(Some(CommitmentConfig::confirmed()))
+        };
         let optimistically_confirmed =
             optimistically_confirmed_bank.get_signature_status_slot(&signature);
 
@@ -1735,6 +2090,35 @@ impl JsonRpcRequestProcessor {
                 Some(TransactionConfirmationStatus::Processed)
             },
         })
+    }
+
+    fn get_transaction_status_from_blockstore(
+        &self,
+        signature: Signature,
+        bank: &Bank,
+        root_slot: Slot,
+    ) -> Option<TransactionStatus> {
+        let confirmed_unrooted_slots: HashSet<_> =
+            bank.status_cache_ancestors().into_iter().collect();
+        self.blockstore
+            .get_transaction_status(signature, &confirmed_unrooted_slots)
+            .ok()
+            .flatten()
+            .map(|(slot, status_meta)| {
+                let finalized = slot <= root_slot;
+                let err = status_meta.status.clone().err();
+                TransactionStatus {
+                    slot,
+                    status: status_meta.status,
+                    confirmations: if finalized { None } else { Some(0) },
+                    err,
+                    confirmation_status: Some(if finalized {
+                        TransactionConfirmationStatus::Finalized
+                    } else {
+                        TransactionConfirmationStatus::Confirmed
+                    }),
+                }
+            })
     }
 
     pub async fn get_transaction(
@@ -2353,11 +2737,20 @@ impl JsonRpcRequestProcessor {
     }
 
     fn get_latest_blockhash(&self, config: RpcContextConfig) -> Result<RpcResponse<RpcBlockhash>> {
-        let bank = self.get_bank_with_config(config)?;
+        let bank = self.get_bank_with_config(RpcContextConfig {
+            commitment: recent_blockhash_commitment_override(self, config.commitment),
+            min_context_slot: config.min_context_slot,
+        })?;
         let blockhash = bank.last_blockhash();
         let last_valid_block_height = bank
             .get_blockhash_last_valid_block_height(&blockhash)
             .expect("bank blockhash queue should contain blockhash");
+        info!(
+            "[FINALIZE_DIAG] get_latest_blockhash slot={} root={} commitment={:?}",
+            bank.slot(),
+            self.bank_forks.read().unwrap().root(),
+            config.commitment
+        );
         Ok(new_response(
             &bank,
             RpcBlockhash {
@@ -2372,7 +2765,10 @@ impl JsonRpcRequestProcessor {
         blockhash: &Hash,
         config: RpcContextConfig,
     ) -> Result<RpcResponse<bool>> {
-        let bank = self.get_bank_with_config(config)?;
+        let bank = self.get_bank_with_config(RpcContextConfig {
+            commitment: recent_blockhash_commitment_override(self, config.commitment),
+            min_context_slot: config.min_context_slot,
+        })?;
         let is_valid = bank.is_blockhash_valid(blockhash);
         Ok(new_response(&bank, is_valid))
     }
@@ -2696,6 +3092,29 @@ fn _send_transaction(
     durable_nonce_info: Option<(Pubkey, Hash)>,
     max_retries: Option<usize>,
 ) -> Result<String> {
+    let (working_slot, root_slot, working_block_height, root_block_height) = {
+        let bank_forks = meta.bank_forks.read().unwrap();
+        let working_bank = bank_forks.working_bank();
+        let root_bank = bank_forks.root_bank();
+        (
+            working_bank.slot(),
+            bank_forks.root(),
+            working_bank.block_height(),
+            root_bank.block_height(),
+        )
+    };
+    info!(
+        "[RPC_DIAG] send_transaction enqueue: signature={} blockhash={} last_valid_block_height={} working_slot={} root_slot={} working_block_height={} root_block_height={} max_retries={:?} durable_nonce={:?}",
+        signature,
+        blockhash,
+        last_valid_block_height,
+        working_slot,
+        root_slot,
+        working_block_height,
+        root_block_height,
+        max_retries,
+        durable_nonce_info
+    );
     let transaction_info = TransactionInfo::new(
         message_hash,
         signature,
@@ -2818,7 +3237,9 @@ pub mod rpc_minimal {
         }
 
         fn get_health(&self, meta: Self::Metadata) -> Result<String> {
-            match meta.health.check() {
+            let status = meta.health.check();
+            info!("[RPC_DIAG] get_health: status={status:?}");
+            match status {
                 RpcHealthStatus::Ok => Ok("ok".to_string()),
                 RpcHealthStatus::Unknown => Err(RpcCustomError::NodeUnhealthy {
                     num_slots_behind: None,
@@ -3612,6 +4033,18 @@ pub mod rpc_full {
             meta: Self::Metadata,
             pubkey_strs: Option<Vec<String>>,
         ) -> Result<Vec<RpcPrioritizationFee>>;
+
+        #[rpc(meta, name = "finalizeHistory")]
+        fn finalize_history(&self, meta: Self::Metadata, slot: Option<Slot>) -> Result<bool>;
+
+        #[rpc(meta, name = "replayHistory")]
+        fn replay_history(
+            &self,
+            meta: Self::Metadata,
+            slot: Option<Slot>,
+            exclude_signatures: Option<Vec<String>>,
+            prepend_transactions: Option<HashMap<String, Vec<String>>>,
+        ) -> Result<bool>;
     }
 
     pub struct FullImpl;
@@ -3708,15 +4141,48 @@ pub mod rpc_full {
                 .collect())
         }
 
+        fn finalize_history(&self, meta: Self::Metadata, slot: Option<Slot>) -> Result<bool> {
+            enqueue_finalize_history_request(
+                &meta,
+                slot,
+                ExternalFinalizeMode::FinalizeOnly,
+                None,
+                None,
+            )
+        }
+
+        fn replay_history(
+            &self,
+            meta: Self::Metadata,
+            slot: Option<Slot>,
+            exclude_signatures: Option<Vec<String>>,
+            prepend_transactions: Option<HashMap<String, Vec<String>>>,
+        ) -> Result<bool> {
+            let exclude_signatures = decode_exclude_signatures(exclude_signatures)?;
+            let prepend_transactions = decode_prepend_transactions(prepend_transactions)?;
+            enqueue_finalize_history_request(
+                &meta,
+                slot,
+                ExternalFinalizeMode::Replay,
+                exclude_signatures,
+                prepend_transactions,
+            )
+        }
+
         fn get_signature_statuses(
             &self,
             meta: Self::Metadata,
             signature_strs: Vec<String>,
             config: Option<RpcSignatureStatusConfig>,
         ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>> {
-            debug!(
-                "get_signature_statuses rpc request received: {:?}",
-                signature_strs.len()
+            let search_transaction_history = config
+                .as_ref()
+                .map(|c| c.search_transaction_history)
+                .unwrap_or(false);
+            info!(
+                "[RPC_DIAG] get_signature_statuses request: items={} search_history={}",
+                signature_strs.len(),
+                search_transaction_history
             );
             if signature_strs.len() > MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS {
                 return Box::pin(future::err(Error::invalid_params(format!(
@@ -3764,16 +4230,43 @@ pub mod rpc_full {
             let pubkey = verify_pubkey(&pubkey_str)?;
 
             let config = config.unwrap_or_default();
-            let bank = meta.bank(config.commitment);
+            let commitment = recent_blockhash_commitment_override(&meta, config.commitment);
+            let bank = meta.bank(commitment);
+            let root_slot = meta.bank_forks.read().unwrap().root_bank().slot();
+            info!(
+                "[RPC_DIAG] request_airdrop: pubkey={pubkey_str} lamports={lamports} commitment={commitment:?} bank_slot={} root_slot={root_slot}",
+                bank.slot()
+            );
 
-            let blockhash = if let Some(blockhash) = config.recent_blockhash {
-                verify_hash(&blockhash)?
-            } else {
-                bank.confirmed_last_blockhash()
-            };
-            let last_valid_block_height = bank
-                .get_blockhash_last_valid_block_height(&blockhash)
-                .unwrap_or(0);
+            let (blockhash, last_valid_block_height) =
+                if let Some(blockhash) = config.recent_blockhash {
+                    let blockhash = verify_hash(&blockhash)?;
+                    let last_valid_block_height = bank
+                        .get_blockhash_last_valid_block_height(&blockhash)
+                        .unwrap_or(0);
+                    if last_valid_block_height == 0 {
+                        return Err(Error::invalid_params(
+                            "Provided recent_blockhash is not valid on selected bank",
+                        ));
+                    }
+                    (blockhash, last_valid_block_height)
+                } else if commitment.map(|c| c.is_processed()).unwrap_or(false) {
+                    let blockhash = bank.last_blockhash();
+                    let last_valid_block_height = bank
+                        .get_blockhash_last_valid_block_height(&blockhash)
+                        .unwrap_or(0);
+                    (blockhash, last_valid_block_height)
+                } else {
+                    let blockhash = bank.confirmed_last_blockhash();
+                    let last_valid_block_height = bank
+                        .get_blockhash_last_valid_block_height(&blockhash)
+                        .unwrap_or(0);
+                    (blockhash, last_valid_block_height)
+                };
+            info!(
+                "[RPC_DIAG] request_airdrop blockhash: bank_slot={} last_valid_block_height={last_valid_block_height} blockhash={blockhash}",
+                bank.slot()
+            );
 
             let transaction =
                 request_airdrop_transaction(&faucet_addr, &pubkey, lamports, blockhash).map_err(
@@ -3835,10 +4328,20 @@ pub mod rpc_full {
             } else {
                 preflight_commitment.map(|commitment| CommitmentConfig { commitment })
             };
+            let preflight_commitment =
+                recent_blockhash_commitment_override(&meta, preflight_commitment);
             let preflight_bank = &*meta.get_bank_with_config(RpcContextConfig {
                 commitment: preflight_commitment,
                 min_context_slot,
             })?;
+            info!(
+                "[RPC_DIAG] send_transaction preflight: skip_preflight={} commitment={:?} min_context_slot={:?} bank_slot={} root_slot={}",
+                skip_preflight,
+                preflight_commitment,
+                min_context_slot,
+                preflight_bank.slot(),
+                meta.bank_forks.read().unwrap().root()
+            );
 
             let transaction = sanitize_transaction(
                 unsanitized_tx,
@@ -3971,9 +4474,18 @@ pub mod rpc_full {
                 decode_and_deserialize::<VersionedTransaction>(data, binary_encoding)?;
 
             let bank = &*meta.get_bank_with_config(RpcContextConfig {
-                commitment,
+                commitment: recent_blockhash_commitment_override(&meta, commitment),
                 min_context_slot,
             })?;
+            info!(
+                "[RPC_DIAG] simulate_transaction: sig_verify={} replace_recent_blockhash={} commitment={:?} min_context_slot={:?} bank_slot={} root_slot={}",
+                sig_verify,
+                replace_recent_blockhash,
+                commitment,
+                min_context_slot,
+                bank.slot(),
+                meta.bank_forks.read().unwrap().root()
+            );
             let mut blockhash: Option<RpcBlockhash> = None;
             if replace_recent_blockhash {
                 if sig_verify {
@@ -3982,12 +4494,12 @@ pub mod rpc_full {
                     ));
                 }
                 let recent_blockhash = bank.last_blockhash();
-                unsanitized_tx
-                    .message
-                    .set_recent_blockhash(recent_blockhash);
                 let last_valid_block_height = bank
                     .get_blockhash_last_valid_block_height(&recent_blockhash)
                     .expect("bank blockhash queue should contain blockhash");
+                unsanitized_tx
+                    .message
+                    .set_recent_blockhash(recent_blockhash);
                 blockhash.replace(RpcBlockhash {
                     blockhash: recent_blockhash.to_string(),
                     last_valid_block_height,
@@ -4253,7 +4765,11 @@ pub mod rpc_full {
                 data,
                 TransactionBinaryEncoding::Base64,
             )?;
-            let bank = &*meta.get_bank_with_config(config.unwrap_or_default())?;
+            let config = config.unwrap_or_default();
+            let bank = &*meta.get_bank_with_config(RpcContextConfig {
+                commitment: recent_blockhash_commitment_override(&meta, config.commitment),
+                min_context_slot: config.min_context_slot,
+            })?;
             let sanitized_versioned_message = SanitizedVersionedMessage::try_from(message)
                 .map_err(|err| {
                     Error::invalid_params(format!("invalid transaction message: {err}"))
@@ -4297,6 +4813,60 @@ pub mod rpc_full {
                 .map(|pubkey_str| verify_pubkey(&pubkey_str))
                 .collect::<Result<Vec<_>>>()?;
             meta.get_recent_prioritization_fees(pubkeys)
+        }
+    }
+}
+
+pub mod rpc_finalize_history {
+    use {super::*, jsonrpc_derive::rpc};
+
+    #[rpc]
+    pub trait FinalizeHistory {
+        type Metadata;
+
+        #[rpc(meta, name = "finalizeHistory")]
+        fn finalize_history(&self, meta: Self::Metadata, slot: Option<Slot>) -> Result<bool>;
+
+        #[rpc(meta, name = "replayHistory")]
+        fn replay_history(
+            &self,
+            meta: Self::Metadata,
+            slot: Option<Slot>,
+            exclude_signatures: Option<Vec<String>>,
+            prepend_transactions: Option<HashMap<String, Vec<String>>>,
+        ) -> Result<bool>;
+    }
+
+    pub struct FinalizeHistoryImpl;
+    impl FinalizeHistory for FinalizeHistoryImpl {
+        type Metadata = JsonRpcRequestProcessor;
+
+        fn finalize_history(&self, meta: Self::Metadata, slot: Option<Slot>) -> Result<bool> {
+            enqueue_finalize_history_request(
+                &meta,
+                slot,
+                ExternalFinalizeMode::FinalizeOnly,
+                None,
+                None,
+            )
+        }
+
+        fn replay_history(
+            &self,
+            meta: Self::Metadata,
+            slot: Option<Slot>,
+            exclude_signatures: Option<Vec<String>>,
+            prepend_transactions: Option<HashMap<String, Vec<String>>>,
+        ) -> Result<bool> {
+            let exclude_signatures = decode_exclude_signatures(exclude_signatures)?;
+            let prepend_transactions = decode_prepend_transactions(prepend_transactions)?;
+            enqueue_finalize_history_request(
+                &meta,
+                slot,
+                ExternalFinalizeMode::Replay,
+                exclude_signatures,
+                prepend_transactions,
+            )
         }
     }
 }
@@ -4823,6 +5393,7 @@ pub mod tests {
                 max_complete_transaction_status_slot.clone(),
                 Arc::new(PrioritizationFeeCache::default()),
                 service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj),
+                None,
             )
             .0;
 
@@ -6863,6 +7434,7 @@ pub mod tests {
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
             runtime.clone(),
+            None,
         );
 
         let client = Client::create_client(Some(runtime.handle().clone()), my_tpu_address, None, 1);
@@ -7166,6 +7738,7 @@ pub mod tests {
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
             runtime,
+            None,
         );
 
         SendTransactionService::new_with_client(
@@ -8868,6 +9441,7 @@ pub mod tests {
             max_complete_transaction_status_slot,
             Arc::new(PrioritizationFeeCache::default()),
             service_runtime(rpc_threads, rpc_blocking_threads, rpc_niceness_adj),
+            None,
         );
 
         let mut io = MetaIoHandler::default();
