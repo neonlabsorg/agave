@@ -750,12 +750,24 @@ impl ReplayStage {
                 }
                 if let Some(request) = requested_finalize {
                     let requested_slot = request.slot;
-                    let target_slot = Self::select_finalize_slot_for_external(
-                        &bank_forks,
-                        &tbft_structs.heaviest_subtree_fork_choice,
-                        &tower,
-                        requested_slot,
-                    );
+                    if matches!(request.mode, ExternalFinalizeMode::Replay) && requested_slot != 0 {
+                        info!(
+                            "[FINALIZE_DIAG] replay explicit target preserved: requested_slot={} (root-based validation will be applied)",
+                            requested_slot
+                        );
+                    }
+                    let target_slot = match request.mode {
+                        // For explicit replayHistory(slot), preserve the caller-selected slot.
+                        // It has already been resolved on the RPC side and will be validated
+                        // against current root by replay-path checks.
+                        ExternalFinalizeMode::Replay if requested_slot != 0 => Some(requested_slot),
+                        _ => Self::select_finalize_slot_for_external(
+                            &bank_forks,
+                            &tbft_structs.heaviest_subtree_fork_choice,
+                            &tower,
+                            requested_slot,
+                        ),
+                    };
                     let Some(target_slot) = target_slot else {
                         warn!(
                             "[FINALIZE_DIAG] external finalize skipped: requested_slot={} reason=no_valid_fork_choice",
