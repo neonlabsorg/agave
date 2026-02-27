@@ -2359,6 +2359,7 @@ pub fn process_single_slot(
 ) -> result::Result<(), BlockstoreProcessorError> {
     let slot = bank.slot();
     let mark_dead_slots_on_error = opts.mark_dead_slots_on_error.unwrap_or(true);
+    let should_mark_dead_slot = mark_dead_slots_on_error && opts.abort_on_invalid_block;
     // Mark corrupt slots as dead so validators don't replay this slot and
     // see AlreadyProcessed errors later in ReplayStage
     confirm_full_slot(
@@ -2382,14 +2383,15 @@ pub fn process_single_slot(
     })
     .map_err(|err| {
         warn!("slot {slot} failed to verify: {err}");
-        if blockstore.is_primary_access() && mark_dead_slots_on_error {
+        if blockstore.is_primary_access() && should_mark_dead_slot {
             blockstore
                 .set_dead_slot(slot)
                 .expect("Failed to mark slot as dead in blockstore");
         } else {
             info!(
-                "Failed slot {slot} won't be marked dead (secondary_access={} mark_dead_slots_on_error={mark_dead_slots_on_error})",
+                "Failed slot {slot} won't be marked dead (secondary_access={} mark_dead_slots_on_error={mark_dead_slots_on_error} abort_on_invalid_block={})",
                 !blockstore.is_primary_access(),
+                opts.abort_on_invalid_block,
             );
         }
         err
@@ -2403,15 +2405,16 @@ pub fn process_single_slot(
         .check_last_fec_set_and_get_block_id(slot, bank.hash(), &bank.feature_set)
         .inspect_err(|err| {
             warn!("slot {slot} failed last fec set checks: {err}");
-            if blockstore.is_primary_access() && mark_dead_slots_on_error {
+            if blockstore.is_primary_access() && should_mark_dead_slot {
                 blockstore
                     .set_dead_slot(slot)
                     .expect("Failed to mark slot as dead in blockstore");
             } else {
                 info!(
                     "Failed last fec set checks slot {slot} won't be marked dead \
-                     (secondary_access={} mark_dead_slots_on_error={mark_dead_slots_on_error})",
+                     (secondary_access={} mark_dead_slots_on_error={mark_dead_slots_on_error} abort_on_invalid_block={})",
                     !blockstore.is_primary_access(),
+                    opts.abort_on_invalid_block,
                 );
             }
         })?;
