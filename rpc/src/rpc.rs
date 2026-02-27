@@ -1951,7 +1951,9 @@ impl JsonRpcRequestProcessor {
                 {
                     found_blockstore += 1;
                     Some(status)
-                } else if search_transaction_history {
+                } else {
+                    // External finalize can move roots aggressively, so widen lookup even when
+                    // client did not request full history search.
                     let rooted_status_limit = self.bank_forks.read().unwrap().root();
                     if let Some(status) = self
                         .blockstore
@@ -1973,19 +1975,21 @@ impl JsonRpcRequestProcessor {
                     {
                         found_blockstore += 1;
                         Some(status)
-                    } else if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
-                        match bigtable_ledger_storage.get_signature_status(&signature).await {
-                            Ok(status) => {
-                                found_bigtable += 1;
-                                Some(status)
+                    } else if search_transaction_history {
+                        if let Some(bigtable_ledger_storage) = &self.bigtable_ledger_storage {
+                            match bigtable_ledger_storage.get_signature_status(&signature).await {
+                                Ok(status) => {
+                                    found_bigtable += 1;
+                                    Some(status)
+                                }
+                                Err(_) => None,
                             }
-                            Err(_) => None,
+                        } else {
+                            None
                         }
                     } else {
                         None
                     }
-                } else {
-                    None
                 }
             } else if search_transaction_history {
                 let rooted_status_limit = if external_finalize_enabled {
