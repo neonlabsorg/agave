@@ -9,6 +9,11 @@ on:
       - parasol-dev
       - '[vt][0-9].[0-9]+.[0-9x]+*'
   workflow_dispatch:
+    inputs:
+      test_image:
+        description: "Docker image for parasol-tests job"
+        required: false
+        default: "neonlabsorg/parasol-tests:main"
 
 env:
   IMAGE_NAME: neonlabsorg/parasol-node
@@ -137,7 +142,7 @@ jobs:
     runs-on: gha-runner-scale-set-large
     env:
       PARASOL_NODE_IP: ${{ needs.prepare-infrastructure.outputs.parasol_node_ip }}
-      TEST_IMAGE: neonlabsorg/parasol-tests:main
+      TEST_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.test_image || 'neonlabsorg/parasol-tests:main' }}
       CONTAINER_NAME: parasol-tests-${{ github.run_id }}
       SOLANA_URL: http://${{ needs.prepare-infrastructure.outputs.parasol_node_ip }}:8899
       WS_SOLANA_URL: ws://${{ needs.prepare-infrastructure.outputs.parasol_node_ip }}:8900
