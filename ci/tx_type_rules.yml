@@ -1,0 +1,13 @@
+rules:
+  # counter program
+  # Program ID: FUVnLFCgK48arAUgngmyYkSSKKD2PpjsneNTyigbe4oh
+  #
+  # Important:
+  # Current counter client sends instruction_data = [0x01] (1 byte).
+  # Agave tx_type matcher requires at least 8 bytes (instruction_data[0..8]),
+  # so this rule will match only if the client pads data to >= 8 bytes, e.g.:
+  # [0x01, 0, 0, 0, 0, 0, 0, 0]
+  - program_id: FUVnLFCgK48arAUgngmyYkSSKKD2PpjsneNTyigbe4oh
+    # Keep discriminator quoted so YAML does not coerce it into numeric u64.
+    discriminator: "0x0100000000000000"
+    tx_type: counter_increment
