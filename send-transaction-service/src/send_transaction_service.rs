@@ -68,6 +68,9 @@ pub struct TransactionInfo {
     pub last_valid_block_height: u64,
     pub durable_nonce_info: Option<(Pubkey, Hash)>,
     pub max_retries: Option<usize>,
+    pub received_at: Instant,
+    pub forwarded_at: Instant,
+    pub tx_type: String,
     retries: usize,
     /// Last time the transaction was sent
     last_sent_time: Option<Instant>,
@@ -84,6 +87,32 @@ impl TransactionInfo {
         max_retries: Option<usize>,
         last_sent_time: Option<Instant>,
     ) -> Self {
+        Self::new_with_timing(
+            message_hash,
+            signature,
+            blockhash,
+            wire_transaction,
+            last_valid_block_height,
+            durable_nonce_info,
+            max_retries,
+            Instant::now(),
+            Instant::now(),
+            last_sent_time,
+        )
+    }
+
+    pub fn new_with_timing(
+        message_hash: Hash,
+        signature: Signature,
+        blockhash: Hash,
+        wire_transaction: Vec<u8>,
+        last_valid_block_height: u64,
+        durable_nonce_info: Option<(Pubkey, Hash)>,
+        max_retries: Option<usize>,
+        received_at: Instant,
+        forwarded_at: Instant,
+        last_sent_time: Option<Instant>,
+    ) -> Self {
         Self {
             message_hash,
             signature,
@@ -92,9 +121,17 @@ impl TransactionInfo {
             last_valid_block_height,
             durable_nonce_info,
             max_retries,
+            received_at,
+            forwarded_at,
+            tx_type: "unknown".to_string(),
             retries: 0,
             last_sent_time,
         }
+    }
+
+    pub fn with_tx_type(mut self, tx_type: String) -> Self {
+        self.tx_type = tx_type;
+        self
     }
 
     fn get_max_retries(
@@ -276,10 +313,45 @@ impl SendTransactionService {
                             let retry_len = retry_transactions.len();
                             let entry = retry_transactions.entry(signature);
                             if let Entry::Vacant(_) = entry {
-                                if retry_len >= retry_pool_max_size {
-                                    break;
-                                } else {
-                                    transaction_info.last_sent_time = Some(last_sent_time);
+                                    if retry_len >= retry_pool_max_size {
+                                        solana_metrics::custom_metrics::inc_tx_dropped_total(1);
+                                        solana_metrics::custom_metrics::inc_tx_dropped_total_with_type(
+                                            1,
+                                            &transaction_info.tx_type,
+                                        );
+                                        break;
+                                    } else {
+                                        transaction_info.last_sent_time = Some(last_sent_time);
+                                    let accepted_at = Instant::now();
+                                    let mempool_acceptance_latency_us = accepted_at
+                                        .saturating_duration_since(transaction_info.forwarded_at)
+                                        .as_micros() as u64;
+                                    let acknowledge_latency_us = accepted_at
+                                        .saturating_duration_since(transaction_info.received_at)
+                                        .as_micros() as u64;
+                                    solana_metrics::custom_metrics::observe_mempool_acceptance_latency_us(
+                                        mempool_acceptance_latency_us,
+                                    );
+                                    solana_metrics::custom_metrics::observe_mempool_acceptance_latency_us_with_type(
+                                        mempool_acceptance_latency_us,
+                                        &transaction_info.tx_type,
+                                    );
+                                    solana_metrics::custom_metrics::observe_acknowledge_latency_us(
+                                        acknowledge_latency_us,
+                                    );
+                                    solana_metrics::custom_metrics::observe_acknowledge_latency_us_with_type(
+                                        acknowledge_latency_us,
+                                        &transaction_info.tx_type,
+                                    );
+                                    solana_metrics::custom_metrics::inc_tx_accepted_total(1);
+                                    solana_metrics::custom_metrics::inc_tx_accepted_total_with_type(
+                                        1,
+                                        &transaction_info.tx_type,
+                                    );
+                                    solana_metrics::custom_metrics::register_tx_acceptance_time(
+                                        transaction_info.signature,
+                                        accepted_at,
+                                    );
                                     transactions_added_to_retry += 1;
                                     entry.or_insert(transaction_info);
                                 }
@@ -290,6 +362,15 @@ impl SendTransactionService {
                         stats
                             .retry_queue_overflow
                             .fetch_add(retry_queue_overflow as u64, Ordering::Relaxed);
+                        if retry_queue_overflow > 0 {
+                            solana_metrics::custom_metrics::inc_tx_dropped_total(
+                                retry_queue_overflow as u64,
+                            );
+                            solana_metrics::custom_metrics::inc_tx_dropped_total_with_type(
+                                retry_queue_overflow as u64,
+                                "other",
+                            );
+                        }
                         stats
                             .retry_queue_size
                             .store(retry_transactions.len() as u64, Ordering::Relaxed);
@@ -414,6 +495,12 @@ impl SendTransactionService {
                     info!("Dropping expired durable-nonce transaction: {signature}");
                     result.expired += 1;
                     stats.expired_transactions.fetch_add(1, Ordering::Relaxed);
+                    solana_metrics::custom_metrics::inc_tx_expired_total(1);
+                    solana_metrics::custom_metrics::inc_tx_expired_total_with_type(
+                        1,
+                        &transaction_info.tx_type,
+                    );
+                    solana_metrics::custom_metrics::clear_tx_acceptance_time(signature);
                     return false;
                 }
             }
@@ -421,6 +508,12 @@ impl SendTransactionService {
                 info!("Dropping expired transaction: {signature}");
                 result.expired += 1;
                 stats.expired_transactions.fetch_add(1, Ordering::Relaxed);
+                solana_metrics::custom_metrics::inc_tx_expired_total(1);
+                solana_metrics::custom_metrics::inc_tx_expired_total_with_type(
+                    1,
+                    &transaction_info.tx_type,
+                );
+                solana_metrics::custom_metrics::clear_tx_acceptance_time(signature);
                 return false;
             }
 
@@ -434,6 +527,7 @@ impl SendTransactionService {
                     stats
                         .transactions_exceeding_max_retries
                         .fetch_add(1, Ordering::Relaxed);
+                    solana_metrics::custom_metrics::clear_tx_acceptance_time(signature);
                     return false;
                 }
             }
@@ -481,6 +575,7 @@ impl SendTransactionService {
                         info!("Dropping failed transaction: {signature}");
                         result.failed += 1;
                         stats.failed_transactions.fetch_add(1, Ordering::Relaxed);
+                        solana_metrics::custom_metrics::clear_tx_acceptance_time(signature);
                         false
                     } else {
                         result.retained += 1;
@@ -591,6 +686,9 @@ mod test {
             last_valid_block_height: 0,
             durable_nonce_info: None,
             max_retries: None,
+            received_at: Instant::now(),
+            forwarded_at: Instant::now(),
+            tx_type: "unknown".to_string(),
             retries: 0,
             last_sent_time: None,
         };

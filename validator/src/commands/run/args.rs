@@ -1270,6 +1270,25 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("The maximum request body size accepted by rpc service"),
     )
     .arg(
+        Arg::with_name("rpc_tx_type_map_config")
+            .long("rpc-tx-type-map-config")
+            .value_name("FILE")
+            .takes_value(true)
+            .help(
+                "Path to YAML/JSON config that maps tx type by program and 8-byte instruction discriminator",
+            ),
+    )
+    .arg(
+        Arg::with_name("rpc_tx_type_map_rule")
+            .long("rpc-tx-type-map-rule")
+            .value_name("PROGRAM_ID:METHOD_NAME|DISCRIMINATOR_HEX|DISCRIMINATOR_U64:TX_TYPE")
+            .takes_value(true)
+            .multiple(true)
+            .help(
+                "Inline tx type mapping rule. Use METHOD_NAME for Anchor (sha256(\"global:METHOD_NAME\")[0..8]), explicit DISCRIMINATOR_HEX, or DISCRIMINATOR_U64 (converted via little-endian to 8 bytes) for matching instruction_data[0..8]",
+            ),
+    )
+    .arg(
         Arg::with_name("geyser_plugin_config")
             .long("geyser-plugin-config")
             .alias("accountsdb-plugin-config")

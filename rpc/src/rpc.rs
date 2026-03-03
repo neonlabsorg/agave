@@ -6,6 +6,7 @@ use {
         filter::filter_allows, max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         parsed_token_accounts::*, rpc_cache::LargestAccountsCache, rpc_health::*,
+        signature_metrics_tracker, tx_type_rules,
     },
     base64::{prelude::BASE64_STANDARD, Engine},
     bincode::{config::Options, serialize},
@@ -46,7 +47,7 @@ use {
         leader_schedule_cache::LeaderScheduleCache,
     },
     solana_message::{AddressLoader, SanitizedMessage},
-    solana_metrics::inc_new_counter_info,
+    solana_metrics::{custom_metrics, inc_new_counter_info},
     solana_perf::packet::PACKET_DATA_SIZE,
     solana_program_pack::Pack,
     solana_pubkey::{Pubkey, PUBKEY_BYTES},
@@ -115,7 +116,7 @@ use {
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, OnceLock, RwLock,
         },
-        time::Duration,
+        time::{Duration, Instant},
     },
     tokio::runtime::Runtime,
 };
@@ -175,6 +176,7 @@ pub struct JsonRpcConfig {
     pub full_api: bool,
     pub rpc_scan_and_fix_roots: bool,
     pub max_request_body_size: Option<usize>,
+    pub tx_type_rules: Vec<tx_type_rules::RpcTxTypeRule>,
     /// Disable the health check, used for tests and TestValidator
     pub disable_health_check: bool,
 }
@@ -196,6 +198,7 @@ impl Default for JsonRpcConfig {
             full_api: Default::default(),
             rpc_scan_and_fix_roots: Default::default(),
             max_request_body_size: Option::default(),
+            tx_type_rules: Vec::default(),
             disable_health_check: Default::default(),
         }
     }
@@ -419,6 +422,7 @@ impl JsonRpcRequestProcessor {
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         runtime: Arc<Runtime>,
     ) -> (Self, Receiver<TransactionInfo>) {
+        tx_type_rules::set_rules(config.tx_type_rules.clone());
         let (transaction_sender, transaction_receiver) = unbounded();
         (
             Self {
@@ -2695,8 +2699,12 @@ fn _send_transaction(
     last_valid_block_height: u64,
     durable_nonce_info: Option<(Pubkey, Hash)>,
     max_retries: Option<usize>,
+    received_at: Instant,
+    forwarded_at: Instant,
+    tx_type: String,
 ) -> Result<String> {
-    let transaction_info = TransactionInfo::new(
+    signature_metrics_tracker::register_signature(signature, received_at, forwarded_at);
+    let transaction_info = TransactionInfo::new_with_timing(
         message_hash,
         signature,
         blockhash,
@@ -2704,8 +2712,11 @@ fn _send_transaction(
         last_valid_block_height,
         durable_nonce_info,
         max_retries,
+        received_at,
+        forwarded_at,
         None,
-    );
+    )
+    .with_tx_type(tx_type);
     meta.transaction_sender
         .send(transaction_info)
         .unwrap_or_else(|err| warn!("Failed to enqueue transaction: {err}"));
@@ -3752,6 +3763,8 @@ pub mod rpc_full {
             lamports: u64,
             config: Option<RpcRequestAirdropConfig>,
         ) -> Result<String> {
+            let received_at = Instant::now();
+            let tx_type = "airdrop".to_string();
             debug!("request_airdrop rpc request received");
             trace!(
                 "request_airdrop id={} lamports={} config: {:?}",
@@ -3771,9 +3784,15 @@ pub mod rpc_full {
             } else {
                 bank.confirmed_last_blockhash()
             };
+            if let Some(blockhash_age_slots) = bank.get_hash_age(&blockhash) {
+                custom_metrics::observe_blockhash_age_at_submit_slots(blockhash_age_slots);
+            }
             let last_valid_block_height = bank
                 .get_blockhash_last_valid_block_height(&blockhash)
                 .unwrap_or(0);
+            custom_metrics::observe_blockhash_remaining_validity_slots(
+                last_valid_block_height.saturating_sub(bank.block_height()),
+            );
 
             let transaction =
                 request_airdrop_transaction(&faucet_addr, &pubkey, lamports, blockhash).map_err(
@@ -3795,7 +3814,19 @@ pub mod rpc_full {
                 return Err(RpcCustomError::TransactionSignatureVerificationFailure.into());
             };
 
-            _send_transaction(
+            let forwarded_at = Instant::now();
+            custom_metrics::observe_node_ingress_latency_us(
+                forwarded_at
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+            );
+            custom_metrics::observe_node_ingress_latency_us_with_type(
+                forwarded_at
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+                &tx_type,
+            );
+            let result = _send_transaction(
                 meta,
                 message_hash,
                 signature,
@@ -3804,7 +3835,22 @@ pub mod rpc_full {
                 last_valid_block_height,
                 None,
                 None,
-            )
+                received_at,
+                forwarded_at,
+                tx_type.clone(),
+            );
+            custom_metrics::observe_node_to_decision_response_latency_us(
+                Instant::now()
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+            );
+            custom_metrics::observe_node_to_decision_response_latency_us_with_type(
+                Instant::now()
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+                &tx_type,
+            );
+            result
         }
 
         fn send_transaction(
@@ -3813,6 +3859,7 @@ pub mod rpc_full {
             data: String,
             config: Option<RpcSendTransactionConfig>,
         ) -> Result<String> {
+            let received_at = Instant::now();
             debug!("send_transaction rpc request received");
             let RpcSendTransactionConfig {
                 skip_preflight,
@@ -3845,9 +3892,16 @@ pub mod rpc_full {
                 preflight_bank,
                 preflight_bank.get_reserved_account_keys(),
             )?;
+            let tx_type = tx_type_rules::infer_from_message(
+                transaction.message(),
+                transaction.is_simple_vote_transaction(),
+            );
             let blockhash = *transaction.message().recent_blockhash();
             let message_hash = *transaction.message_hash();
             let signature = *transaction.signature();
+            if let Some(blockhash_age_slots) = preflight_bank.get_hash_age(&blockhash) {
+                custom_metrics::observe_blockhash_age_at_submit_slots(blockhash_age_slots);
+            }
 
             let mut last_valid_block_height = preflight_bank
                 .get_blockhash_last_valid_block_height(&blockhash)
@@ -3863,6 +3917,9 @@ pub mod rpc_full {
                 // retried until the nonce is advanced.
                 last_valid_block_height = preflight_bank.block_height() + MAX_PROCESSING_AGE as u64;
             }
+            custom_metrics::observe_blockhash_remaining_validity_slots(
+                last_valid_block_height.saturating_sub(preflight_bank.block_height()),
+            );
 
             if !skip_preflight {
                 verify_transaction(&transaction)?;
@@ -3933,7 +3990,19 @@ pub mod rpc_full {
                 }
             }
 
-            _send_transaction(
+            let forwarded_at = Instant::now();
+            custom_metrics::observe_node_ingress_latency_us(
+                forwarded_at
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+            );
+            custom_metrics::observe_node_ingress_latency_us_with_type(
+                forwarded_at
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+                &tx_type,
+            );
+            let result = _send_transaction(
                 meta,
                 message_hash,
                 signature,
@@ -3942,7 +4011,33 @@ pub mod rpc_full {
                 last_valid_block_height,
                 durable_nonce_info,
                 max_retries,
-            )
+                received_at,
+                forwarded_at,
+                tx_type.clone(),
+            );
+            custom_metrics::observe_node_to_decision_response_latency_us(
+                Instant::now()
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+            );
+            custom_metrics::observe_node_to_decision_response_latency_us_with_type(
+                Instant::now()
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+                &tx_type,
+            );
+            custom_metrics::observe_decision_response_latency_us(
+                Instant::now()
+                    .saturating_duration_since(forwarded_at)
+                    .as_micros() as u64,
+            );
+            custom_metrics::observe_decision_response_latency_us_with_type(
+                Instant::now()
+                    .saturating_duration_since(forwarded_at)
+                    .as_micros() as u64,
+                &tx_type,
+            );
+            result
         }
 
         fn simulate_transaction(
@@ -4228,7 +4323,12 @@ pub mod rpc_full {
             config: Option<RpcContextConfig>,
         ) -> Result<RpcResponse<RpcBlockhash>> {
             debug!("get_latest_blockhash rpc request received");
-            meta.get_latest_blockhash(config.unwrap_or_default())
+            let start = Instant::now();
+            let result = meta.get_latest_blockhash(config.unwrap_or_default());
+            custom_metrics::observe_blockhash_fetch_latency_us(
+                Instant::now().saturating_duration_since(start).as_micros() as u64,
+            );
+            result
         }
 
         fn is_blockhash_valid(
