@@ -792,14 +792,14 @@ mod tests {
             .send(to_banking_packet_batch(&txs))
             .unwrap();
 
-        // Priority Expectation:
-        // Thread 0: [3, 1]
-        // Thread 1: [2, 0]
-        let t0_expected = [3, 1]
+        // Uniform-weight expectation (FIFO for equal priorities):
+        // Thread 0: [0, 2]
+        // Thread 1: [1, 3]
+        let t0_expected = [0, 2]
             .into_iter()
             .map(|i| txs[i].message().hash())
             .collect_vec();
-        let t1_expected = [2, 0]
+        let t1_expected = [1, 3]
             .into_iter()
             .map(|i| txs[i].message().hash())
             .collect_vec();
