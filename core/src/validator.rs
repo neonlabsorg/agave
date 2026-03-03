@@ -1663,6 +1663,7 @@ impl Validator {
             finalize_history_receiver,
             blockstore_process_options.clone(),
             config.external_finalize_timeout,
+            config.finalize_history_rpc_addr.is_some(),
         )
         .map_err(ValidatorError::Other)?;
 
