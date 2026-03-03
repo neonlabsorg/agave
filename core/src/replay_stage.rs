@@ -693,6 +693,7 @@ impl ReplayStage {
                 last_print_time: Instant::now(),
             };
             let mut last_external_finalize = Instant::now();
+            let mut last_finalize_diag_log = Instant::now();
             let mut tbft_structs = TowerBFTStructures {
                 heaviest_subtree_fork_choice,
                 duplicate_slots_tracker,
@@ -902,9 +903,18 @@ impl ReplayStage {
                                 Self::reset_poh_recorder(
                                     &my_pubkey,
                                     &blockstore,
-                                    working_bank,
+                                    working_bank.clone(),
                                     &poh_recorder,
                                     &leader_schedule_cache,
+                                );
+                                info!(
+                                    "[FINALIZE_DIAG] post-finalize state: working_bank={} \
+                                     has_new_vote_been_rooted={} vote_only_mode={} \
+                                     poh_has_bank={}",
+                                    working_bank.slot(),
+                                    has_new_vote_been_rooted,
+                                    in_vote_only_mode.load(Ordering::Relaxed),
+                                    poh_recorder.read().unwrap().has_bank(),
                                 );
                             }
                         }
@@ -1118,12 +1128,17 @@ impl ReplayStage {
                     .select_forks(&frozen_banks, &tower, &progress, &ancestors, &bank_forks);
                 select_forks_time.stop();
 
-                Self::check_for_vote_only_mode(
-                    heaviest_bank.slot(),
-                    forks_root,
-                    &in_vote_only_mode,
-                    &bank_forks,
-                );
+                // Skip vote-only-mode check when external finalization is active:
+                // the root-to-tip gap is expected to grow and is not a sign of
+                // the validator falling behind.
+                if !external_finalize_enabled.load(Ordering::Relaxed) {
+                    Self::check_for_vote_only_mode(
+                        heaviest_bank.slot(),
+                        forks_root,
+                        &in_vote_only_mode,
+                        &bank_forks,
+                    );
+                }
 
                 let mut select_vote_and_reset_forks_time =
                     Measure::start("select_vote_and_reset_forks");
@@ -1214,7 +1229,7 @@ impl ReplayStage {
                         &mut tbft_structs,
                     ) {
                         error!("Unable to set root: {e}");
-                        return;
+                        continue;
                     }
                 }
                 voting_time.stop();
@@ -1363,6 +1378,7 @@ impl ReplayStage {
                         &mut skipped_slots_info,
                         &banking_tracer,
                         has_new_vote_been_rooted,
+                        external_finalize_enabled.load(Ordering::Relaxed),
                     );
 
                     let poh_bank = poh_recorder.read().unwrap().bank();
@@ -1377,6 +1393,30 @@ impl ReplayStage {
                 }
                 start_leader_time.stop();
 
+                // Periodic diagnostic for external finalization debugging.
+                if external_finalize_enabled.load(Ordering::Relaxed)
+                    && last_finalize_diag_log.elapsed() >= Duration::from_secs(10)
+                {
+                    let root = bank_forks.read().unwrap().root();
+                    let working = bank_forks.read().unwrap().working_bank().slot();
+                    let forks_len = bank_forks.read().unwrap().len();
+                    let poh_has_bank = poh_recorder.read().unwrap().has_bank();
+                    info!(
+                        "[FINALIZE_DIAG] replay_loop heartbeat: root={} working={} forks={} \
+                         tpu_has_bank={} poh_has_bank={} did_complete_bank={} \
+                         has_new_vote_been_rooted={} vote_only_mode={}",
+                        root,
+                        working,
+                        forks_len,
+                        tpu_has_bank,
+                        poh_has_bank,
+                        did_complete_bank,
+                        has_new_vote_been_rooted,
+                        in_vote_only_mode.load(Ordering::Relaxed),
+                    );
+                    last_finalize_diag_log = Instant::now();
+                }
+
                 let mut wait_receive_time = Measure::start("wait_receive_time");
                 if !did_complete_bank {
                     // only wait for the signal if we did not just process a bank; maybe there are more slots available
@@ -1385,7 +1425,13 @@ impl ReplayStage {
                     let result = ledger_signal_receiver.recv_timeout(timer);
                     match result {
                         Err(RecvTimeoutError::Timeout) => (),
-                        Err(_) => break,
+                        Err(e) => {
+                            error!(
+                                "[FINALIZE_DIAG] ledger_signal_receiver disconnected ({e:?}), \
+                                 replay loop exiting"
+                            );
+                            break;
+                        }
                         Ok(_) => trace!("blockstore signal"),
                     };
                 }
@@ -2282,6 +2328,7 @@ impl ReplayStage {
         skipped_slots_info: &mut SkippedSlotsInfo,
         banking_tracer: &Arc<BankingTracer>,
         has_new_vote_been_rooted: bool,
+        external_finalize_active: bool,
     ) -> bool {
         // all the individual calls to poh_recorder.read() are designed to
         // increase granularity, decrease contention
@@ -2379,12 +2426,13 @@ impl ReplayStage {
             info!("new fork:{poh_slot} parent:{parent_slot} (leader) root:{root_slot}");
 
             let root_distance = poh_slot - root_slot;
-            let vote_only_bank = if root_distance > MAX_ROOT_DISTANCE_FOR_VOTE_ONLY {
-                datapoint_info!("vote-only-bank", ("slot", poh_slot, i64));
-                true
-            } else {
-                false
-            };
+            let vote_only_bank =
+                if !external_finalize_active && root_distance > MAX_ROOT_DISTANCE_FOR_VOTE_ONLY {
+                    datapoint_info!("vote-only-bank", ("slot", poh_slot, i64));
+                    true
+                } else {
+                    false
+                };
 
             let tpu_bank = Self::new_bank_from_parent_with_notify(
                 parent.clone(),
