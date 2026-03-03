@@ -1723,29 +1723,23 @@ fn confirm_slot_entries(
         }
     }
 
-    let mut entry_tx_starting_indexes = Vec::with_capacity(entries.len());
     let mut entry_tx_starting_index = progress.num_txs;
-    let num_txs = entries
-        .iter()
-        .map(|entry| match entry {
-            EntryType::Tick(_) => 0,
-            EntryType::Transactions(transactions) => {
-                let num_txs = transactions.len();
-                let next_tx_starting_index = entry_tx_starting_index.saturating_add(num_txs);
-                entry_tx_starting_indexes.push(entry_tx_starting_index);
-                entry_tx_starting_index = next_tx_starting_index;
-                num_txs
-            }
-        })
-        .sum::<usize>();
+    let mut num_txs = 0usize;
 
     let mut replay_timer = Measure::start("replay_elapsed");
     let replay_entries: Vec<_> = entries
         .into_iter()
-        .zip(entry_tx_starting_indexes)
-        .map(|(entry, tx_starting_index)| ReplayEntry {
-            entry,
-            starting_index: tx_starting_index,
+        .map(|entry| {
+            let starting_index = entry_tx_starting_index;
+            if let EntryType::Transactions(ref txs) = entry {
+                let count = txs.len();
+                entry_tx_starting_index = entry_tx_starting_index.saturating_add(count);
+                num_txs += count;
+            }
+            ReplayEntry {
+                entry,
+                starting_index,
+            }
         })
         .collect();
     let process_result = process_entries(
