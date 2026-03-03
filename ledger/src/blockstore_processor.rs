@@ -2222,7 +2222,7 @@ fn load_frozen_forks(
                                 new_root_bank = new_root_bank.parent().unwrap();
                             }
                             total_rooted_slots += rooted_slots.len();
-                            if blockstore.is_primary_access() {
+                            if blockstore.is_primary_access() && !opts.runtime_replay_from_root {
                                 blockstore
                                     .mark_slots_as_if_rooted_normally_at_startup(rooted_slots, true)
                                     .expect("Blockstore::mark_slots_as_if_rooted_normally_at_startup() should succeed");

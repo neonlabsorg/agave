@@ -734,8 +734,18 @@ impl ReplayStage {
                 }
 
                 let mut requested_finalize = None;
+                let mut finalize_drop_count = 0u64;
                 while let Ok(request) = finalize_history_receiver.try_recv() {
+                    if requested_finalize.is_some() {
+                        finalize_drop_count += 1;
+                    }
                     requested_finalize = Some(request);
+                }
+                if finalize_drop_count > 0 {
+                    warn!(
+                        "[FINALIZE_DIAG] dropped {} finalize request(s), processing latest only",
+                        finalize_drop_count
+                    );
                 }
                 if requested_finalize.is_none()
                     && external_finalize_enabled
@@ -750,23 +760,25 @@ impl ReplayStage {
                 }
                 if let Some(request) = requested_finalize {
                     let requested_slot = request.slot;
-                    if matches!(request.mode, ExternalFinalizeMode::Replay) && requested_slot != 0 {
+                    if requested_slot != 0 {
                         info!(
-                            "[FINALIZE_DIAG] replay explicit target preserved: requested_slot={} (root-based validation will be applied)",
-                            requested_slot
+                            "[FINALIZE_DIAG] explicit target preserved: mode={:?} requested_slot={} (downstream validation will be applied)",
+                            request.mode, requested_slot
                         );
                     }
-                    let target_slot = match request.mode {
-                        // For explicit replayHistory(slot), preserve the caller-selected slot.
-                        // It has already been resolved on the RPC side and will be validated
-                        // against current root by replay-path checks.
-                        ExternalFinalizeMode::Replay if requested_slot != 0 => Some(requested_slot),
-                        _ => Self::select_finalize_slot_for_external(
+                    let target_slot = if requested_slot != 0 {
+                        // For explicit finalizeHistory(slot) or replayHistory(slot),
+                        // preserve the caller-selected slot. It has already been resolved
+                        // on the RPC side and will be validated downstream by ancestry/frozen
+                        // checks (FinalizeOnly) or replay-path checks (Replay).
+                        Some(requested_slot)
+                    } else {
+                        Self::select_finalize_slot_for_external(
                             &bank_forks,
                             &tbft_structs.heaviest_subtree_fork_choice,
                             &tower,
                             requested_slot,
-                        ),
+                        )
                     };
                     let Some(target_slot) = target_slot else {
                         warn!(
@@ -853,6 +865,16 @@ impl ReplayStage {
                             has_new_vote_been_rooted = !wait_for_vote_to_start_leader;
                             latest_validator_votes_for_frozen_banks =
                                 LatestValidatorVotesForFrozenBanks::default();
+                            // Persist tower state after successful finalization to prevent
+                            // tower/root divergence on restart.
+                            if let Err(err) = tower.save(
+                                tower_storage.as_ref(),
+                                &identity_keypair,
+                            ) {
+                                error!(
+                                    "[FINALIZE_DIAG] failed to save tower after finalization: {err:?}"
+                                );
+                            }
                             if matches!(request.mode, ExternalFinalizeMode::FinalizeOnly) {
                                 let working_bank = bank_forks.read().unwrap().working_bank();
                                 let root_slot = bank_forks.read().unwrap().root();
@@ -4201,7 +4223,27 @@ impl ReplayStage {
         tracked_vote_transactions: &mut Vec<TrackedVoteTransaction>,
         tbft_structs: &mut TowerBFTStructures,
     ) {
-        let new_root_bank = &bank_forks[new_root];
+        let Some(new_root_bank) = bank_forks.get(new_root) else {
+            error!(
+                "[FINALIZE_DIAG] set_progress_and_tower_bft_root: new_root {} not found in bank_forks, skipping vote tracking update",
+                new_root
+            );
+            progress.handle_new_root(bank_forks);
+            let TowerBFTStructures {
+                heaviest_subtree_fork_choice,
+                duplicate_slots_tracker,
+                duplicate_confirmed_slots,
+                unfrozen_gossip_verified_vote_hashes,
+                epoch_slots_frozen_slots,
+                ..
+            } = tbft_structs;
+            heaviest_subtree_fork_choice.set_tree_root((new_root, bank_forks.root_bank().hash()));
+            *duplicate_slots_tracker = duplicate_slots_tracker.split_off(&new_root);
+            *duplicate_confirmed_slots = duplicate_confirmed_slots.split_off(&new_root);
+            unfrozen_gossip_verified_vote_hashes.set_root(new_root);
+            *epoch_slots_frozen_slots = epoch_slots_frozen_slots.split_off(&new_root);
+            return;
+        };
         if !*has_new_vote_been_rooted {
             for TrackedVoteTransaction {
                 message_hash,
@@ -4418,6 +4460,7 @@ impl ReplayStage {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn preflight_replay_target_from_root(
         target_slot: Slot,
         bank_forks: &Arc<RwLock<BankForks>>,
@@ -4465,6 +4508,7 @@ impl ReplayStage {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn resolve_replayable_finalize_target(
         initial_target: Slot,
         root_slot: Slot,
@@ -4567,27 +4611,23 @@ impl ReplayStage {
         if target_slot == 0 {
             return Ok(());
         }
+
+        // 1. Validate target_slot > root
         let root_slot = bank_forks.read().unwrap().root();
         if target_slot <= root_slot {
             return Err(format!(
                 "finalize target {target_slot} is not above current root {root_slot}"
             ));
         }
-        let target_slot = Self::resolve_replayable_finalize_target(
-            target_slot,
-            root_slot,
-            bank_forks,
-            blockstore,
-            leader_schedule_cache,
-            process_options,
-            exclude_signatures,
-            prepend_transactions,
-        )?;
+
+        // 2. Validate replay path exists in blockstore (no dead/missing slots)
+        Self::validate_replay_path_from_root(blockstore, root_slot, target_slot)?;
         info!(
-            "[FINALIZE_DIAG] external finalize replay target resolved: root_slot={} target_slot={}",
+            "[FINALIZE_DIAG] real replay: path validated root={} target={}",
             root_slot, target_slot
         );
 
+        // 3. Validate prepend transaction slots are within replay range
         if let Some(prepend_transactions) = prepend_transactions {
             for slot in prepend_transactions.keys() {
                 if *slot <= root_slot || *slot > target_slot {
@@ -4599,57 +4639,90 @@ impl ReplayStage {
             }
         }
 
-        match blockstore.meta(root_slot) {
-            Ok(Some(meta)) => {
-                info!(
-                    "[FINALIZE_DIAG] root meta: slot={} parent={:?} next_slots_len={} is_full={} is_connected={} max_root={}",
-                    root_slot,
-                    meta.parent_slot,
-                    meta.next_slots.len(),
-                    meta.is_full(),
-                    meta.is_connected(),
-                    blockstore.max_root()
-                );
-                let mut logged = 0usize;
-                for next_slot in &meta.next_slots {
-                    if logged >= 20 {
-                        info!("[FINALIZE_DIAG] root meta next_slots: truncated at 20 entries");
-                        break;
-                    }
-                    let is_dead = blockstore.is_dead(*next_slot);
-                    let (has_meta, is_full) = match blockstore.meta(*next_slot) {
-                        Ok(Some(next_meta)) => (true, next_meta.is_full()),
-                        Ok(None) => (false, false),
-                        Err(_) => (false, false),
-                    };
-                    info!(
-                        "[FINALIZE_DIAG] root child slot: slot={} has_meta={} is_full={} is_dead={}",
-                        next_slot,
-                        has_meta,
-                        is_full,
-                        is_dead
-                    );
-                    logged += 1;
-                }
-            }
-            Ok(None) => {
-                return Err(format!(
-                    "root slot {root_slot} not found in blockstore; cannot replay history"
-                ));
-            }
-            Err(err) => {
-                return Err(format!(
-                    "failed to read blockstore meta for root slot {root_slot}: {err}"
-                ));
-            }
+        // 4. Prepare ProcessOptions for real replay with modifications
+        let mut replay_options = process_options.clone();
+        replay_options.halt_at_slot = Some(target_slot);
+        replay_options.abort_on_invalid_block = true;
+        replay_options.runtime_replay_from_root = true;
+        replay_options.mark_dead_slots_on_error = Some(false);
+        replay_options.exclude_signatures = exclude_signatures.cloned();
+        replay_options.prepend_transactions = prepend_transactions.cloned();
+        // Disable PoH verification when transactions are modified —
+        // excluding or prepending transactions breaks the hash chain.
+        if exclude_signatures.map_or(false, |s| !s.is_empty())
+            || prepend_transactions.map_or(false, |p| !p.is_empty())
+        {
+            replay_options.run_verification = false;
         }
 
-        let parent_slot = bank_forks
-            .read()
-            .unwrap()
-            .get(target_slot)
-            .ok_or_else(|| format!("finalize target {target_slot} not found in bank forks"))?
-            .parent_slot();
+        // 5. Clear all non-root banks — this is the pause point.
+        // After this, only the root bank remains. Normal replay loop is
+        // already paused (we're inside the finalization handling block).
+        info!(
+            "[FINALIZE_DIAG] real replay: clearing non-root banks (root={})",
+            root_slot
+        );
+        let removed_banks = bank_forks.write().unwrap().reset_to_root_only();
+        let _ = drop_bank_sender.send(removed_banks);
+
+        // 6. Replay blockstore from root to target WITH modifications on REAL bank_forks.
+        // process_blockstore_from_root asserts banks.len()==1 (satisfied by reset_to_root_only).
+        // Entries are loaded from blockstore, filtered by exclude_signatures,
+        // extended by prepend_transactions, and executed against real AccountsDb.
+        info!(
+            "[FINALIZE_DIAG] real replay: replaying from root {} to target {} (exclude={} prepend={})",
+            root_slot,
+            target_slot,
+            exclude_signatures.map_or(0, |s| s.len()),
+            prepend_transactions.map_or(0, |p| p.len()),
+        );
+        let replay_start = std::time::Instant::now();
+        let replay_result = blockstore_processor::process_blockstore_from_root(
+            blockstore,
+            bank_forks,
+            leader_schedule_cache,
+            &replay_options,
+            None,
+            None,
+            None,
+        );
+        let replay_elapsed = replay_start.elapsed();
+
+        if let Err(err) = replay_result {
+            error!(
+                "[FINALIZE_DIAG] real replay FAILED after {:?}: root={} target={} err={:?}",
+                replay_elapsed, root_slot, target_slot, err
+            );
+            // Node is left with only the root bank — consistent state.
+            // Normal replay loop will re-receive shreds and rebuild the fork tree.
+            return Err(format!(
+                "real replay failed (root={} target={}): {err:?}",
+                root_slot, target_slot
+            ));
+        }
+        info!(
+            "[FINALIZE_DIAG] real replay completed in {:?}: root={} target={}",
+            replay_elapsed, root_slot, target_slot
+        );
+
+        // 7. Validate target was produced and frozen
+        let parent_slot = {
+            let forks = bank_forks.read().unwrap();
+            let target_bank = forks.get(target_slot).ok_or_else(|| {
+                format!(
+                    "target {target_slot} not produced after real replay (banks: {:?})",
+                    forks.banks().keys().collect::<Vec<_>>()
+                )
+            })?;
+            if !target_bank.is_frozen() {
+                return Err(format!(
+                    "target {target_slot} not frozen after real replay"
+                ));
+            }
+            target_bank.parent_slot()
+        };
+
+        // 8. Set root (advance to target with modified state)
         Self::check_and_handle_new_root(
             identity_pubkey,
             parent_slot,
@@ -4669,6 +4742,7 @@ impl ReplayStage {
         )
         .map_err(|err| format!("failed to set root {target_slot}: {err}"))?;
 
+        // 9. Reset PoH recorder to new working bank
         let working_bank = bank_forks.read().unwrap().working_bank();
         Self::reset_poh_recorder(
             identity_pubkey,
@@ -4678,6 +4752,10 @@ impl ReplayStage {
             leader_schedule_cache,
         );
 
+        info!(
+            "[FINALIZE_DIAG] real replay finalized: new root={} elapsed={:?}",
+            target_slot, replay_elapsed
+        );
         Ok(())
     }
 
