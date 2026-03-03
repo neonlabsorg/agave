@@ -690,3 +690,4 @@ solana-fee-structure = { path = "neon/solana-sdk/fee-structure" }
 solana-system-interface = { path = "neon/solana-sdk/system-interface" }
 solana-account-info = { path = "neon/solana-sdk/account-info" }
 solana-compute-budget-interface = { path = "neon/solana-sdk/compute-budget-interface" }
+solana-packet = { path = "neon/solana-sdk/packet" }

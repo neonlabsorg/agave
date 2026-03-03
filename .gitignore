@@ -27,6 +27,9 @@ log-*/
 /solana.iml
 /.vscode/
 
+# agents
+.bgv
+
 # fetch-core-bpf.sh artifacts
 /core-bpf-genesis-args.sh
 /core-bpf-*.so

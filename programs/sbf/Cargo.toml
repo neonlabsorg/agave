@@ -307,3 +307,4 @@ quinn-proto = { git = "https://github.com/anza-xyz/quinn", rev = "fc4decb0cf79b1
 # There is a similar override in `../../Cargo.toml`.  Please keep both comments
 # and the overrides in sync.
 solana-curve25519 = { path = "../../curves/curve25519" }
+solana-packet = { path = "../../neon/solana-sdk/packet" }

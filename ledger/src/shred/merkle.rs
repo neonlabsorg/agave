@@ -40,7 +40,10 @@ use {
     },
 };
 
-const_assert_eq!(ShredData::SIZE_OF_PAYLOAD, 1203);
+const_assert_eq!(
+    ShredData::SIZE_OF_PAYLOAD,
+    ShredCode::SIZE_OF_PAYLOAD - ShredCode::SIZE_OF_HEADERS + SIZE_OF_SIGNATURE
+);
 
 // Layout: {common, data} headers | data buffer
 //     | [Merkle root of the previous erasure batch if chained]

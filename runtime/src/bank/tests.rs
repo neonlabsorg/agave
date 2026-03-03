@@ -5055,13 +5055,16 @@ fn test_fuzz_instructions() {
         };
 
         let instructions: Vec<_> = if num_keys > 0 {
+            let instruction_index_upper_bound = num_keys.min(u8::MAX as usize + 1);
             (0..num_instructions)
                 .map(|_| {
-                    let num_accounts_to_pass = thread_rng().gen_range(0..num_keys);
+                    let num_accounts_to_pass =
+                        thread_rng().gen_range(0..instruction_index_upper_bound);
                     let account_indexes = (0..num_accounts_to_pass)
-                        .map(|_| thread_rng().gen_range(0..num_keys))
+                        .map(|_| thread_rng().gen_range(0..instruction_index_upper_bound) as u8)
                         .collect();
-                    let program_index: u8 = thread_rng().gen_range(0..num_keys);
+                    let program_index =
+                        thread_rng().gen_range(0..instruction_index_upper_bound) as u8;
                     if thread_rng().gen_ratio(4, 5) {
                         let programs_index = thread_rng().gen_range(0..program_keys.len());
                         account_keys[program_index as usize] = program_keys[programs_index].0;
