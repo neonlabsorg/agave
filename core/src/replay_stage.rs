@@ -4661,7 +4661,7 @@ impl ReplayStage {
         bank_forks: &Arc<RwLock<BankForks>>,
         blockstore: &Blockstore,
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
-        snapshot_controller: Option<&SnapshotController>,
+        _snapshot_controller: Option<&SnapshotController>,
         rpc_subscriptions: Option<&RpcSubscriptions>,
         bank_notification_sender: &Option<BankNotificationSenderConfig>,
         process_options: &ProcessOptions,
@@ -4801,7 +4801,7 @@ impl ReplayStage {
             progress,
             blockstore,
             leader_schedule_cache,
-            snapshot_controller,
+            None,
             rpc_subscriptions,
             None,
             bank_notification_sender,
@@ -4835,7 +4835,7 @@ impl ReplayStage {
         bank_forks: &Arc<RwLock<BankForks>>,
         blockstore: &Blockstore,
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
-        snapshot_controller: Option<&SnapshotController>,
+        _snapshot_controller: Option<&SnapshotController>,
         rpc_subscriptions: Option<&RpcSubscriptions>,
         bank_notification_sender: &Option<BankNotificationSenderConfig>,
         identity_pubkey: &Pubkey,
@@ -4854,6 +4854,11 @@ impl ReplayStage {
                 "finalize target {target_slot} is not above current root {root_slot}"
             ));
         }
+        let forks_len = bank_forks.read().unwrap().len();
+        info!(
+            "[FINALIZE_DIAG] finalize_without_replay: target={} root={} forks={} slot_distance={}",
+            target_slot, root_slot, forks_len, target_slot - root_slot
+        );
         let ancestors = bank_forks.read().unwrap().ancestors();
         let is_descended_from_root = ancestors
             .get(&target_slot)
@@ -4882,7 +4887,7 @@ impl ReplayStage {
             progress,
             blockstore,
             leader_schedule_cache,
-            snapshot_controller,
+            None,
             rpc_subscriptions,
             None,
             bank_notification_sender,
@@ -4892,6 +4897,12 @@ impl ReplayStage {
             tbft_structs,
         )
         .map_err(|err| format!("failed to set root {target_slot}: {err}"))?;
+
+        info!(
+            "[FINALIZE_DIAG] finalize_without_replay: completed target={} new_root={}",
+            target_slot,
+            bank_forks.read().unwrap().root()
+        );
 
         Ok(())
     }
