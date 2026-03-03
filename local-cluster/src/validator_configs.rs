@@ -82,6 +82,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         retransmit_xdp: config.retransmit_xdp.clone(),
         repair_handler_type: config.repair_handler_type.clone(),
         external_finalize_timeout: config.external_finalize_timeout,
+        disable_external_finalize: config.disable_external_finalize,
         finalize_history_rpc_addr: config.finalize_history_rpc_addr,
         finalize_history_rpc_max_request_body_size: config
             .finalize_history_rpc_max_request_body_size,

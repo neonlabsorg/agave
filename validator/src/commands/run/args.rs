@@ -903,6 +903,17 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("disable_external_finalize")
+            .long("disable-external-finalize")
+            .takes_value(false)
+            .help(
+                "Disable external finalization mode.  When set, root advances \
+                 normally via MAX_LOCKOUT_HISTORY (upstream Solana behavior).  \
+                 By default external finalization is enabled: root is held until \
+                 an RPC finalizeHistory/replayHistory call arrives.",
+            ),
+    )
+    .arg(
         Arg::with_name("tpu_connection_pool_size")
             .long("tpu-connection-pool-size")
             .takes_value(true)

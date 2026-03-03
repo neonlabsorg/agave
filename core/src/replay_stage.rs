@@ -288,7 +288,13 @@ pub struct ReplayStageConfig {
     pub prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     pub banking_tracer: Arc<BankingTracer>,
     pub snapshot_controller: Option<Arc<SnapshotController>>,
-    pub external_finalize_enabled: bool,
+    /// Runtime flag: true once external finalization is active (after bootstrap).
+    /// Starts `false`; set to `true` after the first root advancement when
+    /// `external_finalize_configured` is `true`.  Using AtomicBool lets the
+    /// replay loop enable it mid-flight without restarting.
+    pub external_finalize_enabled: Arc<AtomicBool>,
+    /// Static config: true when `--finalize-history-rpc-port` was specified.
+    pub external_finalize_configured: bool,
     pub external_finalize_timeout: Duration,
     pub replay_process_options: ProcessOptions,
 }
@@ -593,6 +599,7 @@ impl ReplayStage {
             banking_tracer,
             snapshot_controller,
             external_finalize_enabled,
+            external_finalize_configured,
             external_finalize_timeout,
             replay_process_options,
         } = config;
@@ -748,7 +755,7 @@ impl ReplayStage {
                     );
                 }
                 if requested_finalize.is_none()
-                    && external_finalize_enabled
+                    && external_finalize_enabled.load(Ordering::Relaxed)
                     && last_external_finalize.elapsed() >= external_finalize_timeout
                 {
                     requested_finalize = Some(ExternalFinalizeRequest {
@@ -1202,7 +1209,8 @@ impl ReplayStage {
                         &voting_sender,
                         &drop_bank_sender,
                         wait_to_vote_slot,
-                        external_finalize_enabled,
+                        &external_finalize_enabled,
+                        external_finalize_configured,
                         &mut tbft_structs,
                     ) {
                         error!("Unable to set root: {e}");
@@ -2582,7 +2590,8 @@ impl ReplayStage {
         voting_sender: &Sender<VoteOp>,
         drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
         wait_to_vote_slot: Option<Slot>,
-        external_finalize_enabled: bool,
+        external_finalize_enabled: &Arc<AtomicBool>,
+        external_finalize_configured: bool,
         tbft_structs: &mut TowerBFTStructures,
     ) -> Result<(), SetRootError> {
         if bank.is_empty() {
@@ -2591,7 +2600,7 @@ impl ReplayStage {
         trace!("handle votable bank {}", bank.slot());
         let new_root = tower.record_bank_vote(bank);
 
-        if !external_finalize_enabled {
+        if !external_finalize_enabled.load(Ordering::Relaxed) {
             if let Some(new_root) = new_root {
                 let highest_super_majority_root = Some(
                     block_commitment_cache
@@ -2616,6 +2625,19 @@ impl ReplayStage {
                     drop_bank_sender,
                     tbft_structs,
                 )?;
+
+                // After first successful root advancement, activate external
+                // finalization if configured.  From this point on auto-root is
+                // blocked and root moves only via RPC.
+                if external_finalize_configured
+                    && !external_finalize_enabled.load(Ordering::Relaxed)
+                {
+                    external_finalize_enabled.store(true, Ordering::Relaxed);
+                    info!(
+                        "[FINALIZE_DIAG] external finalization activated after bootstrap (root={})",
+                        new_root
+                    );
+                }
             }
         }
 

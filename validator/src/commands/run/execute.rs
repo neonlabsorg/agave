@@ -171,6 +171,7 @@ pub fn execute(
         .unwrap_or(DEFAULT_TPU_COALESCE);
     let external_finalize_timeout_secs =
         value_t_or_exit!(matches, "external_finalize_timeout_secs", u64);
+    let disable_external_finalize = matches.is_present("disable_external_finalize");
     // Canonicalize ledger path to avoid issues with symlink creation
     let ledger_path = create_and_canonicalize_directory(ledger_path).map_err(|err| {
         format!(
@@ -243,16 +244,10 @@ pub fn execute(
     } else {
         bind_addresses.active()
     };
-    let finalize_history_rpc_addr = if let Some(port) =
-        value_t!(matches, "finalize_history_rpc_port", u16).ok()
-    {
-        Some(SocketAddr::new(rpc_bind_address, port))
-    } else {
-        rpc_port.and_then(|port| {
-            port.checked_add(2)
-                .map(|offset| SocketAddr::new(rpc_bind_address, offset))
-        })
-    };
+    let finalize_history_rpc_addr =
+        value_t!(matches, "finalize_history_rpc_port", u16)
+            .ok()
+            .map(|port| SocketAddr::new(rpc_bind_address, port));
     let finalize_history_rpc_max_request_body_size =
         value_t_or_exit!(matches, "finalize_history_rpc_max_request_body_size", usize);
 
@@ -705,6 +700,7 @@ pub fn execute(
         )]
         .into(),
         external_finalize_timeout: Duration::from_secs(external_finalize_timeout_secs),
+        disable_external_finalize,
         finalize_history_rpc_addr,
         finalize_history_rpc_max_request_body_size,
     };

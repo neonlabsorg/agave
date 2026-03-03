@@ -179,7 +179,7 @@ impl Tvu {
         finalize_history_receiver: Receiver<ExternalFinalizeRequest>,
         replay_process_options: ProcessOptions,
         external_finalize_timeout: Duration,
-        external_finalize_enabled: bool,
+        external_finalize_configured: bool,
     ) -> Result<Self, String> {
         let in_wen_restart = wen_restart_repair_slots.is_some();
 
@@ -352,7 +352,8 @@ impl Tvu {
             prioritization_fee_cache: prioritization_fee_cache.clone(),
             banking_tracer,
             snapshot_controller,
-            external_finalize_enabled,
+            external_finalize_enabled: Arc::new(AtomicBool::new(false)),
+            external_finalize_configured,
             external_finalize_timeout,
             replay_process_options,
         };
@@ -622,7 +623,7 @@ pub mod tests {
             finalize_history_receiver,
             ProcessOptions::default(),
             Duration::from_secs(60 * 60),
-            false, // external_finalize_enabled: disabled in test
+            false, // external_finalize_configured: disabled in test
             Arc::new(Vec::new()),
         )
         .expect("assume success");

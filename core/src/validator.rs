@@ -303,6 +303,10 @@ pub struct ValidatorConfig {
     pub retransmit_xdp: Option<XdpConfig>,
     pub repair_handler_type: RepairHandlerType,
     pub external_finalize_timeout: Duration,
+    /// When true, external finalization is disabled and root advances normally
+    /// via MAX_LOCKOUT_HISTORY (upstream behavior).  Default: false (external
+    /// finalization enabled).
+    pub disable_external_finalize: bool,
     pub finalize_history_rpc_addr: Option<SocketAddr>,
     pub finalize_history_rpc_max_request_body_size: usize,
 }
@@ -387,6 +391,7 @@ impl ValidatorConfig {
             retransmit_xdp: None,
             repair_handler_type: RepairHandlerType::default(),
             external_finalize_timeout: Duration::from_secs(20 * 60),
+            disable_external_finalize: false,
             finalize_history_rpc_addr: None,
             finalize_history_rpc_max_request_body_size: solana_rpc::rpc::MAX_REQUEST_BODY_SIZE,
         }
@@ -1663,7 +1668,7 @@ impl Validator {
             finalize_history_receiver,
             blockstore_process_options.clone(),
             config.external_finalize_timeout,
-            config.finalize_history_rpc_addr.is_some(),
+            !config.disable_external_finalize,
         )
         .map_err(ValidatorError::Other)?;
 
