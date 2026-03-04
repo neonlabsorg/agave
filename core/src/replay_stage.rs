@@ -735,10 +735,16 @@ impl ReplayStage {
                 &leader_schedule_cache,
             );
 
+            let mut verbose_loop_diag: u32 = 0;
             loop {
                 // Stop getting entries if we get exit signal
                 if exit.load(Ordering::Relaxed) {
                     break;
+                }
+                let loop_verbose = verbose_loop_diag > 0;
+                if loop_verbose {
+                    verbose_loop_diag -= 1;
+                    info!("[FINALIZE_DIAG] loop_step=begin remaining_verbose={}", verbose_loop_diag);
                 }
 
                 let mut requested_finalize = None;
@@ -866,6 +872,7 @@ impl ReplayStage {
                     };
                     match finalize_result {
                         Ok(()) => {
+                            verbose_loop_diag = 30;
                             last_external_finalize = Instant::now();
                             current_leader = None;
                             last_reset = Hash::default();
@@ -926,6 +933,7 @@ impl ReplayStage {
                     }
                 }
 
+                if loop_verbose { info!("[FINALIZE_DIAG] loop_step=generate_new_bank_forks"); }
                 let mut generate_new_bank_forks_time =
                     Measure::start("generate_new_bank_forks_time");
                 Self::generate_new_bank_forks(
@@ -941,6 +949,7 @@ impl ReplayStage {
 
                 let mut tpu_has_bank = poh_recorder.read().unwrap().has_bank();
 
+                if loop_verbose { info!("[FINALIZE_DIAG] loop_step=replay_active_banks forks={}", bank_forks.read().unwrap().len()); }
                 let mut replay_active_banks_time = Measure::start("replay_active_banks_time");
                 let (mut ancestors, mut descendants) = {
                     let r_bank_forks = bank_forks.read().unwrap();
@@ -975,6 +984,7 @@ impl ReplayStage {
                 );
                 replay_active_banks_time.stop();
 
+                if loop_verbose { info!("[FINALIZE_DIAG] loop_step=post_replay did_complete={}", did_complete_bank); }
                 let forks_root = bank_forks.read().unwrap().root();
 
                 // Process cluster-agreed versions of duplicate slots for which we potentially
@@ -1070,6 +1080,7 @@ impl ReplayStage {
                 }
                 process_duplicate_slots_time.stop();
 
+                if loop_verbose { info!("[FINALIZE_DIAG] loop_step=collect_frozen_banks"); }
                 let mut collect_frozen_banks_time = Measure::start("frozen_banks");
                 let mut frozen_banks: Vec<_> = bank_forks
                     .read()
@@ -1122,6 +1133,7 @@ impl ReplayStage {
                 }
                 compute_slot_stats_time.stop();
 
+                if loop_verbose { info!("[FINALIZE_DIAG] loop_step=select_forks"); }
                 let mut select_forks_time = Measure::start("select_forks_time");
                 let (heaviest_bank, heaviest_bank_on_same_voted_fork) = tbft_structs
                     .heaviest_subtree_fork_choice
@@ -1188,6 +1200,7 @@ impl ReplayStage {
                 }
                 heaviest_fork_failures_time.stop();
 
+                if loop_verbose { info!("[FINALIZE_DIAG] loop_step=voting"); }
                 let mut voting_time = Measure::start("voting_time");
                 // Vote on a fork
                 if let Some((ref vote_bank, ref switch_fork_decision)) = vote_bank {
