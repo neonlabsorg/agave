@@ -4792,7 +4792,39 @@ impl ReplayStage {
             target_bank.parent_slot()
         };
 
-        // 8. Set root (advance to target with modified state)
+        // 8. Pre-squash outside write lock, then set root
+        let root_slot = bank_forks.read().unwrap().root();
+        {
+            let target_bank = bank_forks
+                .read()
+                .unwrap()
+                .get(target_slot)
+                .expect("target bank must exist after replay");
+            let mut pre_squash_time = Measure::start("pre_squash");
+            let new_rooted_slots: Vec<Slot> = target_bank
+                .parents()
+                .iter()
+                .map(|b| b.slot())
+                .chain(std::iter::once(target_slot))
+                .filter(|&s| s > root_slot)
+                .collect();
+            target_bank.squash();
+            pre_squash_time.stop();
+
+            let mut pre_set_roots_time = Measure::start("pre_set_roots");
+            blockstore
+                .set_roots(new_rooted_slots.iter())
+                .expect("Ledger set roots failed");
+            pre_set_roots_time.stop();
+
+            info!(
+                "[FINALIZE_DIAG] replay pre_squash: squash_ms={} set_roots_ms={} new_rooted_slots={}",
+                pre_squash_time.as_ms(),
+                pre_set_roots_time.as_ms(),
+                new_rooted_slots.len()
+            );
+        }
+
         Self::check_and_handle_new_root(
             identity_pubkey,
             parent_slot,
@@ -4878,6 +4910,30 @@ impl ReplayStage {
         if !target_bank.is_frozen() {
             return Err(format!("finalize target {target_slot} is not frozen"));
         }
+
+        let mut pre_squash_time = Measure::start("pre_squash");
+        let new_rooted_slots: Vec<Slot> = target_bank
+            .parents()
+            .iter()
+            .map(|b| b.slot())
+            .chain(std::iter::once(target_slot))
+            .filter(|&s| s > root_slot)
+            .collect();
+        target_bank.squash();
+        pre_squash_time.stop();
+
+        let mut pre_set_roots_time = Measure::start("pre_set_roots");
+        blockstore
+            .set_roots(new_rooted_slots.iter())
+            .expect("Ledger set roots failed");
+        pre_set_roots_time.stop();
+
+        info!(
+            "[FINALIZE_DIAG] pre_squash: squash_ms={} set_roots_ms={} new_rooted_slots={}",
+            pre_squash_time.as_ms(),
+            pre_set_roots_time.as_ms(),
+            new_rooted_slots.len()
+        );
 
         Self::check_and_handle_new_root(
             identity_pubkey,
