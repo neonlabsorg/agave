@@ -5111,7 +5111,7 @@ fn test_stack_heap_zeroed() {
 
     // Check multiple heap sizes. It's generally a good idea, and also it's needed to ensure that
     // pooled heap and stack values are reused - and therefore zeroed - across executions.
-    for heap_len in [32usize * 1024, 64 * 1024, 128 * 1024, 256 * 1024] {
+    for heap_len in [32usize * 1024, 64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024] {
         // TEST_STACK_HEAP_ZEROED will recursively check that stack and heap are zeroed until it
         // reaches max CPI invoke depth. We make it fail at max depth so we're sure that there's no
         // legit way to access non-zeroed stack and heap regions.
