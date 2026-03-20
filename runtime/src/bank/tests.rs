@@ -3267,6 +3267,45 @@ fn test_bank_get_program_accounts() {
 }
 
 #[test]
+fn test_bank_get_program_accounts_modified_since_parent_filters_cleanable_system_account() {
+    let (genesis_config, _mint_keypair) = create_genesis_config(500);
+    let parent = Arc::new(Bank::new_for_tests(&genesis_config));
+    let bank = Arc::new(new_from_parent(parent));
+
+    let live_pubkey = solana_pubkey::new_rand();
+    let live_account = AccountSharedData::new(1, 0, &solana_sdk_ids::system_program::id());
+    bank.store_account(&live_pubkey, &live_account);
+
+    let dead_pubkey = solana_pubkey::new_rand();
+    let mut dead_account = AccountSharedData::default();
+    dead_account.set_owner(solana_sdk_ids::system_program::id());
+    dead_account.set_rent_epoch(u64::MAX - 1);
+    bank.store_account(&dead_pubkey, &dead_account);
+
+    assert_eq!(
+        bank.get_program_accounts_modified_since_parent(&solana_sdk_ids::system_program::id()),
+        vec![(live_pubkey, live_account)]
+    );
+}
+
+#[test]
+fn test_bank_get_program_accounts_modified_since_parent_keeps_noncleanable_zero_lamport_system_account(
+) {
+    let (genesis_config, _mint_keypair) = create_genesis_config(500);
+    let parent = Arc::new(Bank::new_for_tests(&genesis_config));
+    let bank = Arc::new(new_from_parent(parent));
+
+    let pubkey = solana_pubkey::new_rand();
+    let account = AccountSharedData::new(0, 1, &solana_sdk_ids::system_program::id());
+    bank.store_account(&pubkey, &account);
+
+    assert_eq!(
+        bank.get_program_accounts_modified_since_parent(&solana_sdk_ids::system_program::id()),
+        vec![(pubkey, account)]
+    );
+}
+
+#[test]
 fn test_get_filtered_indexed_accounts_limit_exceeded() {
     let (genesis_config, _mint_keypair) = create_genesis_config(500);
     let mut account_indexes = AccountSecondaryIndexes::default();
@@ -11172,6 +11211,61 @@ fn test_create_zero_lamport_without_clean() {
     with_create_zero_lamport(|_| {
         // just do nothing; this should behave identically with test_create_zero_lamport_with_clean
     });
+}
+
+#[test]
+fn test_system_zero_lamport_empty_account_is_hidden_and_cleaned() {
+    solana_logger::setup();
+
+    let account_key = Pubkey::new_unique();
+    let initial_owner = Pubkey::new_unique();
+    let collector = Pubkey::new_unique();
+
+    let (genesis_config, _mint_keypair) = create_genesis_config_no_tx_fee_no_rent(LAMPORTS_PER_SOL);
+    let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+
+    let bank1 = new_bank_from_parent_with_bank_forks(bank_forks.as_ref(), bank0, &collector, 1);
+    let mut initial_account = AccountSharedData::new(10, 3, &initial_owner);
+    initial_account.set_data(vec![1, 2, 3]);
+    bank1.store_account(&account_key, &initial_account);
+    bank1.freeze();
+    bank1.squash();
+
+    let bank2 = new_bank_from_parent_with_bank_forks(bank_forks.as_ref(), bank1, &collector, 2);
+    let zero_system_account = AccountSharedData::new(0, 0, &system_program::id());
+    bank2.store_account(&account_key, &zero_system_account);
+
+    assert_eq!(bank2.get_account(&account_key), None);
+    assert!(!bank2
+        .get_all_accounts(false)
+        .unwrap()
+        .iter()
+        .any(|(pubkey, _, _slot)| pubkey == &account_key));
+
+    bank2.freeze();
+    bank2.squash();
+
+    let bank3 = new_bank_from_parent_with_bank_forks(bank_forks.as_ref(), bank2, &collector, 3);
+    bank3.freeze();
+    bank3.squash();
+    bank3.force_flush_accounts_cache();
+
+    assert!(bank3
+        .rc
+        .accounts
+        .accounts_db
+        .accounts_index
+        .contains(&account_key));
+
+    bank3.clean_accounts();
+
+    assert_eq!(bank3.get_account(&account_key), None);
+    assert!(!bank3
+        .rc
+        .accounts
+        .accounts_db
+        .accounts_index
+        .contains(&account_key));
 }
 
 #[test]

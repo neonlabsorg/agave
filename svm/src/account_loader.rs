@@ -40,12 +40,15 @@ use {
     std::num::{NonZeroU32, Saturating},
 };
 
-fn is_default_account(account: &AccountSharedData) -> bool {
-    account.lamports() == 0
+fn is_deallocated_account(account: &AccountSharedData) -> bool {
+    (account.lamports() == 0
         && account.data().is_empty()
         && !account.executable()
         && account.rent_epoch() == Epoch::default()
-        && account.owner() == &Pubkey::default()
+        && account.owner() == &Pubkey::default())
+        || (account.lamports() == 0
+            && account.data().is_empty()
+            && account.owner() == &solana_sdk_ids::system_program::id())
 }
 
 // Per SIMD-0186, all accounts are assigned a base size of 64 bytes to cover
@@ -270,7 +273,7 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
             // If the account is a default tombstone, treat it as deallocated.
             // We return None so it can be created fresh.
             // We *never* remove accounts, or else we would fetch stale state from accounts-db.
-            let option_account = if is_default_account(account) {
+            let option_account = if is_deallocated_account(account) {
                 None
             } else {
                 Some(account.clone())
@@ -383,7 +386,7 @@ pub fn validate_fee_payer(
     rent: &Rent,
     fee: u64,
 ) -> Result<()> {
-    if is_default_account(payer_account) {
+    if is_deallocated_account(payer_account) {
         error_metrics.account_not_found += 1;
         return Err(TransactionError::AccountNotFound);
     }
@@ -957,6 +960,38 @@ mod tests {
 
     fn new_unchecked_sanitized_message(message: Message) -> SanitizedMessage {
         SanitizedMessage::Legacy(LegacyMessage::new(message, &HashSet::new()))
+    }
+
+    #[test]
+    fn test_account_loader_treats_system_zero_lamport_empty_account_as_deallocated() {
+        let callbacks = TestCallbacks::default();
+        let mut account_loader: AccountLoader<TestCallbacks> = (&callbacks).into();
+        let account_key = Pubkey::new_unique();
+
+        let mut account = AccountSharedData::default();
+        account.set_owner(system_program::id());
+        account.set_rent_epoch(u64::MAX - 1);
+
+        account_loader.loaded_accounts.insert(account_key, account);
+
+        assert_eq!(account_loader.load_account(&account_key), None);
+    }
+
+    #[test]
+    fn test_account_loader_keeps_non_system_zero_lamport_empty_account_alive() {
+        let callbacks = TestCallbacks::default();
+        let mut account_loader: AccountLoader<TestCallbacks> = (&callbacks).into();
+        let account_key = Pubkey::new_unique();
+
+        let mut account = AccountSharedData::default();
+        account.set_owner(Pubkey::new_unique());
+        account.set_rent_epoch(u64::MAX - 1);
+
+        account_loader
+            .loaded_accounts
+            .insert(account_key, account.clone());
+
+        assert_eq!(account_loader.load_account(&account_key), Some(account));
     }
 
     #[test_case(false; "informal_loaded_size")]

@@ -4228,13 +4228,6 @@ impl Bank {
             .map(|(acc, _slot)| acc)
     }
 
-    pub fn get_account_allow_tombstone(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
-        self.rc
-            .accounts
-            .load_without_fixed_root_allow_tombstone(&self.ancestors, pubkey)
-            .map(|(acc, _slot)| acc)
-    }
-
     // Hi! leaky abstraction here....
     // use this over get_account() if it's called ONLY from on-chain runtime account
     // processing (i.e. from in-band replay/banking stage; that ensures root is *fixed* while
