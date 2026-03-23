@@ -1,7 +1,6 @@
 use {
-    solana_account::ReadableAccount,
-    solana_clock::Epoch,
-    solana_pubkey::Pubkey,
+    solana_account::ReadableAccount, solana_clock::Epoch, solana_pubkey::Pubkey,
+    solana_system_interface::program as system_program,
 };
 
 pub(crate) fn is_default_account_meta(
@@ -20,6 +19,31 @@ pub(crate) fn is_default_account_meta(
 
 pub(crate) fn is_default_account(account: &impl ReadableAccount) -> bool {
     is_default_account_meta(
+        account.lamports(),
+        account.data().len(),
+        account.owner(),
+        account.executable(),
+        account.rent_epoch(),
+    )
+}
+
+/// Accounts that can be purged by zero-lamport clean.
+///
+/// In this fork, in addition to classic default tombstones, we also treat
+/// `owner = system_program`, `lamports = 0`, `data_len = 0` as cleanable.
+pub(crate) fn is_cleanable_zero_lamport_account_meta(
+    lamports: u64,
+    data_len: usize,
+    owner: &Pubkey,
+    executable: bool,
+    rent_epoch: Epoch,
+) -> bool {
+    is_default_account_meta(lamports, data_len, owner, executable, rent_epoch)
+        || (lamports == 0 && data_len == 0 && owner == &system_program::id())
+}
+
+pub(crate) fn is_cleanable_zero_lamport_account(account: &impl ReadableAccount) -> bool {
+    is_cleanable_zero_lamport_account_meta(
         account.lamports(),
         account.data().len(),
         account.owner(),

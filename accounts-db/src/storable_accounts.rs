@@ -1,8 +1,8 @@
 //! trait for abstracting underlying storage of pubkey and account pairs to be written
 use {
     crate::{
-        account_utils::is_default_account,
         account_storage::stored_account_info::StoredAccountInfo,
+        account_utils::{is_cleanable_zero_lamport_account, is_default_account},
         accounts_db::{AccountFromStorage, AccountStorageEntry, AccountsDb},
         is_zero_lamport::IsZeroLamport,
     },
@@ -118,13 +118,13 @@ pub trait StorableAccounts<'a>: Sync {
     fn data_len(&self, index: usize) -> usize;
     /// pubkey of account at 'index'
     fn pubkey(&self, index: usize) -> &Pubkey;
-    /// true if the account is a tombstone default account
+    /// true if the account is a zero-lamport clean candidate
     fn is_tombstone(&self, index: usize) -> bool {
         if !self.is_zero_lamport(index) {
             return false;
         }
 
-        self.account(index, |account| is_default_account(&account))
+        self.account(index, |account| is_cleanable_zero_lamport_account(&account))
     }
     /// None if account is a tombstone default account
     fn account_default_if_zero_lamport<Ret>(

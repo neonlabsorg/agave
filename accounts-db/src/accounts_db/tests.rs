@@ -1477,6 +1477,72 @@ fn test_clean_old_with_zero_lamport_account() {
 }
 
 #[test]
+fn test_clean_zero_lamport_system_owner_empty_data() {
+    solana_logger::setup();
+
+    let accounts = AccountsDb::new_single_for_tests();
+    let account_key = solana_pubkey::new_rand();
+
+    let mut zero_system_account =
+        AccountSharedData::new(0, 0, &solana_sdk_ids::system_program::id());
+    // Ensure non-default rent still gets cleaned for this class.
+    zero_system_account.set_rent_epoch(42);
+
+    accounts.store_for_tests((0, [(&account_key, &zero_system_account)].as_slice()));
+    accounts.add_root_and_flush_write_cache(0);
+
+    assert!(accounts
+        .accounts_index
+        .contains_with(&account_key, None, None));
+    assert_eq!(accounts.alive_account_count_in_slot(0), 1);
+
+    accounts.clean_accounts_for_tests();
+
+    assert!(!accounts
+        .accounts_index
+        .contains_with(&account_key, None, None));
+    assert_eq!(accounts.alive_account_count_in_slot(0), 0);
+}
+
+#[test]
+fn test_load_hides_cleanable_system_zero_lamport_account_before_clean() {
+    solana_logger::setup();
+
+    let accounts = AccountsDb::new_single_for_tests();
+    let account_key = solana_pubkey::new_rand();
+    let ancestors = Ancestors::default();
+
+    let owner = solana_pubkey::new_rand();
+    let mut initial_account = AccountSharedData::new(10, 3, &owner);
+    initial_account.set_data(vec![1, 2, 3]);
+
+    let zero_system_account =
+        AccountSharedData::new(0, 0, &solana_sdk_ids::system_program::id());
+
+    accounts.store_for_tests((0, [(&account_key, &initial_account)].as_slice()));
+    accounts.add_root_and_flush_write_cache(0);
+
+    assert_eq!(
+        accounts
+            .load(&ancestors, &account_key, LoadHint::Unspecified)
+            .unwrap()
+            .0
+            .lamports(),
+        10
+    );
+
+    accounts.store_for_tests((1, [(&account_key, &zero_system_account)].as_slice()));
+    accounts.add_root_and_flush_write_cache(1);
+
+    assert!(accounts.accounts_index.contains_with(&account_key, None, None));
+    assert_eq!(
+        accounts.load(&ancestors, &account_key, LoadHint::Unspecified),
+        None,
+    );
+    assert_eq!(accounts.alive_account_count_in_slot(1), 1);
+}
+
+#[test]
 fn test_clean_old_with_both_normal_and_zero_lamport_accounts() {
     solana_logger::setup();
 
@@ -1586,19 +1652,17 @@ fn test_clean_old_with_both_normal_and_zero_lamport_accounts() {
 
     accounts.clean_accounts_for_tests();
 
-    //both zero lamport and normal accounts are cleaned up
+    // Old rooted states are cleaned, but non-tombstone zero-lamport account stays alive.
     assert_eq!(accounts.alive_account_count_in_slot(0), 0);
-    // The only store to slot 1 was a zero lamport account, should
-    // be purged by zero-lamport cleaning logic because slot 1 is
-    // rooted
-    assert_eq!(accounts.alive_account_count_in_slot(1), 0);
+    // Slot 1 contains a zero-lamport account with non-default owner/data,
+    // so it must not be purged as a tombstone.
+    assert_eq!(accounts.alive_account_count_in_slot(1), 1);
     assert_eq!(accounts.alive_account_count_in_slot(2), 1);
 
-    // `pubkey1`, a zero lamport account, should no longer exist in accounts index
-    // because it has been removed by the clean
-    assert!(!accounts.accounts_index.contains_with(&pubkey1, None, None));
+    // `pubkey1` zero-lamport account remains in accounts index.
+    assert!(accounts.accounts_index.contains_with(&pubkey1, None, None));
 
-    // Secondary index should have purged `pubkey1` as well
+    // Secondary index should retain both pubkeys.
     let mut found_accounts = vec![];
     accounts
         .accounts_index
@@ -1610,7 +1674,10 @@ fn test_clean_old_with_both_normal_and_zero_lamport_accounts() {
             &ScanConfig::default(),
         )
         .unwrap();
-    assert_eq!(found_accounts, vec![pubkey2]);
+    found_accounts.sort();
+    let mut expected_accounts = vec![pubkey1, pubkey2];
+    expected_accounts.sort();
+    assert_eq!(found_accounts, expected_accounts);
 }
 
 #[test]
