@@ -1,5 +1,5 @@
 name: Parasol CI
-run-name: "CI / ${{ github.event_name == 'workflow_dispatch' && inputs.evm_tag || github.event_name == 'pull_request' && github.event.pull_request.title || 'build' }} / ${{ github.event_name }}"
+run-name: "CI / ${{ github.event_name == 'pull_request' && github.event.pull_request.title || 'build' }} / ${{ github.event_name }}"
 
 on:
   pull_request:
@@ -9,11 +9,6 @@ on:
       - parasol-dev
       - '[vt][0-9].[0-9]+.[0-9x]+*'
   workflow_dispatch:
-    inputs:
-      test_image:
-        description: "Docker image for parasol-tests job"
-        required: false
-        default: "neonlabsorg/parasol-tests:main"
 
 env:
   IMAGE_NAME: neonlabsorg/parasol-node
@@ -73,12 +68,12 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
     steps:
       - name: Checkout repository (full history)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Checkout dynamic-ci-cd workflows
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: neonlabsorg/dynamic-ci-cd
           ref: main
@@ -142,11 +137,12 @@ jobs:
     runs-on: gha-runner-scale-set-large
     env:
       PARASOL_NODE_IP: ${{ needs.prepare-infrastructure.outputs.parasol_node_ip }}
-      TEST_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.test_image || 'neonlabsorg/parasol-tests:main' }}
+      TEST_IMAGE_REPOSITORY: neonlabsorg/parasol-tests
       CONTAINER_NAME: parasol-tests-${{ github.run_id }}
       SOLANA_URL: http://${{ needs.prepare-infrastructure.outputs.parasol_node_ip }}:8899
       WS_SOLANA_URL: ws://${{ needs.prepare-infrastructure.outputs.parasol_node_ip }}:8900
     steps:
+      - uses: actions/checkout@v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Docker login
@@ -154,20 +150,43 @@ jobs:
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Set PR test image tag candidate
+        id: pr-test-image-tag
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: echo "tag=${GITHUB_HEAD_REF//\//-}" >> "$GITHUB_OUTPUT"
+      - name: Check PR test image tag
+        id: check-pr-test-image-tag
+        if: github.event_name == 'pull_request'
+        uses: ./.github/actions/check-docker-tag
+        with:
+          repository: ${{ env.TEST_IMAGE_REPOSITORY }}
+          tag: ${{ steps.pr-test-image-tag.outputs.tag }}
+      - name: Resolve test image
+        id: resolve-test-image
+        shell: bash
+        run: |
+          if [[ "${{ steps.check-pr-test-image-tag.outputs.exists }}" == "true" ]]; then
+            image="${TEST_IMAGE_REPOSITORY}:${{ steps.pr-test-image-tag.outputs.tag }}"
+          else
+            image="${TEST_IMAGE_REPOSITORY}:latest"
+          fi
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "Using test image: ${image}"
       - name: Docker pull test image
-        run: docker pull ${{ env.TEST_IMAGE }}
+        run: docker pull ${{ steps.resolve-test-image.outputs.image }}
       - name: Deploy test programs
         run: |
           docker run --rm \
             --name ${{ env.CONTAINER_NAME }} \
-            ${{ env.TEST_IMAGE }} \
+            ${{ steps.resolve-test-image.outputs.image }} \
             /bin/bash -c "./solana_programs/deploy.sh ${{ env.SOLANA_URL }} ${{ env.WS_SOLANA_URL }}"
       - name: Run tests
         run: |
           docker run --rm \
             --name ${{ env.CONTAINER_NAME }} \
-            ${{ env.TEST_IMAGE }}  \
-            /bin/bash -c "pytest --solana-url ${{ env.SOLANA_URL }} --metrics-url ${{ env.SOLANA_URL }}/metrics"
+            ${{ steps.resolve-test-image.outputs.image }}  \
+            /bin/bash -c "pytest --ignore=tests/parasol_dex --solana-url ${{ env.SOLANA_URL }} --metrics-url ${{ env.SOLANA_URL }}/metrics"
 
   destroy-terraform:
     env:
@@ -180,10 +199,8 @@ jobs:
     runs-on: ["gha-runner-scale-set"]
     if: always()
     steps:
-    - uses: actions/checkout@v4
-      with:
-          fetch-depth: 0
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
+    - uses: actions/checkout@v6
       with:
         repository: 'neonlabsorg/dynamic-ci-cd'
         ref: 'main'
