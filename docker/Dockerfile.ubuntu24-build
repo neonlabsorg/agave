@@ -1,3 +1,5 @@
+ARG BIN_FILE_PATH="/opt/agave/target/release"
+ARG BIN_FILE_MASK="[as]*"
 FROM ubuntu:24.04 AS builder
 ARG AGAVE_REF=gasless-parameters
 ARG AGAVE_REPO=https://github.com/neonlabsorg/agave.git
@@ -43,14 +45,18 @@ WORKDIR /opt/agave
 
 # Release build
 RUN cargo build --release
+RUN ls -lah /opt/agave/target/release
 
 # Collect binaries in a clean location for copying out of the image
 FROM scratch AS artifacts
-COPY --from=builder /opt/agave/target/release/solana-* /out/
-COPY --from=builder /opt/agave/target/release/agave-* /out/
+ARG BIN_FILE_PATH
+ARG BIN_FILE_MASK
+COPY --from=builder ${BIN_FILE_PATH}/${BIN_FILE_MASK} /out/
 
 # Minimal runtime image with the compiled binaries
 FROM ubuntu:24.04 AS runtime
+ARG BIN_FILE_PATH
+ARG BIN_FILE_MASK
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -63,8 +69,8 @@ RUN apt-get update && \
       libgcc-s1 && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /opt/agave/target/release/solana-* /usr/local/bin/
-COPY --from=builder /opt/agave/target/release/agave-* /usr/local/bin/
+COPY --from=builder ${BIN_FILE_PATH}/${BIN_FILE_MASK} /usr/local/bin/
+
 
 # Default to showing available binaries; override entrypoint/command as needed
 CMD ["solana-validator", "--version"]
