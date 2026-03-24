@@ -227,9 +227,9 @@ pub(crate) mod external {
 
     pub(crate) struct ExternalWorker {
         exit: Arc<AtomicBool>,
-        receiver: shaq::Consumer<PackToWorkerMessage>,
+        receiver: shaq::spsc::Consumer<PackToWorkerMessage>,
         consumer: Consumer,
-        sender: shaq::Producer<WorkerToPackMessage>,
+        sender: shaq::spsc::Producer<WorkerToPackMessage>,
         allocator: rts_alloc::Allocator,
 
         shared_leader_state: SharedLeaderState,
@@ -251,9 +251,9 @@ pub(crate) mod external {
         pub fn new(
             id: u32,
             exit: Arc<AtomicBool>,
-            receiver: shaq::Consumer<PackToWorkerMessage>,
+            receiver: shaq::spsc::Consumer<PackToWorkerMessage>,
             consumer: Consumer,
-            sender: shaq::Producer<WorkerToPackMessage>,
+            sender: shaq::spsc::Producer<WorkerToPackMessage>,
             allocator: rts_alloc::Allocator,
             shared_leader_state: SharedLeaderState,
             sharable_banks: SharableBanks,

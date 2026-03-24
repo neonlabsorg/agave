@@ -46,7 +46,7 @@ fn tpu_to_pack(
     exit: Arc<AtomicBool>,
     receivers: BankingPacketReceivers,
     allocator: Allocator,
-    mut producer: shaq::Producer<TpuToPackMessage>,
+    mut producer: shaq::spsc::Producer<TpuToPackMessage>,
 ) {
     // select! requires actual receivers, so in the case of None for vote receivers,
     // we create a dummy channel that can never receive.
@@ -76,7 +76,7 @@ fn tpu_to_pack(
 
 fn handle_packet_batches(
     allocator: &Allocator,
-    producer: &mut shaq::Producer<TpuToPackMessage>,
+    producer: &mut shaq::spsc::Producer<TpuToPackMessage>,
     packet_batches: Arc<Vec<PacketBatch>>,
 ) {
     // Clean all remote frees in allocator so we have as much
@@ -130,7 +130,7 @@ fn handle_packet_batches(
 /// - returned `TpuToPackMessage` pointer must be populated with a valid message.
 unsafe fn allocate_and_reserve_message(
     allocator: &Allocator,
-    producer: &mut shaq::Producer<TpuToPackMessage>,
+    producer: &mut shaq::spsc::Producer<TpuToPackMessage>,
     packet_size: usize,
 ) -> Option<(NonNull<u8>, NonNull<TpuToPackMessage>)> {
     // Allocate enough memory for the packet in the allocator.

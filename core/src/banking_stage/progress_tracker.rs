@@ -18,7 +18,7 @@ use {
 /// Spawns a thread to track and send progress updates.
 pub fn spawn(
     exit: Arc<AtomicBool>,
-    mut producer: shaq::Producer<ProgressMessage>,
+    mut producer: shaq::spsc::Producer<ProgressMessage>,
     shared_leader_state: SharedLeaderState,
     ticks_per_slot: u64,
 ) -> JoinHandle<()> {
@@ -54,7 +54,7 @@ impl ProgressTracker {
         }
     }
 
-    fn run(mut self, producer: &mut shaq::Producer<ProgressMessage>) {
+    fn run(mut self, producer: &mut shaq::spsc::Producer<ProgressMessage>) {
         let mut last_published_tick_height = u64::MAX;
         while !self.exit.load(Ordering::Relaxed) {
             let (message, tick_height) = self.produce_progress_message();
@@ -73,7 +73,7 @@ impl ProgressTracker {
     /// returns true if a message was published
     fn publish(
         &mut self,
-        producer: &mut shaq::Producer<ProgressMessage>,
+        producer: &mut shaq::spsc::Producer<ProgressMessage>,
         message: ProgressMessage,
     ) -> bool {
         producer.sync();

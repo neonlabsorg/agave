@@ -227,14 +227,15 @@ impl Server {
     fn create_producer<T>(
         capacity: usize,
         huge: bool,
-    ) -> Result<(File, shaq::Producer<T>), ShaqError> {
+    ) -> Result<(File, shaq::spsc::Producer<T>), ShaqError> {
         let create = |huge: bool| {
             let file = Self::create_shmem(huge)?;
-            let minimum_file_size = shaq::minimum_file_size::<T>(capacity);
+            let minimum_file_size = shaq::spsc::minimum_file_size::<T>(capacity);
             let file_size = Self::align_file_size(minimum_file_size, huge);
 
             // SAFETY: uniqely creating as producer
-            unsafe { shaq::Producer::create(&file, file_size) }.map(|producer| (file, producer))
+            unsafe { shaq::spsc::Producer::create(&file, file_size) }
+                .map(|producer| (file, producer))
         };
 
         // Try to create with huge pages, fallback to regular pages.
@@ -246,14 +247,15 @@ impl Server {
 
     fn create_consumer(
         capacity: usize,
-    ) -> Result<(File, shaq::Consumer<PackToWorkerMessage>), ShaqError> {
+    ) -> Result<(File, shaq::spsc::Consumer<PackToWorkerMessage>), ShaqError> {
         let create = |huge: bool| {
             let file = Self::create_shmem(huge)?;
-            let minimum_file_size = shaq::minimum_file_size::<PackToWorkerMessage>(capacity);
+            let minimum_file_size = shaq::spsc::minimum_file_size::<PackToWorkerMessage>(capacity);
             let file_size = Self::align_file_size(minimum_file_size, huge);
 
             // SAFETY: uniquely creating as consumer.
-            unsafe { shaq::Consumer::create(&file, file_size) }.map(|producer| (file, producer))
+            unsafe { shaq::spsc::Consumer::create(&file, file_size) }
+                .map(|producer| (file, producer))
         };
 
         // Try to create with huge pages, fallback to regular pages.

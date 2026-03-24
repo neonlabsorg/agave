@@ -64,15 +64,15 @@ pub mod logon_flags {}
 /// The complete initialized scheduling session.
 pub struct ClientSession {
     pub allocators: Vec<Allocator>,
-    pub tpu_to_pack: shaq::Consumer<TpuToPackMessage>,
-    pub progress_tracker: shaq::Consumer<ProgressMessage>,
+    pub tpu_to_pack: shaq::spsc::Consumer<TpuToPackMessage>,
+    pub progress_tracker: shaq::spsc::Consumer<ProgressMessage>,
     pub workers: Vec<ClientWorkerSession>,
 }
 
 /// A per worker scheduling session.
 pub struct ClientWorkerSession {
-    pub pack_to_worker: shaq::Producer<PackToWorkerMessage>,
-    pub worker_to_pack: shaq::Consumer<WorkerToPackMessage>,
+    pub pack_to_worker: shaq::spsc::Producer<PackToWorkerMessage>,
+    pub worker_to_pack: shaq::spsc::Consumer<WorkerToPackMessage>,
 }
 
 /// Potential errors that can occur during the client's side of the handshake.
@@ -96,21 +96,21 @@ pub enum ClientHandshakeError {
 pub struct AgaveSession {
     pub flags: u16,
     pub tpu_to_pack: AgaveTpuToPackSession,
-    pub progress_tracker: shaq::Producer<ProgressMessage>,
+    pub progress_tracker: shaq::spsc::Producer<ProgressMessage>,
     pub workers: Vec<AgaveWorkerSession>,
 }
 
 /// Shared memory objects for the tpu to pack worker.
 pub struct AgaveTpuToPackSession {
     pub allocator: Allocator,
-    pub producer: shaq::Producer<TpuToPackMessage>,
+    pub producer: shaq::spsc::Producer<TpuToPackMessage>,
 }
 
 /// Shared memory objects for a single banking worker.
 pub struct AgaveWorkerSession {
     pub allocator: Allocator,
-    pub pack_to_worker: shaq::Consumer<PackToWorkerMessage>,
-    pub worker_to_pack: shaq::Producer<WorkerToPackMessage>,
+    pub pack_to_worker: shaq::spsc::Consumer<PackToWorkerMessage>,
+    pub worker_to_pack: shaq::spsc::Producer<WorkerToPackMessage>,
 }
 
 /// Potential errors that can occur during the Agave side of the handshake.
