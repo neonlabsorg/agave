@@ -54,6 +54,7 @@ solana-svm-log-collector = { workspace = true }
 solana-svm-measure = { workspace = true }
 solana-svm-timings = { workspace = true }
 solana-svm-type-overrides = { workspace = true }
+solana-system-interface = { workspace = true }
 solana-sysvar = { workspace = true }
 solana-sysvar-id = { workspace = true }
 solana-transaction-context = { workspace = true, features = ["bincode"] }
