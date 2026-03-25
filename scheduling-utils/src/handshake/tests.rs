@@ -1,9 +1,7 @@
 use {
     crate::handshake::{
-        client::{connect, ClientHandshakeError},
-        server::{AgaveHandshakeError, Server},
+        AgaveHandshakeError, ClientHandshakeError, ClientLogon, client::connect, server::Server,
         shared::MAX_WORKERS,
-        ClientLogon,
     },
     agave_scheduler_bindings::{
         PackToWorkerMessage, ProgressMessage, SharableTransactionBatchRegion,
@@ -115,6 +113,7 @@ fn message_passing_on_all_queues() {
                 progress_tracker_capacity: 256,
                 pack_to_worker_capacity: 1024,
                 worker_to_pack_capacity: 1024,
+                flags: 0,
             },
             Duration::from_secs(1),
         )
@@ -196,6 +195,7 @@ fn accept_worker_count_max() {
                 progress_tracker_capacity: 256,
                 pack_to_worker_capacity: 1024,
                 worker_to_pack_capacity: 1024,
+                flags: 0,
             },
             Duration::from_secs(1),
         );
@@ -230,6 +230,7 @@ fn reject_worker_count_low() {
                 progress_tracker_capacity: 256,
                 pack_to_worker_capacity: 1024,
                 worker_to_pack_capacity: 1024,
+                flags: 0,
             },
             Duration::from_secs(1),
         );
@@ -267,6 +268,7 @@ fn reject_worker_count_high() {
                 progress_tracker_capacity: 256,
                 pack_to_worker_capacity: 1024,
                 worker_to_pack_capacity: 1024,
+                flags: 0,
             },
             Duration::from_secs(1),
         );

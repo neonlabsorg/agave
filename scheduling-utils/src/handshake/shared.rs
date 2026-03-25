@@ -1,3 +1,14 @@
+use {
+    agave_scheduler_bindings::{
+        PackToWorkerMessage, ProgressMessage, TpuToPackMessage, WorkerToPackMessage,
+    },
+    rts_alloc::Allocator,
+    thiserror::Error,
+};
+
+pub(crate) type RtsAllocError = rts_alloc::error::Error;
+pub(crate) type ShaqError = shaq::error::Error;
+
 pub const MAX_WORKERS: usize = 64;
 
 /// Protocol version.
@@ -25,6 +36,8 @@ pub struct ClientLogon {
     pub pack_to_worker_capacity: usize,
     /// The minimum capacity of the `worker_to_pack` queue in messages.
     pub worker_to_pack_capacity: usize,
+    /// Flags that control the behavior of the new scheduling session.
+    pub flags: u16,
     // NB: If adding more fields please ensure:
     // - The fields are zeroable.
     // - If possible the fields are backwards compatible:
@@ -44,4 +57,83 @@ impl ClientLogon {
         // - `Self` is valid for any byte pattern
         Some(unsafe { core::ptr::read_unaligned(buffer.as_ptr().cast()) })
     }
+}
+
+pub mod logon_flags {}
+
+/// The complete initialized scheduling session.
+pub struct ClientSession {
+    pub allocators: Vec<Allocator>,
+    pub tpu_to_pack: shaq::Consumer<TpuToPackMessage>,
+    pub progress_tracker: shaq::Consumer<ProgressMessage>,
+    pub workers: Vec<ClientWorkerSession>,
+}
+
+/// A per worker scheduling session.
+pub struct ClientWorkerSession {
+    pub pack_to_worker: shaq::Producer<PackToWorkerMessage>,
+    pub worker_to_pack: shaq::Consumer<WorkerToPackMessage>,
+}
+
+/// Potential errors that can occur during the client's side of the handshake.
+#[derive(Debug, Error)]
+pub enum ClientHandshakeError {
+    #[error("Io; err={0}")]
+    Io(#[from] std::io::Error),
+    #[error("Timed out")]
+    TimedOut,
+    #[error("Protocol violation")]
+    ProtocolViolation,
+    #[error("Rejected; reason={0}")]
+    Rejected(String),
+    #[error("Rts alloc; err={0}")]
+    RtsAlloc(#[from] RtsAllocError),
+    #[error("Shaq; err={0}")]
+    Shaq(#[from] ShaqError),
+}
+
+/// An initialized scheduling session.
+pub struct AgaveSession {
+    pub flags: u16,
+    pub tpu_to_pack: AgaveTpuToPackSession,
+    pub progress_tracker: shaq::Producer<ProgressMessage>,
+    pub workers: Vec<AgaveWorkerSession>,
+}
+
+/// Shared memory objects for the tpu to pack worker.
+pub struct AgaveTpuToPackSession {
+    pub allocator: Allocator,
+    pub producer: shaq::Producer<TpuToPackMessage>,
+}
+
+/// Shared memory objects for a single banking worker.
+pub struct AgaveWorkerSession {
+    pub allocator: Allocator,
+    pub pack_to_worker: shaq::Consumer<PackToWorkerMessage>,
+    pub worker_to_pack: shaq::Producer<WorkerToPackMessage>,
+}
+
+/// Potential errors that can occur during the Agave side of the handshake.
+///
+/// # Note
+///
+/// These errors are stringified (up to 256 bytes then truncated) and sent to the client.
+#[derive(Debug, Error)]
+pub enum AgaveHandshakeError {
+    #[error("Io; err={0}")]
+    Io(#[from] std::io::Error),
+    #[error("Timeout")]
+    Timeout,
+    #[error("Close during handshake")]
+    EofDuringHandshake,
+    #[error("Version; server={server}; client={client}")]
+    Version { server: u64, client: u64 },
+    #[error("Worker count; count={0}")]
+    WorkerCount(usize),
+    #[error("Allocator handles; count={0}")]
+    AllocatorHandles(usize),
+    #[error("Rts alloc; err={0:?}")]
+    RtsAlloc(#[from] RtsAllocError),
+    #[error("Shaq; err={0:?}")]
+    Shaq(#[from] ShaqError),
 }

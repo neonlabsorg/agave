@@ -1,10 +1,7 @@
 use {
     crate::handshake::{
+        ClientHandshakeError, ClientLogon, ClientSession, ClientWorkerSession,
         shared::{GLOBAL_ALLOCATORS, LOGON_FAILURE, MAX_WORKERS, VERSION},
-        ClientLogon,
-    },
-    agave_scheduler_bindings::{
-        PackToWorkerMessage, ProgressMessage, TpuToPackMessage, WorkerToPackMessage,
     },
     libc::CMSG_LEN,
     nix::sys::socket::{self, ControlMessageOwned, MsgFlags, UnixAddr},
@@ -19,11 +16,7 @@ use {
         path::Path,
         time::Duration,
     },
-    thiserror::Error,
 };
-
-type RtsError = rts_alloc::error::Error;
-type ShaqError = shaq::error::Error;
 
 /// Number of global shared memory objects (in addition to per worker objects).
 const GLOBAL_SHMEM: usize = 3;
@@ -197,37 +190,6 @@ pub fn setup_session(
     drop(files);
 
     Ok(session)
-}
-
-/// The complete initialized scheduling session.
-pub struct ClientSession {
-    pub allocators: Vec<Allocator>,
-    pub tpu_to_pack: shaq::Consumer<TpuToPackMessage>,
-    pub progress_tracker: shaq::Consumer<ProgressMessage>,
-    pub workers: Vec<ClientWorkerSession>,
-}
-
-/// An per worker scheduling session.
-pub struct ClientWorkerSession {
-    pub pack_to_worker: shaq::Producer<PackToWorkerMessage>,
-    pub worker_to_pack: shaq::Consumer<WorkerToPackMessage>,
-}
-
-/// Potential errors that can occur during the client's side of the handshake.
-#[derive(Debug, Error)]
-pub enum ClientHandshakeError {
-    #[error("Io; err={0}")]
-    Io(#[from] std::io::Error),
-    #[error("Timed out")]
-    TimedOut,
-    #[error("Protocol violation")]
-    ProtocolViolation,
-    #[error("Rejected; reason={0}")]
-    Rejected(String),
-    #[error("Rts alloc; err={0}")]
-    RtsAlloc(#[from] RtsError),
-    #[error("Shaq; err={0}")]
-    Shaq(#[from] ShaqError),
 }
 
 impl From<nix::Error> for ClientHandshakeError {
