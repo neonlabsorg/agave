@@ -4,9 +4,11 @@ use {
 
 /// Max instruction stack depth. This is the maximum nesting of instructions that can happen during
 /// a transaction.
-pub const MAX_INSTRUCTION_STACK_DEPTH: usize = 1_000_001;
-/// Max instruction stack depth with SIMD-0296 enabled. Allows 1_000_000 nested CPIs.
-pub const MAX_INSTRUCTION_STACK_DEPTH_SIMD_0296: usize = 1_000_001;
+///
+/// Maximum instruction stack depth.
+pub const MAX_INSTRUCTION_STACK_DEPTH: usize = 256;
+/// Max instruction stack depth with SIMD-0296 enabled.
+pub const MAX_INSTRUCTION_STACK_DEPTH_SIMD_0296: usize = 256;
 
 fn get_max_instruction_stack_depth(simd_0296_active: bool) -> usize {
     if simd_0296_active {

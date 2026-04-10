@@ -201,15 +201,6 @@ impl Accounts {
         self.load_slow(ancestors, pubkey, LoadHint::Unspecified)
     }
 
-    pub fn load_without_fixed_root_allow_tombstone(
-        &self,
-        ancestors: &Ancestors,
-        pubkey: &Pubkey,
-    ) -> Option<(AccountSharedData, Slot)> {
-        self.accounts_db
-            .load_allow_tombstone(ancestors, pubkey, LoadHint::Unspecified)
-    }
-
     /// scans underlying accounts_db for this delta (slot) with a map function
     ///   from LoadedAccount to B
     /// returns only the latest/current version of B for this slot
@@ -253,10 +244,11 @@ impl Accounts {
         program_id: Option<&Pubkey>,
     ) -> Vec<TransactionAccount> {
         self.scan_slot(slot, |stored_account| {
-            program_id
+            (stored_account.is_loadable()
+                && program_id
                 .map(|program_id| program_id == stored_account.owner())
-                .unwrap_or(true)
-                .then(|| (*stored_account.pubkey(), stored_account.take_account()))
+                .unwrap_or(true))
+            .then(|| (*stored_account.pubkey(), stored_account.take_account()))
         })
     }
 
@@ -798,6 +790,46 @@ mod tests {
         assert_eq!(loaded, vec![(pubkey2, account2)]);
         let loaded = accounts.load_by_program_slot(0, Some(&Pubkey::from([4; 32])));
         assert_eq!(loaded, vec![]);
+    }
+
+    #[test]
+    fn test_load_by_program_slot_filters_cleanable_system_zero_lamport_account() {
+        let accounts_db = AccountsDb::new_single_for_tests();
+        let accounts = Accounts::new(Arc::new(accounts_db));
+
+        let program_id = solana_sdk_ids::system_program::id();
+
+        let live_pubkey = solana_pubkey::new_rand();
+        let live_account = AccountSharedData::new(1, 0, &program_id);
+        accounts.store_for_tests(0, &live_pubkey, &live_account);
+
+        let dead_pubkey = solana_pubkey::new_rand();
+        let mut dead_account = AccountSharedData::default();
+        dead_account.set_owner(program_id);
+        dead_account.set_rent_epoch(u64::MAX - 1);
+        accounts.store_for_tests(0, &dead_pubkey, &dead_account);
+
+        accounts.add_root_and_flush_write_cache(0);
+
+        let loaded = accounts.load_by_program_slot(0, Some(&program_id));
+        assert_eq!(loaded, vec![(live_pubkey, live_account)]);
+    }
+
+    #[test]
+    fn test_load_by_program_slot_keeps_noncleanable_zero_lamport_system_account() {
+        let accounts_db = AccountsDb::new_single_for_tests();
+        let accounts = Accounts::new(Arc::new(accounts_db));
+
+        let program_id = solana_sdk_ids::system_program::id();
+
+        let pubkey = solana_pubkey::new_rand();
+        let account = AccountSharedData::new(0, 1, &program_id);
+        accounts.store_for_tests(0, &pubkey, &account);
+
+        accounts.add_root_and_flush_write_cache(0);
+
+        let loaded = accounts.load_by_program_slot(0, Some(&program_id));
+        assert_eq!(loaded, vec![(pubkey, account)]);
     }
 
     #[test_case(false; "old")]

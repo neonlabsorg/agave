@@ -8,6 +8,7 @@ use {
         rpc::{rpc_accounts::*, rpc_accounts_scan::*, rpc_bank::*, rpc_full::*, rpc_minimal::*, *},
         rpc_cache::LargestAccountsCache,
         rpc_health::*,
+        signature_metrics_tracker,
     },
     crossbeam_channel::unbounded,
     jsonrpc_core::{futures::prelude::*, MetaIoHandler},
@@ -27,7 +28,7 @@ use {
         bigtable_upload_service::BigTableUploadService, blockstore::Blockstore,
         leader_schedule_cache::LeaderScheduleCache,
     },
-    solana_metrics::inc_new_counter_info,
+    solana_metrics::{custom_metrics, inc_new_counter_info},
     solana_perf::thread::renice_this_thread,
     solana_poh::poh_recorder::PohRecorder,
     solana_quic_definitions::NotifyKeyUpdate,
@@ -115,6 +116,7 @@ where
 
 pub struct JsonRpcService {
     thread_hdl: JoinHandle<()>,
+    signature_metrics_sweeper_hdl: Option<JoinHandle<()>>,
 
     #[cfg(test)]
     pub request_processor: JsonRpcRequestProcessor, // Used only by test_rpc_new()...
@@ -392,6 +394,13 @@ impl RequestMiddleware for RpcRequestMiddleware {
             process_rest(&self.bank_forks, path)
         } else if self.is_file_get_path(request.uri().path()) {
             self.process_file_get(request.uri().path())
+        } else if request.uri().path() == "/metrics" {
+            hyper::Response::builder()
+                .status(hyper::StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+                .body(hyper::Body::from(custom_metrics::render_prometheus()))
+                .unwrap()
+                .into()
         } else if request.uri().path() == "/health" {
             hyper::Response::builder()
                 .status(hyper::StatusCode::OK)
@@ -814,7 +823,7 @@ impl JsonRpcService {
             receiver,
             client.clone(),
             send_transaction_service_config,
-            exit,
+            exit.clone(),
         ));
 
         #[cfg(test)]
@@ -892,6 +901,9 @@ impl JsonRpcService {
             }));
         Ok(Self {
             thread_hdl,
+            signature_metrics_sweeper_hdl: Some(signature_metrics_tracker::start_timeout_sweeper(
+                exit.clone(),
+            )),
             #[cfg(test)]
             request_processor: test_request_processor,
             close_handle: Some(close_handle),
@@ -907,6 +919,9 @@ impl JsonRpcService {
 
     pub fn join(mut self) -> thread::Result<()> {
         self.exit();
+        if let Some(sweeper_hdl) = self.signature_metrics_sweeper_hdl.take() {
+            let _ = sweeper_hdl.join();
+        }
         self.thread_hdl.join()
     }
 

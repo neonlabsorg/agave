@@ -828,8 +828,7 @@ pub fn process_create_vote_account(
     )?;
 
     let required_balance = rpc_client
-        .get_minimum_balance_for_rent_exemption(VoteStateV3::size_of())?
-        .max(1);
+        .get_minimum_balance_for_rent_exemption(VoteStateV3::size_of())?;
     let amount = SpendAmount::Some(required_balance);
 
     let fee_payer = config.signers[fee_payer];

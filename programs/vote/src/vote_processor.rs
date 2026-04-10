@@ -1145,8 +1145,7 @@ mod tests {
         let clock_account = account::create_account_shared_data_for_test(&clock);
         let rent_sysvar = Rent::default();
         let minimum_balance = rent_sysvar
-            .minimum_balance(vote_account_with_epoch_credits_1.data().len())
-            .max(1);
+            .minimum_balance(vote_account_with_epoch_credits_1.data().len());
         let lamports = vote_account_with_epoch_credits_1.lamports();
         let transaction_accounts = vec![
             (vote_pubkey_1, vote_account_with_epoch_credits_1),

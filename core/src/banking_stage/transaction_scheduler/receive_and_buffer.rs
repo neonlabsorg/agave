@@ -29,6 +29,7 @@ use {
     solana_cost_model::cost_model::CostModel,
     solana_fee_structure::FeeBudgetLimits,
     solana_measure::measure_us,
+    solana_metrics::custom_metrics,
     solana_message::v0::MessageAddressTableLookup,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_runtime_transaction::{
@@ -347,6 +348,9 @@ impl SanitizedTransactionReceiveAndBuffer {
 
                 let (priority, cost) =
                     calculate_priority_and_cost(&transaction, &fee_budget_limits, &working_bank);
+                custom_metrics::observe_avg_locked_accounts_per_tx(
+                    transaction.message().account_keys().len() as u64,
+                );
                 num_buffered += 1;
                 if container.insert_new_transaction(transaction, max_age, priority, cost) {
                     num_dropped_on_capacity += 1;
@@ -754,44 +758,21 @@ impl TransactionViewReceiveAndBuffer {
     }
 }
 
-/// Calculate priority and cost for a transaction:
+/// Calculate scheduling priority and cost for a transaction.
 ///
-/// Cost is calculated through the `CostModel`,
-/// and priority is calculated through a formula here that attempts to sell
-/// blockspace to the highest bidder.
-///
-/// The priority is calculated as:
-/// P = R / (1 + C)
-/// where P is the priority, R is the reward,
-/// and C is the cost towards block-limits.
-///
-/// Current minimum costs are on the order of several hundred,
-/// so the denominator is effectively C, and the +1 is simply
-/// to avoid any division by zero due to a bug - these costs
-/// are calculated by the cost-model and are not direct
-/// from user input. They should never be zero.
-/// Any difference in the prioritization is negligible for
-/// the current transaction costs.
+/// In Parasol, all valid transactions have uniform scheduling weight.
+/// Cost is still estimated through `CostModel` and used only for safety
+/// capacity accounting (batch/thread CU limits), not for transaction order.
 fn calculate_priority_and_cost(
     transaction: &impl TransactionWithMeta,
-    fee_budget_limits: &FeeBudgetLimits,
+    _fee_budget_limits: &FeeBudgetLimits,
     bank: &Bank,
 ) -> (u64, u64) {
     let cost = CostModel::calculate_cost(transaction, &bank.feature_set).sum();
-    let reward = bank.calculate_reward_for_transaction(transaction, fee_budget_limits);
-
-    // We need a multiplier here to avoid rounding down too aggressively.
-    // For many transactions, the cost will be greater than the fees in terms of raw lamports.
-    // For the purposes of calculating prioritization, we multiply the fees by a large number so that
-    // the cost is a small fraction.
-    // An offset of 1 is used in the denominator to explicitly avoid division by zero.
-    const MULTIPLIER: u64 = 1_000_000;
-    (
-        reward
-            .saturating_mul(MULTIPLIER)
-            .saturating_div(cost.saturating_add(1)),
-        cost,
-    )
+    // Parasol is a fee-less network and scheduler ordering must be independent
+    // of fee-like signals. Every valid transaction has uniform scheduling weight.
+    const UNIFORM_TRANSACTION_PRIORITY: u64 = 0;
+    (UNIFORM_TRANSACTION_PRIORITY, cost)
 }
 
 /// Given the epoch, the minimum deactivation slot, and the current slot,
@@ -827,18 +808,19 @@ mod tests {
         super::*,
         crate::banking_stage::tests::create_slow_genesis_config,
         crossbeam_channel::{unbounded, Receiver},
+        solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
         solana_instruction::{AccountMeta, Instruction},
         solana_keypair::Keypair,
         solana_ledger::genesis_utils::GenesisConfigInfo,
-        solana_message::{v0, AddressLookupTableAccount, VersionedMessage},
+        solana_message::{v0, AddressLookupTableAccount, Message, VersionedMessage},
         solana_packet::{Meta, PACKET_DATA_SIZE},
         solana_perf::packet::{to_packet_batches, Packet, PacketBatch, PinnedPacketBatch},
         solana_pubkey::Pubkey,
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
         solana_system_transaction::transfer,
-        solana_transaction::versioned::VersionedTransaction,
+        solana_transaction::{versioned::VersionedTransaction, Transaction},
         test_case::test_case,
     };
 
@@ -928,6 +910,71 @@ mod tests {
                 alt_invalidation_slot: current_slot + solana_slot_hashes::get_entries() as u64,
             }
         );
+    }
+
+    #[test]
+    fn test_calculate_priority_and_cost_is_uniform_for_mixed_compute_budget() {
+        let (bank_forks, mint_keypair) = test_bank_forks();
+        let bank = bank_forks.read().unwrap().working_bank();
+
+        let from_a = Keypair::new();
+        let fund_a = transfer(
+            &mint_keypair,
+            &from_a.pubkey(),
+            500_000,
+            bank.last_blockhash(),
+        );
+        bank.process_transaction(&fund_a).unwrap();
+        let tx_a = Transaction::new(
+            &[&from_a],
+            Message::new(
+                &[
+                    system_instruction::transfer(&from_a.pubkey(), &Pubkey::new_unique(), 1),
+                    ComputeBudgetInstruction::set_compute_unit_price(1),
+                ],
+                Some(&from_a.pubkey()),
+            ),
+            bank.last_blockhash(),
+        );
+        let tx_a = RuntimeTransaction::from_transaction_for_tests(tx_a);
+        let fee_budget_a = tx_a
+            .compute_budget_instruction_details()
+            .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set)
+            .map(FeeBudgetLimits::from)
+            .unwrap();
+
+        let from_b = Keypair::new();
+        let fund_b = transfer(
+            &mint_keypair,
+            &from_b.pubkey(),
+            500_000,
+            bank.last_blockhash(),
+        );
+        bank.process_transaction(&fund_b).unwrap();
+        let tx_b = Transaction::new(
+            &[&from_b],
+            Message::new(
+                &[
+                    system_instruction::transfer(&from_b.pubkey(), &Pubkey::new_unique(), 1),
+                    ComputeBudgetInstruction::set_compute_unit_limit(400_000),
+                    ComputeBudgetInstruction::set_compute_unit_price(10_000),
+                ],
+                Some(&from_b.pubkey()),
+            ),
+            bank.last_blockhash(),
+        );
+        let tx_b = RuntimeTransaction::from_transaction_for_tests(tx_b);
+        let fee_budget_b = tx_b
+            .compute_budget_instruction_details()
+            .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set)
+            .map(FeeBudgetLimits::from)
+            .unwrap();
+
+        let (priority_a, _cost_a) = calculate_priority_and_cost(&tx_a, &fee_budget_a, &bank);
+        let (priority_b, _cost_b) = calculate_priority_and_cost(&tx_b, &fee_budget_b, &bank);
+
+        assert_eq!(priority_a, priority_b);
+        assert_eq!(priority_a, 0);
     }
 
     #[test_case(setup_sanitized_transaction_receive_and_buffer; "testcase-sdk")]

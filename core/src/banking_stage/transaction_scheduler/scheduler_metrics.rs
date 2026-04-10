@@ -86,10 +86,10 @@ pub struct SchedulerCountMetricsInner {
     pub num_dropped_on_clean: Saturating<usize>,
     /// Number of transactions that were dropped due to exceeded capacity.
     pub num_dropped_on_capacity: Saturating<usize>,
-    /// Min prioritization fees in the transaction container
-    pub min_prioritization_fees: u64,
-    /// Max prioritization fees in the transaction container
-    pub max_prioritization_fees: u64,
+    /// Min transaction priority in the transaction container
+    pub min_transaction_priority: u64,
+    /// Max transaction priority in the transaction container
+    pub max_transaction_priority: u64,
 }
 
 impl IntervalSchedulerCountMetrics {
@@ -141,8 +141,8 @@ impl SchedulerCountMetricsInner {
             num_dropped_on_clear: Saturating(num_dropped_on_clear),
             num_dropped_on_clean: Saturating(num_dropped_on_clean),
             num_dropped_on_capacity: Saturating(num_dropped_on_capacity),
-            min_prioritization_fees: _min_prioritization_fees,
-            max_prioritization_fees: _max_prioritization_fees,
+            min_transaction_priority: _min_transaction_priority,
+            max_transaction_priority: _max_transaction_priority,
         } = self;
         let mut datapoint = create_datapoint!(
             @point name,
@@ -231,8 +231,8 @@ impl SchedulerCountMetricsInner {
         self.num_dropped_on_clear = Saturating(0);
         self.num_dropped_on_clean = Saturating(0);
         self.num_dropped_on_capacity = Saturating(0);
-        self.min_prioritization_fees = u64::MAX;
-        self.max_prioritization_fees = 0;
+        self.min_transaction_priority = u64::MAX;
+        self.max_transaction_priority = 0;
     }
 
     pub fn update_priority_stats(&mut self, min_max_fees: MinMaxResult<u64>) {
@@ -242,27 +242,27 @@ impl SchedulerCountMetricsInner {
                 // do nothing
             }
             itertools::MinMaxResult::OneElement(e) => {
-                self.min_prioritization_fees = e;
-                self.max_prioritization_fees = e;
+                self.min_transaction_priority = e;
+                self.max_transaction_priority = e;
             }
             itertools::MinMaxResult::MinMax(min, max) => {
-                self.min_prioritization_fees = min;
-                self.max_prioritization_fees = max;
+                self.min_transaction_priority = min;
+                self.max_transaction_priority = max;
             }
         }
     }
 
     fn get_min_priority(&self) -> u64 {
         // to avoid getting u64::max recorded by metrics / in case of edge cases
-        if self.min_prioritization_fees != u64::MAX {
-            self.min_prioritization_fees
+        if self.min_transaction_priority != u64::MAX {
+            self.min_transaction_priority
         } else {
             0
         }
     }
 
     fn get_max_priority(&self) -> u64 {
-        self.max_prioritization_fees
+        self.max_transaction_priority
     }
 }
 

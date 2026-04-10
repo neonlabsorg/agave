@@ -2,6 +2,7 @@ use {
     agave_validator::{
         admin_rpc_service, cli, dashboard::Dashboard, ledger_lockfile, lock_ledger,
         println_name_value,
+        commands::run::args::json_rpc_config::load_tx_type_rules,
     },
     clap::{crate_name, value_t, value_t_or_exit, values_t_or_exit},
     crossbeam_channel::unbounded,
@@ -460,6 +461,10 @@ fn main() {
     } else {
         None
     };
+    let tx_type_rules = load_tx_type_rules(&matches).unwrap_or_else(|err| {
+        println!("Error: failed to parse tx type mapping rules: {err}");
+        exit(1);
+    });
 
     genesis
         .ledger_path(&ledger_path)
@@ -493,6 +498,7 @@ fn main() {
         rpc_bigtable_config,
         faucet_addr: Some(faucet_addr),
         account_indexes,
+        tx_type_rules,
         ..JsonRpcConfig::default_for_test()
     });
 

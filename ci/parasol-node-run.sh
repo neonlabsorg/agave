@@ -1,8 +1,9 @@
 #!/bin/sh
 solana-test-validator \
   --ledger /opt/parasol/data \
+  --rpc-tx-type-map-config /usr/local/bin/tx_type_rules.yml \
   --rpc-port 8899 \
   --faucet-port 19900 \
   --gossip-port 18000 \
-  --limit-ledger-size 100000 \
+  --limit-ledger-size 1000000 \
   --log

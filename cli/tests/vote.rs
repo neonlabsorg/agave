@@ -68,8 +68,7 @@ fn test_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     assert_eq!(authorized_withdrawer, config.signers[0].pubkey());
     let expected_balance = rpc_client
         .get_minimum_balance_for_rent_exemption(VoteStateV3::size_of())
-        .unwrap()
-        .max(1);
+        .unwrap();
     check_balance!(expected_balance, &rpc_client, &vote_account_pubkey);
 
     // Transfer in some more SOL
@@ -296,8 +295,7 @@ fn test_offline_vote_authorize_and_withdraw(compute_unit_price: Option<u64>) {
     assert_eq!(authorized_withdrawer, offline_keypair.pubkey());
     let expected_balance = rpc_client
         .get_minimum_balance_for_rent_exemption(VoteStateV3::size_of())
-        .unwrap()
-        .max(1);
+        .unwrap();
     check_balance!(expected_balance, &rpc_client, &vote_account_pubkey);
 
     // Transfer in some more SOL

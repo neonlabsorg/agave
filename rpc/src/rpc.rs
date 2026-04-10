@@ -6,6 +6,7 @@ use {
         filter::filter_allows, max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         parsed_token_accounts::*, rpc_cache::LargestAccountsCache, rpc_health::*,
+        signature_metrics_tracker, tx_type_rules,
     },
     base64::{prelude::BASE64_STANDARD, Engine},
     bincode::{config::Options, serialize},
@@ -46,7 +47,7 @@ use {
         leader_schedule_cache::LeaderScheduleCache,
     },
     solana_message::{AddressLoader, SanitizedMessage},
-    solana_metrics::inc_new_counter_info,
+    solana_metrics::{custom_metrics, inc_new_counter_info},
     solana_perf::packet::PACKET_DATA_SIZE,
     solana_program_pack::Pack,
     solana_pubkey::{Pubkey, PUBKEY_BYTES},
@@ -113,9 +114,9 @@ use {
         str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, RwLock,
+            Arc, OnceLock, RwLock,
         },
-        time::Duration,
+        time::{Duration, Instant},
     },
     tokio::runtime::Runtime,
 };
@@ -175,6 +176,7 @@ pub struct JsonRpcConfig {
     pub full_api: bool,
     pub rpc_scan_and_fix_roots: bool,
     pub max_request_body_size: Option<usize>,
+    pub tx_type_rules: Vec<tx_type_rules::RpcTxTypeRule>,
     /// Disable the health check, used for tests and TestValidator
     pub disable_health_check: bool,
 }
@@ -196,6 +198,7 @@ impl Default for JsonRpcConfig {
             full_api: Default::default(),
             rpc_scan_and_fix_roots: Default::default(),
             max_request_body_size: Option::default(),
+            tx_type_rules: Vec::default(),
             disable_health_check: Default::default(),
         }
     }
@@ -419,6 +422,7 @@ impl JsonRpcRequestProcessor {
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         runtime: Arc<Runtime>,
     ) -> (Self, Receiver<TransactionInfo>) {
+        tx_type_rules::set_rules(config.tx_type_rules.clone());
         let (transaction_sender, transaction_receiver) = unbounded();
         (
             Self {
@@ -2511,11 +2515,7 @@ fn get_encoded_account(
     // only used for simulation results
     overwrite_accounts: Option<&HashMap<Pubkey, AccountSharedData>>,
 ) -> Result<Option<UiAccount>> {
-    match account_resolver::get_account_from_overwrites_or_bank_allow_tombstone(
-        pubkey,
-        bank,
-        overwrite_accounts,
-    ) {
+    match account_resolver::get_account_from_overwrites_or_bank(pubkey, bank, overwrite_accounts) {
         Some(account) => {
             let response = if is_known_spl_token_id(account.owner())
                 && encoding == UiAccountEncoding::JsonParsed
@@ -2695,8 +2695,12 @@ fn _send_transaction(
     last_valid_block_height: u64,
     durable_nonce_info: Option<(Pubkey, Hash)>,
     max_retries: Option<usize>,
+    received_at: Instant,
+    forwarded_at: Instant,
+    tx_type: String,
 ) -> Result<String> {
-    let transaction_info = TransactionInfo::new(
+    signature_metrics_tracker::register_signature(signature, received_at, forwarded_at);
+    let transaction_info = TransactionInfo::new_with_timing(
         message_hash,
         signature,
         blockhash,
@@ -2704,8 +2708,11 @@ fn _send_transaction(
         last_valid_block_height,
         durable_nonce_info,
         max_retries,
+        received_at,
+        forwarded_at,
         None,
-    );
+    )
+    .with_tx_type(tx_type);
     meta.transaction_sender
         .send(transaction_info)
         .unwrap_or_else(|err| warn!("Failed to enqueue transaction: {err}"));
@@ -3752,6 +3759,8 @@ pub mod rpc_full {
             lamports: u64,
             config: Option<RpcRequestAirdropConfig>,
         ) -> Result<String> {
+            let received_at = Instant::now();
+            let tx_type = "airdrop".to_string();
             debug!("request_airdrop rpc request received");
             trace!(
                 "request_airdrop id={} lamports={} config: {:?}",
@@ -3771,9 +3780,15 @@ pub mod rpc_full {
             } else {
                 bank.confirmed_last_blockhash()
             };
+            if let Some(blockhash_age_slots) = bank.get_hash_age(&blockhash) {
+                custom_metrics::observe_blockhash_age_at_submit_slots(blockhash_age_slots);
+            }
             let last_valid_block_height = bank
                 .get_blockhash_last_valid_block_height(&blockhash)
                 .unwrap_or(0);
+            custom_metrics::observe_blockhash_remaining_validity_slots(
+                last_valid_block_height.saturating_sub(bank.block_height()),
+            );
 
             let transaction =
                 request_airdrop_transaction(&faucet_addr, &pubkey, lamports, blockhash).map_err(
@@ -3795,7 +3810,19 @@ pub mod rpc_full {
                 return Err(RpcCustomError::TransactionSignatureVerificationFailure.into());
             };
 
-            _send_transaction(
+            let forwarded_at = Instant::now();
+            custom_metrics::observe_node_ingress_latency_us(
+                forwarded_at
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+            );
+            custom_metrics::observe_node_ingress_latency_us_with_type(
+                forwarded_at
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+                &tx_type,
+            );
+            let result = _send_transaction(
                 meta,
                 message_hash,
                 signature,
@@ -3804,7 +3831,22 @@ pub mod rpc_full {
                 last_valid_block_height,
                 None,
                 None,
-            )
+                received_at,
+                forwarded_at,
+                tx_type.clone(),
+            );
+            custom_metrics::observe_node_to_decision_response_latency_us(
+                Instant::now()
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+            );
+            custom_metrics::observe_node_to_decision_response_latency_us_with_type(
+                Instant::now()
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+                &tx_type,
+            );
+            result
         }
 
         fn send_transaction(
@@ -3813,6 +3855,7 @@ pub mod rpc_full {
             data: String,
             config: Option<RpcSendTransactionConfig>,
         ) -> Result<String> {
+            let received_at = Instant::now();
             debug!("send_transaction rpc request received");
             let RpcSendTransactionConfig {
                 skip_preflight,
@@ -3845,9 +3888,16 @@ pub mod rpc_full {
                 preflight_bank,
                 preflight_bank.get_reserved_account_keys(),
             )?;
+            let tx_type = tx_type_rules::infer_from_message(
+                transaction.message(),
+                transaction.is_simple_vote_transaction(),
+            );
             let blockhash = *transaction.message().recent_blockhash();
             let message_hash = *transaction.message_hash();
             let signature = *transaction.signature();
+            if let Some(blockhash_age_slots) = preflight_bank.get_hash_age(&blockhash) {
+                custom_metrics::observe_blockhash_age_at_submit_slots(blockhash_age_slots);
+            }
 
             let mut last_valid_block_height = preflight_bank
                 .get_blockhash_last_valid_block_height(&blockhash)
@@ -3863,6 +3913,9 @@ pub mod rpc_full {
                 // retried until the nonce is advanced.
                 last_valid_block_height = preflight_bank.block_height() + MAX_PROCESSING_AGE as u64;
             }
+            custom_metrics::observe_blockhash_remaining_validity_slots(
+                last_valid_block_height.saturating_sub(preflight_bank.block_height()),
+            );
 
             if !skip_preflight {
                 verify_transaction(&transaction)?;
@@ -3933,7 +3986,19 @@ pub mod rpc_full {
                 }
             }
 
-            _send_transaction(
+            let forwarded_at = Instant::now();
+            custom_metrics::observe_node_ingress_latency_us(
+                forwarded_at
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+            );
+            custom_metrics::observe_node_ingress_latency_us_with_type(
+                forwarded_at
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+                &tx_type,
+            );
+            let result = _send_transaction(
                 meta,
                 message_hash,
                 signature,
@@ -3942,7 +4007,33 @@ pub mod rpc_full {
                 last_valid_block_height,
                 durable_nonce_info,
                 max_retries,
-            )
+                received_at,
+                forwarded_at,
+                tx_type.clone(),
+            );
+            custom_metrics::observe_node_to_decision_response_latency_us(
+                Instant::now()
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+            );
+            custom_metrics::observe_node_to_decision_response_latency_us_with_type(
+                Instant::now()
+                    .saturating_duration_since(received_at)
+                    .as_micros() as u64,
+                &tx_type,
+            );
+            custom_metrics::observe_decision_response_latency_us(
+                Instant::now()
+                    .saturating_duration_since(forwarded_at)
+                    .as_micros() as u64,
+            );
+            custom_metrics::observe_decision_response_latency_us_with_type(
+                Instant::now()
+                    .saturating_duration_since(forwarded_at)
+                    .as_micros() as u64,
+                &tx_type,
+            );
+            result
         }
 
         fn simulate_transaction(
@@ -4228,7 +4319,12 @@ pub mod rpc_full {
             config: Option<RpcContextConfig>,
         ) -> Result<RpcResponse<RpcBlockhash>> {
             debug!("get_latest_blockhash rpc request received");
-            meta.get_latest_blockhash(config.unwrap_or_default())
+            let start = Instant::now();
+            let result = meta.get_latest_blockhash(config.unwrap_or_default());
+            custom_metrics::observe_blockhash_fetch_latency_us(
+                Instant::now().saturating_duration_since(start).as_micros() as u64,
+            );
+            result
         }
 
         fn is_blockhash_valid(
@@ -4329,8 +4425,13 @@ fn rpc_perf_sample_from_perf_sample(slot: u64, sample: PerfSample) -> RpcPerfSam
     }
 }
 
-const MAX_BASE58_SIZE: usize = 1683; // Golden, bump if PACKET_DATA_SIZE changes
-const MAX_BASE64_SIZE: usize = 1644; // Golden, bump if PACKET_DATA_SIZE changes
+fn max_base58_size() -> usize {
+    static MAX_BASE58_SIZE: OnceLock<usize> = OnceLock::new();
+    *MAX_BASE58_SIZE
+        .get_or_init(|| bs58::encode(vec![0xffu8; PACKET_DATA_SIZE]).into_string().len())
+}
+
+const MAX_BASE64_SIZE: usize = (PACKET_DATA_SIZE + 2) / 3 * 4;
 fn decode_and_deserialize<T>(
     encoded: String,
     encoding: TransactionBinaryEncoding,
@@ -4341,12 +4442,13 @@ where
     let wire_output = match encoding {
         TransactionBinaryEncoding::Base58 => {
             inc_new_counter_info!("rpc-base58_encoded_tx", 1);
-            if encoded.len() > MAX_BASE58_SIZE {
+            let max_base58_size = max_base58_size();
+            if encoded.len() > max_base58_size {
                 return Err(Error::invalid_params(format!(
                     "base58 encoded {} too large: {} bytes (max: encoded/raw {}/{})",
                     type_name::<T>(),
                     encoded.len(),
-                    MAX_BASE58_SIZE,
+                    max_base58_size,
                     PACKET_DATA_SIZE,
                 )));
             }
@@ -8985,7 +9087,7 @@ pub mod tests {
     fn test_worst_case_encoded_tx_goldens() {
         let ff_tx = vec![0xffu8; PACKET_DATA_SIZE];
         let tx58 = bs58::encode(&ff_tx).into_string();
-        assert_eq!(tx58.len(), MAX_BASE58_SIZE);
+        assert_eq!(tx58.len(), max_base58_size());
         let tx64 = BASE64_STANDARD.encode(&ff_tx);
         assert_eq!(tx64.len(), MAX_BASE64_SIZE);
     }
@@ -8998,12 +9100,13 @@ pub mod tests {
 
         let tx58 = bs58::encode(&tx_ser).into_string();
         let tx58_len = tx58.len();
+        let max_base58_size = max_base58_size();
         assert_eq!(
             decode_and_deserialize::<Transaction>(tx58, TransactionBinaryEncoding::Base58)
                 .unwrap_err(),
             Error::invalid_params(format!(
                 "base58 encoded solana_transaction::Transaction too large: {tx58_len} bytes (max: \
-                 encoded/raw {MAX_BASE58_SIZE}/{PACKET_DATA_SIZE})",
+                 encoded/raw {max_base58_size}/{PACKET_DATA_SIZE})",
             ))
         );
 
@@ -9031,12 +9134,13 @@ pub mod tests {
         );
 
         let tx64 = BASE64_STANDARD.encode(&tx_ser);
+        let tx64_len = tx64.len();
         assert_eq!(
             decode_and_deserialize::<Transaction>(tx64, TransactionBinaryEncoding::Base64)
                 .unwrap_err(),
             Error::invalid_params(format!(
-                "decoded solana_transaction::Transaction too large: {too_big} bytes (max: \
-                 {PACKET_DATA_SIZE} bytes)"
+                "base64 encoded solana_transaction::Transaction too large: {tx64_len} bytes (max: \
+                 encoded/raw {MAX_BASE64_SIZE}/{PACKET_DATA_SIZE})",
             ))
         );
 
@@ -9053,10 +9157,14 @@ pub mod tests {
         );
 
         tx64.push('!');
+        let tx64_len = tx64.len();
         assert_eq!(
             decode_and_deserialize::<Transaction>(tx64, TransactionBinaryEncoding::Base64)
                 .unwrap_err(),
-            Error::invalid_params("invalid base64 encoding: InvalidByte(1640, 33)".to_string())
+            Error::invalid_params(format!(
+                "base64 encoded solana_transaction::Transaction too large: {tx64_len} bytes (max: \
+                 encoded/raw {MAX_BASE64_SIZE}/{PACKET_DATA_SIZE})",
+            ))
         );
 
         let mut tx58 = bs58::encode(&tx_ser).into_string();
@@ -9071,13 +9179,13 @@ pub mod tests {
         );
 
         tx58.push('!');
+        let invalid_char_index = tx58.len() - 1;
         assert_eq!(
             decode_and_deserialize::<Transaction>(tx58, TransactionBinaryEncoding::Base58)
                 .unwrap_err(),
-            Error::invalid_params(
-                "invalid base58 encoding: InvalidCharacter { character: '!', index: 1680 }"
-                    .to_string(),
-            )
+            Error::invalid_params(format!(
+                "invalid base58 encoding: InvalidCharacter {{ character: '!', index: {invalid_char_index} }}",
+            ))
         );
     }
 

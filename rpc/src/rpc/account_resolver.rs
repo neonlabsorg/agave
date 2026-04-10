@@ -12,13 +12,3 @@ pub(crate) fn get_account_from_overwrites_or_bank(
         .and_then(|accounts| accounts.get(pubkey).cloned())
         .or_else(|| bank.get_account(pubkey))
 }
-
-pub(crate) fn get_account_from_overwrites_or_bank_allow_tombstone(
-    pubkey: &Pubkey,
-    bank: &Bank,
-    overwrite_accounts: Option<&HashMap<Pubkey, AccountSharedData>>,
-) -> Option<AccountSharedData> {
-    overwrite_accounts
-        .and_then(|accounts| accounts.get(pubkey).cloned())
-        .or_else(|| bank.get_account_allow_tombstone(pubkey))
-}

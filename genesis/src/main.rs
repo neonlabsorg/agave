@@ -253,7 +253,7 @@ fn add_validator_accounts(
             identity_pubkey,
             identity_pubkey,
             commission,
-            VoteStateV3::get_rent_exempt_reserve(rent).max(1),
+            VoteStateV3::get_rent_exempt_reserve(rent),
         );
 
         genesis_config.add_account(

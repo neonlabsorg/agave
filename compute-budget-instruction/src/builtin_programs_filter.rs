@@ -7,7 +7,14 @@ use {
 };
 
 // The maximum number of pubkeys that a packet can contain.
-pub(crate) const FILTER_SIZE: u8 = (PACKET_DATA_SIZE / core::mem::size_of::<Pubkey>()) as u8;
+pub(crate) const FILTER_SIZE: usize = {
+    let max_pubkeys = PACKET_DATA_SIZE / core::mem::size_of::<Pubkey>();
+    if max_pubkeys > u8::MAX as usize + 1 {
+        u8::MAX as usize + 1
+    } else {
+        max_pubkeys
+    }
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ProgramKind {
@@ -25,7 +32,7 @@ pub(crate) struct BuiltinProgramsFilter {
     // array of slots for all possible static and sanitized program_id_index,
     // each slot indicates if a program_id_index has not been checked (eg, None),
     // or already checked with result (eg, Some(ProgramKind)) that can be reused.
-    program_kind: [Option<ProgramKind>; FILTER_SIZE as usize],
+    program_kind: [Option<ProgramKind>; FILTER_SIZE],
 }
 
 impl BuiltinProgramsFilter {

@@ -5505,6 +5505,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d33c28a30771f7f96db69893f78b857f7450d7e0237e9c8fc6427a81bae7ed1"
+dependencies = [
+ "cfg-if 1.0.1",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot 0.12.3",
+ "protobuf",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "proptest"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5585,6 +5600,12 @@ dependencies = [
  "protobuf-src",
  "tonic-build",
 ]
+
+[[package]]
+name = "protobuf"
+version = "2.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "protobuf-src"
@@ -6975,11 +6996,10 @@ dependencies = [
 [[package]]
 name = "solana-account-info"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82f4691b69b172c687d218dd2f1f23fc7ea5e9aa79df9ac26dab3d8dd829ce48"
 dependencies = [
  "bincode",
  "serde",
+ "solana-define-syscall 3.0.0",
  "solana-program-error",
  "solana-program-memory",
  "solana-pubkey",
@@ -8014,8 +8034,6 @@ dependencies = [
 [[package]]
 name = "solana-compute-budget-interface"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8292c436b269ad23cecc8b24f7da3ab07ca111661e25e00ce0e1d22771951ab9"
 dependencies = [
  "borsh",
  "solana-instruction",
@@ -9343,11 +9361,13 @@ dependencies = [
  "env_logger",
  "gethostname",
  "log",
+ "prometheus",
  "rand 0.8.5",
  "reqwest 0.12.23",
  "serial_test",
  "solana-cluster-type",
  "solana-sha256-hasher",
+ "solana-signature",
  "solana-time-utils",
  "thiserror 2.0.16",
 ]
@@ -9462,8 +9482,6 @@ dependencies = [
 [[package]]
 name = "solana-packet"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6edf2f25743c95229ac0fdc32f8f5893ef738dbf332c669e9861d33ddb0f469d"
 dependencies = [
  "bincode",
  "bitflags 2.9.1",
@@ -11036,8 +11054,6 @@ dependencies = [
 [[package]]
 name = "solana-system-interface"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e1790547bfc3061f1ee68ea9d8dc6c973c02a163697b24263a8e9f2e6d4afa2"
 dependencies = [
  "num-traits",
  "serde",

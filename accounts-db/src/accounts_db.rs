@@ -28,11 +28,13 @@ use crate::append_vec::StoredAccountMeta;
 use qualifier_attr::qualifiers;
 use {
     crate::{
-        account_utils::{is_default_account, is_default_account_meta},
         account_info::{AccountInfo, Offset, StorageLocation},
         account_storage::{
             stored_account_info::{StoredAccountInfo, StoredAccountInfoWithoutData},
             AccountStorage, AccountStorageStatus, AccountStoragesOrderer, ShrinkInProgress,
+        },
+        account_utils::{
+            is_cleanable_zero_lamport_account, is_cleanable_zero_lamport_account_meta,
         },
         accounts_cache::{AccountsCache, CachedAccount, SlotCache},
         accounts_db::stats::{
@@ -95,6 +97,8 @@ use {
     },
     tempfile::TempDir,
 };
+#[cfg(test)]
+use crate::account_utils::is_default_account;
 
 // when the accounts write cache exceeds this many bytes, we will flush it
 // this can be specified on the command line, too (--accounts-db-cache-limit-mb)
@@ -253,16 +257,15 @@ pub enum StoreReclaims {
     Ignore,
 }
 
-/// specifies how to return tombstone accounts from a load
+/// specifies how to return zero-lamport tombstone-like accounts from a load
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoadZeroLamports {
-    /// return None if loaded account is a default tombstone
+    /// return None if loaded account is cleanable by zero-lamport clean
     None,
-    /// return Some(account) even if it is a default tombstone
-    /// This used to be the only behavior.
-    /// Note that this is non-deterministic if clean is running asynchronously.
-    /// If a zero lamport account exists in the index, then Some is returned.
-    /// Once it is cleaned from the index, None is returned.
+    /// return Some(account) even if it is a zero-lamport tombstone-like account.
+    /// This is retained for tests and internal paths that need visibility into
+    /// index state before asynchronous clean catches up.
+    #[cfg_attr(not(test), allow(dead_code))]
     Some,
 }
 
@@ -2010,7 +2013,7 @@ impl AccountsDb {
                             .accounts
                             .scan_accounts_without_data(|_offset, account| {
                                 let pubkey = *account.pubkey();
-                                let is_tombstone = is_default_account_meta(
+                                let is_tombstone = is_cleanable_zero_lamport_account_meta(
                                     account.lamports,
                                     account.data_len,
                                     account.owner,
@@ -2970,7 +2973,7 @@ impl AccountsDb {
             .scan_accounts_without_data(|offset, account| {
                 // file_id is unused and can be anything. We will always be loading whatever storage is in the slot.
                 let file_id = 0;
-                let is_tombstone = is_default_account_meta(
+                let is_tombstone = is_cleanable_zero_lamport_account_meta(
                     account.lamports,
                     account.data_len,
                     account.owner,
@@ -4095,15 +4098,6 @@ impl AccountsDb {
         self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::None)
     }
 
-    pub fn load_allow_tombstone(
-        &self,
-        ancestors: &Ancestors,
-        pubkey: &Pubkey,
-        load_hint: LoadHint,
-    ) -> Option<(AccountSharedData, Slot)> {
-        self.do_load(ancestors, pubkey, None, load_hint, LoadZeroLamports::Some)
-    }
-
     /// load the account with `pubkey` into the read only accounts cache.
     /// The goal is to make subsequent loads (which caller expects to occur) to find the account quickly.
     pub fn load_account_into_read_cache(&self, ancestors: &Ancestors, pubkey: &Pubkey) {
@@ -4118,7 +4112,7 @@ impl AccountsDb {
         );
     }
 
-    /// note this returns None for default tombstone accounts
+    /// note this returns None for cleanable tombstone-like accounts
     pub fn load_with_fixed_root(
         &self,
         ancestors: &Ancestors,
@@ -4449,7 +4443,7 @@ impl AccountsDb {
     /// Load account with `pubkey` and maybe put into read cache.
     ///
     /// Return the account and the slot when the account was last stored.
-    /// Return None for default tombstone accounts.
+    /// Return None for cleanable tombstone-like accounts.
     pub fn load_account_with(
         &self,
         ancestors: &Ancestors,
@@ -4464,7 +4458,7 @@ impl AccountsDb {
         if !in_write_cache {
             let result = self.read_only_accounts_cache.load(*pubkey, slot);
             if let Some(account) = result {
-                if is_default_account(&account) {
+                if is_cleanable_zero_lamport_account(&account) {
                     return None;
                 }
                 return Some((account, slot));
@@ -4484,7 +4478,7 @@ impl AccountsDb {
         // since the cache could be flushed in between the 2 calls.
         let in_write_cache = matches!(account_accessor, LoadedAccountAccessor::Cached(_));
         let account = account_accessor.check_and_get_loaded_account_shared_data();
-        if is_default_account(&account) {
+        if is_cleanable_zero_lamport_account(&account) {
             return None;
         }
 
@@ -4532,7 +4526,8 @@ impl AccountsDb {
             if !in_write_cache {
                 let result = self.read_only_accounts_cache.load(*pubkey, slot);
                 if let Some(account) = result {
-                    if load_zero_lamports == LoadZeroLamports::None && is_default_account(&account)
+                    if load_zero_lamports == LoadZeroLamports::None
+                        && is_cleanable_zero_lamport_account(&account)
                     {
                         return None;
                     }
@@ -4563,7 +4558,9 @@ impl AccountsDb {
         // since the cache could be flushed in between the 2 calls.
         let in_write_cache = matches!(account_accessor, LoadedAccountAccessor::Cached(_));
         let account = account_accessor.check_and_get_loaded_account_shared_data();
-        if load_zero_lamports == LoadZeroLamports::None && is_default_account(&account) {
+        if load_zero_lamports == LoadZeroLamports::None
+            && is_cleanable_zero_lamport_account(&account)
+        {
             return None;
         }
 
@@ -6693,7 +6690,7 @@ impl AccountsDb {
                     let data_len = account.data.len() as u64;
                     let stored_size_aligned =
                         storage.accounts.calculate_stored_size(data_len as usize);
-                    let is_tombstone = is_default_account(&account);
+                    let is_tombstone = is_cleanable_zero_lamport_account(&account);
                     let info = IndexInfo {
                         stored_size_aligned,
                         index_info: IndexInfoInner {
@@ -6718,7 +6715,7 @@ impl AccountsDb {
                         let data_len = account.data_len as u64;
                         let stored_size_aligned =
                             storage.accounts.calculate_stored_size(data_len as usize);
-                        let is_tombstone = is_default_account_meta(
+                        let is_tombstone = is_cleanable_zero_lamport_account_meta(
                             account.lamports,
                             account.data_len,
                             account.owner,
@@ -6890,13 +6887,14 @@ impl AccountsDb {
                                     for (slot2, account_info2) in slot_list.iter() {
                                         if *slot2 == slot {
                                             count += 1;
-                                            let is_tombstone = is_default_account_meta(
-                                                account.lamports,
-                                                account.data_len,
-                                                account.owner,
-                                                account.executable,
-                                                account.rent_epoch,
-                                            );
+                                            let is_tombstone =
+                                                is_cleanable_zero_lamport_account_meta(
+                                                    account.lamports,
+                                                    account.data_len,
+                                                    account.owner,
+                                                    account.executable,
+                                                    account.rent_epoch,
+                                                );
                                             let ai = AccountInfo::new(
                                                 StorageLocation::AppendVec(store_id, offset), // will never be cached
                                                 is_tombstone,

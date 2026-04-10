@@ -6,6 +6,7 @@ use {
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         parsed_token_accounts::{get_parsed_token_account, get_parsed_token_accounts},
         rpc_pubsub_service::PubSubConfig,
+        signature_metrics_tracker,
         rpc_subscription_tracker::{
             AccountSubscriptionParams, BlockSubscriptionKind, BlockSubscriptionParams,
             LogsSubscriptionKind, LogsSubscriptionParams, ProgramSubscriptionParams,
@@ -839,6 +840,12 @@ impl RpcSubscriptions {
                             }
                         }
                         NotificationEntry::Bank(commitment_slots) => {
+                            signature_metrics_tracker::mark_confirmed_up_to_slot(
+                                commitment_slots.highest_confirmed_slot,
+                            );
+                            signature_metrics_tracker::mark_finalized_up_to_slot(
+                                commitment_slots.highest_super_majority_root,
+                            );
                             const SOURCE: &str = "bank";
                             RpcSubscriptions::notify_watchers(
                                 max_complete_transaction_status_slot.clone(),
@@ -851,6 +858,7 @@ impl RpcSubscriptions {
                             );
                         }
                         NotificationEntry::Gossip(slot) => {
+                            signature_metrics_tracker::mark_confirmed_up_to_slot(slot);
                             let commitment_slots = CommitmentSlots {
                                 highest_confirmed_slot: slot,
                                 ..CommitmentSlots::default()
@@ -896,6 +904,9 @@ impl RpcSubscriptions {
                     }
                     stats.notification_entry_processing_time_us +=
                         queued_at.elapsed().as_micros() as u64;
+                    solana_metrics::custom_metrics::observe_state_update_notification_latency_us(
+                        queued_at.elapsed().as_micros() as u64,
+                    );
                     stats.notification_entry_processing_count += 1;
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -1113,6 +1124,13 @@ impl RpcSubscriptions {
 
                         if notified {
                             num_signatures_notified.fetch_add(1, Ordering::Relaxed);
+                            if params.commitment.is_finalized() {
+                                signature_metrics_tracker::mark_finalized(&params.signature);
+                            } else if params.commitment.is_confirmed() {
+                                signature_metrics_tracker::mark_confirmed(&params.signature);
+                            } else if params.commitment.is_processed() {
+                                signature_metrics_tracker::mark_processed(&params.signature);
+                            }
                         }
                     }
                 }
@@ -1221,6 +1239,7 @@ pub(crate) mod tests {
             rpc_pubsub_service,
         },
         serial_test::serial,
+        solana_account::WritableAccount,
         solana_commitment_config::CommitmentConfig,
         solana_keypair::Keypair,
         solana_ledger::get_tmp_ledger_path_auto_delete,
@@ -1872,6 +1891,105 @@ pub(crate) mod tests {
                 encoding: UiAccountEncoding::Binary,
                 with_context: false,
             }));
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_program_subscribe_filters_cleanable_system_account() {
+        let GenesisConfigInfo {
+            genesis_config,
+            ..
+        } = create_genesis_config(100);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let bank0 = bank_forks.read().unwrap().get(0).unwrap();
+        let bank1 = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
+        bank_forks.write().unwrap().insert(bank1);
+        let bank1 = bank_forks.read().unwrap().get(1).unwrap();
+
+        let live_pubkey = Keypair::new().pubkey();
+        let live_account = AccountSharedData::new(1, 0, &system_program::id());
+        bank1.store_account(&live_pubkey, &live_account);
+
+        let dead_pubkey = Keypair::new().pubkey();
+        let mut dead_account = AccountSharedData::default();
+        dead_account.set_owner(system_program::id());
+        dead_account.set_rent_epoch(u64::MAX - 1);
+        bank1.store_account(&dead_pubkey, &dead_account);
+
+        let exit = Arc::new(AtomicBool::new(false));
+        let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
+        let subscriptions = Arc::new(RpcSubscriptions::new_for_tests(
+            exit,
+            max_complete_transaction_status_slot,
+            bank_forks.clone(),
+            Arc::new(RwLock::new(BlockCommitmentCache::new_for_tests_with_slots(
+                1, 1,
+            ))),
+            OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks),
+        ));
+        let (rpc, mut receiver) = rpc_pubsub_service::test_connection(&subscriptions);
+
+        let sub_id = rpc
+            .program_subscribe(
+                system_program::id().to_string(),
+                Some(RpcProgramAccountsConfig {
+                    account_config: RpcAccountInfoConfig {
+                        commitment: Some(CommitmentConfig::processed()),
+                        ..RpcAccountInfoConfig::default()
+                    },
+                    ..RpcProgramAccountsConfig::default()
+                }),
+            )
+            .unwrap();
+
+        subscriptions
+            .control
+            .assert_subscribed(&SubscriptionParams::Program(ProgramSubscriptionParams {
+                pubkey: system_program::id(),
+                filters: Vec::new(),
+                commitment: CommitmentConfig::processed(),
+                data_slice: None,
+                encoding: UiAccountEncoding::Binary,
+                with_context: false,
+            }));
+
+        rpc.block_until_processed(&subscriptions);
+        subscriptions.notify_subscribers(CommitmentSlots {
+            slot: 1,
+            ..CommitmentSlots::default()
+        });
+
+        let response = receiver.recv();
+        let expected = json!({
+           "jsonrpc": "2.0",
+           "method": "programNotification",
+           "params": {
+               "result": {
+                   "context": { "slot": 1 },
+                   "value": {
+                       "account": {
+                          "data": "",
+                          "executable": false,
+                          "lamports": 1,
+                          "owner": "11111111111111111111111111111111",
+                          "rentEpoch": 0,
+                          "space": 0,
+                       },
+                       "pubkey": live_pubkey.to_string(),
+                    },
+               },
+               "subscription": 0,
+           }
+        });
+        assert_eq!(
+            expected,
+            serde_json::from_str::<serde_json::Value>(&response).unwrap(),
+        );
+        let should_err = receiver.recv_timeout(std::time::Duration::from_millis(300));
+        assert!(should_err.is_err(), "unexpected second notification: {should_err:?}");
+
+        rpc.program_unsubscribe(sub_id).unwrap();
     }
 
     #[test]

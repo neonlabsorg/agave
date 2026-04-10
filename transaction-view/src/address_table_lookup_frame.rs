@@ -2,7 +2,7 @@ use {
     crate::{
         bytes::{
             advance_offset_for_array, advance_offset_for_type, check_remaining,
-            optimized_read_compressed_u16, read_byte, read_slice_data, read_type,
+            optimized_read_compressed_u16, read_slice_data, read_type,
         },
         result::{Result, TransactionViewError},
     },
@@ -46,8 +46,14 @@ const MIN_SIZED_PACKET_WITH_ATLS: usize = {
 };
 
 /// The maximum number of ATLS that can fit in a valid packet.
-const MAX_ATLS_PER_PACKET: u8 =
-    ((PACKET_DATA_SIZE - MIN_SIZED_PACKET_WITH_ATLS) / MIN_SIZED_ATL) as u8;
+const MAX_ATLS_PER_PACKET: usize = {
+    let max_atls = (PACKET_DATA_SIZE - MIN_SIZED_PACKET_WITH_ATLS) / MIN_SIZED_ATL;
+    if max_atls > u8::MAX as usize {
+        u8::MAX as usize
+    } else {
+        max_atls
+    }
+};
 
 /// Contains metadata about the address table lookups in a transaction packet.
 #[derive(Debug)]
@@ -70,13 +76,12 @@ impl AddressTableLookupFrame {
     /// but will not cache data related to these ATLs.
     #[inline(always)]
     pub(crate) fn try_new(bytes: &[u8], offset: &mut usize) -> Result<Self> {
-        // Maximum number of ATLs should be represented by a single byte,
-        // thus the MSB should not be set.
-        const _: () = assert!(MAX_ATLS_PER_PACKET & 0b1000_0000 == 0);
-        let num_address_table_lookups = read_byte(bytes, offset)?;
-        if num_address_table_lookups > MAX_ATLS_PER_PACKET {
+        let num_address_table_lookups = optimized_read_compressed_u16(bytes, offset)?;
+        if usize::from(num_address_table_lookups) > MAX_ATLS_PER_PACKET {
             return Err(TransactionViewError::ParseError);
         }
+        let num_address_table_lookups = u8::try_from(num_address_table_lookups)
+            .map_err(|_| TransactionViewError::ParseError)?;
 
         // Check that the remaining bytes are enough to hold the ATLs.
         check_remaining(
@@ -91,8 +96,7 @@ impl AddressTableLookupFrame {
 
         // Check that there is no chance of overflow when calculating the total
         // number of writable and readonly lookup accounts using a u32.
-        const _: () =
-            assert!(u16::MAX as usize * MAX_ATLS_PER_PACKET as usize <= u32::MAX as usize);
+        const _: () = assert!(u16::MAX as usize * MAX_ATLS_PER_PACKET <= u32::MAX as usize);
         let mut total_writable_lookup_accounts: u32 = 0;
         let mut total_readonly_lookup_accounts: u32 = 0;
 
