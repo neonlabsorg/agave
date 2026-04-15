@@ -371,9 +371,11 @@ impl SendTransactionService {
                                 "other",
                             );
                         }
+                        let pool_size = retry_transactions.len() as u64;
                         stats
                             .retry_queue_size
-                            .store(retry_transactions.len() as u64, Ordering::Relaxed);
+                            .store(pool_size, Ordering::Relaxed);
+                        solana_metrics::custom_metrics::set_mempool_size(pool_size);
                     }
                     last_batch_sent = Instant::now();
                 }
@@ -407,9 +409,11 @@ impl SendTransactionService {
                     retry_interval_ms = retry_interval_ms_default;
                 } else {
                     let stats = &stats_report.stats;
+                    let pool_size = transactions.len() as u64;
                     stats
                         .retry_queue_size
-                        .store(transactions.len() as u64, Ordering::Relaxed);
+                        .store(pool_size, Ordering::Relaxed);
+                    solana_metrics::custom_metrics::set_mempool_size(pool_size);
                     let (root_bank, working_bank) = {
                         let bank_forks = bank_forks.read().unwrap();
                         (root_bank.load(), bank_forks.working_bank())
