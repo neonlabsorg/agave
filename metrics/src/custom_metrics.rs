@@ -82,6 +82,7 @@ struct CustomMetrics {
     fork_rate: IntCounter,
     duplicate_confirmed_blocks: IntCounter,
 
+    mempool_size: Gauge,
     avg_locked_accounts_per_tx: Gauge,
     locked_accounts_total: AtomicU64,
     locked_accounts_samples: AtomicU64,
@@ -198,6 +199,13 @@ impl CustomMetrics {
             make_counter("duplicate_confirmed_blocks", "Duplicate confirmed block events");
         registry
             .register(Box::new(duplicate_confirmed_blocks.clone()))
+            .expect("metric registration must succeed");
+
+        let mempool_size =
+            Gauge::with_opts(Opts::new("mempool_size", "Current number of transactions in the retry pool"))
+                .expect("gauge opts must be valid");
+        registry
+            .register(Box::new(mempool_size.clone()))
             .expect("metric registration must succeed");
 
         let avg_locked_accounts_per_tx =
@@ -358,6 +366,7 @@ impl CustomMetrics {
             retry_due_to_account_in_use_rate,
             fork_rate,
             duplicate_confirmed_blocks,
+            mempool_size,
             avg_locked_accounts_per_tx,
             locked_accounts_total: AtomicU64::new(0),
             locked_accounts_samples: AtomicU64::new(0),
@@ -443,6 +452,26 @@ pub fn clear_tx_acceptance_time(signature: &Signature) {
     }
 }
 
+/// Pre-initialize all tx_type label series so they appear in Prometheus
+/// with value 0 even before any matching transaction arrives.
+pub fn init_tx_type_series(labels: &[&str]) {
+    let m = &*CUSTOM_METRICS;
+    for label in labels {
+        let label = &*m.bounded_tx_type(label);
+        // Touch each counter/histogram vec so the series is created
+        m.tx_accepted_total_by_type.with_label_values(&[label]);
+        m.tx_executed_total_by_type.with_label_values(&[label]);
+        m.tx_failed_total_by_type.with_label_values(&[label]);
+        m.tx_dropped_total_by_type.with_label_values(&[label]);
+        m.tx_expired_total_by_type.with_label_values(&[label]);
+        m.node_ingress_latency_by_type.with_label_values(&[label]);
+        m.mempool_acceptance_latency_by_type.with_label_values(&[label]);
+        m.decision_response_latency_by_type.with_label_values(&[label]);
+        m.node_to_decision_response_latency_by_type.with_label_values(&[label]);
+        m.acknowledge_latency_by_type.with_label_values(&[label]);
+    }
+}
+
 pub fn inc_tx_accepted_total(value: u64) {
     CUSTOM_METRICS.tx_accepted_total.inc_by(value);
 }
@@ -521,6 +550,10 @@ pub fn inc_fork_rate(value: u64) {
 
 pub fn inc_duplicate_confirmed_blocks(value: u64) {
     CUSTOM_METRICS.duplicate_confirmed_blocks.inc_by(value);
+}
+
+pub fn set_mempool_size(size: u64) {
+    CUSTOM_METRICS.mempool_size.set(size as f64);
 }
 
 pub fn observe_avg_locked_accounts_per_tx(locked_accounts: u64) {
