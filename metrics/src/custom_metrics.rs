@@ -452,6 +452,26 @@ pub fn clear_tx_acceptance_time(signature: &Signature) {
     }
 }
 
+/// Pre-initialize all tx_type label series so they appear in Prometheus
+/// with value 0 even before any matching transaction arrives.
+pub fn init_tx_type_series(labels: &[&str]) {
+    let m = &*CUSTOM_METRICS;
+    for label in labels {
+        let label = &*m.bounded_tx_type(label);
+        // Touch each counter/histogram vec so the series is created
+        m.tx_accepted_total_by_type.with_label_values(&[label]);
+        m.tx_executed_total_by_type.with_label_values(&[label]);
+        m.tx_failed_total_by_type.with_label_values(&[label]);
+        m.tx_dropped_total_by_type.with_label_values(&[label]);
+        m.tx_expired_total_by_type.with_label_values(&[label]);
+        m.node_ingress_latency_by_type.with_label_values(&[label]);
+        m.mempool_acceptance_latency_by_type.with_label_values(&[label]);
+        m.decision_response_latency_by_type.with_label_values(&[label]);
+        m.node_to_decision_response_latency_by_type.with_label_values(&[label]);
+        m.acknowledge_latency_by_type.with_label_values(&[label]);
+    }
+}
+
 pub fn inc_tx_accepted_total(value: u64) {
     CUSTOM_METRICS.tx_accepted_total.inc_by(value);
 }

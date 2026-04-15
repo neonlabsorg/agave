@@ -4,7 +4,7 @@ use {
     solana_sha256_hasher::hash,
     solana_transaction::sanitized::SanitizedTransaction,
     std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         sync::{LazyLock, RwLock},
     },
 };
@@ -22,6 +22,9 @@ static TX_TYPE_RULES: LazyLock<RwLock<TxTypeRuleMap>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub fn set_rules(rules: Vec<RpcTxTypeRule>) {
+    // Collect unique tx_type names before consuming rules
+    let type_names: HashSet<String> = rules.iter().map(|r| r.tx_type.clone()).collect();
+
     let map = rules
         .into_iter()
         .map(|rule| ((rule.program_id, rule.discriminator), rule.tx_type))
@@ -29,6 +32,12 @@ pub fn set_rules(rules: Vec<RpcTxTypeRule>) {
     if let Ok(mut guard) = TX_TYPE_RULES.write() {
         *guard = map;
     }
+
+    // Pre-initialize all Prometheus label series so they appear with 0
+    // even before any matching transaction arrives.
+    let mut labels: Vec<&str> = type_names.iter().map(|s| s.as_str()).collect();
+    labels.push("unknown");
+    solana_metrics::custom_metrics::init_tx_type_series(&labels);
 }
 
 pub fn infer_from_message(message: &SanitizedMessage, is_simple_vote: bool) -> String {
