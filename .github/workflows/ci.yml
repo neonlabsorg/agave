@@ -51,8 +51,17 @@ jobs:
         with:
           context: .
           file: ci/Dockerfile
+          target: runtime
           tags: ${{ env.IMAGE_NAME }}:${{ github.sha }},${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
-          outputs: type=local,dest=./bin
+          push: true
+
+      - name: Build and push Docker image (with Yellowstone gRPC)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ci/Dockerfile
+          target: runtime-yellowstone
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}-yellowstone,${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}-yellowstone
           push: true
     outputs:
         image-tag: ${{ steps.vars.outputs.image_tag }}
