@@ -315,9 +315,9 @@ impl SendTransactionService {
                             if let Entry::Vacant(_) = entry {
                                     if retry_len >= retry_pool_max_size {
                                         solana_metrics::custom_metrics::inc_tx_dropped_total(1);
-                                        solana_metrics::custom_metrics::inc_tx_dropped_total_with_type(
+                                        solana_metrics::custom_metrics::inc_tx_dropped_with_reason(
                                             1,
-                                            &transaction_info.tx_type,
+                                            "retry_pool_full",
                                         );
                                         break;
                                     } else {
@@ -366,9 +366,9 @@ impl SendTransactionService {
                             solana_metrics::custom_metrics::inc_tx_dropped_total(
                                 retry_queue_overflow as u64,
                             );
-                            solana_metrics::custom_metrics::inc_tx_dropped_total_with_type(
+                            solana_metrics::custom_metrics::inc_tx_dropped_with_reason(
                                 retry_queue_overflow as u64,
-                                "other",
+                                "retry_overflow",
                             );
                         }
                         let pool_size = retry_transactions.len() as u64;

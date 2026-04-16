@@ -73,7 +73,7 @@ struct CustomMetrics {
     tx_failed_total: IntCounter,
     tx_failed_total_by_type: IntCounterVec,
     tx_dropped_total: IntCounter,
-    tx_dropped_total_by_type: IntCounterVec,
+    tx_dropped_by_reason: IntCounterVec,
     tx_expired_total: IntCounter,
     tx_expired_total_by_type: IntCounterVec,
     confirmation_timeout_rate: IntCounter,
@@ -152,10 +152,13 @@ impl CustomMetrics {
         registry
             .register(Box::new(tx_dropped_total.clone()))
             .expect("metric registration must succeed");
-        let tx_dropped_total_by_type =
-            make_counter_vec("tx_dropped_total", "Dropped transactions by tx_type");
+        let tx_dropped_by_reason = IntCounterVec::new(
+            Opts::new("tx_dropped_total", "Dropped transactions by reason"),
+            &["reason"],
+        )
+        .expect("counter vec opts must be valid");
         labeled_registry
-            .register(Box::new(tx_dropped_total_by_type.clone()))
+            .register(Box::new(tx_dropped_by_reason.clone()))
             .expect("metric registration must succeed");
 
         let tx_expired_total = make_counter("tx_expired_total", "Expired transactions");
@@ -358,7 +361,7 @@ impl CustomMetrics {
             tx_failed_total,
             tx_failed_total_by_type,
             tx_dropped_total,
-            tx_dropped_total_by_type,
+            tx_dropped_by_reason,
             tx_expired_total,
             tx_expired_total_by_type,
             confirmation_timeout_rate,
@@ -462,13 +465,31 @@ pub fn init_tx_type_series(labels: &[&str]) {
         m.tx_accepted_total_by_type.with_label_values(&[label]);
         m.tx_executed_total_by_type.with_label_values(&[label]);
         m.tx_failed_total_by_type.with_label_values(&[label]);
-        m.tx_dropped_total_by_type.with_label_values(&[label]);
         m.tx_expired_total_by_type.with_label_values(&[label]);
         m.node_ingress_latency_by_type.with_label_values(&[label]);
         m.mempool_acceptance_latency_by_type.with_label_values(&[label]);
         m.decision_response_latency_by_type.with_label_values(&[label]);
         m.node_to_decision_response_latency_by_type.with_label_values(&[label]);
         m.acknowledge_latency_by_type.with_label_values(&[label]);
+    }
+
+    // Pre-initialize drop reason series
+    let drop_reasons = [
+        "without_parsing",
+        "parsing_and_sanitization",
+        "lock_validation",
+        "compute_budget",
+        "age",
+        "already_processed",
+        "fee_payer",
+        "capacity",
+        "retry_pool_full",
+        "retry_overflow",
+        "clean",
+        "clear",
+    ];
+    for reason in &drop_reasons {
+        m.tx_dropped_by_reason.with_label_values(&[reason]);
     }
 }
 
@@ -512,11 +533,10 @@ pub fn inc_tx_dropped_total(value: u64) {
     CUSTOM_METRICS.tx_dropped_total.inc_by(value);
 }
 
-pub fn inc_tx_dropped_total_with_type(value: u64, tx_type: &str) {
-    let tx_type = CUSTOM_METRICS.bounded_tx_type(tx_type);
+pub fn inc_tx_dropped_with_reason(value: u64, reason: &str) {
     CUSTOM_METRICS
-        .tx_dropped_total_by_type
-        .with_label_values(&[tx_type.as_str()])
+        .tx_dropped_by_reason
+        .with_label_values(&[reason])
         .inc_by(value);
 }
 
