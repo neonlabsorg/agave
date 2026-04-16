@@ -73,7 +73,7 @@ struct CustomMetrics {
     tx_failed_total: IntCounter,
     tx_failed_total_by_type: IntCounterVec,
     tx_dropped_total: IntCounter,
-    tx_dropped_total_by_type: IntCounterVec,
+    tx_dropped_by_reason: IntCounterVec,
     tx_expired_total: IntCounter,
     tx_expired_total_by_type: IntCounterVec,
     confirmation_timeout_rate: IntCounter,
@@ -82,6 +82,7 @@ struct CustomMetrics {
     fork_rate: IntCounter,
     duplicate_confirmed_blocks: IntCounter,
 
+    mempool_size: Gauge,
     avg_locked_accounts_per_tx: Gauge,
     locked_accounts_total: AtomicU64,
     locked_accounts_samples: AtomicU64,
@@ -151,10 +152,13 @@ impl CustomMetrics {
         registry
             .register(Box::new(tx_dropped_total.clone()))
             .expect("metric registration must succeed");
-        let tx_dropped_total_by_type =
-            make_counter_vec("tx_dropped_total", "Dropped transactions by tx_type");
+        let tx_dropped_by_reason = IntCounterVec::new(
+            Opts::new("tx_dropped_total", "Dropped transactions by reason"),
+            &["reason"],
+        )
+        .expect("counter vec opts must be valid");
         labeled_registry
-            .register(Box::new(tx_dropped_total_by_type.clone()))
+            .register(Box::new(tx_dropped_by_reason.clone()))
             .expect("metric registration must succeed");
 
         let tx_expired_total = make_counter("tx_expired_total", "Expired transactions");
@@ -198,6 +202,13 @@ impl CustomMetrics {
             make_counter("duplicate_confirmed_blocks", "Duplicate confirmed block events");
         registry
             .register(Box::new(duplicate_confirmed_blocks.clone()))
+            .expect("metric registration must succeed");
+
+        let mempool_size =
+            Gauge::with_opts(Opts::new("mempool_size", "Current number of transactions in the retry pool"))
+                .expect("gauge opts must be valid");
+        registry
+            .register(Box::new(mempool_size.clone()))
             .expect("metric registration must succeed");
 
         let avg_locked_accounts_per_tx =
@@ -350,7 +361,7 @@ impl CustomMetrics {
             tx_failed_total,
             tx_failed_total_by_type,
             tx_dropped_total,
-            tx_dropped_total_by_type,
+            tx_dropped_by_reason,
             tx_expired_total,
             tx_expired_total_by_type,
             confirmation_timeout_rate,
@@ -358,6 +369,7 @@ impl CustomMetrics {
             retry_due_to_account_in_use_rate,
             fork_rate,
             duplicate_confirmed_blocks,
+            mempool_size,
             avg_locked_accounts_per_tx,
             locked_accounts_total: AtomicU64::new(0),
             locked_accounts_samples: AtomicU64::new(0),
@@ -443,6 +455,44 @@ pub fn clear_tx_acceptance_time(signature: &Signature) {
     }
 }
 
+/// Pre-initialize all tx_type label series so they appear in Prometheus
+/// with value 0 even before any matching transaction arrives.
+pub fn init_tx_type_series(labels: &[&str]) {
+    let m = &*CUSTOM_METRICS;
+    for label in labels {
+        let label = &*m.bounded_tx_type(label);
+        // Touch each counter/histogram vec so the series is created
+        m.tx_accepted_total_by_type.with_label_values(&[label]);
+        m.tx_executed_total_by_type.with_label_values(&[label]);
+        m.tx_failed_total_by_type.with_label_values(&[label]);
+        m.tx_expired_total_by_type.with_label_values(&[label]);
+        m.node_ingress_latency_by_type.with_label_values(&[label]);
+        m.mempool_acceptance_latency_by_type.with_label_values(&[label]);
+        m.decision_response_latency_by_type.with_label_values(&[label]);
+        m.node_to_decision_response_latency_by_type.with_label_values(&[label]);
+        m.acknowledge_latency_by_type.with_label_values(&[label]);
+    }
+
+    // Pre-initialize drop reason series
+    let drop_reasons = [
+        "without_parsing",
+        "parsing_and_sanitization",
+        "lock_validation",
+        "compute_budget",
+        "age",
+        "already_processed",
+        "fee_payer",
+        "capacity",
+        "retry_pool_full",
+        "retry_overflow",
+        "clean",
+        "clear",
+    ];
+    for reason in &drop_reasons {
+        m.tx_dropped_by_reason.with_label_values(&[reason]);
+    }
+}
+
 pub fn inc_tx_accepted_total(value: u64) {
     CUSTOM_METRICS.tx_accepted_total.inc_by(value);
 }
@@ -483,11 +533,10 @@ pub fn inc_tx_dropped_total(value: u64) {
     CUSTOM_METRICS.tx_dropped_total.inc_by(value);
 }
 
-pub fn inc_tx_dropped_total_with_type(value: u64, tx_type: &str) {
-    let tx_type = CUSTOM_METRICS.bounded_tx_type(tx_type);
+pub fn inc_tx_dropped_with_reason(value: u64, reason: &str) {
     CUSTOM_METRICS
-        .tx_dropped_total_by_type
-        .with_label_values(&[tx_type.as_str()])
+        .tx_dropped_by_reason
+        .with_label_values(&[reason])
         .inc_by(value);
 }
 
@@ -521,6 +570,10 @@ pub fn inc_fork_rate(value: u64) {
 
 pub fn inc_duplicate_confirmed_blocks(value: u64) {
     CUSTOM_METRICS.duplicate_confirmed_blocks.inc_by(value);
+}
+
+pub fn set_mempool_size(size: u64) {
+    CUSTOM_METRICS.mempool_size.set(size as f64);
 }
 
 pub fn observe_avg_locked_accounts_per_tx(locked_accounts: u64) {
