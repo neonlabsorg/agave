@@ -335,6 +335,32 @@ where
             if total_dropped > 0 {
                 solana_metrics::custom_metrics::inc_tx_dropped_total(total_dropped as u64);
             }
+            // Per-reason drop metrics
+            use solana_metrics::custom_metrics::inc_tx_dropped_with_reason;
+            if *num_dropped_without_buffering > 0 {
+                inc_tx_dropped_with_reason(*num_dropped_without_buffering as u64, "without_parsing");
+            }
+            if *num_dropped_on_parsing_and_sanitization > 0 {
+                inc_tx_dropped_with_reason(*num_dropped_on_parsing_and_sanitization as u64, "parsing_and_sanitization");
+            }
+            if *num_dropped_on_lock_validation > 0 {
+                inc_tx_dropped_with_reason(*num_dropped_on_lock_validation as u64, "lock_validation");
+            }
+            if *num_dropped_on_compute_budget > 0 {
+                inc_tx_dropped_with_reason(*num_dropped_on_compute_budget as u64, "compute_budget");
+            }
+            if *num_dropped_on_age > 0 {
+                inc_tx_dropped_with_reason(*num_dropped_on_age as u64, "age");
+            }
+            if *num_dropped_on_already_processed > 0 {
+                inc_tx_dropped_with_reason(*num_dropped_on_already_processed as u64, "already_processed");
+            }
+            if *num_dropped_on_fee_payer > 0 {
+                inc_tx_dropped_with_reason(*num_dropped_on_fee_payer as u64, "fee_payer");
+            }
+            if *num_dropped_on_capacity > 0 {
+                inc_tx_dropped_with_reason(*num_dropped_on_capacity as u64, "capacity");
+            }
 
             count_metrics.num_received += *num_received;
             count_metrics.num_dropped_on_receive += *num_dropped_without_buffering;
