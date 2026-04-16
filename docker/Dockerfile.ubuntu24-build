@@ -43,6 +43,7 @@ WORKDIR /opt/agave
 
 # Release build
 RUN cargo build --release
+RUN ls -lah /opt/agave/target/release
 
 # Collect binaries in a clean location for copying out of the image
 FROM scratch AS artifacts
