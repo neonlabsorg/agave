@@ -70,7 +70,7 @@ pub struct TransactionInfo {
     pub max_retries: Option<usize>,
     pub received_at: Instant,
     pub forwarded_at: Instant,
-    pub tx_type: String,
+    pub tx_types: Vec<String>,
     retries: usize,
     /// Last time the transaction was sent
     last_sent_time: Option<Instant>,
@@ -123,14 +123,14 @@ impl TransactionInfo {
             max_retries,
             received_at,
             forwarded_at,
-            tx_type: "unknown".to_string(),
+            tx_types: Vec::new(),
             retries: 0,
             last_sent_time,
         }
     }
 
-    pub fn with_tx_type(mut self, tx_type: String) -> Self {
-        self.tx_type = tx_type;
+    pub fn with_tx_types(mut self, tx_types: Vec<String>) -> Self {
+        self.tx_types = tx_types;
         self
     }
 
@@ -332,22 +332,24 @@ impl SendTransactionService {
                                     solana_metrics::custom_metrics::observe_mempool_acceptance_latency_us(
                                         mempool_acceptance_latency_us,
                                     );
-                                    solana_metrics::custom_metrics::observe_mempool_acceptance_latency_us_with_type(
-                                        mempool_acceptance_latency_us,
-                                        &transaction_info.tx_type,
-                                    );
                                     solana_metrics::custom_metrics::observe_acknowledge_latency_us(
                                         acknowledge_latency_us,
                                     );
-                                    solana_metrics::custom_metrics::observe_acknowledge_latency_us_with_type(
-                                        acknowledge_latency_us,
-                                        &transaction_info.tx_type,
-                                    );
                                     solana_metrics::custom_metrics::inc_tx_accepted_total(1);
-                                    solana_metrics::custom_metrics::inc_tx_accepted_total_with_type(
-                                        1,
-                                        &transaction_info.tx_type,
-                                    );
+                                    for tx_type in &transaction_info.tx_types {
+                                        solana_metrics::custom_metrics::observe_mempool_acceptance_latency_us_with_type(
+                                            mempool_acceptance_latency_us,
+                                            tx_type,
+                                        );
+                                        solana_metrics::custom_metrics::observe_acknowledge_latency_us_with_type(
+                                            acknowledge_latency_us,
+                                            tx_type,
+                                        );
+                                        solana_metrics::custom_metrics::inc_tx_accepted_total_with_type(
+                                            1,
+                                            tx_type,
+                                        );
+                                    }
                                     solana_metrics::custom_metrics::register_tx_acceptance_time(
                                         transaction_info.signature,
                                         accepted_at,
@@ -500,10 +502,12 @@ impl SendTransactionService {
                     result.expired += 1;
                     stats.expired_transactions.fetch_add(1, Ordering::Relaxed);
                     solana_metrics::custom_metrics::inc_tx_expired_total(1);
-                    solana_metrics::custom_metrics::inc_tx_expired_total_with_type(
-                        1,
-                        &transaction_info.tx_type,
-                    );
+                    for tx_type in &transaction_info.tx_types {
+                        solana_metrics::custom_metrics::inc_tx_expired_total_with_type(
+                            1,
+                            tx_type,
+                        );
+                    }
                     solana_metrics::custom_metrics::clear_tx_acceptance_time(signature);
                     return false;
                 }
@@ -513,10 +517,12 @@ impl SendTransactionService {
                 result.expired += 1;
                 stats.expired_transactions.fetch_add(1, Ordering::Relaxed);
                 solana_metrics::custom_metrics::inc_tx_expired_total(1);
-                solana_metrics::custom_metrics::inc_tx_expired_total_with_type(
-                    1,
-                    &transaction_info.tx_type,
-                );
+                for tx_type in &transaction_info.tx_types {
+                    solana_metrics::custom_metrics::inc_tx_expired_total_with_type(
+                        1,
+                        tx_type,
+                    );
+                }
                 solana_metrics::custom_metrics::clear_tx_acceptance_time(signature);
                 return false;
             }
@@ -692,7 +698,7 @@ mod test {
             max_retries: None,
             received_at: Instant::now(),
             forwarded_at: Instant::now(),
-            tx_type: "unknown".to_string(),
+            tx_types: Vec::new(),
             retries: 0,
             last_sent_time: None,
         };
