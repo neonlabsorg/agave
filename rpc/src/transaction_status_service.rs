@@ -181,13 +181,17 @@ impl TransactionStatusService {
                     } = committed_tx;
                     let is_tracked = signature_metrics_tracker::is_tracked(transaction.signature());
                     if is_tracked {
-                        let tx_type = tx_type_rules::infer_from_transaction(&transaction);
+                        let tx_types = tx_type_rules::infer_types_from_transaction(&transaction);
                         if status.is_ok() {
                             custom_metrics::inc_tx_executed_total(1);
-                            custom_metrics::inc_tx_executed_total_with_type(1, &tx_type);
+                            for tx_type in &tx_types {
+                                custom_metrics::inc_tx_executed_total_with_type(1, tx_type);
+                            }
                         } else {
                             custom_metrics::inc_tx_failed_total(1);
-                            custom_metrics::inc_tx_failed_total_with_type(1, &tx_type);
+                            for tx_type in &tx_types {
+                                custom_metrics::inc_tx_failed_total_with_type(1, tx_type);
+                            }
                         }
                     }
                     signature_metrics_tracker::mark_processed_with_slot(

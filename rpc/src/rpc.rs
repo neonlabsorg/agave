@@ -2697,7 +2697,7 @@ fn _send_transaction(
     max_retries: Option<usize>,
     received_at: Instant,
     forwarded_at: Instant,
-    tx_type: String,
+    tx_types: Vec<String>,
 ) -> Result<String> {
     signature_metrics_tracker::register_signature(signature, received_at, forwarded_at);
     let transaction_info = TransactionInfo::new_with_timing(
@@ -2712,7 +2712,7 @@ fn _send_transaction(
         forwarded_at,
         None,
     )
-    .with_tx_type(tx_type);
+    .with_tx_types(tx_types);
     meta.transaction_sender
         .send(transaction_info)
         .unwrap_or_else(|err| warn!("Failed to enqueue transaction: {err}"));
@@ -3760,7 +3760,7 @@ pub mod rpc_full {
             config: Option<RpcRequestAirdropConfig>,
         ) -> Result<String> {
             let received_at = Instant::now();
-            let tx_type = "airdrop".to_string();
+            let tx_types = vec!["airdrop".to_string()];
             debug!("request_airdrop rpc request received");
             trace!(
                 "request_airdrop id={} lamports={} config: {:?}",
@@ -3811,17 +3811,16 @@ pub mod rpc_full {
             };
 
             let forwarded_at = Instant::now();
-            custom_metrics::observe_node_ingress_latency_us(
-                forwarded_at
-                    .saturating_duration_since(received_at)
-                    .as_micros() as u64,
-            );
-            custom_metrics::observe_node_ingress_latency_us_with_type(
-                forwarded_at
-                    .saturating_duration_since(received_at)
-                    .as_micros() as u64,
-                &tx_type,
-            );
+            let ingress_latency_us = forwarded_at
+                .saturating_duration_since(received_at)
+                .as_micros() as u64;
+            custom_metrics::observe_node_ingress_latency_us(ingress_latency_us);
+            for tx_type in &tx_types {
+                custom_metrics::observe_node_ingress_latency_us_with_type(
+                    ingress_latency_us,
+                    tx_type,
+                );
+            }
             let result = _send_transaction(
                 meta,
                 message_hash,
@@ -3833,19 +3832,18 @@ pub mod rpc_full {
                 None,
                 received_at,
                 forwarded_at,
-                tx_type.clone(),
+                tx_types.clone(),
             );
-            custom_metrics::observe_node_to_decision_response_latency_us(
-                Instant::now()
-                    .saturating_duration_since(received_at)
-                    .as_micros() as u64,
-            );
-            custom_metrics::observe_node_to_decision_response_latency_us_with_type(
-                Instant::now()
-                    .saturating_duration_since(received_at)
-                    .as_micros() as u64,
-                &tx_type,
-            );
+            let node_to_decision_us = Instant::now()
+                .saturating_duration_since(received_at)
+                .as_micros() as u64;
+            custom_metrics::observe_node_to_decision_response_latency_us(node_to_decision_us);
+            for tx_type in &tx_types {
+                custom_metrics::observe_node_to_decision_response_latency_us_with_type(
+                    node_to_decision_us,
+                    tx_type,
+                );
+            }
             result
         }
 
@@ -3888,10 +3886,7 @@ pub mod rpc_full {
                 preflight_bank,
                 preflight_bank.get_reserved_account_keys(),
             )?;
-            let tx_type = tx_type_rules::infer_from_message(
-                transaction.message(),
-                transaction.is_simple_vote_transaction(),
-            );
+            let tx_types = tx_type_rules::infer_types_from_message(transaction.message());
             let blockhash = *transaction.message().recent_blockhash();
             let message_hash = *transaction.message_hash();
             let signature = *transaction.signature();
@@ -3987,17 +3982,16 @@ pub mod rpc_full {
             }
 
             let forwarded_at = Instant::now();
-            custom_metrics::observe_node_ingress_latency_us(
-                forwarded_at
-                    .saturating_duration_since(received_at)
-                    .as_micros() as u64,
-            );
-            custom_metrics::observe_node_ingress_latency_us_with_type(
-                forwarded_at
-                    .saturating_duration_since(received_at)
-                    .as_micros() as u64,
-                &tx_type,
-            );
+            let ingress_latency_us = forwarded_at
+                .saturating_duration_since(received_at)
+                .as_micros() as u64;
+            custom_metrics::observe_node_ingress_latency_us(ingress_latency_us);
+            for tx_type in &tx_types {
+                custom_metrics::observe_node_ingress_latency_us_with_type(
+                    ingress_latency_us,
+                    tx_type,
+                );
+            }
             let result = _send_transaction(
                 meta,
                 message_hash,
@@ -4009,30 +4003,27 @@ pub mod rpc_full {
                 max_retries,
                 received_at,
                 forwarded_at,
-                tx_type.clone(),
+                tx_types.clone(),
             );
-            custom_metrics::observe_node_to_decision_response_latency_us(
-                Instant::now()
-                    .saturating_duration_since(received_at)
-                    .as_micros() as u64,
-            );
-            custom_metrics::observe_node_to_decision_response_latency_us_with_type(
-                Instant::now()
-                    .saturating_duration_since(received_at)
-                    .as_micros() as u64,
-                &tx_type,
-            );
-            custom_metrics::observe_decision_response_latency_us(
-                Instant::now()
-                    .saturating_duration_since(forwarded_at)
-                    .as_micros() as u64,
-            );
-            custom_metrics::observe_decision_response_latency_us_with_type(
-                Instant::now()
-                    .saturating_duration_since(forwarded_at)
-                    .as_micros() as u64,
-                &tx_type,
-            );
+            let completion_at = Instant::now();
+            let node_to_decision_us = completion_at
+                .saturating_duration_since(received_at)
+                .as_micros() as u64;
+            let decision_us = completion_at
+                .saturating_duration_since(forwarded_at)
+                .as_micros() as u64;
+            custom_metrics::observe_node_to_decision_response_latency_us(node_to_decision_us);
+            custom_metrics::observe_decision_response_latency_us(decision_us);
+            for tx_type in &tx_types {
+                custom_metrics::observe_node_to_decision_response_latency_us_with_type(
+                    node_to_decision_us,
+                    tx_type,
+                );
+                custom_metrics::observe_decision_response_latency_us_with_type(
+                    decision_us,
+                    tx_type,
+                );
+            }
             result
         }
 
