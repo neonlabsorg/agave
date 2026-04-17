@@ -1,3 +1,28 @@
+# --- Yellowstone gRPC geyser plugin ---
+FROM ubuntu:24.04 AS ys-builder
+
+ARG YS_VERSION=v10.1.1+solana.3.0.14
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC \
+    CARGO_TARGET_DIR=/build/ys-target
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates curl git pkg-config \
+    libssl-dev libudev-dev zlib1g-dev llvm clang cmake make \
+    libprotobuf-dev protobuf-compiler libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- --profile minimal -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /build/yellowstone
+RUN git clone --depth 1 --branch ${YS_VERSION} \
+    https://github.com/rpcpool/yellowstone-grpc.git .
+RUN cargo build --release -p yellowstone-grpc-geyser
+
+# --- Agave validator ---
 FROM ubuntu:24.04 AS builder
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Etc/UTC \
@@ -40,7 +65,7 @@ RUN git submodule update --init --recursive
 # Release build
 RUN cargo build --release
 
-# Minimal runtime image with the compiled binaries
+# --- Runtime: base image (no Yellowstone) ---
 FROM ubuntu:24.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && \
@@ -61,5 +86,10 @@ COPY ./ci/tx_type_rules.yml /usr/local/bin/tx_type_rules.yml
 RUN mkdir -p /opt/parasol/data
 COPY ./ci/genesis.bin /opt/parasol/data/genesis.bin
 RUN chmod +x /usr/local/bin/parasol-node-run.sh
-# Default to showing available binaries; override entrypoint/command as needed
 CMD ["solana-test-validator", "--version"]
+
+# --- Runtime: with Yellowstone gRPC plugin ---
+FROM runtime AS runtime-yellowstone
+COPY --from=ys-builder /build/ys-target/release/libyellowstone_grpc_geyser.so /opt/yellowstone/
+RUN mkdir -p /opt/parasol/config
+COPY ./ci/yellowstone.json /opt/parasol/config/yellowstone.json
