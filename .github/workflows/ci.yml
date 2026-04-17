@@ -195,7 +195,7 @@ jobs:
           docker run --rm \
             --name ${{ env.CONTAINER_NAME }} \
             ${{ steps.resolve-test-image.outputs.image }}  \
-            /bin/bash -c "pytest --ignore=tests/parasol_dex --solana-url ${{ env.SOLANA_URL }} --metrics-url ${{ env.SOLANA_URL }}/metrics"
+            /bin/bash -c "python run_tests.py parasol-dex --parasol-url ${{ env.SOLANA_URL }} --metrics-url ${{ env.SOLANA_URL }}/metrics"
 
   destroy-terraform:
     env:
