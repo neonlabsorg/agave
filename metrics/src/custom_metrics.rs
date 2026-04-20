@@ -83,6 +83,9 @@ struct CustomMetrics {
     duplicate_confirmed_blocks: IntCounter,
 
     mempool_size: Gauge,
+    scheduler_buffer_size: Gauge,
+    scheduler_buffer_queue_size: Gauge,
+    scheduler_buffer_capacity: Gauge,
     avg_locked_accounts_per_tx: Gauge,
     locked_accounts_total: AtomicU64,
     locked_accounts_samples: AtomicU64,
@@ -209,6 +212,33 @@ impl CustomMetrics {
                 .expect("gauge opts must be valid");
         registry
             .register(Box::new(mempool_size.clone()))
+            .expect("metric registration must succeed");
+
+        let scheduler_buffer_size = Gauge::with_opts(Opts::new(
+            "scheduler_buffer_size",
+            "Transactions held in the banking-stage scheduler container (queue + pending)",
+        ))
+        .expect("gauge opts must be valid");
+        registry
+            .register(Box::new(scheduler_buffer_size.clone()))
+            .expect("metric registration must succeed");
+
+        let scheduler_buffer_queue_size = Gauge::with_opts(Opts::new(
+            "scheduler_buffer_queue_size",
+            "Transactions currently in the scheduler priority queue (ready-to-schedule subset)",
+        ))
+        .expect("gauge opts must be valid");
+        registry
+            .register(Box::new(scheduler_buffer_queue_size.clone()))
+            .expect("metric registration must succeed");
+
+        let scheduler_buffer_capacity = Gauge::with_opts(Opts::new(
+            "scheduler_buffer_capacity",
+            "Maximum number of transactions the scheduler container can hold (TOTAL_BUFFERED_PACKETS)",
+        ))
+        .expect("gauge opts must be valid");
+        registry
+            .register(Box::new(scheduler_buffer_capacity.clone()))
             .expect("metric registration must succeed");
 
         let avg_locked_accounts_per_tx =
@@ -370,6 +400,9 @@ impl CustomMetrics {
             fork_rate,
             duplicate_confirmed_blocks,
             mempool_size,
+            scheduler_buffer_size,
+            scheduler_buffer_queue_size,
+            scheduler_buffer_capacity,
             avg_locked_accounts_per_tx,
             locked_accounts_total: AtomicU64::new(0),
             locked_accounts_samples: AtomicU64::new(0),
@@ -574,6 +607,18 @@ pub fn inc_duplicate_confirmed_blocks(value: u64) {
 
 pub fn set_mempool_size(size: u64) {
     CUSTOM_METRICS.mempool_size.set(size as f64);
+}
+
+pub fn set_scheduler_buffer_size(size: u64) {
+    CUSTOM_METRICS.scheduler_buffer_size.set(size as f64);
+}
+
+pub fn set_scheduler_buffer_queue_size(size: u64) {
+    CUSTOM_METRICS.scheduler_buffer_queue_size.set(size as f64);
+}
+
+pub fn set_scheduler_buffer_capacity(capacity: u64) {
+    CUSTOM_METRICS.scheduler_buffer_capacity.set(capacity as f64);
 }
 
 pub fn observe_avg_locked_accounts_per_tx(locked_accounts: u64) {
