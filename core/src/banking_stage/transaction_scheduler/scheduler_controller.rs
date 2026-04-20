@@ -72,6 +72,9 @@ where
         scheduler: S,
         worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
     ) -> Self {
+        solana_metrics::custom_metrics::set_scheduler_buffer_capacity(
+            TOTAL_BUFFERED_PACKETS as u64,
+        );
         Self {
             exit,
             decision_maker,
@@ -129,6 +132,13 @@ where
                 .iter()
                 .for_each(|metrics| metrics.maybe_report_and_reset());
             self.scheduling_details.maybe_report();
+
+            solana_metrics::custom_metrics::set_scheduler_buffer_size(
+                self.container.buffer_size() as u64,
+            );
+            solana_metrics::custom_metrics::set_scheduler_buffer_queue_size(
+                self.container.queue_size() as u64,
+            );
         }
 
         Ok(())
