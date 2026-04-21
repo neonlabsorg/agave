@@ -387,6 +387,7 @@ dependencies = [
  "solana-svm-measure",
  "solana-svm-timings",
  "solana-svm-type-overrides",
+ "solana-system-interface",
  "solana-sysvar",
  "solana-sysvar-id",
  "solana-transaction-context",
@@ -6916,8 +6917,6 @@ dependencies = [
 [[package]]
 name = "solana-account"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f885ce7f937871ecb56aadbeaaec963b234a580b7d6ebbdb8fa4249a36f92433"
 dependencies = [
  "bincode",
  "qualifier_attr",
@@ -11403,6 +11402,7 @@ dependencies = [
  "solana-rent",
  "solana-sbpf",
  "solana-sdk-ids",
+ "solana-sha256-hasher",
  "solana-signature",
  "solana-system-interface",
  "solana-transaction-context",

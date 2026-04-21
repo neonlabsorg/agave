@@ -29,16 +29,12 @@ use {
     std::{
         cmp::Reverse,
         collections::{BinaryHeap, HashMap, HashSet},
-        iter,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
         },
     },
 };
-
-// Forces single-transaction execution to allow dynamic account loading.
-const GLOBAL_TX_LOCK_KEY: Pubkey = Pubkey::new_from_array([0x42; 32]);
 
 pub type PubkeyAccountSlot = (Pubkey, AccountSharedData, Slot);
 
@@ -59,7 +55,6 @@ impl<'a, T: SVMMessage> TransactionAccountLocksIterator<'a, T> {
             .iter()
             .enumerate()
             .map(|(index, key)| (key, self.transaction.is_writable(index)))
-            .chain(iter::once((&GLOBAL_TX_LOCK_KEY, true)))
     }
 }
 

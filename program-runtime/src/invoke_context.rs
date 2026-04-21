@@ -173,6 +173,8 @@ impl<'a> EnvironmentConfig<'a> {
 pub struct SyscallContext {
     pub allocator: BpfAllocator,
     pub accounts_metadata: Vec<SerializedAccountMetadata>,
+    pub subaccounts_metadata: Vec<SerializedAccountMetadata>,
+    pub subaccounts_infos: UntypedVmSlice,
     pub trace_log: Vec<[u64; 12]>,
     pub dynamic_cpi_accounts: Vec<DynamicCpiAccount>,
 }
@@ -182,6 +184,14 @@ pub struct DynamicCpiAccount {
     pub index_in_transaction: IndexOfAccount,
     pub is_signer: bool,
     pub is_writable: bool,
+}
+
+/// This is the representation of an array in the VM without a type
+/// Like agave_syscalls::VmVmSlice<T> but without the type parameter.
+#[derive(Default)]
+pub struct UntypedVmSlice {
+    pub vm_data_addr: u64,
+    pub vm_data_len: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -310,7 +320,7 @@ impl<'a> InvokeContext<'a> {
         instruction: Instruction,
         signers: &[Pubkey],
     ) -> Result<(), InstructionError> {
-        self.prepare_next_instruction(&instruction, signers)?;
+        self.prepare_next_instruction(&instruction, signers, Vec::new())?;
         let mut compute_units_consumed = 0;
         self.process_instruction(&mut compute_units_consumed, &mut ExecuteTimings::default())?;
         Ok(())
@@ -322,6 +332,7 @@ impl<'a> InvokeContext<'a> {
         &mut self,
         instruction: &Instruction,
         signers: &[Pubkey],
+        subaccounts: Vec<InstructionAccount>,
     ) -> Result<(), InstructionError> {
         // We reference accounts by an u8 index, so we have a total of 256 accounts.
         // This algorithm allocates the array on the stack for speed.
@@ -449,6 +460,7 @@ impl<'a> InvokeContext<'a> {
             instruction_accounts,
             transaction_callee_map,
             &instruction.data,
+            subaccounts,
         )?;
         Ok(())
     }
@@ -494,6 +506,7 @@ impl<'a> InvokeContext<'a> {
             instruction_accounts,
             transaction_callee_map,
             instruction.data,
+            Vec::new(),
         )?;
         Ok(())
     }
@@ -1288,7 +1301,7 @@ mod tests {
             metas.clone(),
         );
         invoke_context
-            .prepare_next_instruction(&inner_instruction, &[])
+            .prepare_next_instruction(&inner_instruction, &[], Vec::new())
             .unwrap();
 
         let mut compute_units_consumed = 0;
@@ -1475,13 +1488,13 @@ mod tests {
 
         invoke_context.transaction_context.push().unwrap();
         invoke_context
-            .prepare_next_instruction(&instruction_1, &[fee_payer.pubkey()])
+            .prepare_next_instruction(&instruction_1, &[fee_payer.pubkey()], Vec::new())
             .unwrap();
         test_case_1(&invoke_context);
 
         invoke_context.transaction_context.push().unwrap();
         invoke_context
-            .prepare_next_instruction(&instruction_2, &[fee_payer.pubkey()])
+            .prepare_next_instruction(&instruction_2, &[fee_payer.pubkey()], Vec::new())
             .unwrap();
         test_case_2(&invoke_context);
     }
@@ -1561,7 +1574,7 @@ mod tests {
         );
 
         invoke_context
-            .prepare_next_instruction(&instruction, &[fee_payer.pubkey()])
+            .prepare_next_instruction(&instruction, &[fee_payer.pubkey()], Vec::new())
             .unwrap();
         let instruction_context = invoke_context
             .transaction_context
