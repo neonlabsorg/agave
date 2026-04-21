@@ -302,9 +302,49 @@ impl SendTransactionService {
                         let mut transactions_to_retry: usize = 0;
                         let mut transactions_added_to_retry = Saturating::<usize>(0);
                         for (signature, mut transaction_info) in transactions.drain() {
-                            // drop transactions with 0 max retries
                             let max_retries = transaction_info
                                 .get_max_retries(default_max_retries, service_max_retries);
+
+                            // Acceptance is recorded unconditionally: the transaction
+                            // has already been forwarded to the leader via
+                            // `client.send_transactions_in_batch` above, so it is
+                            // "accepted by the node" regardless of whether we retain
+                            // it in the retry pool.
+                            let accepted_at = Instant::now();
+                            let mempool_acceptance_latency_us = accepted_at
+                                .saturating_duration_since(transaction_info.forwarded_at)
+                                .as_micros() as u64;
+                            let acknowledge_latency_us = accepted_at
+                                .saturating_duration_since(transaction_info.received_at)
+                                .as_micros() as u64;
+                            solana_metrics::custom_metrics::observe_mempool_acceptance_latency_us(
+                                mempool_acceptance_latency_us,
+                            );
+                            solana_metrics::custom_metrics::observe_acknowledge_latency_us(
+                                acknowledge_latency_us,
+                            );
+                            solana_metrics::custom_metrics::inc_tx_accepted_total(1);
+                            for tx_type in &transaction_info.tx_types {
+                                solana_metrics::custom_metrics::observe_mempool_acceptance_latency_us_with_type(
+                                    mempool_acceptance_latency_us,
+                                    tx_type,
+                                );
+                                solana_metrics::custom_metrics::observe_acknowledge_latency_us_with_type(
+                                    acknowledge_latency_us,
+                                    tx_type,
+                                );
+                                solana_metrics::custom_metrics::inc_tx_accepted_total_with_type(
+                                    1,
+                                    tx_type,
+                                );
+                            }
+                            solana_metrics::custom_metrics::register_tx_acceptance_time(
+                                transaction_info.signature,
+                                accepted_at,
+                            );
+
+                            // drop transactions with 0 max retries: they are accepted
+                            // and already forwarded, but not retained for retry.
                             if max_retries == Some(0) {
                                 continue;
                             }
@@ -313,47 +353,15 @@ impl SendTransactionService {
                             let retry_len = retry_transactions.len();
                             let entry = retry_transactions.entry(signature);
                             if let Entry::Vacant(_) = entry {
-                                    if retry_len >= retry_pool_max_size {
-                                        solana_metrics::custom_metrics::inc_tx_dropped_total(1);
-                                        solana_metrics::custom_metrics::inc_tx_dropped_with_reason(
-                                            1,
-                                            "retry_pool_full",
-                                        );
-                                        break;
-                                    } else {
-                                        transaction_info.last_sent_time = Some(last_sent_time);
-                                    let accepted_at = Instant::now();
-                                    let mempool_acceptance_latency_us = accepted_at
-                                        .saturating_duration_since(transaction_info.forwarded_at)
-                                        .as_micros() as u64;
-                                    let acknowledge_latency_us = accepted_at
-                                        .saturating_duration_since(transaction_info.received_at)
-                                        .as_micros() as u64;
-                                    solana_metrics::custom_metrics::observe_mempool_acceptance_latency_us(
-                                        mempool_acceptance_latency_us,
+                                if retry_len >= retry_pool_max_size {
+                                    solana_metrics::custom_metrics::inc_tx_dropped_total(1);
+                                    solana_metrics::custom_metrics::inc_tx_dropped_with_reason(
+                                        1,
+                                        "retry_pool_full",
                                     );
-                                    solana_metrics::custom_metrics::observe_acknowledge_latency_us(
-                                        acknowledge_latency_us,
-                                    );
-                                    solana_metrics::custom_metrics::inc_tx_accepted_total(1);
-                                    for tx_type in &transaction_info.tx_types {
-                                        solana_metrics::custom_metrics::observe_mempool_acceptance_latency_us_with_type(
-                                            mempool_acceptance_latency_us,
-                                            tx_type,
-                                        );
-                                        solana_metrics::custom_metrics::observe_acknowledge_latency_us_with_type(
-                                            acknowledge_latency_us,
-                                            tx_type,
-                                        );
-                                        solana_metrics::custom_metrics::inc_tx_accepted_total_with_type(
-                                            1,
-                                            tx_type,
-                                        );
-                                    }
-                                    solana_metrics::custom_metrics::register_tx_acceptance_time(
-                                        transaction_info.signature,
-                                        accepted_at,
-                                    );
+                                    break;
+                                } else {
+                                    transaction_info.last_sent_time = Some(last_sent_time);
                                     transactions_added_to_retry += 1;
                                     entry.or_insert(transaction_info);
                                 }
@@ -737,6 +745,79 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     async fn validator_exit_with_tpu_client_next() {
         validator_exit::<TpuClientNextClient>(Some(Handle::current()));
+    }
+
+    fn max_retries_zero_registers_acceptance<C: ClientWithCreator>(maybe_runtime: Option<Handle>) {
+        // Regression: transactions submitted with maxRetries=0 must still be
+        // counted as accepted by the node (forwarded to leader above the
+        // drain-loop filter), so observability — tx_accepted_total, latency
+        // histograms, and the acceptance-time map — must fire for them.
+        let bank = Bank::default_for_tests();
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let (sender, receiver) = unbounded();
+
+        let signature = Signature::from([0xA7u8; 64]);
+        // Ensure no stale entry from a prior test run.
+        solana_metrics::custom_metrics::clear_tx_acceptance_time(&signature);
+
+        let exit = Arc::new(AtomicBool::new(false));
+        let client = C::create_client(maybe_runtime, "127.0.0.1:0".parse().unwrap(), None, 1);
+
+        let send_transaction_service = SendTransactionService::new_with_client(
+            &bank_forks,
+            receiver,
+            client.clone(),
+            Config::default(),
+            exit.clone(),
+        );
+
+        let tx_info = TransactionInfo {
+            message_hash: Hash::default(),
+            signature,
+            blockhash: Hash::default(),
+            wire_transaction: vec![0; 128],
+            last_valid_block_height: 0,
+            durable_nonce_info: None,
+            max_retries: Some(0),
+            received_at: Instant::now(),
+            forwarded_at: Instant::now(),
+            tx_types: Vec::new(),
+            retries: 0,
+            last_sent_time: None,
+        };
+        sender.send(tx_info).unwrap();
+
+        // Default batch config flushes within 1 ms; poll up to 2 s for CI jitter.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut accepted_at = None;
+        while Instant::now() < deadline {
+            if let Some(ts) = solana_metrics::custom_metrics::get_tx_acceptance_time(&signature) {
+                accepted_at = Some(ts);
+                break;
+            }
+            sleep(Duration::from_millis(5));
+        }
+
+        exit.store(true, Ordering::Relaxed);
+        drop(sender);
+        send_transaction_service.join().unwrap();
+        client.stop();
+
+        solana_metrics::custom_metrics::clear_tx_acceptance_time(&signature);
+        assert!(
+            accepted_at.is_some(),
+            "maxRetries=0 transaction must register acceptance time",
+        );
+    }
+
+    #[test]
+    fn max_retries_zero_registers_acceptance_with_connection_cache() {
+        max_retries_zero_registers_acceptance::<ConnectionCacheClient<NullTpuInfo>>(None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn max_retries_zero_registers_acceptance_with_tpu_client_next() {
+        max_retries_zero_registers_acceptance::<TpuClientNextClient>(Some(Handle::current()));
     }
 
     fn process_transactions<C: ClientWithCreator>(maybe_runtime: Option<Handle>) {
