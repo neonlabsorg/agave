@@ -15,7 +15,6 @@ use {
     std::{
         cell::{Cell, Ref, RefCell, RefMut},
         collections::HashSet,
-        pin::Pin,
         rc::Rc,
     },
 };
@@ -55,6 +54,7 @@ static_assertions::const_assert_eq!(
 
 /// Index of an account inside of the transaction or an instruction.
 pub type IndexOfAccount = u16;
+pub const SUBACCOUNT_MARKER: u16 = 1 << 15;
 
 /// Contains account meta data which varies between instruction.
 ///
@@ -86,6 +86,18 @@ impl InstructionAccount {
         }
     }
 
+    pub fn new_subaccount(
+        index_in_transaction: IndexOfAccount,
+        is_signer: bool,
+        is_writable: bool,
+    ) -> InstructionAccount {
+        InstructionAccount {
+            index_in_transaction: index_in_transaction | SUBACCOUNT_MARKER,
+            is_signer: is_signer as u8,
+            is_writable: is_writable as u8,
+        }
+    }
+
     pub fn is_signer(&self) -> bool {
         self.is_signer != 0
     }
@@ -108,39 +120,56 @@ pub type TransactionAccount = (Pubkey, AccountSharedData);
 
 #[derive(Debug)]
 pub struct TransactionAccounts {
-    accounts: Vec<RefCell<AccountSharedData>>,
-    touched_flags: RefCell<Box<[bool]>>,
+    #[allow(clippy::vec_box)]
+    accounts: RefCell<Vec<Box<RefCell<AccountSharedData>>>>,
+    subaccounts: RefCell<Vec<Box<RefCell<AccountSharedData>>>>,
+    touched_flags: RefCell<Vec<bool>>,
+    touched_subaccounts: RefCell<Vec<bool>>,
     resize_delta: Cell<i64>,
     lamports_delta: Cell<i128>,
+    dynamic_accounts_lamports_sum: Cell<u128>,
 }
 
 impl TransactionAccounts {
+    #[allow(clippy::vec_box)]
     #[cfg(not(target_os = "solana"))]
-    fn new(accounts: Vec<RefCell<AccountSharedData>>) -> TransactionAccounts {
-        let touched_flags = vec![false; accounts.len()].into_boxed_slice();
+    fn new(accounts: Vec<Box<RefCell<AccountSharedData>>>) -> TransactionAccounts {
+        let touched_flags = vec![false; accounts.len()];
         TransactionAccounts {
-            accounts,
+            accounts: RefCell::new(accounts),
             touched_flags: RefCell::new(touched_flags),
+            subaccounts: RefCell::new(Vec::new()),
+            touched_subaccounts: RefCell::new(Vec::new()),
             resize_delta: Cell::new(0),
             lamports_delta: Cell::new(0),
+            dynamic_accounts_lamports_sum: Cell::new(0),
         }
     }
 
     fn len(&self) -> usize {
-        self.accounts.len()
+        self.accounts.borrow().len()
     }
 
     #[cfg(not(target_os = "solana"))]
     pub fn touch(&self, index: IndexOfAccount) -> Result<(), InstructionError> {
-        *self
-            .touched_flags
-            .borrow_mut()
-            .get_mut(index as usize)
-            .ok_or(InstructionError::NotEnoughAccountKeys)? = true;
+        if index & SUBACCOUNT_MARKER != 0 {
+            let subaccount_index = index & !SUBACCOUNT_MARKER;
+            *self
+                .touched_subaccounts
+                .borrow_mut()
+                .get_mut(subaccount_index as usize)
+                .ok_or(InstructionError::NotEnoughAccountKeys)? = true;
+        } else {
+            *self
+                .touched_flags
+                .borrow_mut()
+                .get_mut(index as usize)
+                .ok_or(InstructionError::NotEnoughAccountKeys)? = true;
+        }
         Ok(())
     }
 
-    fn update_accounts_resize_delta(
+    pub fn update_accounts_resize_delta(
         &self,
         old_len: usize,
         new_len: usize,
@@ -152,7 +181,7 @@ impl TransactionAccounts {
         Ok(())
     }
 
-    fn can_data_be_resized(&self, old_len: usize, new_len: usize) -> Result<(), InstructionError> {
+    pub fn can_data_be_resized(&self, old_len: usize, new_len: usize) -> Result<(), InstructionError> {
         // The new length can not exceed the maximum permitted length
         if new_len > MAX_ACCOUNT_DATA_LEN as usize {
             return Err(InstructionError::InvalidRealloc);
@@ -168,14 +197,18 @@ impl TransactionAccounts {
     }
 
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-    fn try_borrow_mut(
+    pub fn try_borrow_mut(
         &self,
         index: IndexOfAccount,
     ) -> Result<RefMut<'_, AccountSharedData>, InstructionError> {
-        self.accounts
+        let accounts = self.accounts.borrow();
+        let account_cell = accounts
             .get(index as usize)
-            .ok_or(InstructionError::MissingAccount)?
-            .try_borrow_mut()
+            .ok_or(InstructionError::MissingAccount)?;
+        let account_ptr: *const RefCell<AccountSharedData> = &**account_cell;
+        drop(accounts);
+        // Safe: the account is boxed, so its address is stable even if the vec moves.
+        unsafe { (*account_ptr).try_borrow_mut() }
             .map_err(|_| InstructionError::AccountBorrowFailed)
     }
 
@@ -183,10 +216,59 @@ impl TransactionAccounts {
         &self,
         index: IndexOfAccount,
     ) -> Result<Ref<'_, AccountSharedData>, InstructionError> {
-        self.accounts
+        let accounts = self.accounts.borrow();
+        let account_cell = accounts
             .get(index as usize)
-            .ok_or(InstructionError::MissingAccount)?
-            .try_borrow()
+            .ok_or(InstructionError::MissingAccount)?;
+        let account_ptr: *const RefCell<AccountSharedData> = &**account_cell;
+        drop(accounts);
+        // Safe: the account is boxed, so its address is stable even if the vec moves.
+        unsafe { (*account_ptr).try_borrow() }
+            .map_err(|_| InstructionError::AccountBorrowFailed)
+    }
+
+    fn _try_borrow_subaccount(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<*const RefCell<AccountSharedData>, InstructionError> {
+        let subaccounts = self.subaccounts.borrow();
+        let account_cell = subaccounts
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        let account_ptr: *const RefCell<AccountSharedData> = &**account_cell;
+        Ok(account_ptr)
+        // drop(subaccounts);
+        // // Safe: the subaccount is boxed, so its address is stable even if the vec moves.
+        // unsafe { (*account_ptr).try_borrow() }
+        //     .map_err(|_| InstructionError::AccountBorrowFailed)
+    }
+
+    pub fn try_borrow_subaccount(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<Ref<'_, AccountSharedData>, InstructionError> {
+        // let subaccounts = self.subaccounts.borrow();
+        // let account_cell = subaccounts
+        //     .get(index as usize)
+        //     .ok_or(InstructionError::MissingAccount)?;
+        // let account_ptr: *const RefCell<AccountSharedData> = &**account_cell;
+        // drop(subaccounts);
+
+        // We need to keep the RefCell borrow alive while we use the pointer.
+        let account_ptr = self._try_borrow_subaccount(index)?;
+        // Safe: the subaccount is boxed, so its address is stable even if the vec moves.
+        unsafe { (*account_ptr).try_borrow() }
+            .map_err(|_| InstructionError::AccountBorrowFailed)
+    }
+
+    pub fn try_borrow_mut_subaccount(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<RefMut<'_, AccountSharedData>, InstructionError> {
+        // We need to keep the RefCell borrow alive while we use the pointer.
+        let account_ptr = self._try_borrow_subaccount(index)?;
+        // Safe: the subaccount is boxed, so its address is stable even if the vec moves.
+        unsafe { (*account_ptr).try_borrow_mut() }
             .map_err(|_| InstructionError::AccountBorrowFailed)
     }
 
@@ -203,6 +285,34 @@ impl TransactionAccounts {
     fn get_lamports_delta(&self) -> i128 {
         self.lamports_delta.get()
     }
+
+    pub fn get_dynamic_accounts_lamports_sum(&self) -> u128 {
+        self.dynamic_accounts_lamports_sum.get()
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    fn add_account(&self, account: AccountSharedData) -> IndexOfAccount {
+        let lamports = account.lamports();
+        let mut accounts = self.accounts.borrow_mut();
+        let index = accounts.len() as IndexOfAccount;
+        accounts.push(Box::new(RefCell::new(account)));
+        self.touched_flags.borrow_mut().push(false);
+        self.dynamic_accounts_lamports_sum
+            .set(self.dynamic_accounts_lamports_sum.get().saturating_add(lamports as u128));
+        index
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    fn add_subaccount(&self, account: AccountSharedData) -> IndexOfAccount {
+        let lamports = account.lamports();
+        let mut subaccounts = self.subaccounts.borrow_mut();
+        let index = subaccounts.len() as IndexOfAccount;
+        subaccounts.push(Box::new(RefCell::new(account)));
+        self.touched_subaccounts.borrow_mut().push(false);
+        self.dynamic_accounts_lamports_sum
+            .set(self.dynamic_accounts_lamports_sum.get().saturating_add(lamports as u128));
+        index
+    }
 }
 
 /// Loaded transaction shared between runtime and programs.
@@ -210,7 +320,8 @@ impl TransactionAccounts {
 /// This context is valid for the entire duration of a transaction being processed.
 #[derive(Debug)]
 pub struct TransactionContext {
-    account_keys: Pin<Box<[Pubkey]>>,
+    account_keys: Vec<Pubkey>,
+    subaccount_keys: Vec<Pubkey>,
     accounts: Rc<TransactionAccounts>,
     instruction_stack_capacity: usize,
     instruction_trace_capacity: usize,
@@ -233,10 +344,11 @@ impl TransactionContext {
     ) -> Self {
         let (account_keys, accounts): (Vec<_>, Vec<_>) = transaction_accounts
             .into_iter()
-            .map(|(key, account)| (key, RefCell::new(account)))
+            .map(|(key, account)| (key, Box::new(RefCell::new(account))))
             .unzip();
         Self {
-            account_keys: Pin::new(account_keys.into_boxed_slice()),
+            account_keys,
+            subaccount_keys: Vec::new(),
             accounts: Rc::new(TransactionAccounts::new(accounts)),
             instruction_stack_capacity,
             instruction_trace_capacity,
@@ -258,14 +370,20 @@ impl TransactionContext {
         Ok(Rc::try_unwrap(self.accounts)
             .expect("transaction_context.accounts has unexpected outstanding refs")
             .accounts
+            .into_inner()
             .into_iter()
-            .map(RefCell::into_inner)
+            .map(|account| RefCell::into_inner(*account))
             .collect())
     }
 
     #[cfg(not(target_os = "solana"))]
     pub fn accounts(&self) -> &Rc<TransactionAccounts> {
         &self.accounts
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn add_lamports_delta(&self, balance: i128) -> Result<(), InstructionError> {
+        self.accounts.add_lamports_delta(balance)
     }
 
     /// Returns the total number of accounts loaded in this Transaction
@@ -278,9 +396,17 @@ impl TransactionContext {
         &self,
         index_in_transaction: IndexOfAccount,
     ) -> Result<&Pubkey, InstructionError> {
-        self.account_keys
-            .get(index_in_transaction as usize)
-            .ok_or(InstructionError::NotEnoughAccountKeys)
+        if index_in_transaction & SUBACCOUNT_MARKER != 0 {
+            let subaccount_index = index_in_transaction & !SUBACCOUNT_MARKER;
+            self
+                .subaccount_keys
+                .get(subaccount_index as usize)
+                .ok_or(InstructionError::NotEnoughAccountKeys)
+        } else {
+            self.account_keys
+                .get(index_in_transaction as usize)
+                .ok_or(InstructionError::NotEnoughAccountKeys)
+        }
     }
 
     /// Searches for an account by its key
@@ -289,6 +415,50 @@ impl TransactionContext {
             .iter()
             .position(|key| key == pubkey)
             .map(|index| index as IndexOfAccount)
+    }
+
+    /// Searches for an subaccount keys
+    pub fn find_index_of_subaccount(&self, pubkey: &Pubkey) -> Option<IndexOfAccount> {
+        self.subaccount_keys
+            .iter()
+            .position(|key| key == pubkey)
+            .map(|index| index as IndexOfAccount)
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn add_subaccount(
+        &mut self,
+        pubkey: Pubkey,
+        account: AccountSharedData,
+    ) -> Result<IndexOfAccount, InstructionError> {
+        if let Some(_index) = self.find_index_of_subaccount(&pubkey) {
+            return Err(InstructionError::DuplicateAccountIndex);
+        }
+        if self.subaccount_keys.len() >= MAX_ACCOUNTS_PER_TRANSACTION {
+            return Err(InstructionError::MaxAccountsExceeded);
+        }
+        let index = self.accounts.add_subaccount(account);
+        self.subaccount_keys.push(pubkey);
+        Ok(index)
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn add_account(
+        &mut self,
+        pubkey: Pubkey,
+        account: AccountSharedData,
+        //is_writable: bool,
+    ) -> Result<IndexOfAccount, InstructionError> {
+        if let Some(_index) = self.find_index_of_account(&pubkey) {
+            return Err(InstructionError::DuplicateAccountIndex);
+        }
+        if self.account_keys.len() >= MAX_ACCOUNTS_PER_TRANSACTION {
+            return Err(InstructionError::MaxAccountsExceeded);
+        }
+
+        let index = self.accounts.add_account(account);
+        self.account_keys.push(pubkey);
+        Ok(index)
     }
 
     /// Gets the max length of the instruction trace
@@ -320,6 +490,8 @@ impl TransactionContext {
             instruction_accounts: &instruction.instruction_accounts,
             dedup_map: &instruction.dedup_map,
             instruction_data: &instruction.instruction_data,
+            subaccounts: &instruction.subaccounts,
+            dedup_subaccounts: &instruction.dedup_subaccounts,
         })
     }
 
@@ -378,8 +550,27 @@ impl TransactionContext {
         instruction_accounts: Vec<InstructionAccount>,
         deduplication_map: Vec<u8>,
         instruction_data: &[u8],
+        subaccounts: Vec<InstructionAccount>,
     ) -> Result<(), InstructionError> {
         debug_assert_eq!(deduplication_map.len(), MAX_ACCOUNTS_PER_TRANSACTION);
+
+        if subaccounts.len() > MAX_ACCOUNTS_PER_INSTRUCTION {
+            return Err(InstructionError::MissingAccount);
+        }
+        let mut dedup_subaccounts = vec![u8::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
+        for (position, subaccount) in subaccounts.iter().enumerate() {
+            let index_in_transaction = subaccount.index_in_transaction & !SUBACCOUNT_MARKER;
+            if index_in_transaction as usize >= self.subaccount_keys.len() {
+                return Err(InstructionError::MissingAccount);
+            }
+            let subaccount_position = dedup_subaccounts
+                .get_mut(index_in_transaction as usize)
+                .ok_or(InstructionError::MissingAccount)?;
+            if *subaccount_position == u8::MAX {
+                *subaccount_position = position as u8;
+            }
+        }
+        
         let instruction = self
             .instruction_trace
             .last_mut()
@@ -388,6 +579,8 @@ impl TransactionContext {
         instruction.instruction_accounts = instruction_accounts;
         instruction.instruction_data = instruction_data.to_vec();
         instruction.dedup_map = deduplication_map;
+        instruction.subaccounts = subaccounts;
+        instruction.dedup_subaccounts = dedup_subaccounts;
         Ok(())
     }
 
@@ -412,9 +605,56 @@ impl TransactionContext {
             instruction_accounts,
             dedup_map,
             instruction_data,
+            Vec::new(),
         )
     }
 
+    pub fn add_account_to_current_instruction(
+        &mut self,
+        index_in_transaction: IndexOfAccount,
+        is_signer: bool,
+        is_writable: bool,
+    ) -> Result<(), InstructionError> {
+        let index_in_trace = *self
+            .instruction_stack
+            .last()
+            .ok_or(InstructionError::CallDepth)?;
+        let instruction = self
+            .instruction_trace
+            .get_mut(index_in_trace)
+            .ok_or(InstructionError::CallDepth)?;
+
+        if index_in_transaction as usize >= instruction.dedup_map.len() {
+            return Err(InstructionError::InvalidArgument);
+        }
+
+        let dedup_index = instruction.dedup_map[index_in_transaction as usize] as usize;
+        if dedup_index < instruction.instruction_accounts.len() {
+            let account = instruction
+                .instruction_accounts
+                .get_mut(dedup_index)
+                .ok_or(InstructionError::InvalidArgument)?;
+            account.set_is_signer(account.is_signer() || is_signer);
+            account.set_is_writable(account.is_writable() || is_writable);
+            return Ok(());
+        }
+
+        if instruction.instruction_accounts.len() >= MAX_ACCOUNTS_PER_INSTRUCTION {
+            return Err(InstructionError::InvalidArgument);
+        }
+
+        let index_in_instruction = instruction.instruction_accounts.len() as u8;
+        instruction
+            .instruction_accounts
+            .push(InstructionAccount::new(
+                index_in_transaction,
+                is_signer,
+                is_writable,
+            ));
+        instruction.dedup_map[index_in_transaction as usize] = index_in_instruction;
+        Ok(())
+    }
+    
     /// Pushes the next instruction
     #[cfg(not(target_os = "solana"))]
     pub fn push(&mut self) -> Result<(), InstructionError> {
@@ -537,9 +777,19 @@ impl TransactionContext {
                 // The four calls below can't really fail. If they fail because of a bug,
                 // whatever is writing will trigger an EbpfError::AccessViolation like
                 // if the region was readonly, and the transaction will fail gracefully.
-                let Ok(mut account) = accounts.try_borrow_mut(index_in_transaction) else {
-                    debug_assert!(false);
-                    return;
+                let mut account = if index_in_transaction & SUBACCOUNT_MARKER != 0 {
+                    let subaccount_index = index_in_transaction & !SUBACCOUNT_MARKER;
+                    let Ok(account) =  accounts.try_borrow_mut_subaccount(subaccount_index) else {
+                        debug_assert!(false);
+                        return;
+                    };
+                    account
+                } else {
+                    let Ok(account) = accounts.try_borrow_mut(index_in_transaction) else {
+                        debug_assert!(false);
+                        return;
+                    };
+                    account
                 };
                 if accounts.touch(index_in_transaction).is_err() {
                     debug_assert!(false);
@@ -602,6 +852,8 @@ pub struct InstructionFrame {
     /// This is a vector of u8s to save memory, since many entries may be unused.
     dedup_map: Vec<u8>,
     instruction_data: Vec<u8>,
+    subaccounts: Vec<InstructionAccount>,
+    dedup_subaccounts: Vec<u8>,
 }
 
 /// View interface to read instructions.
@@ -614,6 +866,8 @@ pub struct InstructionContext<'a> {
     instruction_accounts: &'a [InstructionAccount],
     dedup_map: &'a [u8],
     instruction_data: &'a [u8],
+    subaccounts: &'a [InstructionAccount],
+    dedup_subaccounts: &'a [u8],
 }
 
 impl<'a> InstructionContext<'a> {
@@ -627,6 +881,11 @@ impl<'a> InstructionContext<'a> {
     /// Number of accounts in this Instruction (without program accounts)
     pub fn get_number_of_instruction_accounts(&self) -> IndexOfAccount {
         self.instruction_accounts.len() as IndexOfAccount
+    }
+
+    /// Number of subaccounts in this Instruction
+    pub fn get_number_of_subaccounts(&self) -> IndexOfAccount {
+        self.subaccounts.len() as IndexOfAccount
     }
 
     /// Assert that enough accounts were supplied to this Instruction
@@ -723,6 +982,38 @@ impl<'a> InstructionContext<'a> {
         )
     }
 
+    /// Returns `Some(instruction_subaccount_index)` if this is a duplicate
+    /// and `None` if it is the first subaccount with this key
+    pub fn is_instruction_subaccount_duplicate(
+        &self,
+        instruction_subaccount_index: IndexOfAccount,
+    ) -> Result<Option<IndexOfAccount>, InstructionError> {
+        let index_in_transaction = self
+            .subaccounts
+            .get(instruction_subaccount_index as usize)
+            .ok_or(InstructionError::NotEnoughAccountKeys)?
+            .index_in_transaction;
+
+        let first_instruction_subaccount_index = self.dedup_subaccounts
+            .get((index_in_transaction & !SUBACCOUNT_MARKER) as usize)
+            .and_then(|idx| {
+                if *idx as usize >= self.subaccounts.len() {
+                    None
+                } else {
+                    Some(*idx as IndexOfAccount)
+                }
+            })
+            .ok_or(InstructionError::MissingAccount)?;
+
+        Ok(
+            if first_instruction_subaccount_index == instruction_subaccount_index {
+                None
+            } else {
+                Some(first_instruction_subaccount_index)
+            },
+        )
+    }
+
     /// Gets the key of the last program account of this Instruction
     pub fn get_program_key(&self) -> Result<&'a Pubkey, InstructionError> {
         self.get_index_of_program_account_in_transaction()
@@ -762,6 +1053,28 @@ impl<'a> InstructionContext<'a> {
             transaction_context: self.transaction_context,
             instruction_account,
             account,
+            index_in_transaction_of_instruction_program: self.program_account_index_in_tx,
+        })
+    }
+
+    pub fn try_borrow_subaccount(
+        &self,
+        index_in_instruction: IndexOfAccount,
+    ) -> Result<BorrowedAccount, InstructionError> {
+        let instruction_account = *self
+            .subaccounts
+            .get(index_in_instruction as usize)
+            .ok_or(InstructionError::NotEnoughAccountKeys)?;
+
+        let subaccount = self
+            .transaction_context
+            .accounts
+            .try_borrow_mut_subaccount(instruction_account.index_in_transaction & !SUBACCOUNT_MARKER)?;
+
+        Ok(BorrowedAccount {
+            transaction_context: self.transaction_context,
+            instruction_account: instruction_account,
+            account: subaccount,
             index_in_transaction_of_instruction_program: self.program_account_index_in_tx,
         })
     }
@@ -807,6 +1120,10 @@ impl<'a> InstructionContext<'a> {
 
     pub fn instruction_accounts(&self) -> &[InstructionAccount] {
         self.instruction_accounts
+    }
+
+    pub fn instruction_subaccounts(&self) -> &[InstructionAccount] {
+        self.subaccounts
     }
 
     pub fn get_key_of_instruction_account(
@@ -1168,18 +1485,54 @@ impl From<TransactionContext> for ExecutionRecord {
     fn from(context: TransactionContext) -> Self {
         let TransactionAccounts {
             accounts,
+            subaccounts,
             touched_flags,
+            touched_subaccounts,
             resize_delta,
             ..
         } = Rc::try_unwrap(context.accounts)
             .expect("transaction_context.accounts has unexpected outstanding refs");
-        let accounts = Vec::from(Pin::into_inner(context.account_keys))
+        let mut accounts: Vec<_> = context
+            .account_keys
             .into_iter()
-            .zip(accounts.into_iter().map(RefCell::into_inner))
+            .zip(
+                accounts
+                .into_inner()
+                .into_iter()
+                .map(
+                    |account| RefCell::into_inner(*account)
+                )
+            )
             .collect();
+        let subaccounts = context
+            .subaccount_keys
+            .into_iter()
+            .map(|key| {
+                // TODO: use function subaccount_address instead of inlining the logic here
+                // map subaccounts keys to their corresponding addresses using the same logic as subaccount_address function
+                let address = solana_sha256_hasher::hashv(&[&[1], key.as_ref()]);
+                Pubkey::new_from_array(address.to_bytes())
+            })
+            // .map(|key| {   // map subaccounts keys to their corresponding addresses (do not need because the subaccount_keys contains already translated addresses)
+            //     let address = solana_sha256_hasher::hashv(&[&[1], key.as_ref()]);   // TODO: use subaccount_address function
+            //     Pubkey::new_from_array(address.to_bytes())
+            // })
+            .zip(
+                subaccounts
+                .into_inner()
+                .into_iter()
+                .map(
+                    |subaccount| RefCell::into_inner(*subaccount)
+                )
+            )
+            .collect::<Vec<_>>();
+        accounts.extend(subaccounts);
+
+        // TODO: update touched_account_count & accounts_resize_delta with subaccounts
         let touched_account_count = touched_flags
             .borrow()
             .iter()
+            .chain(touched_subaccounts.borrow().iter())
             .fold(0usize, |accumulator, was_touched| {
                 accumulator.saturating_add(*was_touched as usize)
             }) as u64;

@@ -1,5 +1,5 @@
 pub use self::{
-    cpi::{SyscallInvokeSignedC, SyscallInvokeSignedRust},
+    cpi::{SyscallInvokeSignedC, SyscallInvokeSignedRust, SyscallSelfInvokeRust, SyscallSelfInvokeC,},
     logging::{
         SyscallLog, SyscallLogBpfComputeUnits, SyscallLogData, SyscallLogPubkey, SyscallLogU64,
     },
@@ -13,6 +13,7 @@ pub use self::{
 #[allow(deprecated)]
 use {
     crate::mem_ops::is_nonoverlapping,
+    solana_account::{ReadableAccount, AccountSharedData},
     solana_account_info::AccountInfo,
     solana_big_mod_exp::{big_mod_exp, BigModExpParams},
     solana_blake3_hasher as blake3,
@@ -29,7 +30,7 @@ use {
     solana_program_entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, SUCCESS},
     solana_program_runtime::{
         execution_budget::{SVMTransactionExecutionBudget, SVMTransactionExecutionCost},
-        invoke_context::InvokeContext,
+        invoke_context::{DynamicCpiAccount, InvokeContext, UntypedVmSlice},
         stable_log,
     },
     solana_pubkey::{Pubkey, PubkeyError, MAX_SEEDS, MAX_SEED_LEN, PUBKEY_BYTES},
@@ -43,13 +44,14 @@ use {
     solana_secp256k1_recover::{
         Secp256k1RecoverError, SECP256K1_PUBLIC_KEY_LENGTH, SECP256K1_SIGNATURE_LENGTH,
     },
-    solana_sha256_hasher::Hasher,
+    solana_sha256_hasher::{Hasher, hashv},
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_log_collector::{ic_logger_msg, ic_msg},
     solana_svm_timings::ExecuteTimings,
     solana_svm_type_overrides::sync::Arc,
+    solana_system_interface::{MAX_PERMITTED_DATA_LENGTH, program as system_program},
     solana_sysvar::SysvarSerialize,
-    solana_transaction_context::IndexOfAccount,
+    solana_transaction_context::{InstructionAccount, IndexOfAccount, SUBACCOUNT_MARKER},
     std::{
         alloc::Layout,
         marker::PhantomData,
@@ -67,6 +69,7 @@ mod sysvar;
 
 /// Maximum signers
 const MAX_SIGNERS: usize = 16;
+const MAX_DYNAMIC_CPI_ACCOUNTS: usize = 256;
 
 /// Error definitions
 #[derive(Debug, ThisError, PartialEq, Eq)]
@@ -122,6 +125,10 @@ pub enum SyscallError {
     InvalidPointer,
     #[error("Arithmetic overflow")]
     ArithmeticOverflow,
+    #[error("Invalid self-invoke program ID")]
+    InvalidSelfInvokeProgramId,
+    #[error("Subaccounts are not supported")]
+    SubaccountsNotSupported,
 }
 
 type Error = Box<dyn std::error::Error>;
@@ -451,6 +458,14 @@ pub fn create_program_runtime_environment_v1<'a>(
     // Return data
     result.register_function("sol_set_return_data", SyscallSetReturnData::vm)?;
     result.register_function("sol_get_return_data", SyscallGetReturnData::vm)?;
+
+    // Dynamic account loading
+    result.register_function("sol_create_subaccount", SyscallCreateSubaccount::vm)?;
+    result.register_function("sol_cpi_load_account", SyscallCpiLoadAccount::vm)?;
+    result.register_function("sol_cpi_load_accounts", SyscallCpiLoadAccounts::vm)?;
+    result.register_function("sol_self_invoke_rust", SyscallSelfInvokeRust::vm)?;
+    result.register_function("sol_self_invoke_c", SyscallSelfInvokeC::vm)?;
+    result.register_function("sol_set_subaccount_slice", SyscallSetSubaccountSlice::vm)?;
 
     // Cross-program invocation
     result.register_function("sol_invoke_signed_c", SyscallInvokeSignedC::vm)?;
@@ -1517,6 +1532,415 @@ declare_builtin_function!(
     }
 );
 
+enum CpiLoadAccountResult {
+    Success,
+    AccountAlreadyLoaded { instruction_index: u64 },
+}
+
+fn cpi_load_account(
+    invoke_context: &mut InvokeContext,
+    pubkey: &Pubkey,
+    is_writable: bool,
+    is_signer: bool,
+) -> Result<CpiLoadAccountResult, Error> {
+    let index = if let Some(index) = invoke_context
+        .transaction_context
+        .find_index_of_account(pubkey)
+    {
+        // Check whether or not the account in the instruction
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_current_instruction_context()?;
+        if let Some((instr_index, _account)) = instruction_context
+                .instruction_accounts()
+                .iter()
+                .enumerate()
+                .find(|(_, account)| account.index_in_transaction == index)
+        {
+            // Account already in the instruction.
+            // This accounts should be passed to the nested CPI through AccountInfos
+            // and should not be added to the instruction again through cpi_load_account,
+            // otherwise it will cause data corruption.
+            return Ok(CpiLoadAccountResult::AccountAlreadyLoaded { instruction_index: instr_index as u64 });
+        }
+        index
+    } else {
+        let (account, _slot) = invoke_context
+            .get_account_shared_data(pubkey)
+            .unwrap_or((AccountSharedData::default(), 0));
+        let data_len_cost = (account.data().len() as u64)
+            .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
+            .unwrap_or(u64::MAX);
+        consume_compute_meter(invoke_context, data_len_cost)?;
+        invoke_context
+            .transaction_context
+            .add_account(*pubkey, account)?
+    };
+
+    {
+        let syscall_context = invoke_context.get_syscall_context_mut()?;
+        if let Some(entry) = syscall_context
+            .dynamic_cpi_accounts
+            .iter_mut()
+            .find(|entry| entry.index_in_transaction == index)
+        {
+            entry.is_writable |= is_writable;
+            entry.is_signer |= is_signer;
+        } else {
+            if syscall_context.dynamic_cpi_accounts.len() >= MAX_DYNAMIC_CPI_ACCOUNTS {
+                return Err(Box::new(InstructionError::MaxAccountsExceeded));
+            }
+            syscall_context.dynamic_cpi_accounts.push(DynamicCpiAccount {
+                index_in_transaction: index,
+                is_writable,
+                is_signer,
+            });
+        }
+    }
+
+    if let Err(err) = invoke_context
+        .transaction_context
+        .add_account_to_current_instruction(index, is_signer, is_writable)
+    {
+        ic_msg!(
+            invoke_context,
+            "cpi_load_account: add_account_to_current_instruction failed index={} err={:?}",
+            index,
+            err
+        );
+        return Err(Box::new(err));
+    }
+
+    Ok(CpiLoadAccountResult::Success)
+}
+
+fn subaccount_address(pubkey: &Pubkey) -> Pubkey {
+    let subaccount_address = hashv(&[&[1u8], pubkey.as_ref()]);
+    Pubkey::new_from_array(subaccount_address.to_bytes())
+}
+
+declare_builtin_function!(
+    /// Set the subaccounts AccountInfo slice for the current instruction context, this is used to support subaccounts in CPI
+    SyscallSetSubaccountSlice,
+    fn rust (
+        invoke_context: &mut InvokeContext,
+        subaccounts_info_addr: u64,
+        subaccounts_info_len: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let syscall_base_cost = invoke_context
+            .get_execution_cost()
+            .syscall_base_cost;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+
+        let subaccounts_info = translate_slice::<VmSlice<AccountInfo>>(
+            memory_mapping,
+            subaccounts_info_addr,
+            subaccounts_info_len,
+            invoke_context.get_check_aligned(),
+        )?;
+
+        if subaccounts_info.len() > crate::cpi::MAX_CPI_ACCOUNT_INFOS {
+            return Err(InstructionError::MaxAccountsExceeded.into());
+        }
+
+        let syscall_context = invoke_context.get_syscall_context_mut()?;
+        syscall_context.subaccounts_infos = UntypedVmSlice {
+            vm_data_addr: subaccounts_info_addr,
+            vm_data_len: subaccounts_info_len,
+        };
+
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Create subaccount
+    SyscallCreateSubaccount,
+    fn rust (
+        invoke_context: &mut InvokeContext,
+        _payer_pubkey_addr: u64,
+        seeds_addr: u64,
+        seeds_len: u64,
+        space: u64,
+        lamports: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let syscall_base_cost = invoke_context
+            .get_execution_cost()
+            .syscall_base_cost;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+        let check_aligned = invoke_context.get_check_aligned();
+
+        let (program_id, subaccount_pubkey) = {
+            let instruction_context = invoke_context
+                .transaction_context
+                .get_current_instruction_context()?;
+            let program_id = *instruction_context.get_program_key()?;
+            let (subaccount_pubkey, is_writable) = SyscallSelfInvokeRust::translate_subaccount_seeds(
+                &program_id,
+                seeds_addr,
+                seeds_len,
+                memory_mapping,
+                check_aligned,
+                invoke_context,
+                &instruction_context,
+            )?;
+
+            if !is_writable {
+                return Err(InstructionError::ReadonlyDataModified.into());
+            }
+
+            (program_id, subaccount_pubkey)
+        };
+
+        let subaccount_address = subaccount_address(&subaccount_pubkey);
+        let subaccount_index = if let Some(subaccount_index) = invoke_context
+            .transaction_context
+            .find_index_of_subaccount(&subaccount_pubkey)
+        {
+            subaccount_index
+        } else {
+            let (subaccount, _slot) = invoke_context
+                .get_account_shared_data(&subaccount_address)
+                .unwrap_or((AccountSharedData::default(), 0));
+
+            let data_len_cost = (subaccount.data().len() as u64)
+                .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
+                .unwrap_or(u64::MAX);
+            consume_compute_meter(invoke_context, data_len_cost)?;
+
+            invoke_context
+                .transaction_context
+                .add_subaccount(subaccount_pubkey, subaccount)?
+        };
+
+        let system_program_index = invoke_context
+            .transaction_context
+            .find_index_of_account(&system_program::id())
+            .ok_or(InstructionError::MissingAccount)?;
+
+        invoke_context.transaction_context.configure_next_instruction(
+            system_program_index,
+            Vec::new(),
+            Vec::new(),
+            &[],
+            vec![
+                InstructionAccount::new_subaccount(subaccount_index, false, true),
+            ],
+        )?;
+        invoke_context.transaction_context.push()?;
+        {
+            // Do stuff to create subaccount
+            let instruction_context = invoke_context.transaction_context
+                .get_current_instruction_context()?;
+            let mut subaccount = instruction_context
+                .try_borrow_subaccount(0)?;
+
+            // if it looks like the `to` subaccount is already in use, bail
+            //   (note that the id check is also enforced by message_processor)
+            if !subaccount.get_data().is_empty() || !system_program::check_id(subaccount.get_owner()) {
+                ic_msg!(
+                    invoke_context,
+                    "Allocate: subaccount {:?} already in use",
+                    subaccount_pubkey,
+                );
+                return Err(InstructionError::AccountAlreadyInitialized.into());
+            }
+
+            if space > MAX_PERMITTED_DATA_LENGTH {
+                ic_msg!(
+                    invoke_context,
+                    "Allocate: requested {}, max allowed {}",
+                    space,
+                    MAX_PERMITTED_DATA_LENGTH
+                );
+                return Err(InstructionError::InvalidArgument.into());
+            }
+
+            subaccount.set_data_length(space as usize)?;
+            subaccount.set_owner(&program_id.to_bytes())?;
+        }
+        invoke_context.transaction_context.pop()?;
+
+        if lamports > 0 {
+            // TODO: Do a transfer from the payer to the subaccount to fund it
+        }
+
+        // Mark this account as subaccount
+        use solana_account::WritableAccount;
+        invoke_context
+            .transaction_context
+            .accounts()
+            .try_borrow_mut_subaccount(subaccount_index)?
+            .set_subaccount_mark();
+
+        // Sync the subaccount with AccountInfo if it loaded
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_current_instruction_context()?;
+        let position = instruction_context.instruction_subaccounts()
+            .iter()
+            .position(|account| account.index_in_transaction == subaccount_index | SUBACCOUNT_MARKER);
+        if let Some(position) = position {
+            let stricter_abi_and_runtime_constraints = invoke_context
+                .get_feature_set()
+                .stricter_abi_and_runtime_constraints;
+
+            let syscall_context = invoke_context.get_syscall_context()?;
+            let subaccount_infos = translate_slice::<crate::cpi::SolAccountInfo>(   // TODO: Create special version for C/rust subaccounts
+                memory_mapping,
+                syscall_context.subaccounts_infos.vm_data_addr,
+                syscall_context.subaccounts_infos.vm_data_len,
+                check_aligned,
+            )?;
+            let subaccount_info = subaccount_infos
+                .get(position)
+                .ok_or_else(|| {
+                    ic_msg!(invoke_context, "InstructionError: missing AccountInfo for subaccount");
+                    InstructionError::MissingAccount
+                })?;
+            
+            // TODO: Create special version for C/rust subaccounts
+            let mut caller_account = crate::cpi::CallerAccount::from_sol_account_info(
+                invoke_context,
+                memory_mapping,
+                check_aligned,
+                syscall_context
+                    .subaccounts_infos
+                    .vm_data_addr
+                    .checked_add((position * size_of::<crate::cpi::SolAccountInfo>()) as u64)
+                    .ok_or(SyscallError::ArithmeticOverflow)?,
+                subaccount_info,
+                &syscall_context.subaccounts_metadata[position],
+            )?;
+
+            let mut subaccount = instruction_context
+                .try_borrow_subaccount(position as IndexOfAccount)?;
+
+            crate::cpi::update_caller_account(
+                invoke_context,
+                memory_mapping,
+                check_aligned,
+                &mut caller_account,
+                &mut subaccount,
+                stricter_abi_and_runtime_constraints,
+            )?;
+            crate::cpi::update_caller_account_region(
+                memory_mapping,
+                check_aligned,
+                &caller_account,
+                &mut subaccount,
+                invoke_context.account_data_direct_mapping,
+            )?;
+        }
+
+        // ic_msg!(
+        //     invoke_context,
+        //     "create_subaccount: base_pubkey={} subaccount={} address={} seeds={:?}",
+        //     base_pubkey,
+        //     subaccount_pubkey,
+        //     subaccount_address,
+        //     seeds
+        // );
+
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Load an account into the transaction context for CPI usage
+    SyscallCpiLoadAccount,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        pubkey_addr: u64,
+        is_writable: u64,
+        is_signer: u64,
+        out_index_addr: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        let syscall_base_cost = execution_cost.syscall_base_cost;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+
+        let pubkey = translate_type::<Pubkey>(
+            memory_mapping,
+            pubkey_addr,
+            invoke_context.get_check_aligned(),
+        )?;
+        let is_writable = is_writable != 0;
+        let is_signer = is_signer != 0;
+
+        let index = match cpi_load_account(invoke_context, pubkey, is_writable, is_signer)? {
+            CpiLoadAccountResult::Success => u64::MAX,
+            CpiLoadAccountResult::AccountAlreadyLoaded { instruction_index } => instruction_index,
+        };
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let out_index: &mut u64 = map(out_index_addr)?;
+        );
+        *out_index = index;
+        Ok(SUCCESS)
+    }
+);
+
+declare_builtin_function!(
+    /// Load multiple accounts into the transaction context for CPI usage
+    SyscallCpiLoadAccounts,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        pubkeys_addr: u64,
+        count: u64,
+        is_writable: u64,
+        is_signer: u64,
+        out_indices_addr: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let execution_cost = invoke_context.get_execution_cost();
+        let syscall_base_cost = execution_cost.syscall_base_cost;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+
+        let count = usize::try_from(count).map_err(|_| InstructionError::InvalidArgument)?;
+        if count == 0 {
+            return Err(Box::new(InstructionError::InvalidArgument));
+        }
+
+        let pubkeys = translate_slice::<Pubkey>(
+            memory_mapping,
+            pubkeys_addr,
+            count as u64,
+            invoke_context.get_check_aligned(),
+        )?.to_vec();
+        let is_writable = is_writable != 0;
+        let is_signer = is_signer != 0;
+        let mut out_indices = vec![0u64; count];
+
+        for i in 0..count {
+            let pubkey = &pubkeys[i];
+
+            let index = match cpi_load_account(invoke_context, pubkey, is_writable, is_signer)? {
+                CpiLoadAccountResult::Success => u64::MAX,
+                CpiLoadAccountResult::AccountAlreadyLoaded { instruction_index } => instruction_index,
+            };
+            out_indices[i] = index;
+        }
+
+        translate_mut!(
+            memory_mapping,
+            invoke_context.get_check_aligned(),
+            let out_indices_dst: &mut [u64] = map(out_indices_addr, count as u64)?;
+        );
+        out_indices_dst.copy_from_slice(&out_indices);
+
+        Ok(SUCCESS)
+    }
+);
+
 declare_builtin_function!(
     /// Get a processed sigling instruction
     SyscallGetProcessedSiblingInstruction,
@@ -2152,7 +2576,7 @@ mod tests {
         assert_matches::assert_matches,
         core::slice,
         solana_account::{create_account_shared_data_for_test, AccountSharedData},
-        solana_clock::Clock,
+        solana_clock::{Clock, Slot},
         solana_epoch_rewards::EpochRewards,
         solana_epoch_schedule::EpochSchedule,
         solana_fee_calculator::FeeCalculator,
@@ -2179,6 +2603,7 @@ mod tests {
         solana_stable_layout::stable_instruction::StableInstruction,
         solana_stake_interface::stake_history::{self, StakeHistory, StakeHistoryEntry},
         solana_sysvar_id::SysvarId,
+        solana_svm_callback::TransactionProcessingCallback,
         solana_transaction_context::InstructionAccount,
         std::{
             hash::{DefaultHasher, Hash, Hasher},
@@ -2619,6 +3044,7 @@ mod tests {
                     allocator: BpfAllocator::new(solana_program_entrypoint::HEAP_LENGTH as u64),
                     accounts_metadata: Vec::new(),
                     trace_log: Vec::new(),
+                    dynamic_cpi_accounts: Vec::new(),
                 })
                 .unwrap();
             let config = Config {
@@ -4850,7 +5276,13 @@ mod tests {
         const EXPECTED_TOTAL_STAKE: u64 = 200_000_000_000_000;
 
         struct MockCallback {}
-        impl InvokeContextCallback for MockCallback {
+        impl TransactionProcessingCallback for MockCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, Slot)> {
+                None
+            }
             fn get_epoch_stake(&self) -> u64 {
                 EXPECTED_TOTAL_STAKE
             }
@@ -4905,7 +5337,13 @@ mod tests {
         const EXPECTED_EPOCH_STAKE: u64 = 55_000_000_000;
 
         struct MockCallback {}
-        impl InvokeContextCallback for MockCallback {
+        impl TransactionProcessingCallback for MockCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, Slot)> {
+                None
+            }
             // Total stake is not needed for this test.
             fn get_epoch_stake_for_vote_account(&self, vote_address: &Pubkey) -> u64 {
                 if *vote_address == TARGET_VOTE_ADDRESS {

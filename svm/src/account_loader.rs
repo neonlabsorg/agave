@@ -830,6 +830,7 @@ mod tests {
         crate::transaction_account_state_info::TransactionAccountStateInfo,
         rand0_7::prelude::*,
         solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
+        solana_clock::Slot,
         solana_hash::Hash,
         solana_instruction::{AccountMeta, Instruction},
         solana_keypair::Keypair,

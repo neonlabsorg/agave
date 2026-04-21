@@ -34,6 +34,7 @@ bincode = { workspace = true, optional = true }
 solana-rent = { workspace = true }
 solana-sdk-ids = { workspace = true }
 solana-signature = { workspace = true, optional = true }
+solana-sha256-hasher = { workspace = true }
 
 [dev-dependencies]
 solana-account-info = { workspace = true }

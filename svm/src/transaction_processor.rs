@@ -961,6 +961,8 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             None
         };
 
+        let dynamic_accounts_lamports_sum =
+            transaction_context.accounts().get_dynamic_accounts_lamports_sum();
         let ExecutionRecord {
             accounts,
             return_data,
@@ -970,7 +972,11 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
         if status.is_ok()
             && transaction_accounts_lamports_sum(&accounts)
-                .filter(|lamports_after_tx| lamports_before_tx == *lamports_after_tx)
+                .filter(|lamports_after_tx| {
+                    lamports_before_tx
+                        .saturating_add(dynamic_accounts_lamports_sum)
+                        == *lamports_after_tx
+                })
                 .is_none()
         {
             status = Err(TransactionError::UnbalancedTransaction);
@@ -1131,7 +1137,7 @@ mod tests {
         solana_rent::Rent,
         solana_sdk_ids::{bpf_loader, loader_v4, system_program, sysvar},
         solana_signature::Signature,
-        solana_svm_callback::{AccountState, InvokeContextCallback},
+        solana_svm_callback::{AccountState, InvokeContextCallback, TransactionProcessingCallback},
         solana_transaction::{sanitized::SanitizedTransaction, Transaction},
         solana_transaction_context::TransactionContext,
         solana_transaction_error::{TransactionError, TransactionError::DuplicateInstruction},
