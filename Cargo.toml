@@ -149,6 +149,10 @@ exclude = [
     "dev-bins",
     "programs/sbf",
     "svm/tests/example-programs",
+    # parasol/solana-sdk is a submodule with its own workspace; keep it separate
+    # so Cargo resolves workspace.dependencies against the submodule's root manifest,
+    # not agave's.
+    "parasol",
 ]
 
 resolver = "2"
@@ -654,6 +658,11 @@ opt-level = 3
 [patch.crates-io]
 # for details, see https://github.com/anza-xyz/crossbeam/commit/fd279d707025f0e60951e429bf778b4813d1b6bf
 crossbeam-epoch = { git = "https://github.com/anza-xyz/crossbeam", rev = "fd279d707025f0e60951e429bf778b4813d1b6bf" }
+# Note: parasol-dev also patches quinn/quinn-proto to anza-xyz fork, but v3.1.13
+# already uses the `anza-quinn`/`anza-quinn-proto` renamed packages in its
+# workspace.dependencies (see lines near the quinn = {...} declaration above),
+# so the git-rev patches would be unused here. Keep this reminder when future
+# upstream bumps revert the rename.
 
 # We include the following crates as our dependencies above from crates.io:
 #
@@ -688,4 +697,28 @@ crossbeam-epoch = { git = "https://github.com/anza-xyz/crossbeam", rev = "fd279d
 # There is a similar override in `programs/sbf/Cargo.toml`.  Please keep both
 # comments and the overrides in sync.
 solana-curve25519 = { path = "curves/curve25519" }
+# --------------------------------------------------------------------------
+# Parasol fork scaffolding — parasol/solana-sdk submodule patches go here.
+#
+# The submodule lives at `parasol/solana-sdk` (see .gitmodules, branched
+# from solana-sdk account@v3.2.0). Feature cherry-picks (F1 block-time,
+# F2+F3 gasless+rent, F6 packet size, F7/F9 account+syscall, F10 subaccounts
+# — see shared KB `architecture-parasol-dev-fork-overview`) will add
+# `solana-<crate> = { path = "parasol/solana-sdk/<crate>" }` entries below
+# **as each feature is applied**, not up-front.
+#
+# Why not mirror parasol-dev's 14-path block wholesale?
+# Our submodule is from modern post-split solana-sdk (account@v3.2.0,
+# Oct 2025). Upstream agave v3.1.13 workspace pulls transitive deps (e.g.
+# solana-stake-interface 2.0.1, solana-instructions-sysvar 3.0.0) that
+# expect solana-address 2.x while the submodule ships solana-address 1.0.0.
+# A blanket path-patch creates two versions of solana-address in the
+# dep tree → E0308 type mismatches. Patches must be introduced
+# *per-feature*, with a coordinated submodule bump to align address/pubkey
+# major versions when needed.
+#
+# Example entry (when applying F1 block-time):
+#   solana-clock = { path = "parasol/solana-sdk/clock" }
+#   solana-sysvar = { path = "parasol/solana-sdk/sysvar" }
+# --------------------------------------------------------------------------
 rustls-webpki = { git = "https://github.com/anza-xyz/rustls-webpki", tag = "anza-rustsec-2026-0049-0.103.6" }

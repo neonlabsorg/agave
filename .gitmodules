@@ -1,0 +1,4 @@
+[submodule "parasol/solana-sdk"]
+	path = parasol/solana-sdk
+	url = https://github.com/neonlabsorg/solana-sdk
+	branch = parasol-fork-dev
