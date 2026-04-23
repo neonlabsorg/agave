@@ -1,35 +1,43 @@
 use {
     crate::{args::*, canonicalize_ledger_path, ledger_utils::*},
-    agave_syscalls::create_program_runtime_environment_v1,
     clap::{App, AppSettings, Arg, ArgMatches, SubCommand},
     log::*,
     serde::{Deserialize, Serialize},
     serde_json::Result,
     solana_account::{
-        create_account_shared_data_for_test, state_traits::StateMut, AccountSharedData,
+        AccountSharedData, create_account_shared_data_for_test, state_traits::StateMut,
     },
-    solana_bpf_loader_program::{create_vm, load_program_from_bytes},
     solana_cli_output::{OutputFormat, QuietDisplay, VerboseDisplay},
     solana_clock::Slot,
     solana_ledger::blockstore_options::AccessType,
     solana_loader_v3_interface::state::UpgradeableLoaderState,
     solana_program_runtime::{
-        invoke_context::InvokeContext,
-        loaded_programs::{
-            LoadProgramMetrics, ProgramCacheEntryType, DELAY_VISIBILITY_SLOT_OFFSET,
+        create_vm,
+        invoke_context::{BpfAllocator, InvokeContext},
+        loaded_programs::ProgramRuntimeEnvironment,
+        memory_context::MemoryContext,
+        program_cache_entry::{
+            DELAY_VISIBILITY_SLOT_OFFSET, ProgramCacheEntry, ProgramCacheEntryType,
         },
+        program_metrics::LoadProgramMetrics,
         serialization::serialize_parameters,
         with_mock_invoke_context,
     },
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_sbpf::{
-        assembler::assemble, ebpf::MM_INPUT_START, elf::Executable, static_analysis::Analysis,
+        assembler::assemble,
+        ebpf::MM_INPUT_START,
+        elf::Executable,
+        memory_region::{MemoryMapping, MemoryRegion},
+        static_analysis::Analysis,
         verifier::RequisiteVerifier,
+        vm::{CallFrame, ExecutionMode},
     },
     solana_sdk_ids::{bpf_loader_upgradeable, sysvar},
+    solana_syscalls::create_program_runtime_environment,
     solana_transaction_context::{
-        instruction::InstructionContext, instruction_accounts::InstructionAccount, IndexOfAccount,
+        IndexOfAccount, instruction::InstructionContext, instruction_accounts::InstructionAccount,
     },
     std::{
         collections::HashMap,
@@ -266,14 +274,13 @@ fn load_program<'a>(
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).unwrap();
     let slot = Slot::default();
-    let log_collector = invoke_context.get_log_collector();
     let loader_key = bpf_loader_upgradeable::id();
     let mut load_program_metrics = LoadProgramMetrics {
         program_id: program_id.to_string(),
         ..LoadProgramMetrics::default()
     };
     let account_size = contents.len();
-    let program_runtime_environment = create_program_runtime_environment_v1(
+    let program_runtime_environment = create_program_runtime_environment(
         invoke_context.get_feature_set(),
         invoke_context.get_compute_budget(),
         false, /* deployment */
@@ -283,15 +290,14 @@ fn load_program<'a>(
     // Allowing mut here, since it may be needed for jit compile, which is under a config flag
     #[allow(unused_mut)]
     let mut verified_executable = if is_elf {
-        let result = load_program_from_bytes(
-            log_collector,
-            &mut load_program_metrics,
-            &contents,
+        let result = ProgramCacheEntry::new(
             &loader_key,
-            account_size,
+            ProgramRuntimeEnvironment::clone(&program_runtime_environment),
             slot,
-            Arc::new(program_runtime_environment),
-            false,
+            slot.saturating_add(DELAY_VISIBILITY_SLOT_OFFSET),
+            &contents,
+            account_size,
+            &mut load_program_metrics,
         );
         match result {
             Ok(loaded_program) => match loaded_program.program {
@@ -303,7 +309,7 @@ fn load_program<'a>(
     } else {
         assemble::<InvokeContext>(
             std::str::from_utf8(contents.as_slice()).unwrap(),
-            Arc::new(program_runtime_environment),
+            Arc::clone(&*program_runtime_environment),
         )
         .map_err(|err| format!("Assembling executable failed: {err:?}"))
         .and_then(|executable| {
@@ -473,12 +479,7 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
         sysvar::epoch_schedule::id(),
         create_account_shared_data_for_test(bank.epoch_schedule()),
     ));
-    let interpreted = matches.value_of("mode").unwrap() != "jit";
     with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
-
-    let provide_instruction_data_offset_in_vm_r2 = invoke_context
-        .get_feature_set()
-        .provide_instruction_data_offset_in_vm_r2;
 
     // Adding `DELAY_VISIBILITY_SLOT_OFFSET` to slots to accommodate for delay visibility of the program
     let mut program_cache_for_tx_batch =
@@ -486,7 +487,7 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
     for key in cached_account_keys {
         program_cache_for_tx_batch.replenish(
             key,
-            bank.load_program(&key, false, bank.epoch())
+            bank.load_program(&key, bank.epoch())
                 .expect("Couldn't find program account"),
         );
         debug!("Loaded program {key}");
@@ -495,7 +496,7 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
 
     invoke_context
         .transaction_context
-        .configure_next_instruction_for_tests(
+        .configure_top_level_instruction_for_tests(
             program_index.saturating_add(1),
             instruction_accounts,
             instruction_data,
@@ -508,37 +509,73 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
                 .transaction_context
                 .get_current_instruction_context()
                 .unwrap(),
-            false, // stricter_abi_and_runtime_constraints
+            false, // virtual_address_space_adjustments
             false, // account_data_direct_mapping
-            true,  // for mask_out_rent_epoch_in_vm_serialization
+            false, // direct_account_pointers_in_program_input
         )
         .unwrap();
 
+    let regions = vec![MemoryRegion::default(); 3]
+        .into_iter()
+        .chain(regions)
+        .collect();
     let program = matches.value_of("PROGRAM").unwrap();
     let verified_executable = load_program(Path::new(program), program_id, &invoke_context);
-    create_vm!(
-        vm,
-        &verified_executable,
+
+    let heap_size = invoke_context.get_compute_budget().heap_size;
+    let virtual_address_space_adjustments = invoke_context
+        .get_feature_set()
+        .virtual_address_space_adjustments;
+    let account_data_direct_mapping = invoke_context.get_feature_set().account_data_direct_mapping;
+    let memory_mapping = MemoryMapping::new_uninitialized(
         regions,
-        account_lengths,
-        &mut invoke_context,
+        verified_executable.get_config(),
+        verified_executable.get_sbpf_version(),
+        invoke_context.transaction_context.access_violation_handler(
+            virtual_address_space_adjustments,
+            account_data_direct_mapping,
+        ),
     );
+
+    invoke_context
+        .memory_contexts
+        .set_memory_context(MemoryContext::new(
+            BpfAllocator::new(heap_size as u64),
+            account_lengths,
+            memory_mapping,
+        ))
+        .unwrap();
+
+    create_vm!(vm, &verified_executable, &mut invoke_context,);
     let (mut vm, _, _) = vm.unwrap();
     let start_time = Instant::now();
-    if matches.value_of("mode").unwrap() == "debugger" {
-        vm.debug_port = Some(matches.value_of("port").unwrap().parse::<u16>().unwrap());
-    }
-    vm.registers[1] = MM_INPUT_START;
 
-    // SIMD-0321: Provide offset to instruction data in VM register 2.
-    if provide_instruction_data_offset_in_vm_r2 {
-        vm.registers[2] = instruction_data_offset as u64;
-    }
-    let (instruction_count, result) = vm.execute_program(&verified_executable, interpreted);
+    let mode = matches.value_of("mode").unwrap();
+    let mut execution_mode = if mode == "jit" {
+        ExecutionMode::Jit
+    } else if mode == "debugger" {
+        vm.debug_port = Some(matches.value_of("port").unwrap().parse::<u16>().unwrap());
+        ExecutionMode::Interpreted
+    } else {
+        ExecutionMode::Interpreted
+    };
+    let mut call_frames = match execution_mode {
+        ExecutionMode::Jit => vec![],
+        ExecutionMode::Interpreted | ExecutionMode::PreferJit => {
+            vec![CallFrame::default(); verified_executable.get_config().max_call_depth]
+        }
+    };
+    vm.registers[1] = MM_INPUT_START;
+    vm.registers[2] = instruction_data_offset as u64;
+
+    let (instruction_count, result) =
+        vm.execute_program(&verified_executable, &mut execution_mode, &mut call_frames);
     let duration = Instant::now() - start_time;
     if let Some(trace_option) = matches.value_of("trace") {
-        vm.context_object_pointer.iterate_vm_traces(
-            &|instruction_context: InstructionContext, executable, register_trace| {
+        vm.context()
+            .iterate_vm_traces(&|instruction_context: InstructionContext,
+                                 executable,
+                                 register_trace| {
                 let mut analysis = LazyAnalysis::new(executable);
                 if trace_option == "stdout" {
                     writeln!(
@@ -571,8 +608,7 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
                         .disassemble_register_trace(&mut fd, register_trace)
                         .unwrap();
                 }
-            },
-        );
+            });
     }
     drop(vm);
 

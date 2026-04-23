@@ -1,8 +1,11 @@
 fn main() -> Result<(), std::io::Error> {
     const PROTOC_ENVAR: &str = "PROTOC";
+    // Safety: env is checked and updated before any threads might exist
     if std::env::var(PROTOC_ENVAR).is_err() {
         #[cfg(not(windows))]
-        std::env::set_var(PROTOC_ENVAR, protobuf_src::protoc());
+        unsafe {
+            std::env::set_var(PROTOC_ENVAR, protobuf_src::protoc())
+        }
     }
 
     let proto_base_path = std::path::PathBuf::from("proto");
@@ -18,7 +21,7 @@ fn main() -> Result<(), std::io::Error> {
         protos.push(proto);
     }
 
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_client(true)
         .build_server(false)
         .type_attribute(
@@ -29,5 +32,5 @@ fn main() -> Result<(), std::io::Error> {
             "InstructionErrorType",
             "#[cfg_attr(test, derive(enum_iterator::Sequence))]",
         )
-        .compile(&protos, &[proto_base_path])
+        .compile_protos(&protos, &[proto_base_path])
 }

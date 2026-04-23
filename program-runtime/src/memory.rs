@@ -7,11 +7,11 @@ use {
 };
 
 /// Error types for memory translation operations.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
 pub enum MemoryTranslationError {
     #[error("Unaligned pointer")]
     UnalignedPointer,
-    #[error("Invalid length")]
+    #[error("InvalidLength")]
     InvalidLength,
 }
 
@@ -84,12 +84,12 @@ pub fn translate_type<'a, T>(
         .map(|value| &*value)
 }
 
-pub fn translate_slice<'a, T>(
+pub fn translate_slice<T>(
     memory_mapping: &MemoryMapping,
     vm_addr: u64,
     len: u64,
     check_aligned: bool,
-) -> Result<&'a [T], Box<dyn std::error::Error>> {
+) -> Result<&[T], Box<dyn std::error::Error>> {
     translate_slice_inner!(
         memory_mapping,
         AccessType::Load,

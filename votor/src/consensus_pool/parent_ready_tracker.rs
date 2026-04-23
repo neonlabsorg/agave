@@ -15,7 +15,8 @@
 use {
     crate::{common::MAX_ENTRIES_PER_PUBKEY_FOR_NOTARIZE_LITE, event::VotorEvent},
     agave_votor_messages::consensus_message::Block,
-    solana_clock::{Slot, NUM_CONSECUTIVE_LEADER_SLOTS},
+    core::fmt,
+    solana_clock::{NUM_CONSECUTIVE_LEADER_SLOTS, Slot},
     solana_gossip::cluster_info::ClusterInfo,
     std::{collections::HashMap, sync::Arc},
 };
@@ -27,15 +28,21 @@ pub(crate) enum BlockProductionParent {
     Parent(Block),
 }
 
-pub(crate) struct ParentReadyTracker {
-    cluster_info: Arc<ClusterInfo>,
+struct DebugIgnore<T>(T);
 
+impl<T> fmt::Debug for DebugIgnore<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<ignored>")
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ParentReadyTracker {
+    cluster_info: DebugIgnore<Arc<ClusterInfo>>,
     /// Parent ready status for each slot
     slot_statuses: HashMap<Slot, ParentReadyStatus>,
-
     /// Root
     root: Slot,
-
     /// Highest slot with parent ready status
     // TODO: While the voting loop is sequential we track every slot (not just the first in window)
     // However once we handle all slots concurrently we will update this to only count first leader
@@ -75,7 +82,7 @@ impl ParentReadyTracker {
             },
         );
         Self {
-            cluster_info,
+            cluster_info: DebugIgnore(cluster_info),
             slot_statuses,
             root: root_slot,
             highest_with_parent_ready: root_slot.saturating_add(1),
@@ -98,7 +105,7 @@ impl ParentReadyTracker {
         }
         trace!(
             "{}: Adding new notar fallback for {block:?}",
-            self.cluster_info.id()
+            self.cluster_info.0.id()
         );
         status.notar_fallbacks.push(block);
         assert!(status.notar_fallbacks.len() <= MAX_ENTRIES_PER_PUBKEY_FOR_NOTARIZE_LITE);
@@ -107,7 +114,7 @@ impl ParentReadyTracker {
         for s in slot.saturating_add(1).. {
             trace!(
                 "{}: Adding new parent ready for {s} parent {block:?}",
-                self.cluster_info.id()
+                self.cluster_info.0.id()
             );
             let status = self.slot_statuses.entry(s).or_default();
             if !status.parents_ready.contains(&block) {
@@ -136,7 +143,7 @@ impl ParentReadyTracker {
             return;
         }
 
-        trace!("{}: Adding new skip for {slot:?}", self.cluster_info.id());
+        trace!("{}: Adding new skip for {slot:?}", self.cluster_info.0.id());
         let status = self.slot_statuses.entry(slot).or_default();
         status.skip = true;
 
@@ -175,7 +182,7 @@ impl ParentReadyTracker {
         for s in future_slots {
             trace!(
                 "{}: Adding new parent ready for {s} parents {potential_parents:?}",
-                self.cluster_info.id(),
+                self.cluster_info.0.id(),
             );
             let status = self.slot_statuses.entry(s).or_default();
             for &block in &potential_parents {
@@ -236,25 +243,15 @@ impl ParentReadyTracker {
 #[cfg(test)]
 mod tests {
     use {
-        super::*, itertools::Itertools, solana_clock::NUM_CONSECUTIVE_LEADER_SLOTS,
-        solana_gossip::contact_info::ContactInfo, solana_hash::Hash, solana_keypair::Keypair,
-        solana_net_utils::SocketAddrSpace, solana_signer::Signer,
+        super::*, crate::tests::get_cluster_info, itertools::Itertools,
+        solana_clock::NUM_CONSECUTIVE_LEADER_SLOTS, solana_hash::Hash, solana_keypair::Keypair,
     };
-
-    fn new_cluster_info() -> Arc<ClusterInfo> {
-        let keypair = Keypair::new();
-        let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), 0);
-        Arc::new(ClusterInfo::new(
-            contact_info,
-            Arc::new(keypair),
-            SocketAddrSpace::Unspecified,
-        ))
-    }
 
     #[test]
     fn basic() {
+        let cluster_info = get_cluster_info(Keypair::new());
         let genesis = Block::default();
-        let mut tracker = ParentReadyTracker::new(new_cluster_info(), genesis);
+        let mut tracker = ParentReadyTracker::new(cluster_info, genesis);
         let mut events = vec![];
 
         for i in 1..2 * NUM_CONSECUTIVE_LEADER_SLOTS {
@@ -267,8 +264,9 @@ mod tests {
 
     #[test]
     fn skips() {
+        let cluster_info = get_cluster_info(Keypair::new());
         let genesis = Block::default();
-        let mut tracker = ParentReadyTracker::new(new_cluster_info(), genesis);
+        let mut tracker = ParentReadyTracker::new(cluster_info, genesis);
         let mut events = vec![];
         let block = (1, Hash::new_unique());
 
@@ -284,8 +282,9 @@ mod tests {
 
     #[test]
     fn out_of_order() {
+        let cluster_info = get_cluster_info(Keypair::new());
         let genesis = Block::default();
-        let mut tracker = ParentReadyTracker::new(new_cluster_info(), genesis);
+        let mut tracker = ParentReadyTracker::new(cluster_info, genesis);
         let mut events = vec![];
         let block = (1, Hash::new_unique());
 
@@ -303,9 +302,10 @@ mod tests {
 
     #[test]
     fn snapshot_wfsm() {
+        let cluster_info = get_cluster_info(Keypair::new());
         let root_slot = 2147;
         let root_block = (root_slot, Hash::new_unique());
-        let mut tracker = ParentReadyTracker::new(new_cluster_info(), root_block);
+        let mut tracker = ParentReadyTracker::new(cluster_info, root_block);
         let mut events = vec![];
 
         assert!(tracker.parent_ready(root_slot + 1, root_block));
@@ -331,8 +331,9 @@ mod tests {
 
     #[test]
     fn highest_parent_ready_out_of_order() {
+        let cluster_info = get_cluster_info(Keypair::new());
         let genesis = Block::default();
-        let mut tracker = ParentReadyTracker::new(new_cluster_info(), genesis);
+        let mut tracker = ParentReadyTracker::new(cluster_info, genesis);
         let mut events = vec![];
         assert_eq!(tracker.highest_parent_ready(), 1);
 
@@ -353,8 +354,9 @@ mod tests {
 
     #[test]
     fn missed_window() {
+        let cluster_info = get_cluster_info(Keypair::new());
         let genesis = Block::default();
-        let mut tracker = ParentReadyTracker::new(new_cluster_info(), genesis);
+        let mut tracker = ParentReadyTracker::new(cluster_info, genesis);
         let mut events = vec![];
         assert_eq!(tracker.highest_parent_ready(), 1);
         assert_eq!(
@@ -383,8 +385,9 @@ mod tests {
 
     #[test]
     fn pick_more_skips() {
+        let cluster_info = get_cluster_info(Keypair::new());
         let genesis = Block::default();
-        let mut tracker = ParentReadyTracker::new(new_cluster_info(), genesis);
+        let mut tracker = ParentReadyTracker::new(cluster_info, genesis);
         let mut events = vec![];
 
         for i in 1..=10 {

@@ -1,6 +1,7 @@
+use solana_program_runtime::solana_sbpf::program::BuiltinFunctionDefinition;
 #[allow(deprecated)]
 use {
-    criterion::{criterion_group, criterion_main, Criterion},
+    criterion::{Criterion, criterion_group, criterion_main},
     solana_account::{self as account, AccountSharedData, WritableAccount},
     solana_hash::Hash,
     solana_instruction::AccountMeta,
@@ -16,7 +17,7 @@ use {
         sysvar::{recent_blockhashes, rent},
     },
     solana_system_interface::instruction::SystemInstruction,
-    solana_sysvar::recent_blockhashes::{IterItem, RecentBlockhashes, MAX_ENTRIES},
+    solana_sysvar::recent_blockhashes::{IterItem, MAX_ENTRIES, RecentBlockhashes},
 };
 
 const SEED: &str = "bench test";
@@ -82,6 +83,29 @@ impl TestSetup {
         ];
 
         self.instruction_data = bincode::serialize(&SystemInstruction::CreateAccount {
+            lamports: 1,
+            space: 2,
+            owner: self.owner_address,
+        })
+        .unwrap();
+    }
+
+    fn prep_create_account_allow_prefund(&mut self) {
+        // order is reversed from CreateAccount, since the funding account is optional
+        self.instruction_accounts = vec![
+            AccountMeta {
+                pubkey: self.derived_address,
+                is_signer: true,
+                is_writable: true,
+            },
+            AccountMeta {
+                pubkey: self.funding_address,
+                is_signer: true,
+                is_writable: true,
+            },
+        ];
+
+        self.instruction_data = bincode::serialize(&SystemInstruction::CreateAccountAllowPrefund {
             lamports: 1,
             space: 2,
             owner: self.owner_address,
@@ -460,12 +484,11 @@ impl TestSetup {
     fn run(&self) {
         mock_process_instruction(
             &solana_system_program::id(),
-            None,
             &self.instruction_data,
             self.transaction_accounts.clone(),
             self.instruction_accounts.clone(),
             Ok(()), //expected_result,
-            solana_system_program::system_processor::Entrypoint::vm,
+            solana_system_program::system_processor::Entrypoint::register,
             |_invoke_context| {},
             |_invoke_context| {},
         );
@@ -486,6 +509,15 @@ fn bench_create_account_with_seed(c: &mut Criterion) {
     test_setup.prep_create_account_with_seed();
 
     c.bench_function("create_account_with_seed", |bencher| {
+        bencher.iter(|| test_setup.run())
+    });
+}
+
+fn bench_create_account_allow_prefund(c: &mut Criterion) {
+    let mut test_setup = TestSetup::new();
+    test_setup.prep_create_account_allow_prefund();
+
+    c.bench_function("create_account_allow_prefund", |bencher| {
         bencher.iter(|| test_setup.run())
     });
 }
@@ -587,6 +619,7 @@ criterion_group!(
     benches,
     bench_create_account,
     bench_create_account_with_seed,
+    bench_create_account_allow_prefund,
     bench_allocate,
     bench_allocate_with_seed,
     bench_assign,

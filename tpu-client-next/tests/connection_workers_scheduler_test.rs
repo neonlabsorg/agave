@@ -10,39 +10,39 @@ use {
     solana_streamer::{
         nonblocking::{
             swqos::SwQosConfig,
-            testing_utilities::{make_client_endpoint, setup_quic_server, SpawnTestServerResult},
+            testing_utilities::{SpawnTestServerResult, make_client_endpoint, setup_quic_server},
         },
         packet::PacketBatch,
         quic::QuicStreamerConfig,
         streamer::StakedNodes,
     },
     solana_tpu_client_next::{
+        ClientBuilder, ConnectionWorkersScheduler, ConnectionWorkersSchedulerError,
+        SendTransactionStats,
         connection_workers_scheduler::{
             BindTarget, ConnectionWorkersSchedulerConfig, Fanout, StakeIdentity,
         },
         leader_updater::create_pinned_leader_updater,
         send_transaction_stats::SendTransactionStatsNonAtomic,
         transaction_batch::TransactionBatch,
-        ClientBuilder, ConnectionWorkersScheduler, ConnectionWorkersSchedulerError,
-        SendTransactionStats,
     },
     std::{
         collections::HashMap,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-        num::Saturating,
+        num::{NonZeroUsize, Saturating},
         sync::{
-            atomic::{AtomicU64, Ordering},
             Arc,
+            atomic::{AtomicU64, Ordering},
         },
         time::Duration,
     },
     tokio::{
         sync::{
-            mpsc::{channel, Receiver},
+            mpsc::{Receiver, channel},
             oneshot, watch,
         },
         task::JoinHandle,
-        time::{interval, sleep, Instant},
+        time::{Instant, interval, sleep},
     },
     tokio_util::sync::CancellationToken,
 };
@@ -55,7 +55,7 @@ fn test_config(stake_identity: Option<Keypair>) -> ConnectionWorkersSchedulerCon
     ConnectionWorkersSchedulerConfig {
         bind: BindTarget::Address(address),
         stake_identity: stake_identity.map(|identity| StakeIdentity::new(&identity)),
-        num_connections: 1,
+        num_connections: NonZeroUsize::new(1).unwrap(),
         skip_check_transaction_age: false,
         // At the moment we have only one strategy to send transactions: we try
         // to put to worker channel transaction batch and in case of failure
@@ -68,6 +68,7 @@ fn test_config(stake_identity: Option<Keypair>) -> ConnectionWorkersSchedulerCon
             send: 1,
             connect: 1,
         },
+        override_initial_congestion_window: None,
     }
 }
 
@@ -868,7 +869,6 @@ async fn test_client_builder() {
     );
 
     let _drop_guard = cancel.clone().drop_guard();
-
     let successfully_sent = Arc::new(AtomicU64::new(0));
 
     let port_range = localhost_port_range_for_tests();
@@ -882,7 +882,7 @@ async fn test_client_builder() {
         .bind_socket(socket)
         .leader_send_fanout(1)
         .identity(None)
-        .max_cache_size(1)
+        .max_cache_size(NonZeroUsize::new(1).unwrap())
         .worker_channel_size(100)
         .metric_reporter({
             let successfully_sent = successfully_sent.clone();
@@ -897,6 +897,9 @@ async fn test_client_builder() {
                         }
                     })
                     .await;
+                // update right after the cancel
+                let view = stats.read_and_reset();
+                successfully_sent.fetch_add(view.successfully_sent, Ordering::Relaxed);
             }
         });
 

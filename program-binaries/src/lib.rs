@@ -1,12 +1,4 @@
-#![cfg_attr(
-    not(feature = "agave-unstable-api"),
-    deprecated(
-        since = "3.1.0",
-        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
-                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
-                acknowledge use of an interface that may break without warning."
-    )
-)]
+#![cfg(feature = "agave-unstable-api")]
 #![allow(clippy::arithmetic_side_effects)]
 
 use {
@@ -27,13 +19,13 @@ mod spl_memo_3_0 {
 static SPL_PROGRAMS: &[(Pubkey, Pubkey, &[u8])] = &[
     (
         spl_generic_token::token::ID,
-        solana_sdk_ids::bpf_loader::ID,
-        include_bytes!("programs/spl_token-3.5.0.so"),
+        solana_sdk_ids::bpf_loader_upgradeable::ID,
+        include_bytes!("programs/spl_p_token-1.0.0-rc.1.so"),
     ),
     (
         spl_generic_token::token_2022::ID,
         solana_sdk_ids::bpf_loader_upgradeable::ID,
-        include_bytes!("programs/spl_token_2022-8.0.0.so"),
+        include_bytes!("programs/spl_token_2022-10.0.0.so"),
     ),
     (
         spl_memo_1_0::ID,
@@ -75,7 +67,7 @@ static CORE_BPF_PROGRAMS: &[(Pubkey, Option<Pubkey>, &[u8])] = &[
     (
         solana_sdk_ids::stake::ID,
         None,
-        include_bytes!("programs/core_bpf_stake-1.0.1.so"),
+        include_bytes!("programs/core_bpf_stake-4.0.0.so"),
     ),
     // Add more programs here post-migration...
 ];

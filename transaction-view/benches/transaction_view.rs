@@ -1,22 +1,23 @@
 use {
     agave_transaction_view::transaction_view::TransactionView,
     criterion::{
-        black_box, criterion_group, criterion_main, measurement::Measurement, BenchmarkGroup,
-        Criterion, Throughput,
+        BenchmarkGroup, Criterion, Throughput, criterion_group, criterion_main,
+        measurement::Measurement,
     },
     solana_hash::Hash,
     solana_instruction::Instruction,
     solana_keypair::Keypair,
     solana_message::{
-        v0::{self, MessageAddressTableLookup},
         Message, MessageHeader, VersionedMessage,
+        v0::{self, MessageAddressTableLookup},
     },
     solana_pubkey::Pubkey,
     solana_signer::Signer,
     solana_system_interface::instruction as system_instruction,
     solana_transaction::versioned::{
-        sanitized::SanitizedVersionedTransaction, VersionedTransaction,
+        VersionedTransaction, sanitized::SanitizedVersionedTransaction,
     },
+    std::hint::black_box,
 };
 
 const NUM_TRANSACTIONS: usize = 1024;
@@ -24,7 +25,7 @@ const NUM_TRANSACTIONS: usize = 1024;
 fn serialize_transactions(transactions: Vec<VersionedTransaction>) -> Vec<Vec<u8>> {
     transactions
         .into_iter()
-        .map(|transaction| bincode::serialize(&transaction).unwrap())
+        .map(|transaction| wincode::serialize(&transaction).unwrap())
         .collect()
 }
 
@@ -36,7 +37,7 @@ fn bench_transactions_parsing(
     group.bench_function("VersionedTransaction", |c| {
         c.iter(|| {
             for bytes in serialized_transactions.iter() {
-                let _ = bincode::deserialize::<VersionedTransaction>(black_box(bytes)).unwrap();
+                let _ = wincode::deserialize::<VersionedTransaction>(black_box(bytes)).unwrap();
             }
         });
     });
@@ -45,7 +46,7 @@ fn bench_transactions_parsing(
     group.bench_function("SanitizedVersionedTransaction", |c| {
         c.iter(|| {
             for bytes in serialized_transactions.iter() {
-                let tx = bincode::deserialize::<VersionedTransaction>(black_box(bytes)).unwrap();
+                let tx = wincode::deserialize::<VersionedTransaction>(black_box(bytes)).unwrap();
                 let _ = SanitizedVersionedTransaction::try_new(tx).unwrap();
             }
         });

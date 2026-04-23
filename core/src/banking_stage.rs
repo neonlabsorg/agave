@@ -1,13 +1,10 @@
 //! The `banking_stage` processes Transaction messages. It is intended to be used
 //! to construct a software pipeline.
 
-#[cfg(feature = "dev-context-only-utils")]
-use qualifier_attr::qualifiers;
 use {
     self::{
         committer::Committer, consumer::Consumer, decision_maker::DecisionMaker,
-        qos_service::QosService, vote_packet_receiver::VotePacketReceiver,
-        vote_storage::VoteStorage,
+        vote_packet_receiver::VotePacketReceiver, vote_storage::VoteStorage,
     },
     crate::{
         banking_stage::{
@@ -15,7 +12,7 @@ use {
             transaction_scheduler::{
                 prio_graph_scheduler::PrioGraphScheduler,
                 scheduler_controller::{
-                    SchedulerConfig, SchedulerController, DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS,
+                    DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS, SchedulerConfig, SchedulerController,
                 },
                 scheduler_error::SchedulerError,
             },
@@ -23,8 +20,8 @@ use {
         validator::BlockProductionMethod,
     },
     agave_banking_stage_ingress_types::BankingPacketReceiver,
-    crossbeam_channel::{unbounded, Receiver, Sender},
-    futures::{stream::FuturesUnordered, StreamExt},
+    crossbeam_channel::{Receiver, Sender, unbounded},
+    futures::{StreamExt, stream::FuturesUnordered},
     histogram::Histogram,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfoQuery},
     solana_ledger::blockstore_processor::TransactionStatusSender,
@@ -41,11 +38,11 @@ use {
     solana_time_utils::AtomicInterval,
     solana_unified_scheduler_logic::SchedulingMode,
     std::{
-        num::{NonZeroU64, NonZeroUsize, Saturating},
+        num::{NonZeroU64, NonZeroUsize},
         ops::Deref,
         sync::{
-            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             Arc, RwLock,
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
         thread::{self, Builder, JoinHandle},
         time::Duration,
@@ -60,37 +57,21 @@ use {
     vote_worker::VoteWorker,
 };
 
-// Below modules are pub to allow use by banking_stage bench
-pub mod committer;
-pub mod consumer;
-pub mod leader_slot_metrics;
-pub mod qos_service;
-pub mod vote_storage;
-
-mod consume_worker;
-mod vote_worker;
-
-#[cfg(feature = "dev-context-only-utils")]
-pub mod decision_maker;
-#[cfg(not(feature = "dev-context-only-utils"))]
-mod decision_maker;
-
-mod latest_validator_vote_packet;
-mod leader_slot_timing_metrics;
-mod read_write_account_set;
-mod vote_packet_receiver;
-
-#[cfg(feature = "dev-context-only-utils")]
-pub mod scheduler_messages;
-#[cfg(not(feature = "dev-context-only-utils"))]
-mod scheduler_messages;
-
 pub mod transaction_scheduler;
 
-#[cfg(feature = "dev-context-only-utils")]
-pub mod unified_scheduler;
-#[cfg(not(feature = "dev-context-only-utils"))]
-pub(crate) mod unified_scheduler;
+mod committer;
+mod consume_worker;
+mod consumer;
+mod decision_maker;
+mod latest_validator_vote_packet;
+mod leader_slot_metrics;
+mod leader_slot_timing_metrics;
+mod qos_service;
+mod read_write_account_set;
+mod scheduler_messages;
+mod vote_packet_receiver;
+mod vote_storage;
+mod vote_worker;
 
 #[cfg(unix)]
 mod progress_tracker;
@@ -103,7 +84,6 @@ mod tpu_to_pack;
 const MAX_NUM_WORKERS: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 const DEFAULT_NUM_WORKERS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
-#[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 const TOTAL_BUFFERED_PACKETS: usize = 100_000;
 const SLOT_BOUNDARY_CHECK_PERIOD: Duration = Duration::from_millis(10);
 
@@ -329,30 +309,6 @@ impl BankingStageStats {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct BatchedTransactionDetails {
-    pub costs: BatchedTransactionCostDetails,
-    pub errors: BatchedTransactionErrorDetails,
-}
-
-#[derive(Debug, Default)]
-pub struct BatchedTransactionCostDetails {
-    pub batched_signature_cost: Saturating<u64>,
-    pub batched_write_lock_cost: Saturating<u64>,
-    pub batched_data_bytes_cost: Saturating<u64>,
-    pub batched_loaded_accounts_data_size_cost: Saturating<u64>,
-    pub batched_programs_execute_cost: Saturating<u64>,
-}
-
-#[derive(Debug, Default)]
-pub struct BatchedTransactionErrorDetails {
-    pub batched_retried_txs_per_block_limit_count: Saturating<u64>,
-    pub batched_retried_txs_per_vote_limit_count: Saturating<u64>,
-    pub batched_retried_txs_per_account_limit_count: Saturating<u64>,
-    pub batched_retried_txs_per_account_data_block_limit_count: Saturating<u64>,
-    pub batched_dropped_txs_per_account_data_total_limit_count: Saturating<u64>,
-}
-
 pub trait LikeClusterInfo: Send + Sync + 'static + Clone {
     fn id(&self) -> Pubkey;
 
@@ -520,7 +476,6 @@ impl BankingStage {
                 BlockProductionMethod::CentralSchedulerGreedy => {
                     self.spawn_internal_central(true, num_workers, config)
                 }
-                BlockProductionMethod::UnifiedScheduler => self.spawn_internal_unified(),
             },
             #[cfg(unix)]
             BankingControlMsg::External { session } => self.spawn_external(session),
@@ -543,9 +498,6 @@ impl BankingStage {
         scheduler_config: SchedulerConfig,
     ) -> Result<Vec<JoinHandle<()>>, ()> {
         info!("Spawning internal central scheduler");
-        // Toggling unified scheduler into the disabled state should always be a safe and idempotent
-        // operation.
-        assert!(self.toggle_internal_unified(false));
 
         assert!(num_workers <= BankingStage::max_num_workers());
         let num_workers = num_workers.get();
@@ -553,9 +505,10 @@ impl BankingStage {
         let exit = self.worker_exit_signal.clone();
 
         // Setup receive & buffer.
+        let sharable_banks = self.bank_forks.read().unwrap().sharable_banks();
         let receive_and_buffer = TransactionViewReceiveAndBuffer {
             receiver: self.non_vote_receiver.clone(),
-            sharable_banks: self.bank_forks.read().unwrap().sharable_banks(),
+            sharable_banks: sharable_banks.clone(),
         };
 
         // Spawn vote worker.
@@ -579,7 +532,6 @@ impl BankingStage {
                 Consumer::new(
                     self.committer.clone(),
                     self.transaction_recorder.clone(),
-                    QosService::new(id),
                     self.log_messages_bytes_limit,
                 ),
                 finished_work_sender.clone(),
@@ -605,24 +557,33 @@ impl BankingStage {
         macro_rules! spawn_scheduler {
             ($scheduler:ident) => {
                 let exit = exit.clone();
-                let bank_forks = self.bank_forks.clone();
+                let shutdown_signal = self.banking_shutdown_signal.clone();
                 threads.push(
                     Builder::new()
                         .name("solBnkTxSched".to_string())
                         .spawn(move || {
-                            let scheduler_controller = SchedulerController::new(
+                            let mut scheduler_controller = SchedulerController::new(
                                 exit,
                                 scheduler_config,
                                 decision_maker,
                                 receive_and_buffer,
-                                bank_forks,
+                                sharable_banks,
                                 $scheduler,
                                 worker_metrics,
                             );
 
                             match scheduler_controller.run() {
-                                Ok(_) => {}
-                                Err(SchedulerError::DisconnectedRecvChannel(_)) => {}
+                                Ok(_) => info!("Scheduler exiting without error"),
+                                Err(SchedulerError::DisconnectedRecvChannel(_)) => {
+                                    info!("Upstream disconnected, shutting down banking");
+
+                                    // NB: We must signal shutdown before dropping the scheduler
+                                    //     controller, else, the workers may exit with an error and
+                                    //     trigger a new spawn before we have a chance to issue the
+                                    //     cancel.
+                                    shutdown_signal.cancel();
+                                    drop(scheduler_controller);
+                                }
                                 Err(SchedulerError::DisconnectedSendChannel(_)) => {
                                     warn!("Unexpected worker disconnect from scheduler")
                                 }
@@ -653,24 +614,6 @@ impl BankingStage {
         Ok(threads)
     }
 
-    fn spawn_internal_unified(&self) -> Result<Vec<JoinHandle<()>>, ()> {
-        info!("Spawning internal unified scheduler");
-        if self.toggle_internal_unified(true) {
-            // All unified scheduler threads are managed by itself. So, return none here.
-            Ok(vec![])
-        } else {
-            error!("Spawning unified scheduler failed");
-            Err(())
-        }
-    }
-
-    fn toggle_internal_unified(&self, enable: bool) -> bool {
-        self.bank_forks
-            .read()
-            .unwrap()
-            .toggle_unified_scheduler_block_production_mode(enable)
-    }
-
     fn spawn_vote_worker(&self) -> JoinHandle<()> {
         let vote_storage = VoteStorage::new(&self.bank_forks.read().unwrap().working_bank());
         let tpu_receiver = VotePacketReceiver::new(self.tpu_vote_receiver.clone());
@@ -678,18 +621,19 @@ impl BankingStage {
         let consumer = Consumer::new(
             self.committer.clone(),
             self.transaction_recorder.clone(),
-            QosService::new(0),
             self.log_messages_bytes_limit,
         );
         let decision_maker = DecisionMaker::from(self.poh_recorder.read().unwrap().deref());
 
         let worker_exit_signal = self.worker_exit_signal.clone();
+        let shutdown_signal = self.banking_shutdown_signal.clone();
         let bank_forks = self.bank_forks.clone();
         Builder::new()
             .name("solBanknStgVote".to_string())
             .spawn(move || {
                 VoteWorker::new(
                     worker_exit_signal,
+                    shutdown_signal,
                     decision_maker,
                     tpu_receiver,
                     gossip_receiver,
@@ -720,10 +664,7 @@ mod external {
     use {
         super::*,
         crate::banking_stage::consume_worker::external::ExternalWorker,
-        agave_scheduling_utils::handshake::{
-            logon_flags,
-            server::{AgaveSession, AgaveWorkerSession},
-        },
+        agave_scheduling_utils::handshake::{AgaveSession, AgaveWorkerSession},
         tpu_to_pack::BankingPacketReceivers,
     };
 
@@ -731,16 +672,13 @@ mod external {
         pub(super) fn spawn_external(
             &self,
             AgaveSession {
-                flags,
+                flags: _,
                 tpu_to_pack,
                 progress_tracker,
                 workers,
             }: AgaveSession,
         ) -> Result<Vec<JoinHandle<()>>, ()> {
             info!("Spawning external scheduler");
-            // Toggling unified scheduler into the disabled state should always be a safe and
-            // idempotent operation.
-            assert!(self.toggle_internal_unified(false));
 
             static_assertions::const_assert!(
                 agave_scheduling_utils::handshake::MAX_WORKERS
@@ -748,25 +686,8 @@ mod external {
             );
             assert!(workers.len() <= BankingStage::max_num_workers().get());
 
-            // Potentially spawn vote worker.
-            let mut threads = Vec::with_capacity(workers.len() + 3);
-            let tpu_to_pack_receivers = if flags & logon_flags::REROUTE_VOTES != 0 {
-                BankingPacketReceivers {
-                    non_vote_receiver: self.non_vote_receiver.clone(),
-                    gossip_vote_receiver: Some(self.gossip_vote_receiver.clone()),
-                    tpu_vote_receiver: Some(self.tpu_vote_receiver.clone()),
-                }
-            } else {
-                threads.push(self.spawn_vote_worker());
-
-                BankingPacketReceivers {
-                    non_vote_receiver: self.non_vote_receiver.clone(),
-                    gossip_vote_receiver: None,
-                    tpu_vote_receiver: None,
-                }
-            };
-
             // Spawn the external consumer workers.
+            let mut threads = Vec::with_capacity(workers.len() + 2);
             let mut worker_metrics = Vec::with_capacity(workers.len());
             for (
                 index,
@@ -784,7 +705,6 @@ mod external {
                     Consumer::new(
                         self.committer.clone(),
                         self.transaction_recorder.clone(),
-                        QosService::new(id),
                         self.log_messages_bytes_limit,
                     ),
                     worker_to_pack,
@@ -807,8 +727,14 @@ mod external {
             }
 
             // Spawn tpu to pack.
+            let tpu_to_pack_receivers = BankingPacketReceivers {
+                non_vote_receiver: self.non_vote_receiver.clone(),
+                gossip_vote_receiver: Some(self.gossip_vote_receiver.clone()),
+                tpu_vote_receiver: Some(self.tpu_vote_receiver.clone()),
+            };
             threads.push(tpu_to_pack::spawn(
                 self.worker_exit_signal.clone(),
+                self.banking_shutdown_signal.clone(),
                 tpu_to_pack_receivers,
                 tpu_to_pack,
             ));
@@ -852,11 +778,10 @@ pub enum BankingControlMsg {
     },
     #[cfg(unix)]
     External {
-        session: agave_scheduling_utils::handshake::server::AgaveSession,
+        session: agave_scheduling_utils::handshake::AgaveSession,
     },
 }
 
-#[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 pub(crate) fn update_bank_forks_and_poh_recorder_for_new_tpu_bank(
     bank_forks: &RwLock<BankForks>,
     poh_controller: &mut PohController,
@@ -867,18 +792,10 @@ pub(crate) fn update_bank_forks_and_poh_recorder_for_new_tpu_bank(
         .unwrap()
         .insert_with_scheduling_mode(SchedulingMode::BlockProduction, tpu_bank);
     let tpu_bank_for_poh = tpu_bank.clone_with_scheduler();
-    let set_bank_res = if tpu_bank.has_installed_active_bp_scheduler() {
-        // Waiting here is needed because unified scheduler assumes bank exists in poh immediately
-        // after calling unpause_new_block_production_scheduler(). Otherwise, it wrongly thinks poh
-        // reached to the max tick height.
-        poh_controller.set_bank_sync(tpu_bank_for_poh)
-    } else {
-        poh_controller.set_bank(tpu_bank_for_poh)
-    };
+    let set_bank_res = poh_controller.set_bank(tpu_bank_for_poh);
     if set_bank_res.is_err() {
         warn!("Failed to set poh bank, poh service is disconnected");
     }
-    tpu_bank.unpause_new_block_production_scheduler();
 }
 
 #[derive(Debug)]
@@ -927,29 +844,31 @@ mod tests {
         agave_banking_stage_ingress_types::BankingPacketBatch,
         crossbeam_channel::unbounded,
         itertools::Itertools,
-        solana_entry::entry::{self, EntrySlice},
+        solana_entry::{
+            entry::{self, EntrySlice},
+            entry_or_marker::EntryOrMarker,
+        },
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_ledger::{
             blockstore::Blockstore,
             genesis_utils::{
-                create_genesis_config, create_genesis_config_with_leader, GenesisConfigInfo,
+                GenesisConfigInfo, create_genesis_config, create_genesis_config_with_leader,
             },
             get_tmp_ledger_path_auto_delete,
         },
         solana_perf::packet::to_packet_batches,
         solana_poh::{
-            poh_recorder::{create_test_recorder, PohRecorderError},
+            poh_recorder::{PohRecorderError, create_test_recorder},
             record_channels::record_channels,
             transaction_recorder::RecordTransactionsSummary,
         },
-        solana_poh_config::PohConfig,
         solana_pubkey::Pubkey,
         solana_runtime::{bank::Bank, genesis_utils::bootstrap_validator_stake_lamports},
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_signer::Signer,
         solana_system_transaction as system_transaction,
-        solana_transaction::{sanitized::SanitizedTransaction, Transaction},
+        solana_transaction::{Transaction, sanitized::SanitizedTransaction},
         solana_vote::vote_transaction::new_tower_sync_transaction,
         solana_vote_program::vote_state::TowerSync,
         std::{sync::atomic::Ordering, thread::sleep, time::Instant},
@@ -966,7 +885,7 @@ mod tests {
     #[test]
     fn test_banking_stage_shutdown1() {
         let genesis_config = create_genesis_config(2).genesis_config;
-        let (bank, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         let banking_tracer = BankingTracer::new_disabled();
         let Channels {
             non_vote_sender,
@@ -993,71 +912,7 @@ mod tests {
 
         let banking_stage = BankingStage::new_num_threads(
             BlockProductionMethod::CentralScheduler,
-            poh_recorder.clone(),
-            transaction_recorder,
-            non_vote_receiver,
-            tpu_vote_receiver,
-            gossip_vote_receiver,
-            mpsc::channel(1).1,
-            DEFAULT_NUM_WORKERS,
-            SchedulerConfig {
-                scheduler_pacing: SchedulerPacing::Disabled,
-            },
-            None,
-            replay_vote_sender,
-            None,
-            bank_forks,
-            None,
-        );
-        drop(non_vote_sender);
-        drop(tpu_vote_sender);
-        drop(gossip_vote_sender);
-        exit.store(true, Ordering::Relaxed);
-        banking_stage.join().unwrap();
-        poh_service.join().unwrap();
-    }
-
-    #[test]
-    fn test_banking_stage_tick() {
-        agave_logger::setup();
-        let GenesisConfigInfo {
-            mut genesis_config, ..
-        } = create_genesis_config(2);
-        genesis_config.ticks_per_slot = 4;
-        let num_extra_ticks = 2;
-        let (bank, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
-        let start_hash = bank.last_blockhash();
-        let banking_tracer = BankingTracer::new_disabled();
-        let Channels {
-            non_vote_sender,
-            non_vote_receiver,
-            tpu_vote_sender,
-            tpu_vote_receiver,
-            gossip_vote_sender,
-            gossip_vote_receiver,
-        } = banking_tracer.create_channels();
-        let ledger_path = get_tmp_ledger_path_auto_delete!();
-        let blockstore = Arc::new(
-            Blockstore::open(ledger_path.path())
-                .expect("Expected to be able to open database ledger"),
-        );
-        let poh_config = PohConfig {
-            target_tick_count: Some(bank.max_tick_height() + num_extra_ticks),
-            ..PohConfig::default()
-        };
-        let (
-            exit,
             poh_recorder,
-            _poh_controller,
-            transaction_recorder,
-            poh_service,
-            entry_receiver,
-        ) = create_test_recorder(bank.clone(), blockstore, Some(poh_config), None);
-        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
-
-        let banking_stage = BankingStage::new_num_threads(
-            BlockProductionMethod::CentralScheduler,
-            poh_recorder.clone(),
             transaction_recorder,
             non_vote_receiver,
             tpu_vote_receiver,
@@ -1073,26 +928,12 @@ mod tests {
             bank_forks,
             None,
         );
-        trace!("sending bank");
         drop(non_vote_sender);
         drop(tpu_vote_sender);
         drop(gossip_vote_sender);
         exit.store(true, Ordering::Relaxed);
-        poh_service.join().unwrap();
-        drop(poh_recorder);
         banking_stage.join().unwrap();
-
-        trace!("getting entries");
-        let entries: Vec<_> = entry_receiver
-            .iter()
-            .map(|(_bank, (entry, _tick_height))| entry)
-            .collect();
-        trace!("done");
-        assert_eq!(entries.len(), genesis_config.ticks_per_slot as usize);
-        assert!(entries
-            .verify(&start_hash, &entry::thread_pool_for_tests())
-            .status());
-        assert_eq!(entries[entries.len() - 1].hash, bank.last_blockhash());
+        poh_service.join().unwrap();
     }
 
     #[test]
@@ -1103,7 +944,7 @@ mod tests {
             mint_keypair,
             ..
         } = create_slow_genesis_config(10);
-        let (bank, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         let start_hash = bank.last_blockhash();
         let banking_tracer = BankingTracer::new_disabled();
         let Channels {
@@ -1126,7 +967,7 @@ mod tests {
             transaction_recorder,
             poh_service,
             entry_receiver,
-        ) = create_test_recorder(bank.clone(), blockstore, None, None);
+        ) = create_test_recorder(bank, blockstore, None, None);
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
 
         let banking_stage = BankingStage::new_num_threads(
@@ -1144,7 +985,7 @@ mod tests {
             None,
             replay_vote_sender,
             None,
-            bank_forks.clone(), // keep a local-copy of bank-forks so worker threads do not lose weak access to bank-forks
+            bank_forks, // keep a local-copy of bank-forks so worker threads do not lose weak access to bank-forks
             None,
         );
 
@@ -1179,7 +1020,7 @@ mod tests {
         // capture the entry receiver until we've received all our entries.
         let mut entries = Vec::with_capacity(100);
         loop {
-            if let Ok((_bank, (entry, _))) = entry_receiver.try_recv() {
+            if let Ok((_bank, (EntryOrMarker::Entry(entry), _))) = entry_receiver.try_recv() {
                 let tx_entry = !entry.transactions.is_empty();
                 entries.push(entry);
                 if tx_entry {
@@ -1199,19 +1040,21 @@ mod tests {
         drop(poh_recorder);
 
         let blockhash = start_hash;
-        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
 
         // receive entries + ticks. The sender has been dropped, so there
         // are no more entries that will ever come in after the `iter` here.
         entries.extend(
             entry_receiver
                 .iter()
-                .map(|(_bank, (entry, _tick_height))| entry),
+                .map(|(_bank, (entry_or_marker, _tick_height))| entry_or_marker.unwrap_entry()),
         );
 
-        assert!(entries
-            .verify(&blockhash, &entry::thread_pool_for_tests())
-            .status());
+        assert!(
+            entries
+                .verify(&blockhash, &entry::thread_pool_for_tests())
+                .status()
+        );
         for entry in entries {
             bank.process_entry_transactions(entry.transactions)
                 .iter()
@@ -1272,7 +1115,7 @@ mod tests {
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let entry_receiver = {
             // start a banking_stage to eat verified receiver
-            let (bank, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+            let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
             let (
                 exit,
                 poh_recorder,
@@ -1283,7 +1126,7 @@ mod tests {
             ) = create_test_recorder(bank.clone(), blockstore, None, None);
             let banking_stage = BankingStage::new_num_threads(
                 BlockProductionMethod::CentralScheduler,
-                poh_recorder.clone(),
+                poh_recorder,
                 transaction_recorder,
                 non_vote_receiver,
                 tpu_vote_receiver,
@@ -1322,10 +1165,10 @@ mod tests {
         // check that the balance is what we expect.
         let entries: Vec<_> = entry_receiver
             .iter()
-            .map(|(_bank, (entry, _tick_height))| entry)
+            .map(|(_bank, (entry_or_marker, _tick_height))| entry_or_marker.unwrap_entry())
             .collect();
 
-        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         for entry in entries {
             let _ = bank
                 .try_process_entry_transactions(entry.transactions)
@@ -1347,7 +1190,7 @@ mod tests {
             mint_keypair,
             ..
         } = create_genesis_config(10_000);
-        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
 
         let (record_sender, mut record_receiver) = record_channels(false);
         let recorder = TransactionRecorder::new(record_sender);
@@ -1408,7 +1251,7 @@ mod tests {
             mint_keypair,
             ..
         } = create_slow_genesis_config(10000);
-        let (bank, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
         let start_hash = bank.last_blockhash();
         let banking_tracer = BankingTracer::new_disabled();
         let Channels {
@@ -1436,7 +1279,7 @@ mod tests {
 
         let banking_stage = BankingStage::new_num_threads(
             BlockProductionMethod::CentralScheduler,
-            poh_recorder.clone(),
+            poh_recorder,
             transaction_recorder,
             non_vote_receiver,
             tpu_vote_receiver,

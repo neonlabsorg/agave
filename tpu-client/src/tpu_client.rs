@@ -12,7 +12,7 @@ use {
     },
     solana_rpc_client::rpc_client::RpcClient,
     solana_signature::Signature,
-    solana_transaction::{versioned::VersionedTransaction, Transaction},
+    solana_transaction::{Transaction, versioned::VersionedTransaction},
     solana_transaction_error::{TransportError, TransportResult},
     std::{
         collections::VecDeque,
@@ -25,7 +25,6 @@ use {
     solana_transaction_error::TransactionError, tokio::time::Duration,
 };
 
-pub const DEFAULT_TPU_ENABLE_UDP: bool = false;
 pub const DEFAULT_VOTE_USE_QUIC: bool = false;
 
 /// The default connection count is set to 1 -- it should
@@ -95,7 +94,7 @@ where
     /// Serialize and send transaction to the current and upcoming leader TPUs according to fanout
     /// size
     /// Returns the last error if all sends fail
-    pub fn try_send_transaction(&self, transaction: &Transaction) -> TransportResult<()> {
+    pub fn try_send_transaction(&self, transaction: &VersionedTransaction) -> TransportResult<()> {
         self.invoke(self.tpu_client.try_send_transaction(transaction))
     }
 
@@ -109,7 +108,7 @@ where
         transaction: &Transaction,
     ) -> TransportResult<()> {
         let wire_transaction =
-            Arc::new(bincode::serialize(&transaction).expect("should serialize transaction"));
+            Arc::new(wincode::serialize(&transaction).expect("should serialize transaction"));
 
         let leaders = self
             .tpu_client
@@ -140,10 +139,13 @@ where
     /// Serialize and send a batch of transactions to the current and upcoming leader TPUs according
     /// to fanout size
     /// Returns the last error if all sends fail
-    pub fn try_send_transaction_batch(&self, transactions: &[Transaction]) -> TransportResult<()> {
+    pub fn try_send_transaction_batch(
+        &self,
+        transactions: &[VersionedTransaction],
+    ) -> TransportResult<()> {
         let wire_transactions = transactions
             .into_par_iter()
-            .map(|tx| bincode::serialize(&tx).expect("serialize Transaction in send_batch"))
+            .map(|tx| wincode::serialize(&tx).expect("serialize Transaction in send_batch"))
             .collect::<Vec<_>>();
         self.invoke(
             self.tpu_client
@@ -250,7 +252,7 @@ where
         transaction: VersionedTransaction,
     ) -> TransportResult<Signature> {
         let wire_transaction =
-            bincode::serialize(&transaction).expect("serialize Transaction in send_batch");
+            wincode::serialize(&transaction).expect("serialize Transaction in send_batch");
         self.send_wire_transaction(wire_transaction);
         Ok(transaction.signatures[0])
     }
@@ -261,7 +263,7 @@ where
     ) -> TransportResult<()> {
         let buffers = batch
             .into_par_iter()
-            .map(|tx| bincode::serialize(&tx).expect("serialize Transaction in send_batch"))
+            .map(|tx| wincode::serialize(&tx).expect("serialize Transaction in send_batch"))
             .collect::<Vec<_>>();
         self.try_send_wire_transaction_batch(buffers)?;
         Ok(())

@@ -11,8 +11,8 @@ use {
     solana_system_interface::error::SystemError,
     solana_sysvar::rent::Rent,
     solana_transaction_context::{
-        instruction::InstructionContext, instruction_accounts::BorrowedInstructionAccount,
-        IndexOfAccount,
+        IndexOfAccount, instruction::InstructionContext,
+        instruction_accounts::BorrowedInstructionAccount,
     },
     std::collections::HashSet,
 };
@@ -96,8 +96,20 @@ pub(crate) fn withdraw_nonce_account(
         return Err(InstructionError::InvalidArgument);
     }
 
+    let check_signer = |signer: &Pubkey| {
+        if !signers.contains(signer) {
+            ic_msg!(
+                invoke_context,
+                "Withdraw nonce account: Account {} must sign",
+                signer
+            );
+            return Err(InstructionError::MissingRequiredSignature);
+        }
+        Ok(())
+    };
+
     let state: Versions = from.get_state()?;
-    let signer = match state.state() {
+    match state.state() {
         State::Uninitialized => {
             if lamports > from.get_lamports() {
                 ic_msg!(
@@ -108,7 +120,7 @@ pub(crate) fn withdraw_nonce_account(
                 );
                 return Err(InstructionError::InsufficientFunds);
             }
-            *from.get_key()
+            check_signer(from.get_key())?;
         }
         State::Initialized(data) => {
             if lamports == from.get_lamports() {
@@ -121,6 +133,7 @@ pub(crate) fn withdraw_nonce_account(
                     );
                     return Err(SystemError::NonceBlockhashNotExpired.into());
                 }
+                check_signer(&data.authority)?;
                 from.set_state(&Versions::new(State::Uninitialized))?;
             } else {
                 let min_balance = rent.minimum_balance(from.get_data().len());
@@ -134,19 +147,10 @@ pub(crate) fn withdraw_nonce_account(
                     );
                     return Err(InstructionError::InsufficientFunds);
                 }
+                check_signer(&data.authority)?;
             }
-            data.authority
         }
     };
-
-    if !signers.contains(&signer) {
-        ic_msg!(
-            invoke_context,
-            "Withdraw nonce account: Account {} must sign",
-            signer
-        );
-        return Err(InstructionError::MissingRequiredSignature);
-    }
 
     from.checked_sub_lamports(lamports)?;
     drop(from);
@@ -265,7 +269,7 @@ mod test {
         ($invoke_context:expr, $instruction_context:ident, $instruction_accounts:ident) => {
             $invoke_context
                 .transaction_context
-                .configure_next_instruction_for_tests(2, $instruction_accounts, vec![])
+                .configure_top_level_instruction_for_tests(2, $instruction_accounts, vec![])
                 .unwrap();
             $invoke_context.push().unwrap();
             let transaction_context = &$invoke_context.transaction_context;
@@ -278,7 +282,7 @@ mod test {
     macro_rules! prepare_mockup {
         ($invoke_context:ident, $instruction_accounts:ident, $rent:ident, $transaction_context:ident) => {
             let $rent = Rent {
-                lamports_per_byte_year: 42,
+                lamports_per_byte: 42,
                 ..Rent::default()
             };
             let from_lamports = $rent.minimum_balance(State::size()) + 42;

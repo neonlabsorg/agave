@@ -1,13 +1,16 @@
 use {
     super::{
+        DiskIndexValue, IndexValue, SlotListItem,
         bucket_map_holder::{Age, AtomicAge, BucketMapHolder},
         in_mem_accounts_index::InMemAccountsIndex,
-        DiskIndexValue, IndexValue, SlotListItem,
     },
     solana_time_utils::AtomicInterval,
     std::{
         fmt::Debug,
-        sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        },
     },
 };
 
@@ -49,8 +52,10 @@ pub struct Stats {
     pub bg_throttling_wait_us: AtomicU64,
     pub count_in_mem: AtomicUsize,
     pub capacity_in_mem: AtomicUsize,
-    pub flush_entries_updated_on_disk: AtomicU64,
-    pub flush_entries_evicted_from_mem: AtomicU64,
+    pub flush_entries_updated_on_disk_immediate: AtomicU64,
+    pub flush_entries_updated_on_disk_background: AtomicU64,
+    pub flush_entries_evicted_from_mem_immediate: AtomicU64,
+    pub flush_entries_evicted_from_mem_background: AtomicU64,
     pub active_threads: AtomicU64,
     last_age: AtomicAge,
     last_ages_flushed: AtomicU64,
@@ -135,13 +140,13 @@ impl Stats {
             age_now += Age::MAX as u64 + 1;
         }
         let age_delta = age_now.saturating_sub(last_age);
-        if age_delta > 0 {
-            return elapsed_ms / age_delta;
+        if let Some(v) = elapsed_ms.checked_div(age_delta) {
+            return v;
         } else {
             // did not advance an age, but probably did partial work, so report that
             let bin_delta = ages_flushed.saturating_sub(last_ages_flushed);
-            if bin_delta > 0 {
-                return elapsed_ms * self.bins / bin_delta;
+            if let Some(v) = (elapsed_ms * self.bins).checked_div(bin_delta) {
+                return v;
             }
         }
         0 // avoid crazy numbers
@@ -179,23 +184,10 @@ impl Stats {
         self.count.load(Ordering::Relaxed)
     }
 
-    /// This is an estimate of the # of items in mem that are awaiting flushing to disk.
-    /// returns (# items in mem) - (# items we intend to hold in mem for performance heuristics)
-    /// The result is also an estimate because 'held_in_mem' is based on a stat that is swapped out when stats are reported.
-    pub fn get_remaining_items_to_flush_estimate(&self) -> usize {
-        let in_mem = self.count_in_mem.load(Ordering::Relaxed) as u64;
-        // Note, `held_in_mem.clean` is purposely not included in this
-        // summation because clean items do not need to be flushed.
-        let held_in_mem = self.held_in_mem.slot_list_cached.load(Ordering::Relaxed)
-            + self.held_in_mem.slot_list_len.load(Ordering::Relaxed)
-            + self.held_in_mem.ref_count.load(Ordering::Relaxed)
-            + self.held_in_mem.age.load(Ordering::Relaxed);
-        in_mem.saturating_sub(held_in_mem) as usize
-    }
-
     pub fn report_stats<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>>(
         &self,
         storage: &BucketMapHolder<T, U>,
+        in_mem: &[Arc<InMemAccountsIndex<T, U>>],
     ) {
         let elapsed_ms = self.last_time.elapsed_ms();
         if elapsed_ms < STATS_INTERVAL_MS {
@@ -217,6 +209,8 @@ impl Stats {
             })
             .unwrap_or_default();
         let disk_stats = Self::get_stats(disk_per_bucket_counts);
+        let mem_per_bucket_counts = in_mem.iter().map(|bin| bin.len()).collect();
+        let mem_stats = Self::get_stats(mem_per_bucket_counts);
 
         const US_PER_MS: u64 = 1_000;
 
@@ -228,9 +222,8 @@ impl Stats {
         let capacity_in_mem = self.capacity_in_mem.load(Ordering::Relaxed);
 
         // sum of elapsed time in each thread
-        let mut thread_time_elapsed_ms = elapsed_ms * storage.threads as u64;
+        let thread_time_elapsed_ms = elapsed_ms * storage.threads as u64;
         let datapoint_name = if startup || was_startup {
-            thread_time_elapsed_ms *= 2; // more threads are allocated during startup
             "accounts_index_startup"
         } else {
             "accounts_index"
@@ -332,6 +325,10 @@ impl Stats {
                 ("max_in_bin_disk", disk_stats.1, i64),
                 ("count_from_bins_disk", disk_stats.2, i64),
                 ("median_from_bins_disk", disk_stats.3, i64),
+                ("min_in_bin_mem", mem_stats.0, i64),
+                ("max_in_bin_mem", mem_stats.1, i64),
+                ("count_from_bins_mem", mem_stats.2, i64),
+                ("median_from_bins_mem", mem_stats.3, i64),
                 (
                     "gets_from_mem",
                     self.gets_from_mem.swap(0, Ordering::Relaxed),
@@ -478,30 +475,8 @@ impl Stats {
                     i64
                 ),
                 (
-                    "disk_index_index_file_size",
+                    "disk_index_file_size",
                     disk.map(|disk| disk.stats.index.total_file_size.load(Ordering::Relaxed))
-                        .unwrap_or_default(),
-                    i64
-                ),
-                (
-                    "index_exceptional_entry",
-                    disk.map(|disk| disk
-                        .stats
-                        .index
-                        .index_uses_uncommon_slot_list_len_or_refcount
-                        .load(Ordering::Relaxed))
-                        .unwrap_or_default(),
-                    i64
-                ),
-                (
-                    "disk_index_data_file_size",
-                    disk.map(|disk| disk.stats.data.total_file_size.load(Ordering::Relaxed))
-                        .unwrap_or_default(),
-                    i64
-                ),
-                (
-                    "disk_index_data_file_count",
-                    disk.map(|disk| disk.stats.data.file_count.load(Ordering::Relaxed))
                         .unwrap_or_default(),
                     i64
                 ),
@@ -518,6 +493,28 @@ impl Stats {
                 (
                     "disk_index_flush_mmap_us",
                     disk.map(|disk| disk.stats.index.mmap_us.swap(0, Ordering::Relaxed))
+                        .unwrap_or_default(),
+                    i64
+                ),
+                (
+                    "index_exceptional_entry",
+                    disk.map(|disk| disk
+                        .stats
+                        .index
+                        .index_uses_uncommon_slot_list_len_or_refcount
+                        .load(Ordering::Relaxed))
+                        .unwrap_or_default(),
+                    i64
+                ),
+                (
+                    "disk_data_file_size",
+                    disk.map(|disk| disk.stats.data.total_file_size.load(Ordering::Relaxed))
+                        .unwrap_or_default(),
+                    i64
+                ),
+                (
+                    "disk_data_file_count",
+                    disk.map(|disk| disk.stats.data.file_count.load(Ordering::Relaxed))
                         .unwrap_or_default(),
                     i64
                 ),
@@ -558,14 +555,26 @@ impl Stats {
                     i64
                 ),
                 (
-                    "flush_entries_updated_on_disk",
-                    self.flush_entries_updated_on_disk
+                    "flush_entries_updated_on_disk_immediate",
+                    self.flush_entries_updated_on_disk_immediate
                         .swap(0, Ordering::Relaxed),
                     i64
                 ),
                 (
-                    "flush_entries_evicted_from_mem",
-                    self.flush_entries_evicted_from_mem
+                    "flush_entries_updated_on_disk_background",
+                    self.flush_entries_updated_on_disk_background
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "flush_entries_evicted_from_mem_immediate",
+                    self.flush_entries_evicted_from_mem_immediate
+                        .swap(0, Ordering::Relaxed),
+                    i64
+                ),
+                (
+                    "flush_entries_evicted_from_mem_background",
+                    self.flush_entries_evicted_from_mem_background
                         .swap(0, Ordering::Relaxed),
                     i64
                 ),
@@ -635,6 +644,10 @@ impl Stats {
                 ("inserts", self.inserts.swap(0, Ordering::Relaxed), i64),
                 ("deletes", self.deletes.swap(0, Ordering::Relaxed), i64),
                 ("keys", self.keys.swap(0, Ordering::Relaxed), i64),
+                ("min_in_bin_mem", mem_stats.0, i64),
+                ("max_in_bin_mem", mem_stats.1, i64),
+                ("count_from_bins_mem", mem_stats.2, i64),
+                ("median_from_bins_mem", mem_stats.3, i64),
             );
         }
     }

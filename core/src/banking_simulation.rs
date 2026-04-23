@@ -2,23 +2,24 @@
 use {
     crate::{
         banking_stage::{
+            BankingStage, BankingStageHandle, LikeClusterInfo,
             transaction_scheduler::scheduler_controller::SchedulerConfig,
-            update_bank_forks_and_poh_recorder_for_new_tpu_bank, BankingStage, BankingStageHandle,
-            LikeClusterInfo,
+            update_bank_forks_and_poh_recorder_for_new_tpu_bank,
         },
         banking_trace::{
-            BankingTracer, ChannelLabel, Channels, TimedTracedEvent, TracedEvent, TracedSender,
-            TracerThread, BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT, BASENAME,
+            BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT, BASENAME, BankingTracer, ChannelLabel, Channels,
+            TimedTracedEvent, TracedEvent, TracedSender, TracerThread,
         },
         validator::BlockProductionMethod,
     },
     agave_banking_stage_ingress_types::BankingPacketBatch,
+    agave_votor_messages::migration::MigrationStatus,
     assert_matches::assert_matches,
     bincode::deserialize_from,
-    crossbeam_channel::{unbounded, Sender},
+    crossbeam_channel::{Sender, bounded, unbounded},
     itertools::Itertools,
     log::*,
-    solana_clock::{Slot, DEFAULT_MS_PER_SLOT, HOLD_TRANSACTIONS_SLOT_OFFSET},
+    solana_clock::{DEFAULT_MS_PER_SLOT, HOLD_TRANSACTIONS_SLOT_OFFSET, Slot},
     solana_genesis_config::GenesisConfig,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfoQuery, node::Node},
     solana_keypair::Keypair,
@@ -27,13 +28,13 @@ use {
         leader_schedule_cache::LeaderScheduleCache,
     },
     solana_net_utils::{
-        sockets::{bind_in_range_with_config, SocketConfiguration},
         SocketAddrSpace,
+        sockets::{SocketConfiguration, bind_in_range_with_config},
     },
     solana_poh::{
         poh_controller::PohController,
-        poh_recorder::{PohRecorder, GRACE_TICKS_FACTOR, MAX_GRACE_SLOTS},
-        poh_service::{PohService, DEFAULT_HASHES_PER_BATCH, DEFAULT_PINNED_CPU_CORE},
+        poh_recorder::{GRACE_TICKS_FACTOR, MAX_GRACE_SLOTS, PohRecorder},
+        poh_service::{DEFAULT_HASHES_PER_BATCH, DEFAULT_PINNED_CPU_CORE, PohService},
         record_channels::record_channels,
         transaction_recorder::TransactionRecorder,
     },
@@ -54,10 +55,10 @@ use {
         net::{IpAddr, Ipv4Addr},
         path::PathBuf,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, RwLock,
+            atomic::{AtomicBool, Ordering},
         },
-        thread::{self, sleep, JoinHandle},
+        thread::{self, JoinHandle, sleep},
         time::{Duration, Instant, SystemTime},
     },
     thiserror::Error,
@@ -85,7 +86,7 @@ use {
 /// simulated block's hashes would differ than the recorded ones as block composition difference is
 /// inevitable.
 ///
-/// As in the real environment, for PoH time we use the `PohRecorder`. This is simply a 400ms
+/// As in the real environment, for PoH time we use the `PohRecorder`. This is simply a slot
 /// timer, external to `BankingStage` and thus mostly irrelevant to `BankingStage` performance. For
 /// wall time, we use the first `BankStatus::BlockAndBankHash` and `SystemTime::now()` to define
 /// T=0 for simulation. Then, simulation progress is timed accordingly. For context, this syncing
@@ -271,22 +272,22 @@ impl SimulatorLoopLogger {
 
     fn log_frozen_bank_cost(&self, bank: &Bank, bank_elapsed: Duration) {
         info!(
-            "simulated bank slot+delta: {}+{}ms costs: {:?} fees: {} txs: {} (frozen)",
+            "simulated bank slot+delta: {}+{}ms costs: {:?} fees: {:?} txs: {} (frozen)",
             bank.slot(),
             bank_elapsed.as_millis(),
             Self::bank_costs(bank),
-            bank.collector_fees(),
+            bank.get_collector_fee_details(),
             bank.executed_transaction_count(),
         );
     }
 
     fn log_ongoing_bank_cost(&self, bank: &Bank, bank_elapsed: Duration) {
         info!(
-            "simulated bank slot+delta: {}+{}ms costs: {:?} fees: {} txs: {} (ongoing)",
+            "simulated bank slot+delta: {}+{}ms costs: {:?} fees: {:?} txs: {} (ongoing)",
             bank.slot(),
             bank_elapsed.as_millis(),
             Self::bank_costs(bank),
-            bank.collector_fees(),
+            bank.get_collector_fee_details(),
             bank.executed_transaction_count(),
         );
     }
@@ -479,8 +480,8 @@ impl SimulatorLoop {
                     .leader_schedule_cache
                     .slot_leader_at(new_slot, None)
                     .unwrap();
-                if new_leader != self.simulated_leader {
-                    logger.on_new_leader(&bank, bank_created.elapsed(), new_slot, new_leader);
+                if new_leader.id != self.simulated_leader {
+                    logger.on_new_leader(&bank, bank_created.elapsed(), new_slot, new_leader.id);
                     break;
                 } else if sender_thread.is_finished() {
                     warn!("sender thread existed maybe due to completion of sending traced events");
@@ -488,11 +489,8 @@ impl SimulatorLoop {
                 } else {
                     info!("new leader bank slot: {new_slot}");
                 }
-                let new_bank = Bank::new_from_parent(
-                    bank.clone_without_scheduler(),
-                    &self.simulated_leader,
-                    new_slot,
-                );
+                let new_bank =
+                    Bank::new_from_parent(bank.clone_without_scheduler(), new_leader, new_slot);
                 // make sure parent is frozen for finalized hashes via the above
                 // new()-ing of its child bank
                 self.retracer
@@ -713,7 +711,8 @@ impl BankingSimulator {
 
         let simulated_leader = leader_schedule_cache
             .slot_leader_at(self.first_simulated_slot, None)
-            .unwrap();
+            .unwrap()
+            .id;
         info!(
             "Simulated leader and slot: {}, {}",
             simulated_leader, self.first_simulated_slot,
@@ -729,7 +728,9 @@ impl BankingSimulator {
         {
             info!("purging slots {}, {}", self.first_simulated_slot, end_slot);
             blockstore.purge_from_next_slots(self.first_simulated_slot, end_slot);
-            blockstore.purge_slots(self.first_simulated_slot, end_slot, PurgeType::Exact);
+            blockstore
+                .purge_slots(self.first_simulated_slot, end_slot, PurgeType::Exact)
+                .unwrap();
             info!("done: purging");
         } else {
             info!("skipping purging...");
@@ -754,6 +755,7 @@ impl BankingSimulator {
         let (record_sender, record_receiver) = record_channels(false);
         let transaction_recorder = TransactionRecorder::new(record_sender);
         let (poh_controller, poh_service_message_receiver) = PohController::new();
+        let (record_receiver_sender, _record_receiver_receiver) = bounded(1);
         let poh_service = PohService::new(
             poh_recorder.clone(),
             &genesis_config.poh_config,
@@ -763,6 +765,8 @@ impl BankingSimulator {
             DEFAULT_HASHES_PER_BATCH,
             record_receiver,
             poh_service_message_receiver,
+            Arc::new(MigrationStatus::default()),
+            record_receiver_sender,
         );
 
         // Enable BankingTracer to approximate the real environment as close as possible because
@@ -784,6 +788,8 @@ impl BankingSimulator {
         assert!(retracer.is_enabled());
         info!("Enabled banking retracer (dir_byte_limit: {BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT})",);
 
+        let num_workers = BankingStage::default_num_workers();
+        let banking_tracer_channels = retracer.create_channels();
         let Channels {
             non_vote_sender,
             non_vote_receiver,
@@ -791,15 +797,15 @@ impl BankingSimulator {
             tpu_vote_receiver,
             gossip_vote_sender,
             gossip_vote_receiver,
-        } = retracer.create_channels();
+        } = banking_tracer_channels;
 
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let (retransmit_slots_sender, retransmit_slots_receiver) = unbounded();
+        let (completed_block_sender, _completed_block_receiver) = unbounded();
         let shred_version = compute_shred_version(
             &genesis_config.hash(),
             Some(&bank_forks.read().unwrap().root_bank().hard_forks()),
         );
-        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
 
         // Create a completely-dummy ClusterInfo for the broadcast stage.
         // We only need it to write shreds into the blockstore and it seems given ClusterInfo is
@@ -820,27 +826,27 @@ impl BankingSimulator {
         .expect("should bind");
         let broadcast_stage = BroadcastStageType::Standard.new_broadcast_stage(
             vec![socket],
-            cluster_info_for_broadcast.clone(),
+            cluster_info_for_broadcast,
             entry_receiver,
             retransmit_slots_receiver,
             exit.clone(),
             blockstore.clone(),
             bank_forks.clone(),
             shred_version,
-            sender,
             None,
+            completed_block_sender,
         );
 
         info!("Start banking stage!...");
         let banking_stage = BankingStage::new_num_threads(
-            block_production_method.clone(),
+            block_production_method,
             poh_recorder.clone(),
             transaction_recorder,
             non_vote_receiver,
             tpu_vote_receiver,
             gossip_vote_receiver,
             mpsc::channel(1).1,
-            BankingStage::default_num_workers(),
+            num_workers,
             SchedulerConfig::default(),
             None,
             replay_vote_sender,

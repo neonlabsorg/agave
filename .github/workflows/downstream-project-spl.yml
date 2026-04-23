@@ -14,8 +14,6 @@ on:
       - "rust-toolchain.toml"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "platform-tools-sdk/cargo-build-sbf"
-      - "platform-tools-sdk/cargo-test-sbf"
       - "ci/downstream-projects/run-spl.sh"
       - ".github/workflows/downstream-project-spl.yml"
       - ".github/scripts/downstream-project-spl-common.sh"
@@ -40,7 +38,7 @@ jobs:
   check:
     #if: github.repository == 'anza-xyz/agave'
     if: false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       matrix:
@@ -57,13 +55,13 @@ jobs:
           # re-enable with https://github.com/buffalojoec/mollusk/pull/74
           # - token
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - shell: bash
         run: |
           .github/scripts/purge-ubuntu-runner.sh
 
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad  # v0.0.9
         with:
           version: "v0.10.0"
 
@@ -79,7 +77,7 @@ jobs:
   test_cli:
     #if: github.repository == 'anza-xyz/agave'
     if: false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       matrix:
@@ -87,13 +85,13 @@ jobs:
           - single-pool
           - token-2022
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - shell: bash
         run: |
           .github/scripts/purge-ubuntu-runner.sh
 
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad  # v0.0.9
         with:
           version: "v0.10.0"
 
@@ -110,7 +108,7 @@ jobs:
   cargo-test-sbf:
     #if: github.repository == 'anza-xyz/agave'
     if: false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       matrix:
@@ -127,13 +125,13 @@ jobs:
           # re-enable with https://github.com/buffalojoec/mollusk/pull/74
           # - token
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - shell: bash
         run: |
           .github/scripts/purge-ubuntu-runner.sh
 
-      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad  # v0.0.9
         with:
           version: "v0.10.0"
 

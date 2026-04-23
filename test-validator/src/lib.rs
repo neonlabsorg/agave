@@ -1,22 +1,21 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
-    agave_feature_set::{
-        alpenglow, increase_cpi_account_info_limit, raise_cpi_nesting_limit_to_8, FeatureSet,
-        FEATURE_NAMES,
-    },
+    agave_feature_set::{FEATURE_NAMES, FeatureSet, alpenglow, raise_cpi_nesting_limit_to_8},
     agave_snapshots::{
-        paths::BANK_SNAPSHOTS_DIR, snapshot_config::SnapshotConfig, SnapshotInterval,
+        SnapshotInterval, paths::BANK_SNAPSHOTS_DIR, snapshot_config::SnapshotConfig,
     },
-    base64::{prelude::BASE64_STANDARD, Engine},
+    arc_swap::ArcSwap,
+    base64::{Engine, prelude::BASE64_STANDARD},
     crossbeam_channel::Receiver,
     log::*,
     solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
     solana_accounts_db::{
-        accounts_db::AccountsDbConfig, accounts_index::AccountsIndexConfig,
+        accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsDbConfig},
+        accounts_index::{AccountsIndexConfig, ScanFilter},
         utils::create_accounts_run_and_snapshot_dirs,
     },
     solana_cli_output::CliAccount,
-    solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
+    solana_clock::{DEFAULT_MS_PER_SLOT, Slot},
     solana_commitment_config::CommitmentConfig,
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_core::{
@@ -28,7 +27,7 @@ use {
     solana_fee_calculator::FeeRateGovernor,
     solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
     solana_geyser_plugin_manager::{
-        geyser_plugin_manager::GeyserPluginManager, GeyserPluginManagerRequest,
+        GeyserPluginManagerRequest, geyser_plugin_manager::GeyserPluginManager,
     },
     solana_gossip::{
         cluster_info::{ClusterInfo, NodeConfig},
@@ -36,17 +35,19 @@ use {
         node::Node,
     },
     solana_inflation::Inflation,
-    solana_instruction::{AccountMeta, Instruction},
-    solana_keypair::{read_keypair_file, write_keypair_file, Keypair},
+    solana_instruction::Instruction,
+    solana_keypair::{Keypair, read_keypair_file, write_keypair_file},
     solana_ledger::{
         blockstore::create_new_ledger, blockstore_options::LedgerColumnOptions,
         create_new_tmp_ledger,
     },
     solana_loader_v3_interface::state::UpgradeableLoaderState,
-    solana_message::Message,
     solana_native_token::LAMPORTS_PER_SOL,
     solana_net_utils::{
-        find_available_ports_in_range, multihomed_sockets::BindIpAddrs, PortRange, SocketAddrSpace,
+        PortRange, SocketAddrSpace, find_available_ports_in_range, multihomed_sockets::BindIpAddrs,
+    },
+    solana_program_runtime::{
+        execution_budget::SVMTransactionExecutionBudget, invoke_context::InvokeContext,
     },
     solana_pubkey::Pubkey,
     solana_rent::Rent,
@@ -56,21 +57,21 @@ use {
         client_error::Error as RpcClientError, request::MAX_MULTIPLE_ACCOUNTS,
     },
     solana_runtime::{
-        bank_forks::BankForks,
-        genesis_utils::{self, create_genesis_config_with_leader_ex_no_features},
+        bank_forks::BankForks, genesis_utils::create_genesis_config_with_leader_ex,
         runtime_config::RuntimeConfig,
     },
+    solana_sbpf::{elf::Executable, verifier::RequisiteVerifier},
     solana_sdk_ids::address_lookup_table,
     solana_signer::Signer,
     solana_streamer::quic::DEFAULT_QUIC_ENDPOINTS,
-    solana_tpu_client::tpu_client::DEFAULT_TPU_ENABLE_UDP,
+    solana_syscalls::create_program_runtime_environment,
     solana_transaction::{Transaction, TransactionError},
     solana_validator_exit::Exit,
     std::{
         collections::{HashMap, HashSet},
         ffi::OsStr,
         fmt::Display,
-        fs::{self, remove_dir_all, File},
+        fs::{self, File, remove_dir_all},
         io::Read,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         num::{NonZero, NonZeroU64},
@@ -145,8 +146,7 @@ pub struct TestValidatorGenesis {
     compute_unit_limit: Option<u64>,
     pub log_messages_bytes_limit: Option<usize>,
     pub transaction_account_lock_limit: Option<usize>,
-    pub tpu_enable_udp: bool,
-    pub geyser_plugin_manager: Arc<RwLock<GeyserPluginManager>>,
+    pub geyser_plugin_manager: Arc<ArcSwap<GeyserPluginManager>>,
     admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
 }
 
@@ -181,8 +181,7 @@ impl Default for TestValidatorGenesis {
             compute_unit_limit: Option::<u64>::default(),
             log_messages_bytes_limit: Option::<usize>::default(),
             transaction_account_lock_limit: Option::<usize>::default(),
-            tpu_enable_udp: DEFAULT_TPU_ENABLE_UDP,
-            geyser_plugin_manager: Arc::new(RwLock::new(GeyserPluginManager::default())),
+            geyser_plugin_manager: Arc::new(ArcSwap::new(Arc::new(GeyserPluginManager::default()))),
             admin_rpc_service_post_init:
                 Arc::<RwLock<Option<AdminRpcRequestMetadataPostInit>>>::default(),
         }
@@ -246,11 +245,6 @@ impl TestValidatorGenesis {
     /// Check if a given TestValidator ledger has already been initialized
     pub fn ledger_exists(ledger_path: &Path) -> bool {
         ledger_path.join("vote-account-keypair.json").exists()
-    }
-
-    pub fn tpu_enable_udp(&mut self, tpu_enable_udp: bool) -> &mut Self {
-        self.tpu_enable_udp = tpu_enable_udp;
-        self
     }
 
     pub fn fee_rate_governor(&mut self, fee_rate_governor: FeeRateGovernor) -> &mut Self {
@@ -706,7 +700,7 @@ impl TestValidatorGenesis {
                 .enable_time()
                 .build()
                 .unwrap();
-            runtime.block_on(test_validator.wait_for_nonzero_fees());
+            runtime.block_on(test_validator.wait_for_first_slot());
         })
     }
 
@@ -766,7 +760,7 @@ impl TestValidatorGenesis {
     ) -> Result<TestValidator, Box<dyn std::error::Error>> {
         let test_validator =
             TestValidator::start(mint_keypair.pubkey(), self, socket_addr_space, None)?;
-        test_validator.wait_for_nonzero_fees().await;
+        test_validator.wait_for_first_slot().await;
         let upgradeable_program_ids: Vec<&Pubkey> = self
             .upgradeable_programs
             .iter()
@@ -804,7 +798,6 @@ pub struct TestValidator {
     preserve_ledger: bool,
     rpc_pubsub_url: String,
     rpc_url: String,
-    tpu: SocketAddr,
     tpu_quic: SocketAddr,
     gossip: SocketAddr,
     validator: Option<Validator>,
@@ -814,134 +807,36 @@ pub struct TestValidator {
 impl TestValidator {
     /// Create a configured genesis and start validator
     /// Sync only; calling from a tokio runtime will panic due to nested runtimes.
-    fn start_with_config(
+    pub fn start_with_config(
         mint_address: Pubkey,
         faucet_addr: Option<SocketAddr>,
         socket_addr_space: SocketAddrSpace,
-        target_lamports_per_signature: u64,
-        tpu_enable_udp: bool,
-        wait_for_fees: bool,
     ) -> Self {
-        let test_validator = TestValidatorGenesis::default()
-            .tpu_enable_udp(tpu_enable_udp)
-            .fee_rate_governor(FeeRateGovernor::new(target_lamports_per_signature, 0))
+        TestValidatorGenesis::default()
             .rent(Rent {
-                lamports_per_byte_year: 1,
-                exemption_threshold: 1.0,
+                lamports_per_byte: 1,
                 ..Rent::default()
             })
             .faucet_addr(faucet_addr)
             .start_with_mint_address(mint_address, socket_addr_space)
-            .expect("validator start failed");
-
-        if wait_for_fees {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_io()
-                .enable_time()
-                .build()
-                .unwrap();
-            runtime.block_on(test_validator.wait_for_nonzero_fees());
-        }
-        test_validator
+            .expect("validator start failed")
     }
 
     /// Create a configured genesis and start validator (async version)
-    async fn async_start_with_config(
+    pub async fn async_start_with_config(
         mint_keypair: &Keypair,
         faucet_addr: Option<SocketAddr>,
         socket_addr_space: SocketAddrSpace,
-        target_lamports_per_signature: u64,
     ) -> Self {
         TestValidatorGenesis::default()
-            .fee_rate_governor(FeeRateGovernor::new(target_lamports_per_signature, 0))
             .rent(Rent {
-                lamports_per_byte_year: 1,
-                exemption_threshold: 1.0,
+                lamports_per_byte: 1,
                 ..Rent::default()
             })
             .faucet_addr(faucet_addr)
             .start_async_with_mint_address(mint_keypair, socket_addr_space)
             .await
             .expect("validator start failed")
-    }
-
-    /// Create and start a `TestValidator` with no transaction fees and minimal rent.
-    /// Faucet optional.
-    ///
-    /// This function panics on initialization failure.
-    pub fn with_no_fees(
-        mint_address: Pubkey,
-        faucet_addr: Option<SocketAddr>,
-        socket_addr_space: SocketAddrSpace,
-    ) -> Self {
-        Self::start_with_config(
-            mint_address,
-            faucet_addr,
-            socket_addr_space,
-            0,
-            false,
-            false,
-        )
-    }
-
-    /// Create a test validator using udp for TPU.
-    pub fn with_no_fees_udp(
-        mint_address: Pubkey,
-        faucet_addr: Option<SocketAddr>,
-        socket_addr_space: SocketAddrSpace,
-    ) -> Self {
-        Self::start_with_config(mint_address, faucet_addr, socket_addr_space, 0, true, false)
-    }
-
-    /// Create and start a `TestValidator` with custom transaction fees and minimal rent.
-    /// Faucet optional.
-    ///
-    /// This function panics on initialization failure.
-    pub fn with_custom_fees(
-        mint_address: Pubkey,
-        target_lamports_per_signature: u64,
-        faucet_addr: Option<SocketAddr>,
-        socket_addr_space: SocketAddrSpace,
-    ) -> Self {
-        Self::start_with_config(
-            mint_address,
-            faucet_addr,
-            socket_addr_space,
-            target_lamports_per_signature,
-            false,
-            true,
-        )
-    }
-
-    /// Create and start a `TestValidator` with no transaction fees and minimal rent (async version).
-    /// Faucet optional.
-    ///
-    /// This function panics on initialization failure.
-    pub async fn async_with_no_fees(
-        mint_keypair: &Keypair,
-        faucet_addr: Option<SocketAddr>,
-        socket_addr_space: SocketAddrSpace,
-    ) -> Self {
-        Self::async_start_with_config(mint_keypair, faucet_addr, socket_addr_space, 0).await
-    }
-
-    /// Create and start a `TestValidator` with custom transaction fees and minimal rent (async version).
-    /// Faucet optional.
-    ///
-    /// This function panics on initialization failure.
-    pub async fn async_with_custom_fees(
-        mint_keypair: &Keypair,
-        target_lamports_per_signature: u64,
-        faucet_addr: Option<SocketAddr>,
-        socket_addr_space: SocketAddrSpace,
-    ) -> Self {
-        Self::async_start_with_config(
-            mint_keypair,
-            faucet_addr,
-            socket_addr_space,
-            target_lamports_per_signature,
-        )
-        .await
     }
 
     /// Initialize the ledger directory
@@ -962,14 +857,25 @@ impl TestValidator {
         let mint_lamports = 500_000_000 * LAMPORTS_PER_SOL;
 
         // Only activate features which are not explicitly deactivated.
-        let mut feature_set = FeatureSet::default().inactive().clone();
+        let mut feature_set = FeatureSet::all_enabled();
         for feature in &config.deactivate_feature_set {
-            if feature_set.remove(feature) {
-                info!("Feature for {feature:?} deactivated")
+            if FEATURE_NAMES.contains_key(feature) {
+                feature_set.deactivate(feature);
+                info!("Feature for {feature:?} deactivated");
             } else {
                 warn!("Feature {feature:?} set for deactivation is not a known Feature public key",)
             }
         }
+
+        let runtime_features = feature_set.runtime_features();
+        let program_runtime_environment = create_program_runtime_environment(
+            &runtime_features,
+            &SVMTransactionExecutionBudget::new_with_defaults(
+                runtime_features.raise_cpi_nesting_limit_to_8,
+            ),
+            true,
+            false,
+        )?;
 
         let mut accounts = config.accounts.clone();
         for (address, account) in solana_program_binaries::spl_programs(&config.rent) {
@@ -977,13 +883,22 @@ impl TestValidator {
         }
         for (address, account) in
             solana_program_binaries::core_bpf_programs(&config.rent, |feature_id| {
-                feature_set.contains(feature_id)
+                feature_set.is_active(feature_id)
             })
         {
             accounts.entry(address).or_insert(account);
         }
         for upgradeable_program in &config.upgradeable_programs {
             let data = solana_program_test::read_file(&upgradeable_program.program_path);
+            let executable = Executable::<InvokeContext>::from_elf(
+                &data,
+                Arc::clone(&*program_runtime_environment),
+            )
+            .map_err(|err| format!("ELF error: {err}"))?;
+            executable
+                .verify::<RequisiteVerifier>()
+                .map_err(|err| format!("ELF error: {err}"))?;
+
             let (programdata_address, _) = Pubkey::find_program_address(
                 &[upgradeable_program.program_id.as_ref()],
                 &upgradeable_program.loader,
@@ -1021,7 +936,7 @@ impl TestValidator {
             );
         }
 
-        let mut genesis_config = create_genesis_config_with_leader_ex_no_features(
+        let mut genesis_config = create_genesis_config_with_leader_ex(
             mint_lamports,
             &mint_address,
             &validator_identity.pubkey(),
@@ -1033,6 +948,7 @@ impl TestValidator {
             config.fee_rate_governor.clone(),
             config.rent.clone(),
             solana_cluster_type::ClusterType::Development,
+            &feature_set,
             accounts.into_iter().collect(),
         );
         genesis_config.epoch_schedule = config
@@ -1047,10 +963,6 @@ impl TestValidator {
 
         if let Some(inflation) = config.inflation {
             genesis_config.inflation = inflation;
-        }
-
-        for feature in feature_set {
-            genesis_utils::activate_feature(&mut genesis_config, feature);
         }
 
         let ledger_path = match &config.ledger_path {
@@ -1138,7 +1050,6 @@ impl TestValidator {
                 num_tvu_retransmit_sockets: NonZero::new(1).unwrap(),
                 num_quic_endpoints: NonZero::new(DEFAULT_QUIC_ENDPOINTS)
                     .expect("Number of QUIC endpoints can not be zero"),
-                vortexor_receiver_addr: None,
             };
             let mut node =
                 Node::new_with_external_ip(&validator_identity.pubkey(), validator_node_config);
@@ -1158,8 +1069,7 @@ impl TestValidator {
         let vote_account_address = validator_vote_account.pubkey();
         let rpc_url = format!("http://{}", node.info.rpc().unwrap());
         let rpc_pubsub_url = format!("ws://{}/", node.info.rpc_pubsub().unwrap());
-        let tpu = node.info.tpu(Protocol::UDP).unwrap();
-        let tpu_quic = node.info.tpu(Protocol::QUIC).unwrap_or(tpu);
+        let tpu_quic = node.info.tpu(Protocol::QUIC).unwrap();
         let gossip = node.info.gossip().unwrap();
 
         {
@@ -1176,7 +1086,10 @@ impl TestValidator {
         let accounts_db_config = AccountsDbConfig {
             index: Some(AccountsIndexConfig::default()),
             account_indexes: Some(config.rpc_config.account_indexes.clone()),
-            ..AccountsDbConfig::default()
+            scan_filter_for_shrinking: ScanFilter::All,
+            use_registered_io_uring_buffers: false,
+            snapshots_use_direct_io: false,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
         };
 
         let runtime_config = RuntimeConfig {
@@ -1188,9 +1101,6 @@ impl TestValidator {
                         !config
                             .deactivate_feature_set
                             .contains(&raise_cpi_nesting_limit_to_8::id()),
-                        !config
-                            .deactivate_feature_set
-                            .contains(&increase_cpi_account_info_limit::id()),
                     )
                 }),
             log_messages_bytes_limit: config.log_messages_bytes_limit,
@@ -1253,8 +1163,9 @@ impl TestValidator {
             rpc_to_plugin_manager_receiver,
             config.start_progress.clone(),
             socket_addr_space,
-            ValidatorTpuConfig::new_for_tests(config.tpu_enable_udp),
+            ValidatorTpuConfig::new_for_tests(),
             config.admin_rpc_service_post_init.clone(),
+            None,
         )?);
 
         let test_validator = TestValidator {
@@ -1262,7 +1173,6 @@ impl TestValidator {
             preserve_ledger,
             rpc_pubsub_url,
             rpc_url,
-            tpu,
             tpu_quic,
             gossip,
             validator,
@@ -1271,21 +1181,11 @@ impl TestValidator {
         Ok(test_validator)
     }
 
-    /// This is a hack to delay until the fees are non-zero for test consistency
-    /// (fees from genesis are zero until the first block with a transaction in it is completed
-    ///  due to a bug in the Bank)
-    async fn wait_for_nonzero_fees(&self) {
+    /// Delay until the validator has produced its first slot after startup.
+    async fn wait_for_first_slot(&self) {
         let rpc_client = nonblocking::rpc_client::RpcClient::new_with_commitment(
             self.rpc_url.clone(),
             CommitmentConfig::processed(),
-        );
-        let mut message = Message::new(
-            &[Instruction::new_with_bytes(
-                Pubkey::new_unique(),
-                &[],
-                vec![AccountMeta::new(Pubkey::new_unique(), true)],
-            )],
-            None,
         );
         const MAX_TRIES: u64 = 10;
         let mut num_tries = 0;
@@ -1294,24 +1194,15 @@ impl TestValidator {
             if num_tries > MAX_TRIES {
                 break;
             }
-            println!("Waiting for fees to stabilize {num_tries:?}...");
-            match rpc_client.get_latest_blockhash().await {
-                Ok(blockhash) => {
-                    message.recent_blockhash = blockhash;
-                    match rpc_client.get_fee_for_message(&message).await {
-                        Ok(fee) => {
-                            if fee != 0 {
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            warn!("get_fee_for_message() failed: {err:?}");
-                            break;
-                        }
+            println!("Waiting for first slot {num_tries:?}...");
+            match rpc_client.get_slot().await {
+                Ok(slot) => {
+                    if slot > 0 {
+                        break;
                     }
                 }
                 Err(err) => {
-                    warn!("get_latest_blockhash() failed: {err:?}");
+                    warn!("get_slot() failed: {err:?}");
                     break;
                 }
             }
@@ -1392,11 +1283,6 @@ impl TestValidator {
             sleep(Duration::from_millis(DEFAULT_MS_PER_SLOT)).await;
         }
         panic!("Timeout waiting for program to become usable");
-    }
-
-    /// Return the validator's TPU address
-    pub fn tpu(&self) -> &SocketAddr {
-        &self.tpu
     }
 
     /// Return the validator's TPU QUIC address
@@ -1511,9 +1397,11 @@ mod test {
             blockhash,
         );
 
-        assert!(rpc_client
-            .send_and_confirm_transaction(&transaction)
-            .is_ok());
+        assert!(
+            rpc_client
+                .send_and_confirm_transaction(&transaction)
+                .is_ok()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1537,10 +1425,12 @@ mod test {
             blockhash,
         );
 
-        assert!(rpc_client
-            .send_and_confirm_transaction(&transaction)
-            .await
-            .is_ok());
+        assert!(
+            rpc_client
+                .send_and_confirm_transaction(&transaction)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1558,6 +1448,9 @@ mod test {
             agave_feature_set::deprecate_rewards_sysvar::id(),
             agave_feature_set::disable_fees_sysvar::id(),
             alpenglow::id(),
+            agave_feature_set::bls_pubkey_management_in_vote_account::id(),
+            agave_feature_set::vote_account_initialize_v2::id(),
+            agave_feature_set::validator_admission_ticket::id(),
         ]
         .into_iter()
         .for_each(|feature| {

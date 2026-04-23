@@ -37,17 +37,18 @@ use {
     },
     assert_matches::debug_assert_matches,
     indexmap::{
-        map::{rayon::ParValues, Entry, IndexMap},
+        map::{Entry, IndexMap, rayon::ParValues},
         set::IndexSet,
     },
-    lru::LruCache,
-    rayon::{prelude::*, ThreadPool},
+    lazy_lru::LruCache,
+    rand::{rng, seq::IteratorRandom},
+    rayon::{ThreadPool, prelude::*},
     solana_clock::Slot,
     solana_hash::Hash,
     solana_pubkey::Pubkey,
     std::{
         cmp::Ordering,
-        collections::{hash_map, BTreeMap, HashMap, VecDeque},
+        collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map},
         ops::{Bound, Index, IndexMut},
         sync::Mutex,
     },
@@ -81,8 +82,6 @@ pub struct Crds {
     entries: BTreeMap<u64 /*insert order*/, usize /*index*/>,
     // Hash of recently purged values.
     purged: VecDeque<(Hash, u64 /*timestamp*/)>,
-    // Mapping from nodes' pubkeys to their respective shred-version.
-    shred_versions: HashMap<Pubkey, u16>,
     stats: Mutex<CrdsStats>,
 }
 
@@ -90,7 +89,6 @@ pub struct Crds {
 pub enum CrdsError {
     DuplicatePush(/*num dups:*/ u8),
     InsertFailed,
-    UnknownStakes,
 }
 
 #[derive(Clone, Copy)]
@@ -179,7 +177,6 @@ impl Default for Crds {
             records: HashMap::default(),
             entries: BTreeMap::default(),
             purged: VecDeque::default(),
-            shred_versions: HashMap::default(),
             stats: Mutex::<CrdsStats>::default(),
         }
     }
@@ -192,12 +189,11 @@ fn overrides(value: &CrdsValue, other: &VersionedCrdsValue) -> bool {
     // Contact-infos are special cased so that if there are
     // two running instances of the same node, the more recent start is
     // propagated through gossip regardless of wallclocks.
-    if let CrdsData::ContactInfo(value) = value.data() {
-        if let CrdsData::ContactInfo(other) = other.value.data() {
-            if let Some(out) = value.overrides(other) {
-                return out;
-            }
-        }
+    if let CrdsData::ContactInfo(value) = value.data()
+        && let CrdsData::ContactInfo(other) = other.value.data()
+        && let Some(out) = value.overrides(other)
+    {
+        return out;
     }
     match value.wallclock().cmp(&other.value.wallclock()) {
         Ordering::Less => false,
@@ -236,9 +232,8 @@ impl Crds {
                 let entry_index = entry.index();
                 self.shards.insert(entry_index, &value);
                 match value.value.data() {
-                    CrdsData::ContactInfo(node) => {
+                    CrdsData::ContactInfo(_node) => {
                         self.nodes.insert(entry_index);
-                        self.shred_versions.insert(pubkey, node.shred_version());
                     }
                     CrdsData::Vote(_, _) => {
                         self.votes.insert(value.ordinal, entry_index);
@@ -263,8 +258,7 @@ impl Crds {
                 self.shards.remove(entry_index, entry.get());
                 self.shards.insert(entry_index, &value);
                 match value.value.data() {
-                    CrdsData::ContactInfo(node) => {
-                        self.shred_versions.insert(pubkey, node.shred_version());
+                    CrdsData::ContactInfo(_node) => {
                         // self.nodes does not need to be updated since the
                         // entry at this index was and stays contact-info.
                         debug_assert_matches!(entry.get().value.data(), CrdsData::ContactInfo(_));
@@ -329,8 +323,9 @@ impl Crds {
         V::get_entry(&self.table, key)
     }
 
-    pub(crate) fn get_shred_version(&self, pubkey: &Pubkey) -> Option<u16> {
-        self.shred_versions.get(pubkey).copied()
+    #[cfg(test)]
+    fn get_shred_version(&self, pubkey: &Pubkey) -> Option<u16> {
+        self.get(*pubkey).map(|ci: &ContactInfo| ci.shred_version())
     }
 
     /// Returns all entries which are ContactInfo.
@@ -458,24 +453,16 @@ impl Crds {
 
     /// Returns all crds values which the first 'mask_bits'
     /// of their hash value is equal to 'mask'.
-    /// Excludes deprecated values and ContactInfo with invalid shred version
+    /// Excludes deprecated values.
     pub(crate) fn filter_bitmask(
         &self,
         mask: u64,
         mask_bits: u32,
-        self_shred_version: u16,
     ) -> impl Iterator<Item = &VersionedCrdsValue> {
         self.shards
             .find(mask, mask_bits)
             .map(move |i| self.table.index(i))
-            .filter(move |VersionedCrdsValue { value, .. }| {
-                let data = value.data();
-                !value.data().is_deprecated()
-                    && match data {
-                        CrdsData::ContactInfo(info) => info.shred_version() == self_shred_version,
-                        _ => true,
-                    }
-            })
+            .filter(move |VersionedCrdsValue { value, .. }| !value.data().is_deprecated())
     }
 
     /// Update the timestamp's of all the labels that are associated with Pubkey
@@ -518,16 +505,15 @@ impl Crds {
             // If the origin's contact-info hasn't expired yet then preserve
             // all associated values.
             let origin = CrdsValueLabel::ContactInfo(*pubkey);
-            if let Some(origin) = self.table.get(&origin) {
-                if origin
+            if let Some(origin) = self.table.get(&origin)
+                && origin
                     .value
                     .wallclock()
                     .min(origin.local_timestamp)
                     .saturating_add(timeout)
                     > now
-                {
-                    return vec![];
-                }
+            {
+                return vec![];
             }
             // Otherwise check each value's timestamp individually.
             index
@@ -583,7 +569,6 @@ impl Crds {
         records_entry.get_mut().swap_remove(&index);
         if records_entry.get().is_empty() {
             records_entry.remove();
-            self.shred_versions.remove(&pubkey);
         }
         // If index == self.table.len(), then the removed entry was the last
         // entry in the table, in which case no other keys were modified.
@@ -628,35 +613,36 @@ impl Crds {
         10 * self.records.len() > 11 * cap
     }
 
-    /// Trims the table by dropping all values associated with the pubkeys with
-    /// the lowest stake, so that the number of unique pubkeys are bounded.
+    /// Trims the table so that the number of unique pubkeys are bounded.
     pub(crate) fn trim(
         &mut self,
         cap: usize, // Capacity hint for number of unique pubkeys.
         // Set of pubkeys to never drop.
-        // e.g. known validators, self pubkey, ...
-        keep: &[Pubkey],
+        // e.g. known validators, self pubkey, entrypoints, ...
+        keep: &HashSet<Pubkey>,
         stakes: &HashMap<Pubkey, u64>,
         now: u64,
-    ) -> Result</*num purged:*/ usize, CrdsError> {
+    ) -> usize {
         if self.should_trim(cap) {
             let size = self.records.len().saturating_sub(cap);
             self.drop(size, keep, stakes, now)
         } else {
-            Ok(0)
+            0
         }
     }
 
-    // Drops 'size' many pubkeys with the lowest stake.
+    // Drops 'size' many pubkeys with the lowest stake if stakes are known
+    // Otherwise select and drop a random sample of `size` many pubkeys
     fn drop(
         &mut self,
         size: usize,
-        keep: &[Pubkey],
+        keep: &HashSet<Pubkey>,
         stakes: &HashMap<Pubkey, u64>,
         now: u64,
-    ) -> Result</*num purged:*/ usize, CrdsError> {
+    ) -> usize {
         if stakes.values().all(|&stake| stake == 0) {
-            return Err(CrdsError::UnknownStakes);
+            // Stakes are unavailable, evict amount above cap
+            return self.drop_random(size, keep, now);
         }
         let mut keys: Vec<_> = self
             .records
@@ -677,7 +663,25 @@ impl Crds {
         for key in &keys {
             self.remove(key, now);
         }
-        Ok(keys.len())
+        keys.len()
+    }
+
+    // Drop `size` many pubkeys randomly
+    fn drop_random(&mut self, size: usize, keep: &HashSet<Pubkey>, now: u64) -> usize {
+        let mut rng = rng();
+        let keys: Vec<_> = self
+            .records
+            .iter()
+            .filter(|(pubkey, _)| !keep.contains(pubkey))
+            .choose_multiple(&mut rng, size)
+            .into_iter()
+            .flat_map(|(_, indices)| indices.iter().copied())
+            .map(|index| self.table.get_index(index).unwrap().0.clone())
+            .collect();
+        for key in &keys {
+            self.remove(key, now);
+        }
+        keys.len()
     }
 
     pub(crate) fn take_stats(&self) -> CrdsStats {
@@ -698,11 +702,11 @@ impl Default for CrdsDataStats {
 impl CrdsDataStats {
     fn record_insert(&mut self, entry: &VersionedCrdsValue, route: GossipRoute) {
         self.counts[Self::ordinal(entry)] += 1;
-        if let CrdsData::Vote(_, vote) = entry.value.data() {
-            if let Some(slot) = vote.slot() {
-                let num_nodes = self.votes.get(&slot).copied().unwrap_or_default();
-                self.votes.put(slot, num_nodes + 1);
-            }
+        if let CrdsData::Vote(_, vote) = entry.value.data()
+            && let Some(slot) = vote.slot()
+        {
+            let num_nodes = self.votes.get(&slot).copied().unwrap_or_default();
+            self.votes.put(slot, num_nodes + 1);
         }
 
         let GossipRoute::PushMessage(from) = route else {
@@ -781,13 +785,18 @@ impl CrdsStats {
 mod tests {
     use {
         super::*,
-        crate::crds_data::{new_rand_timestamp, AccountsHashes},
-        rand::{thread_rng, Rng},
+        crate::crds_data::{AccountsHashes, new_rand_timestamp},
+        rand::{Rng, rng},
         rayon::ThreadPoolBuilder,
         solana_keypair::Keypair,
         solana_signer::Signer,
         solana_time_utils::timestamp,
-        std::{collections::HashSet, iter::repeat_with, net::Ipv4Addr, time::Duration},
+        std::{
+            collections::{HashMap, HashSet},
+            iter::repeat_with,
+            net::Ipv4Addr,
+            time::Duration,
+        },
     };
 
     #[test]
@@ -922,7 +931,7 @@ mod tests {
     #[test]
     fn test_find_old_records_with_override() {
         let thread_pool = ThreadPoolBuilder::new().build().unwrap();
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let mut crds = Crds::default();
         let val = CrdsValue::new_rand(&mut rng, None);
         let mut stakes = HashMap::from([(Pubkey::new_unique(), 1u64)]);
@@ -1052,10 +1061,10 @@ mod tests {
 
         let mut crds = Crds::default();
         let keypairs: Vec<_> = std::iter::repeat_with(Keypair::new).take(256).collect();
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let mut num_inserts = 0;
         for _ in 0..4096 {
-            let keypair = &keypairs[rng.gen_range(0..keypairs.len())];
+            let keypair = &keypairs[rng.random_range(0..keypairs.len())];
             let value = CrdsValue::new_rand(&mut rng, Some(keypair));
             let local_timestamp = new_rand_timestamp(&mut rng);
             if let Ok(()) = crds.insert(value, local_timestamp, GossipRoute::LocalMessage) {
@@ -1072,7 +1081,7 @@ mod tests {
         check_crds_shards(&crds);
         // Remove values one by one and assert that shards stay valid.
         while !crds.table.is_empty() {
-            let index = rng.gen_range(0..crds.table.len());
+            let index = rng.random_range(0..crds.table.len());
             let key = crds.table.get_index(index).unwrap().0.clone();
             crds.remove(&key, /*now=*/ 0);
             check_crds_shards(&crds);
@@ -1088,10 +1097,10 @@ mod tests {
         usize, // number of epoch slots
     ) {
         let size = crds.table.len();
-        let since = if size == 0 || rng.gen() {
-            rng.gen_range(0..crds.cursor.0 + 1)
+        let since = if size == 0 || rng.random() {
+            rng.random_range(0..crds.cursor.0 + 1)
         } else {
-            crds.table[rng.gen_range(0..size)].ordinal
+            crds.table[rng.random_range(0..size)].ordinal
         };
         let num_epoch_slots = crds
             .table
@@ -1192,12 +1201,12 @@ mod tests {
 
     #[test]
     fn test_crds_value_indices() {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let keypairs: Vec<_> = repeat_with(Keypair::new).take(128).collect();
         let mut crds = Crds::default();
         let mut num_inserts = 0;
         for k in 0..4096 {
-            let keypair = &keypairs[rng.gen_range(0..keypairs.len())];
+            let keypair = &keypairs[rng.random_range(0..keypairs.len())];
             let value = CrdsValue::new_rand(&mut rng, Some(keypair));
             let local_timestamp = new_rand_timestamp(&mut rng);
             if let Ok(()) = crds.insert(value, local_timestamp, GossipRoute::LocalMessage) {
@@ -1220,7 +1229,7 @@ mod tests {
         assert!(num_epoch_slots > 100, "num epoch slots: {num_epoch_slots}");
         // Remove values one by one and assert that nodes indices stay valid.
         while !crds.table.is_empty() {
-            let index = rng.gen_range(0..crds.table.len());
+            let index = rng.random_range(0..crds.table.len());
             let key = crds.table.get_index(index).unwrap().0.clone();
             crds.remove(&key, /*now=*/ 0);
             if crds.table.len() % 16 == 0 {
@@ -1243,11 +1252,11 @@ mod tests {
                 }
             }
         }
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let keypairs: Vec<_> = repeat_with(Keypair::new).take(128).collect();
         let mut crds = Crds::default();
         for k in 0..4096 {
-            let keypair = &keypairs[rng.gen_range(0..keypairs.len())];
+            let keypair = &keypairs[rng.random_range(0..keypairs.len())];
             let value = CrdsValue::new_rand(&mut rng, Some(keypair));
             let local_timestamp = new_rand_timestamp(&mut rng);
             let _ = crds.insert(value, local_timestamp, GossipRoute::LocalMessage);
@@ -1259,7 +1268,7 @@ mod tests {
         assert!(crds.records.len() <= keypairs.len());
         // Remove values one by one and assert that records stay valid.
         while !crds.table.is_empty() {
-            let index = rng.gen_range(0..crds.table.len());
+            let index = rng.random_range(0..crds.table.len());
             let key = crds.table.get_index(index).unwrap().0.clone();
             crds.remove(&key, /*now=*/ 0);
             if crds.table.len() % 64 == 0 {
@@ -1271,7 +1280,7 @@ mod tests {
 
     #[test]
     fn test_get_shred_version() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let pubkey = Pubkey::new_unique();
         let mut crds = Crds::default();
         assert_eq!(crds.get_shred_version(&pubkey), None);
@@ -1319,15 +1328,13 @@ mod tests {
             Ok(())
         );
         assert_eq!(crds.get_shred_version(&pubkey), Some(8));
-        // Remove contact-info. Shred version should stay there since there
-        // are still values associated with the pubkey.
+        // Remove contact-info. Shred version should be gone now.
         crds.remove(&CrdsValueLabel::ContactInfo(pubkey), timestamp());
         assert_eq!(crds.get::<&ContactInfo>(pubkey), None);
-        assert_eq!(crds.get_shred_version(&pubkey), Some(8));
+        assert_eq!(crds.get_shred_version(&pubkey), None);
         // Remove the remaining entry with the same pubkey.
         crds.remove(&CrdsValueLabel::AccountsHashes(pubkey), timestamp());
         assert_eq!(crds.get_records(&pubkey).count(), 0);
-        assert_eq!(crds.get_shred_version(&pubkey), None);
     }
 
     #[test]
@@ -1342,15 +1349,15 @@ mod tests {
                 .collect::<HashSet<_>>()
                 .len()
         }
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let keypairs: Vec<_> = repeat_with(Keypair::new).take(64).collect();
         let stakes = keypairs
             .iter()
-            .map(|k| (k.pubkey(), rng.gen_range(0..1000)))
+            .map(|k| (k.pubkey(), rng.random_range(0..1000)))
             .collect();
         let mut crds = Crds::default();
         for _ in 0..2048 {
-            let keypair = &keypairs[rng.gen_range(0..keypairs.len())];
+            let keypair = &keypairs[rng.random_range(0..keypairs.len())];
             let value = CrdsValue::new_rand(&mut rng, Some(keypair));
             let local_timestamp = new_rand_timestamp(&mut rng);
             let _ = crds.insert(value, local_timestamp, GossipRoute::LocalMessage);
@@ -1360,7 +1367,7 @@ mod tests {
         assert!(!crds.should_trim(num_pubkeys));
         assert!(crds.should_trim(num_pubkeys * 5 / 6));
         let values: Vec<_> = crds.table.values().cloned().collect();
-        crds.drop(16, &[], &stakes, /*now=*/ 0).unwrap();
+        crds.drop(16, &HashSet::new(), &stakes, /*now=*/ 0);
         let purged: Vec<_> = {
             let purged: HashSet<_> = crds.purged.iter().map(|(hash, _)| hash).copied().collect();
             values

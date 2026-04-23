@@ -1,6 +1,6 @@
 use {
-    criterion::{criterion_group, criterion_main, Criterion},
-    solana_account::{state_traits::StateMut, AccountSharedData},
+    criterion::{Criterion, criterion_group, criterion_main},
+    solana_account::{AccountSharedData, state_traits::StateMut},
     solana_bpf_loader_program::Entrypoint,
     solana_instruction::AccountMeta,
     solana_loader_v3_interface::{
@@ -8,6 +8,7 @@ use {
     },
     solana_program_runtime::invoke_context::mock_process_instruction,
     solana_pubkey::Pubkey,
+    solana_sbpf::program::BuiltinFunctionDefinition,
     solana_sdk_ids::bpf_loader_upgradeable,
 };
 
@@ -143,12 +144,11 @@ impl TestSetup {
     fn run(&self) {
         mock_process_instruction(
             &self.loader_address,
-            None,
             &self.instruction_data,
             self.transaction_accounts.clone(),
             self.instruction_accounts.clone(),
             Ok(()),
-            Entrypoint::vm,
+            Entrypoint::register,
             |_invoke_context| {},
             |_invoke_context| {},
         );

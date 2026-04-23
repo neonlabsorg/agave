@@ -1,7 +1,9 @@
+#[cfg(feature = "dev-context-only-utils")]
+use qualifier_attr::qualifiers;
 #[cfg(feature = "frozen-abi")]
 use solana_frozen_abi::abi_example::AbiExample;
 use {
-    solana_account::{state_traits::StateMut, AccountSharedData, ReadableAccount},
+    solana_account::{AccountSharedData, ReadableAccount, state_traits::StateMut},
     solana_instruction::error::InstructionError,
     solana_pubkey::Pubkey,
     solana_stake_interface::{
@@ -24,7 +26,6 @@ pub struct StakeAccount<T> {
 }
 
 #[derive(Debug, Error)]
-#[allow(clippy::enum_variant_names)]
 pub enum Error {
     #[error(transparent)]
     InstructionError(#[from] InstructionError),
@@ -48,6 +49,7 @@ impl<T> StakeAccount<T> {
 
 impl StakeAccount<Delegation> {
     #[inline]
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     pub(crate) fn delegation(&self) -> &Delegation {
         // Safe to unwrap here because StakeAccount<Delegation> will always
         // only wrap a stake-state which is a delegation.

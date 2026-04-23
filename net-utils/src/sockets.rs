@@ -1,47 +1,21 @@
 #[cfg(feature = "dev-context-only-utils")]
 use tokio::net::UdpSocket as TokioUdpSocket;
 use {
-    crate::PortRange,
+    crate::{PortRange, test_port_allocator::unique_port_range_for_tests_internal},
     log::warn,
     socket2::{Domain, SockAddr, Socket, Type},
     std::{
         io,
         net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
         ops::Range,
-        sync::atomic::{AtomicU16, Ordering},
     },
 };
 // base port for deconflicted allocations
 pub(crate) const UNIQUE_ALLOC_BASE_PORT: u16 = 2000;
-// how much to allocate per individual process.
-// we expect to have at most 64 concurrent tests in CI at any moment on a given host.
-const SLICE_PER_PROCESS: u16 = (u16::MAX - UNIQUE_ALLOC_BASE_PORT) / 64;
-/// When running under nextest, this will try to provide
-/// a unique slice of port numbers (assuming no other nextest processes
-/// are running on the same host) based on NEXTEST_TEST_GLOBAL_SLOT variable
-/// The port ranges will be reused following nextest logic.
-///
-/// When running without nextest, this will only bump an atomic and eventually
-/// panic when it runs out of port numbers to assign.
-#[allow(clippy::arithmetic_side_effects)]
+
+/// Allocates a unique range of `size` ports for use in tests.
 pub fn unique_port_range_for_tests(size: u16) -> Range<u16> {
-    static SLICE: AtomicU16 = AtomicU16::new(0);
-    let offset = SLICE.fetch_add(size, Ordering::SeqCst);
-    let start = offset
-        + match std::env::var("NEXTEST_TEST_GLOBAL_SLOT") {
-            Ok(slot) => {
-                let slot: u16 = slot.parse().unwrap();
-                assert!(
-                    offset < SLICE_PER_PROCESS,
-                    "Overrunning into the port range of another test! Consider using fewer ports \
-                     per test."
-                );
-                UNIQUE_ALLOC_BASE_PORT + slot * SLICE_PER_PROCESS
-            }
-            Err(_) => UNIQUE_ALLOC_BASE_PORT,
-        };
-    assert!(start < u16::MAX - size, "Ran out of port numbers!");
-    start..start + size
+    unique_port_range_for_tests_internal(size)
 }
 
 /// Retrieve a free 25-port slice for unit tests
@@ -340,11 +314,11 @@ mod tests {
     use {
         super::*,
         crate::{
-            bind_in_range, get_cluster_shred_version, get_public_ip_addr_with_binding,
-            ip_echo_client, ip_echo_server, parse_host,
+            DEFAULT_IP_ECHO_SERVER_THREADS, MAX_PORT_VERIFY_THREADS, bind_in_range,
+            get_cluster_shred_version, get_public_ip_addr_with_binding, ip_echo_client,
+            ip_echo_server, parse_host,
             sockets::{localhost_port_range_for_tests, unique_port_range_for_tests},
-            verify_all_reachable_tcp, verify_all_reachable_udp, DEFAULT_IP_ECHO_SERVER_THREADS,
-            MAX_PORT_VERIFY_THREADS,
+            verify_all_reachable_tcp, verify_all_reachable_udp,
         },
         itertools::Itertools,
         std::{net::Ipv4Addr, time::Duration},
@@ -448,14 +422,16 @@ mod tests {
         ) {
             assert!(port2 == port1 + offset);
         }
-        assert!(bind_two_in_range_with_offset_and_config(
-            ip_addr,
-            (port_range.start, port_range.start + 5),
-            offset,
-            config,
-            config
-        )
-        .is_err());
+        assert!(
+            bind_two_in_range_with_offset_and_config(
+                ip_addr,
+                (port_range.start, port_range.start + 5),
+                offset,
+                config,
+                config
+            )
+            .is_err()
+        );
     }
 
     #[test]

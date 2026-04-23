@@ -1,6 +1,6 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
-    solana_cli::cli::{process_command, CliCommand, CliConfig},
+    solana_cli::cli::{CliCommand, CliConfig, process_command},
     solana_commitment_config::CommitmentConfig,
     solana_faucet::faucet::run_local_faucet_with_unique_port_for_tests,
     solana_keypair::Keypair,
@@ -14,7 +14,7 @@ use {
 async fn test_cli_request_airdrop() {
     let mint_keypair = Keypair::new();
     let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair.insecure_clone());
-    let test_validator = TestValidator::async_with_no_fees(
+    let test_validator = TestValidator::async_start_with_config(
         &mint_keypair,
         Some(faucet_addr),
         SocketAddrSpace::Unspecified,

@@ -1,12 +1,4 @@
-#![cfg_attr(
-    not(feature = "agave-unstable-api"),
-    deprecated(
-        since = "3.1.0",
-        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
-                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
-                acknowledge use of an interface that may break without warning."
-    )
-)]
+#![cfg(feature = "agave-unstable-api")]
 use {log::warn, std::env};
 //TODO remove this hack when rayon fixes itself
 
@@ -28,14 +20,4 @@ static MAX_RAYON_THREADS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(
 
 pub fn get_thread_count() -> usize {
     *MAX_RAYON_THREADS
-}
-
-#[deprecated(
-    since = "3.0.0",
-    note = "The solana-rayon-threadlimit crate will be removed, use num_cpus::get() or something \
-            similar instead"
-)]
-pub fn get_max_thread_count() -> usize {
-    #[allow(deprecated)]
-    get_thread_count().saturating_mul(2)
 }

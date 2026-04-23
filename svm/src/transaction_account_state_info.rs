@@ -1,16 +1,15 @@
 use {
-    crate::rent_calculator::{check_rent_state, get_account_rent_state, RentState},
+    crate::rent_calculator::{RentState, check_rent_state, get_account_rent_state},
     solana_account::ReadableAccount,
     solana_rent::Rent,
-    solana_sdk_ids::native_loader,
     solana_svm_transaction::svm_message::SVMMessage,
-    solana_transaction_context::{IndexOfAccount, TransactionContext},
+    solana_transaction_context::{IndexOfAccount, transaction::TransactionContext},
     solana_transaction_error::TransactionResult as Result,
 };
 
 #[derive(PartialEq, Debug)]
 pub(crate) struct TransactionAccountStateInfo {
-    rent_state: Option<RentState>, // None: readonly account
+    info: Option<WritableTransactionAccountStateInfo>, // None: readonly account
 }
 
 impl TransactionAccountStateInfo {
@@ -21,20 +20,18 @@ impl TransactionAccountStateInfo {
     ) -> Vec<Self> {
         (0..message.account_keys().len())
             .map(|i| {
-                let rent_state = if message.is_writable(i) {
+                let info = if message.is_writable(i) {
                     let state = if let Ok(account) = transaction_context
                         .accounts()
                         .try_borrow(i as IndexOfAccount)
                     {
-                        // Native programs appear to be RentPaying because they carry low lamport
-                        // balances; however they will never be loaded as writable
-                        debug_assert!(!native_loader::check_id(account.owner()));
-
-                        Some(get_account_rent_state(
-                            rent,
-                            account.lamports(),
-                            account.data().len(),
-                        ))
+                        let balance = account.lamports();
+                        let data_size = account.data().len();
+                        let rent_state = get_account_rent_state(rent, balance, data_size);
+                        Some(WritableTransactionAccountStateInfo {
+                            rent_state,
+                            data_size,
+                        })
                     } else {
                         None
                     };
@@ -46,7 +43,7 @@ impl TransactionAccountStateInfo {
                 } else {
                     None
                 };
-                Self { rent_state }
+                Self { info }
             })
             .collect()
     }
@@ -59,15 +56,35 @@ impl TransactionAccountStateInfo {
         for (i, (pre_state_info, post_state_info)) in
             pre_state_infos.iter().zip(post_state_infos).enumerate()
         {
-            check_rent_state(
-                pre_state_info.rent_state.as_ref(),
-                post_state_info.rent_state.as_ref(),
-                transaction_context,
-                i as IndexOfAccount,
-            )?;
+            if let (Some(pre_state_info), Some(post_state_info)) =
+                (pre_state_info.info.as_ref(), post_state_info.info.as_ref())
+            {
+                check_rent_state(
+                    &pre_state_info.rent_state,
+                    &post_state_info.rent_state,
+                    transaction_context,
+                    i as IndexOfAccount,
+                )?;
+            }
         }
         Ok(())
     }
+}
+
+#[derive(PartialEq, Debug)]
+struct WritableTransactionAccountStateInfo {
+    rent_state: RentState,
+    data_size: usize,
+}
+
+// Returns the cumulative size of all post-exec uninitialized accounts
+pub(crate) fn get_uninitialized_accounts_size(post: &[TransactionAccountStateInfo]) -> u64 {
+    post.iter()
+        .filter_map(|post_info| post_info.info.as_ref())
+        .filter_map(|post| {
+            matches!(&post.rent_state, RentState::Uninitialized).then_some(post.data_size as u64)
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -78,12 +95,12 @@ mod test {
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_message::{
-            compiled_instruction::CompiledInstruction, LegacyMessage, Message, MessageHeader,
-            SanitizedMessage,
+            LegacyMessage, Message, MessageHeader, SanitizedMessage,
+            compiled_instruction::CompiledInstruction,
         },
         solana_rent::Rent,
         solana_signer::Signer,
-        solana_transaction_context::TransactionContext,
+        solana_transaction_context::transaction::TransactionContext,
         solana_transaction_error::TransactionError,
         std::collections::HashSet,
     };
@@ -123,17 +140,23 @@ mod test {
             (key3.pubkey(), AccountSharedData::default()),
         ];
 
-        let context = TransactionContext::new(transaction_accounts, rent.clone(), 20, 20);
+        let context = TransactionContext::new(transaction_accounts, rent.clone(), 20, 20, 1);
         let result = TransactionAccountStateInfo::new(&context, &sanitized_message, &rent);
         assert_eq!(
             result,
             vec![
                 TransactionAccountStateInfo {
-                    rent_state: Some(RentState::Uninitialized)
+                    info: Some(WritableTransactionAccountStateInfo {
+                        rent_state: RentState::Uninitialized,
+                        data_size: 0,
+                    })
                 },
-                TransactionAccountStateInfo { rent_state: None },
+                TransactionAccountStateInfo { info: None },
                 TransactionAccountStateInfo {
-                    rent_state: Some(RentState::Uninitialized)
+                    info: Some(WritableTransactionAccountStateInfo {
+                        rent_state: RentState::Uninitialized,
+                        data_size: 0,
+                    })
                 }
             ]
         );
@@ -175,7 +198,7 @@ mod test {
             (key3.pubkey(), AccountSharedData::default()),
         ];
 
-        let context = TransactionContext::new(transaction_accounts, rent.clone(), 20, 20);
+        let context = TransactionContext::new(transaction_accounts, rent.clone(), 20, 20, 1);
         let _result = TransactionAccountStateInfo::new(&context, &sanitized_message, &rent);
     }
 
@@ -185,14 +208,23 @@ mod test {
         let key2 = Keypair::new();
         let pre_rent_state = vec![
             TransactionAccountStateInfo {
-                rent_state: Some(RentState::Uninitialized),
+                info: Some(WritableTransactionAccountStateInfo {
+                    rent_state: RentState::Uninitialized,
+                    data_size: 0,
+                }),
             },
             TransactionAccountStateInfo {
-                rent_state: Some(RentState::Uninitialized),
+                info: Some(WritableTransactionAccountStateInfo {
+                    rent_state: RentState::Uninitialized,
+                    data_size: 0,
+                }),
             },
         ];
         let post_rent_state = vec![TransactionAccountStateInfo {
-            rent_state: Some(RentState::Uninitialized),
+            info: Some(WritableTransactionAccountStateInfo {
+                rent_state: RentState::Uninitialized,
+                data_size: 0,
+            }),
         }];
 
         let transaction_accounts = vec![
@@ -200,7 +232,7 @@ mod test {
             (key2.pubkey(), AccountSharedData::default()),
         ];
 
-        let context = TransactionContext::new(transaction_accounts, Rent::default(), 20, 20);
+        let context = TransactionContext::new(transaction_accounts, Rent::default(), 20, 20, 1);
 
         let result = TransactionAccountStateInfo::verify_changes(
             &pre_rent_state,
@@ -210,12 +242,18 @@ mod test {
         assert!(result.is_ok());
 
         let pre_rent_state = vec![TransactionAccountStateInfo {
-            rent_state: Some(RentState::Uninitialized),
+            info: Some(WritableTransactionAccountStateInfo {
+                rent_state: RentState::Uninitialized,
+                data_size: 0,
+            }),
         }];
         let post_rent_state = vec![TransactionAccountStateInfo {
-            rent_state: Some(RentState::RentPaying {
+            info: Some(WritableTransactionAccountStateInfo {
+                rent_state: RentState::RentPaying {
+                    data_size: 2,
+                    lamports: 5,
+                },
                 data_size: 2,
-                lamports: 5,
             }),
         }];
 
@@ -224,7 +262,7 @@ mod test {
             (key2.pubkey(), AccountSharedData::default()),
         ];
 
-        let context = TransactionContext::new(transaction_accounts, Rent::default(), 20, 20);
+        let context = TransactionContext::new(transaction_accounts, Rent::default(), 20, 20, 1);
         let result = TransactionAccountStateInfo::verify_changes(
             &pre_rent_state,
             &post_rent_state,
@@ -234,5 +272,38 @@ mod test {
             result.err(),
             Some(TransactionError::InsufficientFundsForRent { account_index: 0 })
         );
+    }
+
+    #[test]
+    fn test_get_uninitialized_accounts_size_with_deleted_accounts() {
+        let post_state_infos = vec![
+            TransactionAccountStateInfo {
+                info: Some(WritableTransactionAccountStateInfo {
+                    rent_state: RentState::Uninitialized,
+                    data_size: 50,
+                }),
+            },
+            TransactionAccountStateInfo {
+                info: Some(WritableTransactionAccountStateInfo {
+                    rent_state: RentState::Uninitialized,
+                    data_size: 50,
+                }),
+            },
+            TransactionAccountStateInfo {
+                info: Some(WritableTransactionAccountStateInfo {
+                    rent_state: RentState::Uninitialized,
+                    data_size: 50,
+                }),
+            },
+            TransactionAccountStateInfo {
+                info: Some(WritableTransactionAccountStateInfo {
+                    rent_state: RentState::RentExempt,
+                    data_size: 50,
+                }),
+            },
+        ];
+
+        // 3 deleted accounts should contribute 3 * (50) = 150 to the count
+        assert_eq!(get_uninitialized_accounts_size(&post_state_infos), 150);
     }
 }

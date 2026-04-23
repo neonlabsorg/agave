@@ -1,18 +1,21 @@
 #![cfg(feature = "shuttle-test")]
 
 use {
-    crate::mock_bank::{create_custom_loader, deploy_program, register_builtins, MockForkGraph},
+    crate::mock_bank::{MockForkGraph, create_custom_loader, deploy_program, register_builtins},
     assert_matches::assert_matches,
     mock_bank::MockBankCallback,
     shuttle::{
+        Runner,
         sync::{Arc, RwLock},
-        thread, Runner,
+        thread,
     },
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
+    solana_clock::Slot,
     solana_instruction::{AccountMeta, Instruction},
     solana_program_runtime::{
         execution_budget::SVMTransactionExecutionAndFeeBudgetLimits,
-        loaded_programs::{ProgramCacheEntryType, ProgramCacheForTxBatch},
+        loaded_programs::{ProgramCacheForTxBatch, ProgramRuntimeEnvironments},
+        program_cache_entry::ProgramCacheEntryType,
     },
     solana_pubkey::Pubkey,
     solana_svm::{
@@ -22,13 +25,13 @@ use {
         },
         transaction_processor::{
             ExecutionRecordingConfig, TransactionBatchProcessor, TransactionProcessingConfig,
-            TransactionProcessingEnvironment,
+            TransactionProcessingEnvironment, get_mock_transaction_processing_environment,
         },
     },
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_timings::ExecuteTimings,
-    solana_transaction::{sanitized::SanitizedTransaction, Transaction},
-    std::collections::HashSet,
+    solana_transaction::{Transaction, sanitized::SanitizedTransaction},
+    std::collections::{HashMap, HashSet},
 };
 
 mod mock_bank;
@@ -38,8 +41,7 @@ const MAX_ITERATIONS: usize = 10_000;
 fn program_cache_execution(threads: usize) {
     let mut mock_bank = MockBankCallback::default();
     let fork_graph = Arc::new(RwLock::new(MockForkGraph {}));
-    let batch_processor =
-        TransactionBatchProcessor::new(5, 5, Arc::downgrade(&fork_graph), None, None);
+    let batch_processor = TransactionBatchProcessor::new(5, 5, Arc::downgrade(&fork_graph), None);
 
     let programs = vec![
         deploy_program("hello-solana".to_string(), 0, &mut mock_bank),
@@ -47,7 +49,7 @@ fn program_cache_execution(threads: usize) {
         deploy_program("clock-sysvar".to_string(), 0, &mut mock_bank),
     ];
 
-    let account_maps: HashSet<Pubkey> = programs.iter().copied().collect();
+    let account_maps: HashMap<Pubkey, Slot> = programs.iter().map(|key| (*key, 0)).collect();
 
     let ths: Vec<_> = (0..threads)
         .map(|_| {
@@ -68,12 +70,12 @@ fn program_cache_execution(threads: usize) {
                     0,
                 );
                 let mut result = ProgramCacheForTxBatch::new(processor.slot);
-                let program_runtime_environments_for_execution =
-                    processor.get_environments_for_epoch(processor.epoch);
+                let program_runtime_environment_for_execution =
+                    processor.program_runtime_environment_for_epoch(processor.epoch);
                 processor.replenish_program_cache(
                     &account_loader,
                     &maps,
-                    &program_runtime_environments_for_execution,
+                    &program_runtime_environment_for_execution,
                     &mut result,
                     &mut ExecuteTimings::default(),
                     false,
@@ -143,13 +145,12 @@ fn svm_concurrent() {
         5,
         2,
         Arc::downgrade(&fork_graph),
-        Some(Arc::new(create_custom_loader())),
-        None, // We are not using program runtime v2.
+        Some(create_custom_loader()),
     ));
 
     mock_bank.configure_sysvars();
     batch_processor.fill_missing_sysvar_cache_entries(&*mock_bank);
-    register_builtins(&mock_bank, &batch_processor, false);
+    register_builtins(&mock_bank, &batch_processor);
 
     let program_id = deploy_program("transfer-from-account".to_string(), 0, &mock_bank);
 
@@ -157,7 +158,7 @@ fn svm_concurrent() {
     const TRANSACTIONS_PER_THREAD: usize = 3;
     const AMOUNT: u64 = 50;
     const CAPACITY: usize = THREADS * TRANSACTIONS_PER_THREAD;
-    const BALANCE: u64 = 500000;
+    const BALANCE: u64 = 10_000_000;
 
     let mut transactions = vec![Vec::new(); THREADS];
     let mut check_data = vec![Vec::new(); THREADS];
@@ -264,10 +265,11 @@ fn svm_concurrent() {
                     &th_txs,
                     check_results,
                     &TransactionProcessingEnvironment {
-                        program_runtime_environments_for_execution: local_batch
-                            .environments
-                            .clone(),
-                        ..TransactionProcessingEnvironment::default()
+                        program_runtime_environments: ProgramRuntimeEnvironments::new(
+                            local_batch.program_runtime_environment.clone(),
+                            local_batch.program_runtime_environment.clone(),
+                        ),
+                        ..get_mock_transaction_processing_environment()
                     },
                     &processing_config,
                 );

@@ -1,59 +1,32 @@
-#![cfg_attr(
-    not(feature = "agave-unstable-api"),
-    deprecated(
-        since = "3.1.0",
-        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
-                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
-                acknowledge use of an interface that may break without warning."
-    )
-)]
+#![cfg(feature = "agave-unstable-api")]
 #![deny(clippy::arithmetic_side_effects)]
 #![deny(clippy::indexing_slicing)]
 
 #[cfg(feature = "svm-internal")]
 use qualifier_attr::qualifiers;
 use {
-    cfg_if::cfg_if,
     solana_bincode::limited_deserialize,
-    solana_clock::Slot,
-    solana_instruction::{error::InstructionError, AccountMeta},
+    solana_instruction::{AccountMeta, error::InstructionError},
     solana_loader_v3_interface::{
-        instruction::UpgradeableLoaderInstruction, state::UpgradeableLoaderState,
+        instruction::{MINIMUM_EXTEND_PROGRAM_BYTES, UpgradeableLoaderInstruction},
+        state::UpgradeableLoaderState,
     },
-    solana_program_entrypoint::{MAX_PERMITTED_DATA_INCREASE, SUCCESS},
     solana_program_runtime::{
-        execution_budget::MAX_INSTRUCTION_STACK_DEPTH,
-        invoke_context::{BpfAllocator, InvokeContext, SerializedAccountMetadata, SyscallContext},
-        loaded_programs::{
-            LoadProgramMetrics, ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
-            ProgramCacheForTxBatch, ProgramRuntimeEnvironment, DELAY_VISIBILITY_SLOT_OFFSET,
-        },
-        mem_pool::VmMemoryPool,
-        serialization, stable_log,
+        deploy_program,
+        invoke_context::InvokeContext,
+        program_cache_entry::{ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType},
         sysvar_cache::get_sysvar_with_account_check,
+        vm::execute,
     },
     solana_pubkey::Pubkey,
-    solana_sbpf::{
-        declare_builtin_function,
-        ebpf::{self, MM_HEAP_START},
-        elf::{ElfError, Executable},
-        error::{EbpfError, ProgramResult},
-        memory_region::{AccessType, MemoryMapping, MemoryRegion},
-        program::BuiltinProgram,
-        verifier::RequisiteVerifier,
-        vm::{ContextObject, EbpfVm},
-    },
-    solana_sdk_ids::{
-        bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4, native_loader,
-    },
-    solana_svm_log_collector::{ic_logger_msg, ic_msg, LogCollector},
+    solana_sbpf::declare_builtin_function,
+    solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, native_loader},
+    solana_svm_log_collector::{LogCollector, ic_logger_msg, ic_msg},
     solana_svm_measure::measure::Measure,
-    solana_svm_type_overrides::sync::{atomic::Ordering, Arc},
-    solana_system_interface::{instruction as system_instruction, MAX_PERMITTED_DATA_LENGTH},
-    solana_transaction_context::{
-        instruction::InstructionContext, IndexOfAccount, TransactionContext,
-    },
-    std::{cell::RefCell, mem, rc::Rc},
+    solana_svm_type_overrides::sync::Arc,
+    solana_system_interface::{MAX_PERMITTED_DATA_LENGTH, instruction as system_instruction},
+    solana_transaction_context::{IndexOfAccount, instruction::InstructionContext},
+    std::{cell::RefCell, rc::Rc},
 };
 
 #[cfg_attr(feature = "svm-internal", qualifiers(pub))]
@@ -62,162 +35,6 @@ const DEFAULT_LOADER_COMPUTE_UNITS: u64 = 570;
 const DEPRECATED_LOADER_COMPUTE_UNITS: u64 = 1_140;
 #[cfg_attr(feature = "svm-internal", qualifiers(pub))]
 const UPGRADEABLE_LOADER_COMPUTE_UNITS: u64 = 2_370;
-
-thread_local! {
-    pub static MEMORY_POOL: RefCell<VmMemoryPool> = RefCell::new(VmMemoryPool::new());
-}
-
-fn morph_into_deployment_environment_v1<'a>(
-    from: Arc<BuiltinProgram<InvokeContext<'a, 'a>>>,
-) -> Result<BuiltinProgram<InvokeContext<'a, 'a>>, ElfError> {
-    let mut config = from.get_config().clone();
-    config.reject_broken_elfs = true;
-    // Once the tests are being build using a toolchain which supports the newer SBPF versions,
-    // the deployment of older versions will be disabled:
-    // config.enabled_sbpf_versions =
-    //     *config.enabled_sbpf_versions.end()..=*config.enabled_sbpf_versions.end();
-
-    let mut result = BuiltinProgram::new_loader(config);
-
-    for (_key, (name, value)) in from.get_function_registry().iter() {
-        // Deployment of programs with sol_alloc_free is disabled. So do not register the syscall.
-        if name != *b"sol_alloc_free_" {
-            result.register_function(unsafe { std::str::from_utf8_unchecked(name) }, value)?;
-        }
-    }
-
-    Ok(result)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn load_program_from_bytes(
-    log_collector: Option<Rc<RefCell<LogCollector>>>,
-    load_program_metrics: &mut LoadProgramMetrics,
-    programdata: &[u8],
-    loader_key: &Pubkey,
-    account_size: usize,
-    deployment_slot: Slot,
-    program_runtime_environment: Arc<BuiltinProgram<InvokeContext<'static, 'static>>>,
-    reloading: bool,
-) -> Result<ProgramCacheEntry, InstructionError> {
-    let effective_slot = deployment_slot.saturating_add(DELAY_VISIBILITY_SLOT_OFFSET);
-    let loaded_program = if reloading {
-        // Safety: this is safe because the program is being reloaded in the cache.
-        unsafe {
-            ProgramCacheEntry::reload(
-                loader_key,
-                program_runtime_environment,
-                deployment_slot,
-                effective_slot,
-                programdata,
-                account_size,
-                load_program_metrics,
-            )
-        }
-    } else {
-        ProgramCacheEntry::new(
-            loader_key,
-            program_runtime_environment,
-            deployment_slot,
-            effective_slot,
-            programdata,
-            account_size,
-            load_program_metrics,
-        )
-    }
-    .map_err(|err| {
-        ic_logger_msg!(log_collector, "{}", err);
-        InstructionError::InvalidAccountData
-    })?;
-    Ok(loaded_program)
-}
-
-/// Directly deploy a program using a provided invoke context.
-/// This function should only be invoked from the runtime, since it does not
-/// provide any account loads or checks.
-pub fn deploy_program(
-    log_collector: Option<Rc<RefCell<LogCollector>>>,
-    program_cache_for_tx_batch: &mut ProgramCacheForTxBatch,
-    program_runtime_environment: ProgramRuntimeEnvironment,
-    program_id: &Pubkey,
-    loader_key: &Pubkey,
-    account_size: usize,
-    programdata: &[u8],
-    deployment_slot: Slot,
-) -> Result<LoadProgramMetrics, InstructionError> {
-    let mut load_program_metrics = LoadProgramMetrics::default();
-    let mut register_syscalls_time = Measure::start("register_syscalls_time");
-    let deployment_program_runtime_environment =
-        morph_into_deployment_environment_v1(program_runtime_environment.clone()).map_err(|e| {
-            ic_logger_msg!(log_collector, "Failed to register syscalls: {}", e);
-            InstructionError::ProgramEnvironmentSetupFailure
-        })?;
-    register_syscalls_time.stop();
-    load_program_metrics.register_syscalls_us = register_syscalls_time.as_us();
-    // Verify using stricter deployment_program_runtime_environment
-    let mut load_elf_time = Measure::start("load_elf_time");
-    let executable = Executable::<InvokeContext>::load(
-        programdata,
-        Arc::new(deployment_program_runtime_environment),
-    )
-    .map_err(|err| {
-        ic_logger_msg!(log_collector, "{}", err);
-        InstructionError::InvalidAccountData
-    })?;
-    load_elf_time.stop();
-    load_program_metrics.load_elf_us = load_elf_time.as_us();
-    let mut verify_code_time = Measure::start("verify_code_time");
-    executable.verify::<RequisiteVerifier>().map_err(|err| {
-        ic_logger_msg!(log_collector, "{}", err);
-        InstructionError::InvalidAccountData
-    })?;
-    verify_code_time.stop();
-    load_program_metrics.verify_code_us = verify_code_time.as_us();
-    // Reload but with program_runtime_environment
-    let executor = load_program_from_bytes(
-        log_collector,
-        &mut load_program_metrics,
-        programdata,
-        loader_key,
-        account_size,
-        deployment_slot,
-        program_runtime_environment,
-        true,
-    )?;
-    if let Some(old_entry) = program_cache_for_tx_batch.find(program_id) {
-        executor.tx_usage_counter.store(
-            old_entry.tx_usage_counter.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-    }
-    load_program_metrics.program_id = program_id.to_string();
-    program_cache_for_tx_batch.store_modified_entry(*program_id, Arc::new(executor));
-    Ok(load_program_metrics)
-}
-
-#[macro_export]
-macro_rules! deploy_program {
-    ($invoke_context:expr, $program_id:expr, $loader_key:expr, $account_size:expr, $programdata:expr, $deployment_slot:expr $(,)?) => {
-        assert_eq!(
-            $deployment_slot,
-            $invoke_context.program_cache_for_tx_batch.slot()
-        );
-        let load_program_metrics = $crate::deploy_program(
-            $invoke_context.get_log_collector(),
-            $invoke_context.program_cache_for_tx_batch,
-            $invoke_context
-                .get_program_runtime_environments_for_deployment()
-                .program_runtime_v1
-                .clone(),
-            $program_id,
-            $loader_key,
-            $account_size,
-            $programdata,
-            $deployment_slot,
-        )?;
-        load_program_metrics.submit_datapoint(&mut $invoke_context.timings);
-    };
-}
 
 fn write_program_data(
     program_data_offset: usize,
@@ -244,127 +61,6 @@ fn write_program_data(
     Ok(())
 }
 
-/// Only used in macro, do not use directly!
-pub fn calculate_heap_cost(heap_size: u32, heap_cost: u64) -> u64 {
-    const KIBIBYTE: u64 = 1024;
-    const PAGE_SIZE_KB: u64 = 32;
-    let mut rounded_heap_size = u64::from(heap_size);
-    rounded_heap_size =
-        rounded_heap_size.saturating_add(PAGE_SIZE_KB.saturating_mul(KIBIBYTE).saturating_sub(1));
-    rounded_heap_size
-        .checked_div(PAGE_SIZE_KB.saturating_mul(KIBIBYTE))
-        .expect("PAGE_SIZE_KB * KIBIBYTE > 0")
-        .saturating_sub(1)
-        .saturating_mul(heap_cost)
-}
-
-/// Only used in macro, do not use directly!
-#[cfg_attr(feature = "svm-internal", qualifiers(pub))]
-fn create_vm<'a, 'b>(
-    program: &'a Executable<InvokeContext<'b, 'b>>,
-    regions: Vec<MemoryRegion>,
-    accounts_metadata: Vec<SerializedAccountMetadata>,
-    invoke_context: &'a mut InvokeContext<'b, 'b>,
-    stack: &mut [u8],
-    heap: &mut [u8],
-) -> Result<EbpfVm<'a, InvokeContext<'b, 'b>>, Box<dyn std::error::Error>> {
-    let stack_size = stack.len();
-    let heap_size = heap.len();
-    let memory_mapping = create_memory_mapping(
-        program,
-        stack,
-        heap,
-        regions,
-        invoke_context.transaction_context,
-        invoke_context
-            .get_feature_set()
-            .stricter_abi_and_runtime_constraints,
-        invoke_context.get_feature_set().account_data_direct_mapping,
-    )?;
-    invoke_context.set_syscall_context(SyscallContext {
-        allocator: BpfAllocator::new(heap_size as u64),
-        accounts_metadata,
-    })?;
-    Ok(EbpfVm::new(
-        program.get_loader().clone(),
-        program.get_sbpf_version(),
-        invoke_context,
-        memory_mapping,
-        stack_size,
-    ))
-}
-
-/// Create the SBF virtual machine
-#[macro_export]
-macro_rules! create_vm {
-    ($vm:ident, $program:expr, $regions:expr, $accounts_metadata:expr, $invoke_context:expr $(,)?) => {
-        let invoke_context = &*$invoke_context;
-        let stack_size = $program.get_config().stack_size();
-        let heap_size = invoke_context.get_compute_budget().heap_size;
-        let heap_cost_result = invoke_context.consume_checked($crate::calculate_heap_cost(
-            heap_size,
-            invoke_context.get_execution_cost().heap_cost,
-        ));
-        let $vm = heap_cost_result.and_then(|_| {
-            let (mut stack, mut heap) = $crate::MEMORY_POOL
-                .with_borrow_mut(|pool| (pool.get_stack(stack_size), pool.get_heap(heap_size)));
-            let vm = $crate::create_vm(
-                $program,
-                $regions,
-                $accounts_metadata,
-                $invoke_context,
-                stack
-                    .as_slice_mut()
-                    .get_mut(..stack_size)
-                    .expect("invalid stack size"),
-                heap.as_slice_mut()
-                    .get_mut(..heap_size as usize)
-                    .expect("invalid heap size"),
-            );
-            vm.map(|vm| (vm, stack, heap))
-        });
-    };
-}
-
-fn create_memory_mapping<'a, 'b, C: ContextObject>(
-    executable: &'a Executable<C>,
-    stack: &'b mut [u8],
-    heap: &'b mut [u8],
-    additional_regions: Vec<MemoryRegion>,
-    transaction_context: &TransactionContext,
-    stricter_abi_and_runtime_constraints: bool,
-    account_data_direct_mapping: bool,
-) -> Result<MemoryMapping<'a>, Box<dyn std::error::Error>> {
-    let config = executable.get_config();
-    let sbpf_version = executable.get_sbpf_version();
-    let regions: Vec<MemoryRegion> = vec![
-        executable.get_ro_region(),
-        MemoryRegion::new_writable_gapped(
-            stack,
-            ebpf::MM_STACK_START,
-            if !sbpf_version.dynamic_stack_frames() && config.enable_stack_frame_gaps {
-                config.stack_frame_size as u64
-            } else {
-                0
-            },
-        ),
-        MemoryRegion::new_writable(heap, MM_HEAP_START),
-    ]
-    .into_iter()
-    .chain(additional_regions)
-    .collect();
-
-    Ok(MemoryMapping::new_with_access_violation_handler(
-        regions,
-        config,
-        sbpf_version,
-        transaction_context.access_violation_handler(
-            stricter_abi_and_runtime_constraints,
-            account_data_direct_mapping,
-        ),
-    )?)
-}
-
 declare_builtin_function!(
     Entrypoint,
     fn rust(
@@ -374,7 +70,6 @@ declare_builtin_function!(
         _arg2: u64,
         _arg3: u64,
         _arg4: u64,
-        _memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Box<dyn std::error::Error>> {
         process_instruction_inner(invoke_context)
     }
@@ -398,17 +93,23 @@ pub(crate) fn process_instruction_inner<'a>(
     if native_loader::check_id(&owner_id) {
         let program_id = instruction_context.get_program_key()?;
         return if bpf_loader_upgradeable::check_id(program_id) {
-            invoke_context.consume_checked(UPGRADEABLE_LOADER_COMPUTE_UNITS)?;
+            invoke_context
+                .compute_meter
+                .consume_checked(UPGRADEABLE_LOADER_COMPUTE_UNITS)?;
             process_loader_upgradeable_instruction(invoke_context)
         } else if bpf_loader::check_id(program_id) {
-            invoke_context.consume_checked(DEFAULT_LOADER_COMPUTE_UNITS)?;
+            invoke_context
+                .compute_meter
+                .consume_checked(DEFAULT_LOADER_COMPUTE_UNITS)?;
             ic_logger_msg!(
                 log_collector,
                 "BPF loader management instructions are no longer supported",
             );
             Err(InstructionError::UnsupportedProgramId)
         } else if bpf_loader_deprecated::check_id(program_id) {
-            invoke_context.consume_checked(DEPRECATED_LOADER_COMPUTE_UNITS)?;
+            invoke_context
+                .compute_meter
+                .consume_checked(DEPRECATED_LOADER_COMPUTE_UNITS)?;
             ic_logger_msg!(log_collector, "Deprecated loader is no longer supported");
             Err(InstructionError::UnsupportedProgramId)
         } else {
@@ -438,7 +139,7 @@ pub(crate) fn process_instruction_inner<'a>(
             ic_logger_msg!(log_collector, "Program is not deployed");
             Err(Box::new(InstructionError::UnsupportedProgramId) as Box<dyn std::error::Error>)
         }
-        ProgramCacheEntryType::Loaded(executable) => execute(executable, invoke_context),
+        ProgramCacheEntryType::Loaded(executable) => execute(executable, invoke_context, &executor),
         _ => Err(Box::new(InstructionError::UnsupportedProgramId) as Box<dyn std::error::Error>),
     }
     .map(|_| 0)
@@ -597,17 +298,8 @@ fn process_loader_upgradeable_instruction(
                 .accounts
                 .push(AccountMeta::new(buffer_key, false));
 
-            let transaction_context = &invoke_context.transaction_context;
-            let instruction_context = transaction_context.get_current_instruction_context()?;
-            let caller_program_id = instruction_context.get_program_key()?;
-            // The conversion from `PubkeyError` to `InstructionError` through
-            // num-traits is incorrect, but it's the existing behavior.
-            let signers = [[new_program_id.as_ref(), &[bump_seed]]]
-                .iter()
-                .map(|seeds| Pubkey::create_program_address(seeds, caller_program_id))
-                .collect::<Result<Vec<Pubkey>, solana_pubkey::PubkeyError>>()
-                .map_err(|e| e as u64)?;
-            invoke_context.native_invoke(instruction, signers.as_slice())?;
+            invoke_context
+                .native_invoke_signed(instruction, &[&[new_program_id.as_ref(), &[bump_seed]]])?;
 
             // Load and verify the program bits
             let transaction_context = &invoke_context.transaction_context;
@@ -1008,7 +700,10 @@ fn process_loader_upgradeable_instruction(
                         ic_logger_msg!(log_collector, "Program account not owned by loader");
                         return Err(InstructionError::IncorrectProgramId);
                     }
-                    let clock = invoke_context.get_sysvar_cache().get_clock()?;
+                    let clock = invoke_context
+                        .environment_config
+                        .sysvar_cache()
+                        .get_clock()?;
                     if clock.slot == slot {
                         ic_logger_msg!(log_collector, "Program was deployed in this block already");
                         return Err(InstructionError::InvalidArgument);
@@ -1032,7 +727,10 @@ fn process_loader_upgradeable_instruction(
                                 &instruction_context,
                                 &log_collector,
                             )?;
-                            let clock = invoke_context.get_sysvar_cache().get_clock()?;
+                            let clock = invoke_context
+                                .environment_config
+                                .sysvar_cache()
+                                .get_clock()?;
                             invoke_context
                                 .program_cache_for_tx_batch
                                 .store_modified_entry(
@@ -1059,185 +757,7 @@ fn process_loader_upgradeable_instruction(
             }
         }
         UpgradeableLoaderInstruction::ExtendProgram { additional_bytes } => {
-            if invoke_context
-                .get_feature_set()
-                .enable_extend_program_checked
-            {
-                ic_logger_msg!(
-                    log_collector,
-                    "ExtendProgram was superseded by ExtendProgramChecked"
-                );
-                return Err(InstructionError::InvalidInstructionData);
-            }
             common_extend_program(invoke_context, additional_bytes, false)?;
-        }
-        UpgradeableLoaderInstruction::ExtendProgramChecked { additional_bytes } => {
-            if !invoke_context
-                .get_feature_set()
-                .enable_extend_program_checked
-            {
-                return Err(InstructionError::InvalidInstructionData);
-            }
-            common_extend_program(invoke_context, additional_bytes, true)?;
-        }
-        UpgradeableLoaderInstruction::Migrate => {
-            if !invoke_context.get_feature_set().enable_loader_v4 {
-                return Err(InstructionError::InvalidInstructionData);
-            }
-
-            instruction_context.check_number_of_instruction_accounts(3)?;
-            let programdata_address = *instruction_context.get_key_of_instruction_account(0)?;
-            let program_address = *instruction_context.get_key_of_instruction_account(1)?;
-            let provided_authority_address =
-                *instruction_context.get_key_of_instruction_account(2)?;
-            let clock_slot = invoke_context
-                .get_sysvar_cache()
-                .get_clock()
-                .map(|clock| clock.slot)?;
-
-            // Verify ProgramData account
-            let programdata = instruction_context.try_borrow_instruction_account(0)?;
-            if !programdata.is_writable() {
-                ic_logger_msg!(log_collector, "ProgramData account not writeable");
-                return Err(InstructionError::InvalidArgument);
-            }
-            let (program_len, upgrade_authority_address) =
-                if let Ok(UpgradeableLoaderState::ProgramData {
-                    slot,
-                    upgrade_authority_address,
-                }) = programdata.get_state()
-                {
-                    if clock_slot == slot {
-                        ic_logger_msg!(log_collector, "Program was deployed in this block already");
-                        return Err(InstructionError::InvalidArgument);
-                    }
-                    (
-                        programdata
-                            .get_data()
-                            .len()
-                            .saturating_sub(UpgradeableLoaderState::size_of_programdata_metadata()),
-                        upgrade_authority_address,
-                    )
-                } else {
-                    (0, None)
-                };
-            let programdata_funds = programdata.get_lamports();
-            drop(programdata);
-
-            // Verify authority signature
-            if !migration_authority::check_id(&provided_authority_address)
-                && provided_authority_address
-                    != upgrade_authority_address.unwrap_or(program_address)
-            {
-                ic_logger_msg!(log_collector, "Incorrect migration authority provided");
-                return Err(InstructionError::IncorrectAuthority);
-            }
-            if !instruction_context.is_instruction_account_signer(2)? {
-                ic_logger_msg!(log_collector, "Migration authority did not sign");
-                return Err(InstructionError::MissingRequiredSignature);
-            }
-
-            // Verify Program account
-            let mut program = instruction_context.try_borrow_instruction_account(1)?;
-            if !program.is_writable() {
-                ic_logger_msg!(log_collector, "Program account not writeable");
-                return Err(InstructionError::InvalidArgument);
-            }
-            if program.get_owner() != program_id {
-                ic_logger_msg!(log_collector, "Program account not owned by loader");
-                return Err(InstructionError::IncorrectProgramId);
-            }
-            if let UpgradeableLoaderState::Program {
-                programdata_address: stored_programdata_address,
-            } = program.get_state()?
-            {
-                if programdata_address != stored_programdata_address {
-                    ic_logger_msg!(log_collector, "Program and ProgramData account mismatch");
-                    return Err(InstructionError::InvalidArgument);
-                }
-            } else {
-                ic_logger_msg!(log_collector, "Invalid Program account");
-                return Err(InstructionError::InvalidAccountData);
-            }
-            program.set_data_from_slice(&[])?;
-            program.checked_add_lamports(programdata_funds)?;
-            program.set_owner(&loader_v4::id().to_bytes())?;
-            drop(program);
-
-            let mut programdata = instruction_context.try_borrow_instruction_account(0)?;
-            programdata.set_lamports(0)?;
-            drop(programdata);
-
-            if program_len == 0 {
-                invoke_context
-                    .program_cache_for_tx_batch
-                    .store_modified_entry(
-                        program_address,
-                        Arc::new(ProgramCacheEntry::new_tombstone(
-                            clock_slot,
-                            ProgramCacheEntryOwner::LoaderV4,
-                            ProgramCacheEntryType::Closed,
-                        )),
-                    );
-            } else {
-                invoke_context.native_invoke(
-                    solana_loader_v4_interface::instruction::set_program_length(
-                        &program_address,
-                        &provided_authority_address,
-                        program_len as u32,
-                        &program_address,
-                    ),
-                    &[],
-                )?;
-
-                invoke_context.native_invoke(
-                    solana_loader_v4_interface::instruction::copy(
-                        &program_address,
-                        &provided_authority_address,
-                        &programdata_address,
-                        0,
-                        0,
-                        program_len as u32,
-                    ),
-                    &[],
-                )?;
-
-                invoke_context.native_invoke(
-                    solana_loader_v4_interface::instruction::deploy(
-                        &program_address,
-                        &provided_authority_address,
-                    ),
-                    &[],
-                )?;
-
-                if upgrade_authority_address.is_none() {
-                    invoke_context.native_invoke(
-                        solana_loader_v4_interface::instruction::finalize(
-                            &program_address,
-                            &provided_authority_address,
-                            &program_address,
-                        ),
-                        &[],
-                    )?;
-                } else if migration_authority::check_id(&provided_authority_address) {
-                    invoke_context.native_invoke(
-                        solana_loader_v4_interface::instruction::transfer_authority(
-                            &program_address,
-                            &provided_authority_address,
-                            &upgrade_authority_address.unwrap(),
-                        ),
-                        &[],
-                    )?;
-                }
-            }
-
-            let transaction_context = &invoke_context.transaction_context;
-            let instruction_context = transaction_context.get_current_instruction_context()?;
-            let mut programdata = instruction_context.try_borrow_instruction_account(0)?;
-            programdata.set_data_from_slice(&[])?;
-            drop(programdata);
-
-            ic_logger_msg!(log_collector, "Migrated program {:?}", &program_address);
         }
     }
 
@@ -1320,8 +840,33 @@ fn common_extend_program(
         return Err(InstructionError::InvalidRealloc);
     }
 
+    if invoke_context
+        .get_feature_set()
+        .loader_v3_minimum_extend_program_size
+    {
+        // SIMD-0431: Minimum Extend Program Size
+        //
+        // All extensions must be >= 10 KiB in additional_bytes, unless
+        // MAX_PERMITTED_DATA_LENGTH - current_len < 10 KiB. In that case,
+        // additional_bytes must be equal to the remaining free space.
+        let headroom = (MAX_PERMITTED_DATA_LENGTH as usize).saturating_sub(old_len);
+        if additional_bytes < MINIMUM_EXTEND_PROGRAM_BYTES
+            && (additional_bytes as usize) != headroom
+        {
+            ic_logger_msg!(
+                log_collector,
+                "ExtendProgram requires a minimum of {} additional bytes or to extend to maximum \
+                 size, but only {} were requested",
+                MINIMUM_EXTEND_PROGRAM_BYTES,
+                additional_bytes,
+            );
+            return Err(InstructionError::InvalidArgument);
+        }
+    }
+
     let clock_slot = invoke_context
-        .get_sysvar_cache()
+        .environment_config
+        .sysvar_cache()
         .get_clock()
         .map(|clock| clock.slot)?;
 
@@ -1364,12 +909,15 @@ fn common_extend_program(
 
     let required_payment = {
         let balance = programdata_account.get_lamports();
-        let rent = invoke_context.get_sysvar_cache().get_rent()?;
+        let rent = invoke_context
+            .environment_config
+            .sysvar_cache()
+            .get_rent()?;
         let min_balance = rent.minimum_balance(new_len).max(1);
         min_balance.saturating_sub(balance)
     };
 
-    // Borrowed accounts need to be dropped before native_invoke
+    // Borrowed accounts need to be dropped before native_invoke_signed
     drop(programdata_account);
 
     // Dereference the program ID to prevent overlapping mutable/immutable borrow of invoke context
@@ -1378,7 +926,7 @@ fn common_extend_program(
         let payer_key =
             *instruction_context.get_key_of_instruction_account(optional_payer_account_index)?;
 
-        invoke_context.native_invoke(
+        invoke_context.native_invoke_signed(
             system_instruction::transfer(&payer_key, &programdata_key, required_payment),
             &[],
         )?;
@@ -1449,265 +997,16 @@ fn common_close_account(
 }
 
 #[cfg_attr(feature = "svm-internal", qualifiers(pub))]
-fn execute<'a, 'b: 'a>(
-    executable: &'a Executable<InvokeContext<'static, 'static>>,
-    invoke_context: &'a mut InvokeContext<'b, 'b>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // We dropped the lifetime tracking in the Executor by setting it to 'static,
-    // thus we need to reintroduce the correct lifetime of InvokeContext here again.
-    let executable = unsafe {
-        mem::transmute::<
-            &'a Executable<InvokeContext<'static, 'static>>,
-            &'a Executable<InvokeContext<'b, 'b>>,
-        >(executable)
-    };
-    let log_collector = invoke_context.get_log_collector();
-    let transaction_context = &invoke_context.transaction_context;
-    let instruction_context = transaction_context.get_current_instruction_context()?;
-    let program_id = *instruction_context.get_program_key()?;
-    let is_loader_deprecated =
-        instruction_context.get_program_owner()? == bpf_loader_deprecated::id();
-    cfg_if! {
-        if #[cfg(any(
-            target_os = "windows",
-            not(target_arch = "x86_64"),
-            feature = "sbpf-debugger"
-        ))] {
-            let use_jit = false;
-        } else {
-            let use_jit = executable.get_compiled_program().is_some();
-        }
-    }
-    let stricter_abi_and_runtime_constraints = invoke_context
-        .get_feature_set()
-        .stricter_abi_and_runtime_constraints;
-    let account_data_direct_mapping = invoke_context.get_feature_set().account_data_direct_mapping;
-    let mask_out_rent_epoch_in_vm_serialization = invoke_context
-        .get_feature_set()
-        .mask_out_rent_epoch_in_vm_serialization;
-    let provide_instruction_data_offset_in_vm_r2 = invoke_context
-        .get_feature_set()
-        .provide_instruction_data_offset_in_vm_r2;
-
-    let mut serialize_time = Measure::start("serialize");
-    let (parameter_bytes, regions, accounts_metadata, instruction_data_offset) =
-        serialization::serialize_parameters(
-            &instruction_context,
-            stricter_abi_and_runtime_constraints,
-            account_data_direct_mapping,
-            mask_out_rent_epoch_in_vm_serialization,
-        )?;
-    serialize_time.stop();
-
-    // save the account addresses so in case we hit an AccessViolation error we
-    // can map to a more specific error
-    let account_region_addrs = accounts_metadata
-        .iter()
-        .map(|m| {
-            let vm_end = m
-                .vm_data_addr
-                .saturating_add(m.original_data_len as u64)
-                .saturating_add(if !is_loader_deprecated {
-                    MAX_PERMITTED_DATA_INCREASE as u64
-                } else {
-                    0
-                });
-            m.vm_data_addr..vm_end
-        })
-        .collect::<Vec<_>>();
-
-    let mut create_vm_time = Measure::start("create_vm");
-    let execution_result = {
-        let compute_meter_prev = invoke_context.get_remaining();
-        create_vm!(vm, executable, regions, accounts_metadata, invoke_context);
-        let (mut vm, stack, heap) = match vm {
-            Ok(info) => info,
-            Err(e) => {
-                ic_logger_msg!(log_collector, "Failed to create SBF VM: {}", e);
-                return Err(Box::new(InstructionError::ProgramEnvironmentSetupFailure));
-            }
-        };
-        create_vm_time.stop();
-
-        vm.context_object_pointer.execute_time = Some(Measure::start("execute"));
-        vm.registers[1] = ebpf::MM_INPUT_START;
-
-        // SIMD-0321: Provide offset to instruction data in VM register 2.
-        if provide_instruction_data_offset_in_vm_r2 {
-            vm.registers[2] = instruction_data_offset as u64;
-        }
-        let (compute_units_consumed, result) = vm.execute_program(executable, !use_jit);
-        let register_trace = std::mem::take(&mut vm.register_trace);
-        MEMORY_POOL.with_borrow_mut(|memory_pool| {
-            memory_pool.put_stack(stack);
-            memory_pool.put_heap(heap);
-            debug_assert!(memory_pool.stack_len() <= MAX_INSTRUCTION_STACK_DEPTH);
-            debug_assert!(memory_pool.heap_len() <= MAX_INSTRUCTION_STACK_DEPTH);
-        });
-        drop(vm);
-        invoke_context.insert_register_trace(register_trace);
-        if let Some(execute_time) = invoke_context.execute_time.as_mut() {
-            execute_time.stop();
-            invoke_context.timings.execute_us += execute_time.as_us();
-        }
-
-        ic_logger_msg!(
-            log_collector,
-            "Program {} consumed {} of {} compute units",
-            &program_id,
-            compute_units_consumed,
-            compute_meter_prev
-        );
-        let (_returned_from_program_id, return_data) =
-            invoke_context.transaction_context.get_return_data();
-        if !return_data.is_empty() {
-            stable_log::program_return(&log_collector, &program_id, return_data);
-        }
-        match result {
-            ProgramResult::Ok(status) if status != SUCCESS => {
-                let error: InstructionError = status.into();
-                Err(Box::new(error) as Box<dyn std::error::Error>)
-            }
-            ProgramResult::Err(mut error) => {
-                // Don't clean me up!!
-                // This feature is active on all networks, but we still toggle
-                // it off during fuzzing.
-                if invoke_context
-                    .get_feature_set()
-                    .deplete_cu_meter_on_vm_failure
-                    && !matches!(error, EbpfError::SyscallError(_))
-                {
-                    // when an exception is thrown during the execution of a
-                    // Basic Block (e.g., a null memory dereference or other
-                    // faults), determining the exact number of CUs consumed
-                    // up to the point of failure requires additional effort
-                    // and is unnecessary since these cases are rare.
-                    //
-                    // In order to simplify CU tracking, simply consume all
-                    // remaining compute units so that the block cost
-                    // tracker uses the full requested compute unit cost for
-                    // this failed transaction.
-                    invoke_context.consume(invoke_context.get_remaining());
-                }
-
-                if stricter_abi_and_runtime_constraints {
-                    if let EbpfError::SyscallError(err) = error {
-                        error = err
-                            .downcast::<EbpfError>()
-                            .map(|err| *err)
-                            .unwrap_or_else(EbpfError::SyscallError);
-                    }
-                    if let EbpfError::AccessViolation(access_type, vm_addr, len, _section_name) =
-                        error
-                    {
-                        // If stricter_abi_and_runtime_constraints is enabled and a program tries to write to a readonly
-                        // region we'll get a memory access violation. Map it to a more specific
-                        // error so it's easier for developers to see what happened.
-                        if let Some((instruction_account_index, vm_addr_range)) =
-                            account_region_addrs
-                                .iter()
-                                .enumerate()
-                                .find(|(_, vm_addr_range)| vm_addr_range.contains(&vm_addr))
-                        {
-                            let transaction_context = &invoke_context.transaction_context;
-                            let instruction_context =
-                                transaction_context.get_current_instruction_context()?;
-                            let account = instruction_context.try_borrow_instruction_account(
-                                instruction_account_index as IndexOfAccount,
-                            )?;
-                            if vm_addr.saturating_add(len) <= vm_addr_range.end {
-                                // The access was within the range of the accounts address space,
-                                // but it might not be within the range of the actual data.
-                                let is_access_outside_of_data = vm_addr
-                                    .saturating_add(len)
-                                    .saturating_sub(vm_addr_range.start)
-                                    as usize
-                                    > account.get_data().len();
-                                error = EbpfError::SyscallError(Box::new(
-                                    #[allow(deprecated)]
-                                    match access_type {
-                                        AccessType::Store => {
-                                            if let Err(err) = account.can_data_be_changed() {
-                                                err
-                                            } else {
-                                                // The store was allowed but failed,
-                                                // thus it must have been an attempt to grow the account.
-                                                debug_assert!(is_access_outside_of_data);
-                                                InstructionError::InvalidRealloc
-                                            }
-                                        }
-                                        AccessType::Load => {
-                                            // Loads should only fail when they are outside of the account data.
-                                            debug_assert!(is_access_outside_of_data);
-                                            if account.can_data_be_changed().is_err() {
-                                                // Load beyond readonly account data happened because the program
-                                                // expected more data than there actually is.
-                                                InstructionError::AccountDataTooSmall
-                                            } else {
-                                                // Load beyond writable account data also attempted to grow.
-                                                InstructionError::InvalidRealloc
-                                            }
-                                        }
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                }
-                Err(if let EbpfError::SyscallError(err) = error {
-                    err
-                } else {
-                    error.into()
-                })
-            }
-            _ => Ok(()),
-        }
-    };
-
-    fn deserialize_parameters(
-        invoke_context: &mut InvokeContext,
-        parameter_bytes: &[u8],
-        stricter_abi_and_runtime_constraints: bool,
-        account_data_direct_mapping: bool,
-    ) -> Result<(), InstructionError> {
-        serialization::deserialize_parameters(
-            &invoke_context
-                .transaction_context
-                .get_current_instruction_context()?,
-            stricter_abi_and_runtime_constraints,
-            account_data_direct_mapping,
-            parameter_bytes,
-            &invoke_context.get_syscall_context()?.accounts_metadata,
-        )
-    }
-
-    let mut deserialize_time = Measure::start("deserialize");
-    let execute_or_deserialize_result = execution_result.and_then(|_| {
-        deserialize_parameters(
-            invoke_context,
-            parameter_bytes.as_slice(),
-            stricter_abi_and_runtime_constraints,
-            account_data_direct_mapping,
-        )
-        .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
-    });
-    deserialize_time.stop();
-
-    // Update the timings
-    invoke_context.timings.serialize_us += serialize_time.as_us();
-    invoke_context.timings.create_vm_us += create_vm_time.as_us();
-    invoke_context.timings.deserialize_us += deserialize_time.as_us();
-
-    execute_or_deserialize_result
-}
-
-#[cfg_attr(feature = "svm-internal", qualifiers(pub))]
 mod test_utils {
+    #[cfg(all(feature = "svm-internal", feature = "metrics"))]
+    use solana_program_runtime::program_metrics::LoadProgramMetrics;
     #[cfg(feature = "svm-internal")]
     use {
-        super::*, agave_syscalls::create_program_runtime_environment_v1,
-        solana_account::ReadableAccount, solana_loader_v4_interface::state::LoaderV4State,
-        solana_sdk_ids::loader_v4,
+        super::*, solana_account::ReadableAccount,
+        solana_loader_v4_interface::state::LoaderV4State,
+        solana_program_runtime::loaded_programs::ProgramRuntimeEnvironment,
+        solana_program_runtime::program_cache_entry::DELAY_VISIBILITY_SLOT_OFFSET,
+        solana_sdk_ids::loader_v4, solana_syscalls::create_program_runtime_environment,
     };
 
     #[cfg(feature = "svm-internal")]
@@ -1721,14 +1020,13 @@ mod test_utils {
     #[cfg(feature = "svm-internal")]
     #[cfg_attr(feature = "svm-internal", qualifiers(pub))]
     fn load_all_invoked_programs(invoke_context: &mut InvokeContext) {
-        let mut load_program_metrics = LoadProgramMetrics::default();
-        let program_runtime_environment = create_program_runtime_environment_v1(
+        let program_runtime_environment = create_program_runtime_environment(
             invoke_context.get_feature_set(),
             invoke_context.get_compute_budget(),
             false, /* deployment */
             false, /* debugging_features */
-        );
-        let program_runtime_environment = Arc::new(program_runtime_environment.unwrap());
+        )
+        .unwrap();
         let num_accounts = invoke_context.transaction_context.get_number_of_accounts();
         for index in 0..num_accounts {
             let account = invoke_context
@@ -1749,19 +1047,23 @@ mod test_utils {
                     .get_key_of_account_at_index(index)
                     .expect("Failed to get account key");
 
-                if let Ok(loaded_program) = load_program_from_bytes(
-                    None,
-                    &mut load_program_metrics,
-                    account
-                        .data()
-                        .get(programdata_data_offset.min(account.data().len())..)
-                        .unwrap(),
+                let programdata = account
+                    .data()
+                    .get(programdata_data_offset.min(account.data().len())..)
+                    .unwrap();
+                let effective_slot = DELAY_VISIBILITY_SLOT_OFFSET;
+                let loaded_program = ProgramCacheEntry::new(
                     owner,
-                    account.data().len(),
+                    ProgramRuntimeEnvironment::clone(&program_runtime_environment),
                     0,
-                    program_runtime_environment.clone(),
-                    false,
-                ) {
+                    effective_slot,
+                    programdata,
+                    account.data().len(),
+                    #[cfg(feature = "metrics")]
+                    &mut LoadProgramMetrics::default(),
+                )
+                .map_err(|_| InstructionError::InvalidAccountData);
+                if let Ok(loaded_program) = loaded_program {
                     invoke_context
                         .program_cache_for_tx_batch
                         .store_modified_entry(*pubkey, Arc::new(loaded_program));
@@ -1778,37 +1080,38 @@ mod tests {
         assert_matches::assert_matches,
         rand::Rng,
         solana_account::{
-            create_account_shared_data_for_test as create_account_for_test, state_traits::StateMut,
             AccountSharedData, ReadableAccount, WritableAccount,
+            create_account_shared_data_for_test as create_account_for_test, state_traits::StateMut,
         },
         solana_clock::Clock,
         solana_epoch_schedule::EpochSchedule,
-        solana_instruction::{error::InstructionError, AccountMeta},
+        solana_instruction::{AccountMeta, error::InstructionError},
         solana_program_runtime::{
-            invoke_context::mock_process_instruction, with_mock_invoke_context,
+            invoke_context::mock_process_instruction, loaded_programs::ProgramRuntimeEnvironment,
+            program_metrics::ProgramStatistics, vm::calculate_heap_cost, with_mock_invoke_context,
         },
         solana_pubkey::Pubkey,
         solana_rent::Rent,
+        solana_sbpf::program::{BuiltinFunctionDefinition, BuiltinProgram},
         solana_sdk_ids::{system_program, sysvar},
+        solana_svm_type_overrides::sync::atomic::Ordering,
         std::{fs::File, io::Read, ops::Range, sync::atomic::AtomicU64},
     };
 
     fn process_instruction(
-        loader_id: &Pubkey,
-        program_index: Option<IndexOfAccount>,
+        program_id: &Pubkey,
         instruction_data: &[u8],
         transaction_accounts: Vec<(Pubkey, AccountSharedData)>,
         instruction_accounts: Vec<AccountMeta>,
         expected_result: Result<(), InstructionError>,
     ) -> Vec<AccountSharedData> {
         mock_process_instruction(
-            loader_id,
-            program_index,
+            program_id,
             instruction_data,
             transaction_accounts,
             instruction_accounts,
             expected_result,
-            Entrypoint::vm,
+            Entrypoint::register,
             |invoke_context| {
                 test_utils::load_all_invoked_programs(invoke_context);
             },
@@ -1845,7 +1148,6 @@ mod tests {
         // Case: No program account
         process_instruction(
             &loader_id,
-            None,
             &[],
             Vec::new(),
             Vec::new(),
@@ -1854,8 +1156,7 @@ mod tests {
 
         // Case: Only a program account
         process_instruction(
-            &loader_id,
-            Some(0),
+            &program_id,
             &[],
             vec![(program_id, program_account.clone())],
             Vec::new(),
@@ -1864,8 +1165,7 @@ mod tests {
 
         // Case: With program and parameter account
         process_instruction(
-            &loader_id,
-            Some(0),
+            &program_id,
             &[],
             vec![
                 (program_id, program_account.clone()),
@@ -1877,8 +1177,7 @@ mod tests {
 
         // Case: With duplicate accounts
         process_instruction(
-            &loader_id,
-            Some(0),
+            &program_id,
             &[],
             vec![
                 (program_id, program_account.clone()),
@@ -1890,15 +1189,14 @@ mod tests {
 
         // Case: limited budget
         mock_process_instruction(
-            &loader_id,
-            Some(0),
+            &program_id,
             &[],
             vec![(program_id, program_account)],
             Vec::new(),
             Err(InstructionError::ProgramFailedToComplete),
-            Entrypoint::vm,
+            Entrypoint::register,
             |invoke_context| {
-                invoke_context.mock_set_remaining(0);
+                invoke_context.compute_meter.mock_set_remaining(0);
                 test_utils::load_all_invoked_programs(invoke_context);
             },
             |_invoke_context| {},
@@ -1906,21 +1204,19 @@ mod tests {
 
         // Case: Account not a program
         mock_process_instruction(
-            &loader_id,
-            Some(0),
+            &program_id,
             &[],
             vec![(program_id, parameter_account.clone())],
             Vec::new(),
             Err(InstructionError::UnsupportedProgramId),
-            Entrypoint::vm,
+            Entrypoint::register,
             |invoke_context| {
                 test_utils::load_all_invoked_programs(invoke_context);
             },
             |_invoke_context| {},
         );
         process_instruction(
-            &loader_id,
-            Some(0),
+            &program_id,
             &[],
             vec![(program_id, parameter_account)],
             Vec::new(),
@@ -1944,8 +1240,7 @@ mod tests {
 
         // Case: With program and parameter account
         process_instruction(
-            &loader_id,
-            Some(0),
+            &program_id,
             &[],
             vec![
                 (program_id, program_account.clone()),
@@ -1957,8 +1252,7 @@ mod tests {
 
         // Case: With duplicate accounts
         process_instruction(
-            &loader_id,
-            Some(0),
+            &program_id,
             &[],
             vec![
                 (program_id, program_account),
@@ -1985,8 +1279,7 @@ mod tests {
 
         // Case: With program and parameter account
         process_instruction(
-            &loader_id,
-            Some(0),
+            &program_id,
             &[],
             vec![
                 (program_id, program_account.clone()),
@@ -1998,8 +1291,7 @@ mod tests {
 
         // Case: With duplicate accounts
         process_instruction(
-            &loader_id,
-            Some(0),
+            &program_id,
             &[],
             vec![
                 (program_id, program_account),
@@ -2037,7 +1329,6 @@ mod tests {
         // Case: Success
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction_data,
             vec![
                 (buffer_address, buffer_account),
@@ -2057,7 +1348,6 @@ mod tests {
         // Case: Already initialized
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction_data,
             vec![
                 (buffer_address, accounts.first().unwrap().clone()),
@@ -2102,7 +1392,6 @@ mod tests {
         .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![(buffer_address, buffer_account.clone())],
             instruction_accounts.clone(),
@@ -2122,7 +1411,6 @@ mod tests {
             .unwrap();
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![(buffer_address, buffer_account.clone())],
             instruction_accounts.clone(),
@@ -2160,7 +1448,6 @@ mod tests {
             .unwrap();
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![(buffer_address, buffer_account.clone())],
             instruction_accounts.clone(),
@@ -2196,7 +1483,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![(buffer_address, buffer_account.clone())],
             instruction_accounts.clone(),
@@ -2216,7 +1502,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![(buffer_address, buffer_account.clone())],
             instruction_accounts.clone(),
@@ -2236,7 +1521,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![(buffer_address, buffer_account.clone())],
             vec![
@@ -2268,7 +1552,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (buffer_address, buffer_account.clone()),
@@ -2302,7 +1585,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![(buffer_address, buffer_account.clone())],
             instruction_accounts,
@@ -2449,12 +1731,11 @@ mod tests {
                 bincode::serialize(&UpgradeableLoaderInstruction::Upgrade).unwrap();
             mock_process_instruction(
                 &bpf_loader_upgradeable::id(),
-                None,
                 &instruction_data,
                 transaction_accounts,
                 instruction_accounts,
                 expected_result,
-                Entrypoint::vm,
+                Entrypoint::register,
                 |_invoke_context| {},
                 |_invoke_context| {},
             )
@@ -2478,6 +1759,10 @@ mod tests {
         );
         assert_eq!(0, accounts.get(2).unwrap().lamports());
         assert_eq!(1, accounts.get(3).unwrap().lamports());
+        assert_eq!(
+            UpgradeableLoaderState::size_of_buffer(0),
+            accounts.get(2).unwrap().data().len()
+        );
         let state: UpgradeableLoaderState = accounts.first().unwrap().state().unwrap();
         assert_eq!(
             state,
@@ -2599,12 +1884,11 @@ mod tests {
 
         mock_process_instruction(
             &bpf_loader_upgradeable::id(),
-            None,
             &instruction_data,
             transaction_accounts.clone(),
             instruction_accounts.clone(),
             Err(InstructionError::InvalidAccountData),
-            Entrypoint::vm,
+            Entrypoint::register,
             |invoke_context| {
                 test_utils::load_all_invoked_programs(invoke_context);
             },
@@ -2705,6 +1989,32 @@ mod tests {
             transaction_accounts,
             instruction_accounts,
             Err(InstructionError::InvalidArgument),
+        );
+
+        // Case: Buffer account not owned by loader
+        // The program actually does not deliberately check for this.
+        // It's only when it attempts to mutate the account that it trips an
+        // error.
+        //
+        // For `Upgrade`, this occurs when attempting to close the buffer.
+        // The first thing it attempts to do is debit the lamports, which
+        // immediately throws `ExternalAccountLamportSpend`.
+        let (mut transaction_accounts, instruction_accounts) = get_accounts(
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf_orig,
+            &elf_new,
+        );
+        transaction_accounts
+            .get_mut(2)
+            .unwrap()
+            .1
+            .set_owner(Pubkey::new_unique());
+        process_instruction(
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::ExternalAccountLamportSpend),
         );
 
         // Case: Buffer account too big
@@ -2828,6 +2138,499 @@ mod tests {
     }
 
     #[test]
+    fn test_bpf_loader_upgradeable_deploy_with_max_data_len() {
+        let mut file = File::open("test_elfs/out/sbpfv3_return_ok.so").expect("file open failed");
+        let mut elf = Vec::new();
+        file.read_to_end(&mut elf).unwrap();
+        const SLOT: u64 = 42;
+        let payer_address = Pubkey::new_unique();
+        let buffer_address = Pubkey::new_unique();
+        let upgrade_authority_address = Pubkey::new_unique();
+
+        fn get_accounts(
+            payer_address: &Pubkey,
+            buffer_address: &Pubkey,
+            buffer_authority: &Pubkey,
+            upgrade_authority_address: &Pubkey,
+            elf: &[u8],
+        ) -> (Vec<(Pubkey, AccountSharedData)>, Vec<AccountMeta>) {
+            let loader_id = bpf_loader_upgradeable::id();
+            let program_address = Pubkey::new_unique();
+            let rent = Rent::default();
+            let min_program_balance =
+                1.max(rent.minimum_balance(UpgradeableLoaderState::size_of_program()));
+            let min_programdata_balance =
+                1.max(rent.minimum_balance(UpgradeableLoaderState::size_of_programdata(elf.len())));
+            let (programdata_address, _) =
+                Pubkey::find_program_address(&[program_address.as_ref()], &loader_id);
+            let mut buffer_account = AccountSharedData::new(
+                1,
+                UpgradeableLoaderState::size_of_buffer(elf.len()),
+                &bpf_loader_upgradeable::id(),
+            );
+            buffer_account
+                .set_state(&UpgradeableLoaderState::Buffer {
+                    authority_address: Some(*buffer_authority),
+                })
+                .unwrap();
+            buffer_account
+                .data_as_mut_slice()
+                .get_mut(UpgradeableLoaderState::size_of_buffer_metadata()..)
+                .unwrap()
+                .copy_from_slice(elf);
+            let programdata_account = AccountSharedData::new(0, 0, &system_program::id());
+            let mut program_account = AccountSharedData::new(
+                min_program_balance,
+                UpgradeableLoaderState::size_of_program(),
+                &bpf_loader_upgradeable::id(),
+            );
+            program_account
+                .set_state(&UpgradeableLoaderState::Uninitialized)
+                .unwrap();
+            let payer_account = AccountSharedData::new(
+                min_programdata_balance.saturating_add(1),
+                0,
+                &system_program::id(),
+            );
+            let rent_account = create_account_for_test(&rent);
+            let clock_account = create_account_for_test(&Clock {
+                slot: SLOT,
+                ..Clock::default()
+            });
+            let system_program_account = AccountSharedData::new(0, 0, &native_loader::id());
+            let upgrade_authority_account = AccountSharedData::new(1, 0, &Pubkey::new_unique());
+            let transaction_accounts = vec![
+                (*payer_address, payer_account),
+                (programdata_address, programdata_account),
+                (program_address, program_account),
+                (*buffer_address, buffer_account),
+                (sysvar::rent::id(), rent_account),
+                (sysvar::clock::id(), clock_account),
+                (system_program::id(), system_program_account),
+                (*upgrade_authority_address, upgrade_authority_account),
+            ];
+            let instruction_accounts = vec![
+                AccountMeta {
+                    pubkey: *payer_address,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: programdata_address,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: program_address,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: *buffer_address,
+                    is_signer: false,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    pubkey: sysvar::rent::id(),
+                    is_signer: false,
+                    is_writable: false,
+                },
+                AccountMeta {
+                    pubkey: sysvar::clock::id(),
+                    is_signer: false,
+                    is_writable: false,
+                },
+                AccountMeta {
+                    pubkey: system_program::id(),
+                    is_signer: false,
+                    is_writable: false,
+                },
+                AccountMeta {
+                    pubkey: *upgrade_authority_address,
+                    is_signer: true,
+                    is_writable: false,
+                },
+            ];
+            (transaction_accounts, instruction_accounts)
+        }
+
+        fn process_instruction(
+            max_data_len: usize,
+            transaction_accounts: Vec<(Pubkey, AccountSharedData)>,
+            instruction_accounts: Vec<AccountMeta>,
+            expected_result: Result<(), InstructionError>,
+        ) -> Vec<AccountSharedData> {
+            let instruction_data =
+                bincode::serialize(&UpgradeableLoaderInstruction::DeployWithMaxDataLen {
+                    max_data_len,
+                })
+                .unwrap();
+            mock_process_instruction(
+                &bpf_loader_upgradeable::id(),
+                &instruction_data,
+                transaction_accounts,
+                instruction_accounts,
+                expected_result,
+                Entrypoint::register,
+                |invoke_context| {
+                    // Register the system program for CPI support.
+                    invoke_context.program_cache_for_tx_batch.replenish(
+                        system_program::id(),
+                        Arc::new(ProgramCacheEntry::new_builtin(
+                            0,
+                            0,
+                            solana_system_program::system_processor::Entrypoint::register,
+                        )),
+                    );
+                },
+                |_invoke_context| {},
+            )
+        }
+
+        // Case: Success
+        let (transaction_accounts, instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        let programdata_address = instruction_accounts.get(1).unwrap().pubkey;
+        let accounts = process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Ok(()),
+        );
+        let min_programdata_balance =
+            Rent::default().minimum_balance(UpgradeableLoaderState::size_of_programdata(elf.len()));
+        assert_eq!(min_programdata_balance, accounts.get(1).unwrap().lamports());
+        assert_eq!(2, accounts.first().unwrap().lamports());
+        assert_eq!(0, accounts.get(3).unwrap().lamports());
+        assert_eq!(
+            UpgradeableLoaderState::size_of_buffer(0),
+            accounts.get(3).unwrap().data().len()
+        );
+        let state: UpgradeableLoaderState = accounts.get(1).unwrap().state().unwrap();
+        assert_eq!(
+            state,
+            UpgradeableLoaderState::ProgramData {
+                slot: SLOT,
+                upgrade_authority_address: Some(upgrade_authority_address),
+            }
+        );
+        for (i, byte) in accounts
+            .get(1)
+            .unwrap()
+            .data()
+            .get(
+                UpgradeableLoaderState::size_of_programdata_metadata()
+                    ..UpgradeableLoaderState::size_of_programdata(elf.len()),
+            )
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(*elf.get(i).unwrap(), *byte);
+        }
+        let state: UpgradeableLoaderState = accounts.get(2).unwrap().state().unwrap();
+        assert_eq!(
+            state,
+            UpgradeableLoaderState::Program {
+                programdata_address,
+            }
+        );
+        assert!(accounts.get(2).unwrap().executable());
+
+        // Case: wrong authority
+        let (mut transaction_accounts, mut instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        let invalid_upgrade_authority_address = Pubkey::new_unique();
+        transaction_accounts.get_mut(7).unwrap().0 = invalid_upgrade_authority_address;
+        instruction_accounts.get_mut(7).unwrap().pubkey = invalid_upgrade_authority_address;
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::IncorrectAuthority),
+        );
+
+        // Case: authority did not sign
+        let (transaction_accounts, mut instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        instruction_accounts.get_mut(7).unwrap().is_signer = false;
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::MissingRequiredSignature),
+        );
+
+        // Case: Buffer account and payer account alias
+        let (transaction_accounts, mut instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        *instruction_accounts.get_mut(0).unwrap() = instruction_accounts.get(3).unwrap().clone();
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::AccountBorrowFailed),
+        );
+
+        // Case: Program account not owned by loader
+        //
+        // Unlike `Upgrade`, `DeployWithMaxDataLen` has no explicit owner
+        // check on the program account. Validation passes, and the failure
+        // only surfaces at the end when the handler tries to mutate the
+        // program's state — `set_state` requires the account to be owned by
+        // the currently-executing program, so it trips
+        // `ExternalAccountDataModified`.
+        let (mut transaction_accounts, instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        transaction_accounts
+            .get_mut(2)
+            .unwrap()
+            .1
+            .set_owner(Pubkey::new_unique());
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::ExternalAccountDataModified),
+        );
+
+        // Case: Program account not writable
+        //
+        // `DeployWithMaxDataLen` also lacks an explicit writability check on
+        // the program account, so the failure again surfaces at
+        // `set_state`, this time via the writability guard: a non-writable
+        // account yields `ReadonlyDataModified`.
+        let (transaction_accounts, mut instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        instruction_accounts.get_mut(2).unwrap().is_writable = false;
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::ReadonlyDataModified),
+        );
+
+        // Case: Program account already initialized
+        let (mut transaction_accounts, instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        transaction_accounts
+            .get_mut(2)
+            .unwrap()
+            .1
+            .set_state(&UpgradeableLoaderState::Program {
+                programdata_address: Pubkey::new_unique(),
+            })
+            .unwrap();
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::AccountAlreadyInitialized),
+        );
+
+        // Case: Program account too small
+        let (mut transaction_accounts, instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        truncate_data(&mut transaction_accounts.get_mut(2).unwrap().1, 5);
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::AccountDataTooSmall),
+        );
+
+        // Case: Program account not rent-exempt
+        let (mut transaction_accounts, instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        transaction_accounts.get_mut(2).unwrap().1.set_lamports(1);
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::ExecutableAccountNotRentExempt),
+        );
+
+        // Case: ProgramData address not derived
+        let (mut transaction_accounts, mut instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        let invalid_programdata_address = Pubkey::new_unique();
+        transaction_accounts.get_mut(1).unwrap().0 = invalid_programdata_address;
+        instruction_accounts.get_mut(1).unwrap().pubkey = invalid_programdata_address;
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::InvalidArgument),
+        );
+
+        // Case: Buffer account not initialized
+        let (mut transaction_accounts, instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        transaction_accounts
+            .get_mut(3)
+            .unwrap()
+            .1
+            .set_state(&UpgradeableLoaderState::Uninitialized)
+            .unwrap();
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::InvalidArgument),
+        );
+
+        // Case: Buffer account not owned by loader
+        // The program actually does not deliberately check for this.
+        // It's only when it attempts to mutate the account that it trips an
+        // error.
+        //
+        // For `DeployWithMaxDataLen`, this occurs when attempting to close the
+        // buffer. The first thing it attempts to do is debit the lamports,
+        // which immediately throws `ExternalAccountLamportSpend`.
+        let (mut transaction_accounts, instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        transaction_accounts
+            .get_mut(3)
+            .unwrap()
+            .1
+            .set_owner(Pubkey::new_unique());
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::ExternalAccountLamportSpend),
+        );
+
+        // Case: Max data length too small for Buffer data
+        let (transaction_accounts, instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        process_instruction(
+            elf.len().saturating_sub(1),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::AccountDataTooSmall),
+        );
+
+        // Case: Max data length too large
+        let (transaction_accounts, instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        process_instruction(
+            MAX_PERMITTED_DATA_LENGTH as usize,
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::InvalidArgument),
+        );
+
+        // Case: Mismatched buffer authority
+        let (transaction_accounts, instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::IncorrectAuthority),
+        );
+
+        // Case: No buffer authority
+        let (mut transaction_accounts, instruction_accounts) = get_accounts(
+            &payer_address,
+            &buffer_address,
+            &buffer_address,
+            &upgrade_authority_address,
+            &elf,
+        );
+        transaction_accounts
+            .get_mut(3)
+            .unwrap()
+            .1
+            .set_state(&UpgradeableLoaderState::Buffer {
+                authority_address: None,
+            })
+            .unwrap();
+        process_instruction(
+            elf.len(),
+            transaction_accounts,
+            instruction_accounts,
+            Err(InstructionError::IncorrectAuthority),
+        );
+    }
+
+    #[test]
     fn test_bpf_loader_upgradeable_set_upgrade_authority() {
         let instruction = bincode::serialize(&UpgradeableLoaderInstruction::SetAuthority).unwrap();
         let loader_id = bpf_loader_upgradeable::id();
@@ -2871,7 +2674,6 @@ mod tests {
         // Case: Set to new authority
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -2900,7 +2702,6 @@ mod tests {
         // Case: Not upgradeable
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -2921,7 +2722,6 @@ mod tests {
         // Case: Authority did not sign
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -2942,7 +2742,6 @@ mod tests {
         let invalid_upgrade_authority_address = Pubkey::new_unique();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -2973,7 +2772,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -2991,7 +2789,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -3047,7 +2844,6 @@ mod tests {
         // Case: Set to new authority
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -3077,7 +2873,6 @@ mod tests {
         // Case: set to same authority
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -3094,7 +2889,6 @@ mod tests {
         // Case: present authority not in instruction
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -3111,7 +2905,6 @@ mod tests {
         // Case: new authority not in instruction
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -3128,7 +2921,6 @@ mod tests {
         // Case: present authority did not sign
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -3153,7 +2945,6 @@ mod tests {
         // Case: New authority did not sign
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -3179,7 +2970,6 @@ mod tests {
         let invalid_upgrade_authority_address = Pubkey::new_unique();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -3210,7 +3000,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -3232,7 +3021,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -3288,7 +3076,6 @@ mod tests {
         // Case: New authority required
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![buffer_meta.clone(), authority_meta.clone()],
@@ -3310,7 +3097,6 @@ mod tests {
             .unwrap();
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![
@@ -3331,7 +3117,6 @@ mod tests {
         // Case: Authority did not sign
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![
@@ -3349,7 +3134,6 @@ mod tests {
         // Case: wrong authority
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (buffer_address, buffer_account.clone()),
@@ -3371,7 +3155,6 @@ mod tests {
         // Case: No authority
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![buffer_meta.clone(), authority_meta.clone()],
@@ -3389,7 +3172,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![
@@ -3411,7 +3193,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![buffer_meta, authority_meta, new_authority_meta],
@@ -3466,7 +3247,6 @@ mod tests {
             .unwrap();
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![
@@ -3487,7 +3267,6 @@ mod tests {
         // Case: set to same authority
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![
@@ -3501,7 +3280,6 @@ mod tests {
         // Case: Missing current authority
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![buffer_meta.clone(), new_authority_meta.clone()],
@@ -3511,7 +3289,6 @@ mod tests {
         // Case: Missing new authority
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![buffer_meta.clone(), authority_meta.clone()],
@@ -3521,7 +3298,6 @@ mod tests {
         // Case: wrong present authority
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (buffer_address, buffer_account.clone()),
@@ -3543,7 +3319,6 @@ mod tests {
         // Case: present authority did not sign
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![
@@ -3561,7 +3336,6 @@ mod tests {
         // Case: new authority did not sign
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![
@@ -3587,7 +3361,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![
@@ -3609,7 +3382,6 @@ mod tests {
             .unwrap();
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts.clone(),
             vec![buffer_meta, authority_meta, new_authority_meta],
@@ -3692,7 +3464,6 @@ mod tests {
         // Case: close a buffer account
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction,
             transaction_accounts,
             vec![
@@ -3714,7 +3485,6 @@ mod tests {
         // Case: close with wrong authority
         process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (buffer_address, buffer_account.clone()),
@@ -3736,7 +3506,6 @@ mod tests {
         // Case: close an uninitialized account
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (uninitialized_address, uninitialized_account.clone()),
@@ -3766,7 +3535,6 @@ mod tests {
         // Case: close a program account
         let accounts = process_instruction(
             &loader_id,
-            None,
             &instruction,
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -3804,8 +3572,7 @@ mod tests {
         programdata_account = accounts.first().unwrap().clone();
         program_account = accounts.get(3).unwrap().clone();
         process_instruction(
-            &loader_id,
-            Some(1),
+            &program_address,
             &[],
             vec![
                 (programdata_address, programdata_account.clone()),
@@ -3818,7 +3585,6 @@ mod tests {
         // Case: Reopen should fail
         process_instruction(
             &loader_id,
-            None,
             &bincode::serialize(&UpgradeableLoaderInstruction::DeployWithMaxDataLen {
                 max_data_len: 0,
             })
@@ -3931,8 +3697,7 @@ mod tests {
                 program_account.set_data(bytes.to_vec());
                 program_account.set_executable(true);
                 process_instruction(
-                    &loader_id,
-                    None,
+                    &program_id,
                     &[],
                     vec![(program_id, program_account)],
                     Vec::new(),
@@ -3987,14 +3752,18 @@ mod tests {
         )];
         with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
         let program_id = Pubkey::new_unique();
-        let env = Arc::new(BuiltinProgram::new_mock());
+        let env = ProgramRuntimeEnvironment::from(BuiltinProgram::new_mock());
+        let stats = ProgramStatistics {
+            uses: 100.into(),
+            ..Default::default()
+        };
         let program = ProgramCacheEntry {
             program: ProgramCacheEntryType::Unloaded(env),
             account_owner: ProgramCacheEntryOwner::LoaderV2,
             account_size: 0,
             deployment_slot: 0,
             effective_slot: 0,
-            tx_usage_counter: Arc::new(AtomicU64::new(100)),
+            stats: stats.into(),
             latest_access_slot: AtomicU64::new(0),
         };
         invoke_context
@@ -4015,10 +3784,7 @@ mod tests {
             .expect("Didn't find upgraded program in the cache");
 
         assert_eq!(updated_program.deployment_slot, 2);
-        assert_eq!(
-            updated_program.tx_usage_counter.load(Ordering::Relaxed),
-            100
-        );
+        assert_eq!(updated_program.stats.uses.load(Ordering::Relaxed), 100);
     }
 
     #[test]
@@ -4029,14 +3795,18 @@ mod tests {
         )];
         with_mock_invoke_context!(invoke_context, transaction_context, transaction_accounts);
         let program_id = Pubkey::new_unique();
-        let env = Arc::new(BuiltinProgram::new_mock());
+        let env = ProgramRuntimeEnvironment::from(BuiltinProgram::new_mock());
+        let stats = ProgramStatistics {
+            uses: 100.into(),
+            ..Default::default()
+        };
         let program = ProgramCacheEntry {
             program: ProgramCacheEntryType::Unloaded(env),
             account_owner: ProgramCacheEntryOwner::LoaderV2,
             account_size: 0,
             deployment_slot: 0,
             effective_slot: 0,
-            tx_usage_counter: Arc::new(AtomicU64::new(100)),
+            stats: stats.into(),
             latest_access_slot: AtomicU64::new(0),
         };
         invoke_context
@@ -4058,6 +3828,6 @@ mod tests {
             .expect("Didn't find upgraded program in the cache");
 
         assert_eq!(program2.deployment_slot, 2);
-        assert_eq!(program2.tx_usage_counter.load(Ordering::Relaxed), 0);
+        assert_eq!(program2.stats.uses.load(Ordering::Relaxed), 0);
     }
 }

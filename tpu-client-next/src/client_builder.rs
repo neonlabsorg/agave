@@ -18,7 +18,7 @@
 //!        ))
 //!        .leader_send_fanout(1)
 //!        .identity(&identity_keypair)
-//!        .max_cache_size(128);
+//!        .max_cache_size(NonZeroUsize::new(128).unwrap())
 //!        .metric_reporter({
 //!            let successfully_sent = successfully_sent.clone();
 //!            |stats: Arc<SendTransactionStats>, cancel: CancellationToken| async move {
@@ -41,16 +41,16 @@
 //! ```
 use {
     crate::{
+        ConnectionWorkersScheduler, ConnectionWorkersSchedulerError, SendTransactionStats,
         connection_workers_scheduler::{
             BindTarget, ConnectionWorkersSchedulerConfig, Fanout, NonblockingBroadcaster,
             StakeIdentity, WorkersBroadcaster,
         },
         leader_updater::LeaderUpdater,
         transaction_batch::TransactionBatch,
-        ConnectionWorkersScheduler, ConnectionWorkersSchedulerError, SendTransactionStats,
     },
     solana_keypair::Keypair,
-    std::{future::Future, net::UdpSocket, pin::Pin, sync::Arc},
+    std::{future::Future, net::UdpSocket, num::NonZeroUsize, pin::Pin, sync::Arc},
     thiserror::Error,
     tokio::{
         runtime,
@@ -79,7 +79,7 @@ pub struct ClientBuilder {
     leader_updater: Box<dyn LeaderUpdater>,
     bind_target: Option<BindTarget>,
     identity: Option<StakeIdentity>,
-    num_connections: usize,
+    num_connections: NonZeroUsize,
     leader_send_fanout: usize,
     skip_check_transaction_age: bool,
     sender_channel_size: usize,
@@ -89,6 +89,7 @@ pub struct ClientBuilder {
     report_fn: Option<ReportFn>,
     cancel_scheduler: CancellationToken,
     cancel_reporter: CancellationToken,
+    override_initial_congestion_window: Option<u64>,
 }
 
 impl ClientBuilder {
@@ -98,7 +99,7 @@ impl ClientBuilder {
             leader_updater,
             bind_target: None,
             identity: None,
-            num_connections: 64,
+            num_connections: NonZeroUsize::new(64).unwrap(),
             leader_send_fanout: 2,
             skip_check_transaction_age: true,
             worker_channel_size: 2,
@@ -108,6 +109,7 @@ impl ClientBuilder {
             report_fn: None,
             cancel_scheduler: CancellationToken::new(),
             cancel_reporter: CancellationToken::new(),
+            override_initial_congestion_window: None,
         }
     }
 
@@ -139,7 +141,7 @@ impl ClientBuilder {
     }
 
     /// Set the maximum number of cached connections.
-    pub fn max_cache_size(mut self, num_connections: usize) -> Self {
+    pub fn max_cache_size(mut self, num_connections: NonZeroUsize) -> Self {
         self.num_connections = num_connections;
         self
     }
@@ -178,6 +180,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the initial congestion window size in bytes.
+    ///
+    /// If not set, defaults to INITIAL_CONGESTION_WINDOW.
+    pub fn override_initial_congestion_window(mut self, bytes: u64) -> Self {
+        self.override_initial_congestion_window = Some(bytes);
+        self
+    }
+
     /// Set the broadcaster used by the scheduler.
     pub fn broadcaster(mut self, broadcaster: impl WorkersBroadcaster + 'static) -> Self {
         self.broadcaster = Box::new(broadcaster);
@@ -213,6 +223,7 @@ impl ClientBuilder {
                 connect: self.leader_send_fanout.saturating_add(1),
                 send: self.leader_send_fanout,
             },
+            override_initial_congestion_window: self.override_initial_congestion_window,
         };
 
         let scheduler = ConnectionWorkersScheduler::new(

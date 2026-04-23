@@ -27,7 +27,7 @@ cargo_build_sbf_sanity() {
   for program in "${rust_programs[@]}"
   do
     pushd "$program"
-    $cargo_build_sbf --arch "$1"
+    $cargo_build_sbf --arch "$1" --tools-version v1.54
     popd
   done
   popd
@@ -77,7 +77,7 @@ test-stable-sbf)
   "$cargo_build_sbf" --version
 
   # Install the platform tools
-  _ platform-tools-sdk/sbf/scripts/install.sh
+  _ programs/sbf/install.sh
 
   # SBPFv0 program tests
   _ make -C programs/sbf test-v0
@@ -93,6 +93,11 @@ test-stable-sbf)
   _ make -C programs/sbf clean-all test-v2
   _ make -C programs/sbf clean-all
   _ cargo_build_sbf_sanity "v2"
+
+  # SBPFv3 program tests
+  _ make -C programs/sbf clean-all test-v3
+  _ make -C programs/sbf clean-all
+  _ cargo_build_sbf_sanity "v3"
 
   exit 0
   ;;

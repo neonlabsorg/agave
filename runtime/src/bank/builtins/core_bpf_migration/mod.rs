@@ -5,7 +5,7 @@ mod target_builtin;
 mod target_core_bpf;
 
 use {
-    crate::bank::{builtins::core_bpf_migration::target_bpf_v2::TargetBpfV2, Bank},
+    crate::bank::{Bank, builtins::core_bpf_migration::target_bpf_v2::TargetBpfV2},
     error::CoreBpfMigrationError,
     num_traits::{CheckedAdd, CheckedSub},
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
@@ -15,14 +15,18 @@ use {
     solana_instruction::error::InstructionError,
     solana_loader_v3_interface::state::UpgradeableLoaderState,
     solana_program_runtime::{
+        deploy::deploy_program,
         invoke_context::{EnvironmentConfig, InvokeContext},
-        loaded_programs::ProgramCacheForTxBatch,
+        loaded_programs::{
+            ProgramCacheForTxBatch, ProgramRuntimeEnvironment, ProgramRuntimeEnvironments,
+        },
+        program_metrics::LoadProgramMetrics,
         sysvar_cache::SysvarCache,
     },
     solana_pubkey::Pubkey,
     solana_sdk_ids::bpf_loader_upgradeable,
     solana_svm_callback::InvokeContextCallback,
-    solana_transaction_context::TransactionContext,
+    solana_transaction_context::transaction::TransactionContext,
     source_buffer::SourceBuffer,
     std::{cmp::Ordering, sync::atomic::Ordering::Relaxed},
     target_builtin::TargetBuiltin,
@@ -136,9 +140,9 @@ impl Bank {
         // Set up the two `LoadedProgramsForTxBatch` instances, as if
         // processing a new transaction batch.
         let mut program_cache_for_tx_batch = ProgramCacheForTxBatch::new(self.slot);
-        let program_runtime_environments = self
+        let program_runtime_environment = self
             .transaction_processor
-            .get_environments_for_epoch(self.epoch);
+            .program_runtime_environment_for_epoch(self.epoch);
 
         // Configure a dummy `InvokeContext` from the runtime's current
         // environment, as well as the two `ProgramCacheForTxBatch`
@@ -147,7 +151,7 @@ impl Bank {
             let compute_budget = self
                 .compute_budget()
                 .unwrap_or(ComputeBudget::new_with_defaults(
-                    /* simd_0268_active */ false, /* simd_0339_active */ false,
+                    /* simd_0268_active */ false,
                 ));
             let mut sysvar_cache = SysvarCache::default();
             sysvar_cache.fill_missing_entries(|pubkey, set_sysvar| {
@@ -161,20 +165,25 @@ impl Bank {
                 self.rent_collector.rent.clone(),
                 compute_budget.max_instruction_stack_depth,
                 compute_budget.max_instruction_trace_length,
+                1,
             );
 
             struct MockCallback {}
             impl InvokeContextCallback for MockCallback {}
             let feature_set = self.feature_set.runtime_features();
+            let program_runtime_environments = ProgramRuntimeEnvironments::new(
+                ProgramRuntimeEnvironment::clone(&program_runtime_environment),
+                ProgramRuntimeEnvironment::clone(&program_runtime_environment),
+            );
             let mut dummy_invoke_context = InvokeContext::new(
                 &mut dummy_transaction_context,
                 &mut program_cache_for_tx_batch,
                 EnvironmentConfig::new(
                     Hash::default(),
                     0,
+                    false,
                     &MockCallback {},
                     &feature_set,
-                    &program_runtime_environments,
                     &program_runtime_environments,
                     &sysvar_cache,
                 ),
@@ -183,10 +192,12 @@ impl Bank {
                 compute_budget.to_cost(),
             );
 
-            let load_program_metrics = solana_bpf_loader_program::deploy_program(
+            let mut load_program_metrics = LoadProgramMetrics::default();
+            deploy_program(
                 dummy_invoke_context.get_log_collector(),
+                &mut load_program_metrics,
                 dummy_invoke_context.program_cache_for_tx_batch,
-                program_runtime_environments.program_runtime_v1.clone(),
+                ProgramRuntimeEnvironment::clone(&program_runtime_environment),
                 program_id,
                 &bpf_loader_upgradeable::id(),
                 // The size of the program cache entry is the size of the program account
@@ -205,7 +216,8 @@ impl Bank {
             .write()
             .unwrap()
             .merge(
-                &self.transaction_processor.environments,
+                &self.transaction_processor.program_runtime_environment,
+                self.slot,
                 &program_cache_for_tx_batch.drain_modified_entries(),
             );
 
@@ -216,11 +228,16 @@ impl Bank {
         &mut self,
         builtin_program_id: &Pubkey,
         config: &CoreBpfMigrationConfig,
+        allow_prefunded: bool,
     ) -> Result<(), CoreBpfMigrationError> {
         datapoint_info!(config.datapoint_name, ("slot", self.slot, i64));
 
-        let target =
-            TargetBuiltin::new_checked(self, builtin_program_id, &config.migration_target)?;
+        let target = TargetBuiltin::new_checked(
+            self,
+            builtin_program_id,
+            &config.migration_target,
+            allow_prefunded,
+        )?;
         let source = if let Some(expected_hash) = config.verified_build_hash {
             SourceBuffer::new_checked_with_verified_build_hash(
                 self,
@@ -310,7 +327,7 @@ impl Bank {
     ///     );
     /// }
     /// ```
-    #[allow(dead_code)] // Only used when an upgrade is configured.
+    // #[expect(dead_code)] // Only used when an upgrade is configured.
     pub(crate) fn upgrade_core_bpf_program(
         &mut self,
         core_bpf_program_address: &Pubkey,
@@ -381,22 +398,25 @@ impl Bank {
     ///     self.upgrade_loader_v2_program_with_loader_v3_program(
     ///        &bpf_loader_v2_program_address,
     ///        &source_buffer_address,
+    ///        true,
     ///        "test_upgrade_loader_v2_program_with_loader_v3_program",
     ///     );
     /// }
     /// ```
     /// The `source_buffer_address` must point to a Loader v3 buffer account
     /// (state equal to [`UpgradeableLoaderState::Buffer`]).
-    #[allow(dead_code)] // Only used when an upgrade is configured.
+    // #[expect(dead_code)] // Only used when an upgrade is configured.
     pub(crate) fn upgrade_loader_v2_program_with_loader_v3_program(
         &mut self,
         loader_v2_bpf_program_address: &Pubkey,
         source_buffer_address: &Pubkey,
+        allow_prefunded: bool,
         datapoint_name: &'static str,
     ) -> Result<(), CoreBpfMigrationError> {
         datapoint_info!(datapoint_name, ("slot", self.slot, i64));
 
-        let target = TargetBpfV2::new_checked(self, loader_v2_bpf_program_address)?;
+        let target =
+            TargetBpfV2::new_checked(self, loader_v2_bpf_program_address, allow_prefunded)?;
         let source = SourceBuffer::new_checked(self, source_buffer_address)?;
 
         // Attempt serialization first before modifying the bank.
@@ -487,10 +507,11 @@ pub(crate) mod tests {
         super::*,
         crate::{
             bank::{
+                Bank, SlotLeader,
                 test_utils::goto_end_of_slot,
                 tests::{create_genesis_config, create_simple_test_bank},
-                Bank,
             },
+            genesis_utils::{GenesisConfigInfo, create_genesis_config_with_leader},
             runtime_config::RuntimeConfig,
             snapshot_bank_utils::{bank_from_snapshot_archives, bank_to_full_snapshot_archive},
             snapshot_utils::create_tmp_accounts_dir_for_tests,
@@ -499,13 +520,13 @@ pub(crate) mod tests {
         agave_snapshots::snapshot_config::SnapshotConfig,
         assert_matches::assert_matches,
         solana_account::{
-            state_traits::StateMut, AccountSharedData, ReadableAccount, WritableAccount,
+            AccountSharedData, ReadableAccount, WritableAccount, state_traits::StateMut,
         },
         solana_accounts_db::accounts_db::ACCOUNTS_DB_CONFIG_FOR_TESTING,
         solana_builtins::{
+            BUILTINS,
             core_bpf_migration::{CoreBpfMigrationConfig, CoreBpfMigrationTargetType},
             prototype::{BuiltinPrototype, StatelessBuiltinPrototype},
-            BUILTINS,
         },
         solana_clock::Slot,
         solana_epoch_schedule::EpochSchedule,
@@ -515,7 +536,10 @@ pub(crate) mod tests {
         solana_loader_v3_interface::{get_program_data_address, state::UpgradeableLoaderState},
         solana_message::Message,
         solana_native_token::LAMPORTS_PER_SOL,
-        solana_program_runtime::loaded_programs::{ProgramCacheEntry, ProgramCacheEntryType},
+        solana_program_runtime::{
+            program_cache_entry::{ProgramCacheEntry, ProgramCacheEntryType},
+            solana_sbpf::{self, program::BuiltinFunctionDefinition, vm::ContextObject},
+        },
         solana_pubkey::Pubkey,
         solana_sdk_ids::{bpf_loader, bpf_loader_upgradeable, native_loader, system_program},
         solana_signer::Signer,
@@ -523,6 +547,32 @@ pub(crate) mod tests {
         std::{fs::File, io::Read, sync::Arc},
         test_case::test_case,
     };
+
+    struct NoopBuiltin;
+    impl<C: ContextObject> BuiltinFunctionDefinition<C> for NoopBuiltin {
+        type Error = Box<dyn std::error::Error>;
+        fn rust(
+            _: &mut C,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+        ) -> Result<u64, Box<dyn std::error::Error>> {
+            Ok(0)
+        }
+
+        fn vm(
+            _: solana_sbpf::vm::EncryptedHostAddressToEbpfVm<C>,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+        ) {
+        }
+        fn codegen(_: &mut solana_sbpf::program::JitCompiler<C>) {}
+    }
 
     fn test_elf() -> Vec<u8> {
         let mut elf = Vec::new();
@@ -702,12 +752,14 @@ pub(crate) mod tests {
 
             // The bank's builtins should not contain the target program
             // address.
-            assert!(!bank
-                .transaction_processor
-                .builtin_program_ids
-                .read()
-                .unwrap()
-                .contains(&self.target_program_address));
+            assert!(
+                !bank
+                    .transaction_processor
+                    .builtin_program_ids
+                    .read()
+                    .unwrap()
+                    .contains(&self.target_program_address)
+            );
 
             // The cache should contain the target program.
             let program_cache = bank
@@ -715,11 +767,13 @@ pub(crate) mod tests {
                 .global_program_cache
                 .read()
                 .unwrap();
-            let entries = program_cache.get_flattened_entries(true, true);
+            let entries = program_cache.get_flattened_entries();
             let target_entry = entries
                 .iter()
-                .find(|(program_id, _)| program_id == &self.target_program_address)
-                .map(|(_, entry)| entry)
+                .find(|(program_id, _last_modification_slot, _entry)| {
+                    program_id == &self.target_program_address
+                })
+                .map(|(_program_id, _last_modification_slot, entry)| entry)
                 .unwrap();
 
             // The target program entry should be updated.
@@ -753,11 +807,7 @@ pub(crate) mod tests {
             bank.add_builtin(
                 builtin_id,
                 builtin_name.as_str(),
-                ProgramCacheEntry::new_builtin(
-                    0,
-                    builtin_name.len(),
-                    |_invoke_context, _param0, _param1, _param2, _param3, _param4| {},
-                ),
+                ProgramCacheEntry::new_builtin(0, builtin_name.len(), NoopBuiltin::register),
             );
             account
         };
@@ -792,7 +842,7 @@ pub(crate) mod tests {
 
         // Perform the migration.
         let migration_slot = bank.slot();
-        bank.migrate_builtin_to_core_bpf(&builtin_id, &core_bpf_migration_config)
+        bank.migrate_builtin_to_core_bpf(&builtin_id, &core_bpf_migration_config, true)
             .unwrap();
 
         // Run the post-migration program checks.
@@ -857,7 +907,7 @@ pub(crate) mod tests {
 
         // Perform the migration.
         let migration_slot = bank.slot();
-        bank.migrate_builtin_to_core_bpf(&builtin_id, &core_bpf_migration_config)
+        bank.migrate_builtin_to_core_bpf(&builtin_id, &core_bpf_migration_config, true)
             .unwrap();
 
         // Run the post-migration program checks.
@@ -893,11 +943,7 @@ pub(crate) mod tests {
             bank.add_builtin(
                 builtin_id,
                 builtin_name.as_str(),
-                ProgramCacheEntry::new_builtin(
-                    0,
-                    builtin_name.len(),
-                    |_invoke_context, _param0, _param1, _param2, _param3, _param4| {},
-                ),
+                ProgramCacheEntry::new_builtin(0, builtin_name.len(), NoopBuiltin::register),
             );
             account
         };
@@ -924,7 +970,7 @@ pub(crate) mod tests {
         };
 
         assert_matches!(
-            bank.migrate_builtin_to_core_bpf(&builtin_id, &core_bpf_migration_config)
+            bank.migrate_builtin_to_core_bpf(&builtin_id, &core_bpf_migration_config, true)
                 .unwrap_err(),
             CoreBpfMigrationError::UpgradeAuthorityMismatch(_, _)
         )
@@ -947,11 +993,7 @@ pub(crate) mod tests {
             bank.add_builtin(
                 builtin_id,
                 builtin_name.as_str(),
-                ProgramCacheEntry::new_builtin(
-                    0,
-                    builtin_name.len(),
-                    |_invoke_context, _param0, _param1, _param2, _param3, _param4| {},
-                ),
+                ProgramCacheEntry::new_builtin(0, builtin_name.len(), NoopBuiltin::register),
             );
             account
         };
@@ -978,7 +1020,7 @@ pub(crate) mod tests {
         };
 
         assert_matches!(
-            bank.migrate_builtin_to_core_bpf(&builtin_id, &core_bpf_migration_config)
+            bank.migrate_builtin_to_core_bpf(&builtin_id, &core_bpf_migration_config, true)
                 .unwrap_err(),
             CoreBpfMigrationError::BuildHashMismatch(_, _)
         )
@@ -1001,11 +1043,7 @@ pub(crate) mod tests {
             bank.add_builtin(
                 builtin_id,
                 builtin_name.as_str(),
-                ProgramCacheEntry::new_builtin(
-                    0,
-                    builtin_name.len(),
-                    |_invoke_context, _param0, _param1, _param2, _param3, _param4| {},
-                ),
+                ProgramCacheEntry::new_builtin(0, builtin_name.len(), NoopBuiltin::register),
             );
             account
         };
@@ -1040,7 +1078,7 @@ pub(crate) mod tests {
             datapoint_name: "test_migrate_builtin",
         };
 
-        bank.migrate_builtin_to_core_bpf(&builtin_id, &core_bpf_migration_config)
+        bank.migrate_builtin_to_core_bpf(&builtin_id, &core_bpf_migration_config, true)
             .unwrap();
 
         let program_data_address = get_program_data_address(&builtin_id);
@@ -1244,7 +1282,7 @@ pub(crate) mod tests {
 
             let instruction = Instruction::new_with_bytes(*target_program_id, &[], Vec::new());
 
-            invoke_context.native_invoke(instruction, &[])
+            invoke_context.native_invoke_signed(instruction, &[])
         });
     }
 
@@ -1287,7 +1325,7 @@ pub(crate) mod tests {
         let bank = Bank::new_from_parent_with_bank_forks(
             &bank_forks,
             bank,
-            &Pubkey::default(),
+            SlotLeader::default(),
             first_slot_in_next_epoch,
         );
 
@@ -1310,7 +1348,7 @@ pub(crate) mod tests {
         let bank = Bank::new_from_parent_with_bank_forks(
             &bank_forks,
             bank,
-            &Pubkey::default(),
+            SlotLeader::default(),
             first_slot_in_next_epoch,
         );
 
@@ -1322,8 +1360,12 @@ pub(crate) mod tests {
         // effective in the program cache.
         goto_end_of_slot(bank.clone());
         let next_slot = bank.slot() + 1;
-        let bank =
-            Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), next_slot);
+        let bank = Bank::new_from_parent_with_bank_forks(
+            &bank_forks,
+            bank,
+            SlotLeader::default(),
+            next_slot,
+        );
 
         // Successfully invoke the new BPF loader v3 program.
         bank.process_transaction(&Transaction::new(
@@ -1357,7 +1399,7 @@ pub(crate) mod tests {
         let bank = Bank::new_from_parent_with_bank_forks(
             &bank_forks,
             bank,
-            &Pubkey::default(),
+            SlotLeader::default(),
             first_slot_in_next_epoch,
         );
 
@@ -1417,7 +1459,11 @@ pub(crate) mod tests {
         root_bank.add_builtin(
             cpi_program_id,
             cpi_program_name,
-            ProgramCacheEntry::new_builtin(0, cpi_program_name.len(), cpi_mockup::Entrypoint::vm),
+            ProgramCacheEntry::new_builtin(
+                0,
+                cpi_program_name.len(),
+                cpi_mockup::Entrypoint::register,
+            ),
         );
 
         let (builtin_id, config) = prototype.deconstruct();
@@ -1468,7 +1514,7 @@ pub(crate) mod tests {
 
         // Add the feature to the bank's inactive feature set.
         let mut feature_set = FeatureSet::all_enabled();
-        feature_set.inactive_mut().insert(*feature_id);
+        feature_set.deactivate(feature_id);
         root_bank.feature_set = Arc::new(feature_set);
 
         // Initialize the source buffer account.
@@ -1497,16 +1543,18 @@ pub(crate) mod tests {
         // Advance the bank to cross the epoch boundary and activate the
         // feature.
         goto_end_of_slot(bank.clone());
-        let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), 33);
+        let bank =
+            Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), 33);
 
         // Assert the feature _was_ activated but the program was not migrated.
         assert!(bank.feature_set.is_active(feature_id));
-        assert!(bank
-            .transaction_processor
-            .builtin_program_ids
-            .read()
-            .unwrap()
-            .contains(builtin_id));
+        assert!(
+            bank.transaction_processor
+                .builtin_program_ids
+                .read()
+                .unwrap()
+                .contains(builtin_id)
+        );
         assert_eq!(
             bank.get_account(builtin_id).unwrap().owner(),
             &native_loader::id()
@@ -1514,17 +1562,19 @@ pub(crate) mod tests {
 
         // Simulate crossing an epoch boundary again.
         goto_end_of_slot(bank.clone());
-        let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), 96);
+        let bank =
+            Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), 96);
 
         // Again, assert the feature is still active and the program still was
         // not migrated.
         assert!(bank.feature_set.is_active(feature_id));
-        assert!(bank
-            .transaction_processor
-            .builtin_program_ids
-            .read()
-            .unwrap()
-            .contains(builtin_id));
+        assert!(
+            bank.transaction_processor
+                .builtin_program_ids
+                .read()
+                .unwrap()
+                .contains(builtin_id)
+        );
         assert_eq!(
             bank.get_account(builtin_id).unwrap().owner(),
             &native_loader::id()
@@ -1551,7 +1601,7 @@ pub(crate) mod tests {
 
         // Set up the feature set with the migration feature marked as active.
         let mut feature_set = FeatureSet::all_enabled();
-        feature_set.active_mut().insert(*feature_id, 0);
+        feature_set.activate(feature_id, 0);
         bank.feature_set = Arc::new(feature_set);
         bank.store_account_and_update_capitalization(
             feature_id,
@@ -1587,12 +1637,13 @@ pub(crate) mod tests {
 
         // Assert the feature is active and the bank still added the builtin.
         assert!(bank.feature_set.is_active(feature_id));
-        assert!(bank
-            .transaction_processor
-            .builtin_program_ids
-            .read()
-            .unwrap()
-            .contains(builtin_id));
+        assert!(
+            bank.transaction_processor
+                .builtin_program_ids
+                .read()
+                .unwrap()
+                .contains(builtin_id)
+        );
         assert_eq!(
             bank.get_account(builtin_id).unwrap().owner(),
             &native_loader::id()
@@ -1601,16 +1652,18 @@ pub(crate) mod tests {
         // Simulate crossing an epoch boundary for a new bank.
         let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
         goto_end_of_slot(bank.clone());
-        let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), 33);
+        let bank =
+            Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), 33);
 
         // Assert the feature is active but the builtin was not migrated.
         assert!(bank.feature_set.is_active(feature_id));
-        assert!(bank
-            .transaction_processor
-            .builtin_program_ids
-            .read()
-            .unwrap()
-            .contains(builtin_id));
+        assert!(
+            bank.transaction_processor
+                .builtin_program_ids
+                .read()
+                .unwrap()
+                .contains(builtin_id)
+        );
         assert_eq!(
             bank.get_account(builtin_id).unwrap().owner(),
             &native_loader::id()
@@ -1668,12 +1721,14 @@ pub(crate) mod tests {
         let check_builtin_is_bpf = |bank: &Bank| {
             // The bank's transaction processor should not contain the builtin
             // in its list of builtin program IDs.
-            assert!(!bank
-                .transaction_processor
-                .builtin_program_ids
-                .read()
-                .unwrap()
-                .contains(builtin_id));
+            assert!(
+                !bank
+                    .transaction_processor
+                    .builtin_program_ids
+                    .read()
+                    .unwrap()
+                    .contains(builtin_id)
+            );
             // The builtin should be owned by the upgradeable loader and have
             // the correct state.
             let fetched_builtin_program_account = bank.get_account(builtin_id).unwrap();
@@ -1721,7 +1776,7 @@ pub(crate) mod tests {
         // Now, add the feature ID as active, and run `finish_init` again to
         // make sure the feature is idempotent.
         let mut feature_set = FeatureSet::all_enabled();
-        feature_set.active_mut().insert(*feature_id, 0);
+        feature_set.activate(feature_id, 0);
         bank.feature_set = Arc::new(feature_set);
         bank.store_account_and_update_capitalization(
             feature_id,
@@ -1810,6 +1865,7 @@ pub(crate) mod tests {
         bank.upgrade_loader_v2_program_with_loader_v3_program(
             &bpf_loader_v2_program_address,
             &source_buffer_address,
+            true,
             "test_upgrade_loader_v2_program_with_loader_v3_program",
         )
         .unwrap();
@@ -1890,6 +1946,7 @@ pub(crate) mod tests {
             bank.upgrade_loader_v2_program_with_loader_v3_program(
                 &bpf_loader_v2_program_address,
                 &source_buffer_address,
+                true,
                 "test_upgrade_loader_v2_program_with_loader_v3_program",
             )
             .unwrap_err(),
@@ -1942,7 +1999,11 @@ pub(crate) mod tests {
         root_bank.add_builtin(
             cpi_program_id,
             cpi_program_name,
-            ProgramCacheEntry::new_builtin(0, cpi_program_name.len(), cpi_mockup::Entrypoint::vm),
+            ProgramCacheEntry::new_builtin(
+                0,
+                cpi_program_name.len(),
+                cpi_mockup::Entrypoint::register,
+            ),
         );
 
         // Add the feature to the bank's inactive feature set.
@@ -1992,7 +2053,7 @@ pub(crate) mod tests {
 
         // Add the feature to the bank's inactive feature set.
         let mut feature_set = FeatureSet::all_enabled();
-        feature_set.inactive_mut().insert(*feature_id);
+        feature_set.deactivate(feature_id);
         root_bank.feature_set = Arc::new(feature_set);
 
         // Initialize the source buffer account.
@@ -2016,7 +2077,8 @@ pub(crate) mod tests {
         // Advance the bank to cross the epoch boundary and activate the
         // feature.
         goto_end_of_slot(bank.clone());
-        let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), 33);
+        let bank =
+            Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), 33);
 
         // Assert the feature _was_ activated but the program was not migrated.
         assert!(bank.feature_set.is_active(feature_id));
@@ -2027,7 +2089,8 @@ pub(crate) mod tests {
 
         // Simulate crossing an epoch boundary again.
         goto_end_of_slot(bank.clone());
-        let bank = Bank::new_from_parent_with_bank_forks(&bank_forks, bank, &Pubkey::default(), 96);
+        let bank =
+            Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), 96);
 
         // Again, assert the feature is still active and the program still was
         // not migrated.
@@ -2042,7 +2105,9 @@ pub(crate) mod tests {
     // activated and the migration was successful.
     #[test]
     fn test_startup_from_snapshot_after_replace_spl_token_with_p_token() {
-        let (genesis_config, _mint_keypair) = create_genesis_config(0);
+        let leader_id = Pubkey::new_unique();
+        let GenesisConfigInfo { genesis_config, .. } =
+            create_genesis_config_with_leader(0, &leader_id, LAMPORTS_PER_SOL);
         let mut bank = Bank::new_for_tests(&genesis_config);
 
         let bpf_loader_v2_program_address = Pubkey::new_unique();
@@ -2087,6 +2152,7 @@ pub(crate) mod tests {
         bank.upgrade_loader_v2_program_with_loader_v3_program(
             &bpf_loader_v2_program_address,
             &source_buffer_address,
+            true,
             "test_upgrade_loader_v2_program_with_loader_v3_program",
         )
         .unwrap();
@@ -2095,6 +2161,7 @@ pub(crate) mod tests {
         test_context.run_program_checks(&bank, upgrade_slot);
 
         bank.fill_bank_with_ticks_for_tests();
+        bank.set_block_id(Some(Hash::default()));
         // Force flush the bank to create the account storage entry
         bank.squash();
         bank.force_flush_accounts_cache();
@@ -2103,17 +2170,15 @@ pub(crate) mod tests {
         let (_tmp_dir, accounts_dir) = create_tmp_accounts_dir_for_tests();
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
         let snapshot_archives_dir = tempfile::TempDir::new().unwrap();
-        let snapshot_archive_format = SnapshotConfig::default().archive_format;
 
-        let full_snapshot_archive_info = bank_to_full_snapshot_archive(
-            bank_snapshots_dir.path(),
-            &bank,
-            None,
-            snapshot_archives_dir.path(),
-            snapshot_archives_dir.path(),
-            snapshot_archive_format,
-        )
-        .unwrap();
+        let snapshot_config = SnapshotConfig {
+            full_snapshot_archives_dir: snapshot_archives_dir.path().to_path_buf(),
+            incremental_snapshot_archives_dir: snapshot_archives_dir.path().to_path_buf(),
+            bank_snapshots_dir: bank_snapshots_dir.path().to_path_buf(),
+            ..SnapshotConfig::default()
+        };
+        let full_snapshot_archive_info =
+            bank_to_full_snapshot_archive(&snapshot_config, &bank).unwrap();
 
         // Restore the bank from the snapshot and run checks.
         let roundtrip_bank = bank_from_snapshot_archives(
@@ -2124,6 +2189,7 @@ pub(crate) mod tests {
             &genesis_config,
             &RuntimeConfig::default(),
             None,
+            None, // leader_for_tests
             None,
             false,
             false,
@@ -2136,7 +2202,7 @@ pub(crate) mod tests {
 
         // Load the migrated program to the cache and run checks.
         let entry = roundtrip_bank
-            .load_program(&bpf_loader_v2_program_address, false, upgrade_slot)
+            .load_program(&bpf_loader_v2_program_address, upgrade_slot)
             .unwrap();
 
         let mut program_cache = roundtrip_bank
@@ -2146,8 +2212,11 @@ pub(crate) mod tests {
             .unwrap();
 
         program_cache.assign_program(
-            &roundtrip_bank.transaction_processor.environments,
+            &roundtrip_bank
+                .transaction_processor
+                .program_runtime_environment,
             bpf_loader_v2_program_address,
+            upgrade_slot,
             entry,
         );
         // Release the lock on the program cache.
@@ -2189,7 +2258,11 @@ pub(crate) mod tests {
         root_bank.add_builtin(
             cpi_program_id,
             cpi_program_name,
-            ProgramCacheEntry::new_builtin(0, cpi_program_name.len(), cpi_mockup::Entrypoint::vm),
+            ProgramCacheEntry::new_builtin(
+                0,
+                cpi_program_name.len(),
+                cpi_mockup::Entrypoint::register,
+            ),
         );
 
         // Add the feature to the bank's inactive feature set.
@@ -2250,7 +2323,11 @@ pub(crate) mod tests {
         root_bank.add_builtin(
             cpi_program_id,
             cpi_program_name,
-            ProgramCacheEntry::new_builtin(0, cpi_program_name.len(), cpi_mockup::Entrypoint::vm),
+            ProgramCacheEntry::new_builtin(
+                0,
+                cpi_program_name.len(),
+                cpi_mockup::Entrypoint::register,
+            ),
         );
 
         // Add the feature to the bank's inactive feature set.
@@ -2279,7 +2356,7 @@ pub(crate) mod tests {
         let bank = Bank::new_from_parent_with_bank_forks(
             &bank_forks,
             bank,
-            &Pubkey::default(),
+            SlotLeader::default(),
             first_slot_in_next_epoch,
         );
 
@@ -2302,7 +2379,7 @@ pub(crate) mod tests {
         let bank = Bank::new_from_parent_with_bank_forks(
             &bank_forks,
             bank,
-            &Pubkey::default(),
+            SlotLeader::default(),
             first_slot_in_next_epoch,
         );
 

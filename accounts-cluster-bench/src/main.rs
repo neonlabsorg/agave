@@ -1,13 +1,13 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
-    clap::{crate_description, crate_name, value_t, values_t, values_t_or_exit, App, Arg},
+    clap::{App, Arg, crate_description, crate_name, value_t, values_t, values_t_or_exit},
     log::*,
-    rand::{rng, Rng},
+    rand::{Rng, rng},
     rayon::prelude::*,
     solana_clap_utils::{
         hidden_unless_forced, input_parsers::pubkey_of, input_validators::is_url_or_moniker,
     },
-    solana_cli_config::{ConfigInput, CONFIG_FILE},
+    solana_cli_config::{CONFIG_FILE, ConfigInput},
     solana_client::{
         rpc_client::SerializableTransaction, rpc_config::RpcBlockConfig,
         rpc_request::MAX_GET_CONFIRMED_BLOCKS_RANGE, transaction_executor::TransactionExecutor,
@@ -17,7 +17,7 @@ use {
     solana_gossip::gossip_service::discover_peers,
     solana_hash::Hash,
     solana_instruction::{AccountMeta, Instruction},
-    solana_keypair::{read_keypair_file, Keypair},
+    solana_keypair::{Keypair, read_keypair_file},
     solana_measure::measure::Measure,
     solana_message::Message,
     solana_net_utils::SocketAddrSpace,
@@ -39,10 +39,10 @@ use {
         process::exit,
         str::FromStr,
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Barrier, RwLock,
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
-        thread::{sleep, Builder, JoinHandle},
+        thread::{Builder, JoinHandle, sleep},
         time::{Duration, Instant},
     },
 };
@@ -466,19 +466,11 @@ fn run_rpc_bench_loop(
             "t({}) rpc({:?}) iters: {} success: {} errors: {}",
             thread, rpc_bench, iters, stats.success, stats.errors
         );
-        if stats.success > 0 {
-            info!(
-                " t({}) rpc({:?} average success_time: {} us",
-                thread,
-                rpc_bench,
-                stats.total_success_time_us / stats.success
-            );
+        if let Some(avg_success) = stats.total_success_time_us.checked_div(stats.success) {
+            info!(" t({thread}) rpc({rpc_bench:?} average success_time: {avg_success} us",);
         }
-        if stats.errors > 0 {
-            info!(
-                " rpc average average errors time: {} us",
-                stats.total_errors_time_us / stats.errors
-            );
+        if let Some(avg_errors) = stats.total_errors_time_us.checked_div(stats.errors) {
+            info!(" rpc average average errors time: {avg_errors} us");
         }
         *last_print = Instant::now();
         *stats = RpcBenchStats::default();
@@ -1363,7 +1355,7 @@ fn main() {
             info!("Finding cluster entry: {entrypoint_addr:?}");
             let (gossip_nodes, _validators) = discover_peers(
                 None,
-                &vec![entrypoint_addr],
+                &[entrypoint_addr],
                 None,
                 Duration::from_secs(60),
                 None,
@@ -1434,7 +1426,6 @@ pub mod test {
         },
         solana_measure::measure::Measure,
         solana_native_token::LAMPORTS_PER_SOL,
-        solana_poh_config::PohConfig,
         solana_program_pack::Pack,
         solana_test_validator::TestValidator,
         spl_token_interface::state::{Account, Mint},
@@ -1456,6 +1447,8 @@ pub mod test {
         indexes.indexes.insert(AccountIndex::ProgramId);
     }
 
+    const TEST_CLUSTER_MINT_LAMPORTS: u64 = 200 * LAMPORTS_PER_SOL;
+
     #[test]
     fn test_accounts_cluster_bench() {
         agave_logger::setup();
@@ -1463,8 +1456,7 @@ pub mod test {
         initialize_and_add_secondary_indexes(&mut validator_config);
         let num_nodes = 1;
         let mut config = ClusterConfig {
-            mint_lamports: 10_000_000,
-            poh_config: PohConfig::new_sleep(Duration::from_millis(50)),
+            mint_lamports: TEST_CLUSTER_MINT_LAMPORTS,
             node_stakes: vec![100; num_nodes],
             validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
             ..ClusterConfig::default()
@@ -1513,8 +1505,7 @@ pub mod test {
         initialize_and_add_secondary_indexes(&mut validator_config);
         let num_nodes = 1;
         let mut config = ClusterConfig {
-            mint_lamports: 10_000_000,
-            poh_config: PohConfig::new_sleep(Duration::from_millis(50)),
+            mint_lamports: TEST_CLUSTER_MINT_LAMPORTS,
             node_stakes: vec![100; num_nodes],
             validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
             ..ClusterConfig::default()
@@ -1566,9 +1557,8 @@ pub mod test {
             None, /* per_time_cap */
             0,    /* port */
         );
-        let test_validator = TestValidator::with_custom_fees(
+        let test_validator = TestValidator::start_with_config(
             mint_pubkey,
-            1,
             Some(faucet_addr),
             SocketAddrSpace::Unspecified,
         );

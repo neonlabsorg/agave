@@ -1,16 +1,9 @@
-#![cfg_attr(
-    not(feature = "agave-unstable-api"),
-    deprecated(
-        since = "3.1.0",
-        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
-                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
-                acknowledge use of an interface that may break without warning."
-    )
-)]
+#![cfg(feature = "agave-unstable-api")]
 #[derive(Clone, Copy, Default)]
 pub struct SVMFeatureSet {
     pub move_precompile_verification_to_svm: bool,
-    pub stricter_abi_and_runtime_constraints: bool,
+    pub syscall_parameter_address_restrictions: bool,
+    pub virtual_address_space_adjustments: bool,
     pub account_data_direct_mapping: bool,
     pub enable_bpf_loader_set_authority_checked_ix: bool,
     pub enable_loader_v4: bool,
@@ -18,7 +11,6 @@ pub struct SVMFeatureSet {
     pub abort_on_invalid_curve: bool,
     pub blake3_syscall_enabled: bool,
     pub curve25519_syscall_enabled: bool,
-    pub disable_deploy_of_alloc_free_syscall: bool,
     pub disable_fees_sysvar: bool,
     pub disable_sbpf_v0_execution: bool,
     pub enable_alt_bn128_compression_syscall: bool,
@@ -35,31 +27,39 @@ pub struct SVMFeatureSet {
     pub remaining_compute_units_syscall_enabled: bool,
     pub remove_bpf_loader_incorrect_program_id: bool,
     pub move_stake_and_move_lamports_ixs: bool,
-    pub stake_raise_minimum_delegation_to_1_sol: bool,
     pub deprecate_legacy_vote_ixs: bool,
-    pub mask_out_rent_epoch_in_vm_serialization: bool,
     pub simplify_alt_bn128_syscall_error_codes: bool,
     pub fix_alt_bn128_multiplication_input_length: bool,
     pub increase_tx_account_lock_limit: bool,
-    pub enable_extend_program_checked: bool,
     pub formalize_loaded_transaction_data_size: bool,
     pub disable_zk_elgamal_proof_program: bool,
     pub reenable_zk_elgamal_proof_program: bool,
     pub delay_commission_updates: bool,
     pub raise_cpi_nesting_limit_to_8: bool,
-    pub provide_instruction_data_offset_in_vm_r2: bool,
     pub increase_cpi_account_info_limit: bool,
-    pub vote_state_v4: bool,
     pub poseidon_enforce_padding: bool,
     pub fix_alt_bn128_pairing_length_check: bool,
     pub alt_bn128_little_endian: bool,
+    pub create_account_allow_prefund: bool,
+    pub bls_pubkey_management_in_vote_account: bool,
+    pub enable_alt_bn128_g2_syscalls: bool,
+    pub commission_rate_in_basis_points: bool,
+    pub custom_commission_collector: bool,
+    pub enable_bls12_381_syscall: bool,
+    pub block_revenue_sharing: bool,
+    pub vote_account_initialize_v2: bool,
+    pub direct_account_pointers_in_program_input: bool,
+    pub loader_v3_minimum_extend_program_size: bool,
+    pub enable_sha512_syscall: bool,
+    pub relax_post_exec_min_balance_check: bool,
 }
 
 impl SVMFeatureSet {
     pub fn all_enabled() -> Self {
         Self {
             move_precompile_verification_to_svm: true,
-            stricter_abi_and_runtime_constraints: true,
+            syscall_parameter_address_restrictions: true,
+            virtual_address_space_adjustments: true,
             account_data_direct_mapping: true,
             enable_bpf_loader_set_authority_checked_ix: true,
             enable_loader_v4: true,
@@ -67,7 +67,6 @@ impl SVMFeatureSet {
             abort_on_invalid_curve: true,
             blake3_syscall_enabled: true,
             curve25519_syscall_enabled: true,
-            disable_deploy_of_alloc_free_syscall: true,
             disable_fees_sysvar: true,
             disable_sbpf_v0_execution: true,
             enable_alt_bn128_compression_syscall: true,
@@ -84,24 +83,31 @@ impl SVMFeatureSet {
             remaining_compute_units_syscall_enabled: true,
             remove_bpf_loader_incorrect_program_id: true,
             move_stake_and_move_lamports_ixs: true,
-            stake_raise_minimum_delegation_to_1_sol: true,
             deprecate_legacy_vote_ixs: true,
-            mask_out_rent_epoch_in_vm_serialization: true,
             simplify_alt_bn128_syscall_error_codes: true,
             fix_alt_bn128_multiplication_input_length: true,
             increase_tx_account_lock_limit: true,
-            enable_extend_program_checked: true,
             formalize_loaded_transaction_data_size: true,
             disable_zk_elgamal_proof_program: true,
             reenable_zk_elgamal_proof_program: true,
             delay_commission_updates: true,
             raise_cpi_nesting_limit_to_8: true,
-            provide_instruction_data_offset_in_vm_r2: true,
             increase_cpi_account_info_limit: true,
-            vote_state_v4: true,
             poseidon_enforce_padding: true,
             fix_alt_bn128_pairing_length_check: true,
             alt_bn128_little_endian: true,
+            create_account_allow_prefund: true,
+            bls_pubkey_management_in_vote_account: true,
+            enable_alt_bn128_g2_syscalls: true,
+            commission_rate_in_basis_points: true,
+            custom_commission_collector: true,
+            enable_bls12_381_syscall: true,
+            block_revenue_sharing: true,
+            vote_account_initialize_v2: true,
+            direct_account_pointers_in_program_input: true,
+            loader_v3_minimum_extend_program_size: true,
+            enable_sha512_syscall: true,
+            relax_post_exec_min_balance_check: true,
         }
     }
 }

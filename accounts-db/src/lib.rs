@@ -1,18 +1,11 @@
-#![cfg_attr(
-    not(feature = "agave-unstable-api"),
-    deprecated(
-        since = "3.1.0",
-        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
-                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
-                acknowledge use of an interface that may break without warning."
-    )
-)]
+#![cfg(feature = "agave-unstable-api")]
 #![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 #![allow(clippy::arithmetic_side_effects)]
 
 pub mod account_info;
 pub mod account_locks;
 pub mod account_storage;
+pub mod account_storage_entry;
 pub mod account_storage_reader;
 pub mod accounts;
 mod accounts_cache;
@@ -20,6 +13,7 @@ pub mod accounts_db;
 pub mod accounts_file;
 pub mod accounts_hash;
 pub mod accounts_index;
+pub mod accounts_scan;
 pub mod accounts_update_notifier_interface;
 mod active_stats;
 pub mod ancestors;
@@ -43,7 +37,6 @@ mod rolling_bit_field;
 pub mod sorted_storages;
 pub mod stake_rewards;
 pub mod storable_accounts;
-pub mod tiered_storage;
 pub mod utils;
 pub mod waitable_condvar;
 

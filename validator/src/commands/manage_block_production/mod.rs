@@ -4,7 +4,7 @@ use {
         cli::DefaultArgs,
         commands::{FromClapArgMatches, Result},
     },
-    clap::{value_t, App, Arg, ArgMatches, SubCommand},
+    clap::{App, Arg, ArgMatches, SubCommand, value_t},
     solana_core::{
         banking_stage::BankingStage,
         validator::{BlockProductionMethod, SchedulerPacing, TransactionStructure},
@@ -24,13 +24,12 @@ pub struct ManageBlockProductionArgs {
 
 impl FromClapArgMatches for ManageBlockProductionArgs {
     fn from_clap_arg_match(matches: &ArgMatches) -> Result<Self> {
+        let block_production_method =
+            value_t!(matches, "block_production_method", BlockProductionMethod).unwrap_or_default();
+        block_production_method.warn_if_deprecated_value();
+
         Ok(ManageBlockProductionArgs {
-            block_production_method: value_t!(
-                matches,
-                "block_production_method",
-                BlockProductionMethod
-            )
-            .unwrap_or_default(),
+            block_production_method,
             transaction_structure: value_t!(matches, "transaction_struct", TransactionStructure)
                 .unwrap_or_default(),
             num_workers: value_t!(matches, "block_production_num_workers", NonZeroUsize)

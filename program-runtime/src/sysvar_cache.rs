@@ -1,4 +1,4 @@
-#[allow(deprecated)]
+#[expect(deprecated)]
 use solana_sysvar::{fees::Fees, recent_blockhashes::RecentBlockhashes};
 use {
     crate::invoke_context::InvokeContext,
@@ -16,7 +16,7 @@ use {
     solana_svm_type_overrides::sync::Arc,
     solana_sysvar::SysvarSerialize,
     solana_sysvar_id::SysvarId,
-    solana_transaction_context::{instruction::InstructionContext, IndexOfAccount},
+    solana_transaction_context::{IndexOfAccount, instruction::InstructionContext},
 };
 
 #[cfg(feature = "frozen-abi")]
@@ -45,9 +45,9 @@ pub struct SysvarCache {
     stake_history_obj: Option<Arc<StakeHistory>>,
 
     // deprecated sysvars, these should be removed once practical
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     fees: Option<Fees>,
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     recent_blockhashes: Option<RecentBlockhashes>,
 }
 
@@ -59,7 +59,7 @@ const RECENT_BLOCKHASHES_ID: Pubkey =
 
 impl SysvarCache {
     /// Overwrite a sysvar. For testing purposes only.
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     pub fn set_sysvar_for_tests<T: SysvarSerialize + SysvarId>(&mut self, sysvar: &T) {
         let data = bincode::serialize(sysvar).expect("Failed to serialize sysvar.");
         let sysvar_id = T::id();
@@ -174,7 +174,7 @@ impl SysvarCache {
     }
 
     #[deprecated]
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     pub fn get_fees(&self) -> Result<Arc<Fees>, InstructionError> {
         self.fees
             .clone()
@@ -183,7 +183,7 @@ impl SysvarCache {
     }
 
     #[deprecated]
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     pub fn get_recent_blockhashes(&self) -> Result<Arc<RecentBlockhashes>, InstructionError> {
         self.recent_blockhashes
             .clone()
@@ -253,7 +253,7 @@ impl SysvarCache {
             });
         }
 
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         if self.fees.is_none() {
             get_account_data(&Fees::id(), &mut |data: &[u8]| {
                 if let Ok(fees) = bincode::deserialize(data) {
@@ -262,7 +262,7 @@ impl SysvarCache {
             });
         }
 
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         if self.recent_blockhashes.is_none() {
             get_account_data(&RecentBlockhashes::id(), &mut |data: &[u8]| {
                 if let Ok(recent_blockhashes) = bincode::deserialize(data) {
@@ -302,7 +302,7 @@ pub mod get_sysvar_with_account_check {
         instruction_account_index: IndexOfAccount,
     ) -> Result<Arc<Clock>, InstructionError> {
         check_sysvar_account::<Clock>(instruction_context, instruction_account_index)?;
-        invoke_context.get_sysvar_cache().get_clock()
+        invoke_context.environment_config.sysvar_cache().get_clock()
     }
 
     pub fn rent(
@@ -311,7 +311,7 @@ pub mod get_sysvar_with_account_check {
         instruction_account_index: IndexOfAccount,
     ) -> Result<Arc<Rent>, InstructionError> {
         check_sysvar_account::<Rent>(instruction_context, instruction_account_index)?;
-        invoke_context.get_sysvar_cache().get_rent()
+        invoke_context.environment_config.sysvar_cache().get_rent()
     }
 
     pub fn slot_hashes(
@@ -320,17 +320,23 @@ pub mod get_sysvar_with_account_check {
         instruction_account_index: IndexOfAccount,
     ) -> Result<Arc<SlotHashes>, InstructionError> {
         check_sysvar_account::<SlotHashes>(instruction_context, instruction_account_index)?;
-        invoke_context.get_sysvar_cache().get_slot_hashes()
+        invoke_context
+            .environment_config
+            .sysvar_cache()
+            .get_slot_hashes()
     }
 
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     pub fn recent_blockhashes(
         invoke_context: &InvokeContext,
         instruction_context: &InstructionContext,
         instruction_account_index: IndexOfAccount,
     ) -> Result<Arc<RecentBlockhashes>, InstructionError> {
         check_sysvar_account::<RecentBlockhashes>(instruction_context, instruction_account_index)?;
-        invoke_context.get_sysvar_cache().get_recent_blockhashes()
+        invoke_context
+            .environment_config
+            .sysvar_cache()
+            .get_recent_blockhashes()
     }
 
     pub fn stake_history(
@@ -339,7 +345,10 @@ pub mod get_sysvar_with_account_check {
         instruction_account_index: IndexOfAccount,
     ) -> Result<Arc<StakeHistory>, InstructionError> {
         check_sysvar_account::<StakeHistory>(instruction_context, instruction_account_index)?;
-        invoke_context.get_sysvar_cache().get_stake_history()
+        invoke_context
+            .environment_config
+            .sysvar_cache()
+            .get_stake_history()
     }
 
     pub fn last_restart_slot(
@@ -348,7 +357,10 @@ pub mod get_sysvar_with_account_check {
         instruction_account_index: IndexOfAccount,
     ) -> Result<Arc<LastRestartSlot>, InstructionError> {
         check_sysvar_account::<LastRestartSlot>(instruction_context, instruction_account_index)?;
-        invoke_context.get_sysvar_cache().get_last_restart_slot()
+        invoke_context
+            .environment_config
+            .sysvar_cache()
+            .get_last_restart_slot()
     }
 }
 

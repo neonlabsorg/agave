@@ -5,20 +5,20 @@ use {
     crate::{
         blockstore_meta::ErasureConfig,
         shred::{
-            self, merkle_tree::SIZE_OF_MERKLE_ROOT, traits::Shred, Error, Nonce, ShredFlags,
-            ShredId, ShredType, ShredVariant, SIZE_OF_COMMON_SHRED_HEADER,
+            self, Error, Nonce, SIZE_OF_COMMON_SHRED_HEADER, ShredFlags, ShredId, ShredType,
+            ShredVariant, merkle_tree::SIZE_OF_MERKLE_ROOT, traits::Shred,
         },
     },
     solana_clock::Slot,
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_perf::packet::{PacketRef, PacketRefMut},
-    solana_signature::{Signature, SIGNATURE_BYTES},
+    solana_signature::{SIGNATURE_BYTES, Signature},
     solana_signer::Signer,
 };
 #[cfg(test)]
 use {
-    rand::{prelude::IndexedMutRandom as _, Rng},
+    rand::{Rng, prelude::IndexedMutRandom as _},
     solana_perf::packet::Packet,
     std::collections::HashMap,
     std::ops::Range,
@@ -84,7 +84,7 @@ pub(super) fn get_shred_variant(shred: &[u8]) -> Result<ShredVariant, Error> {
 }
 
 #[inline]
-pub(super) fn get_shred_type(shred: &[u8]) -> Result<ShredType, Error> {
+pub fn get_shred_type(shred: &[u8]) -> Result<ShredType, Error> {
     get_shred_variant(shred).map(ShredType::from)
 }
 
@@ -201,20 +201,6 @@ pub fn get_shred_id(shred: &[u8]) -> Option<ShredId> {
         get_index(shred)?,
         get_shred_type(shred).ok()?,
     ))
-}
-
-pub(crate) fn get_signed_data(shred: &[u8]) -> Option<Hash> {
-    let data = match get_shred_variant(shred).ok()? {
-        ShredVariant::MerkleCode {
-            proof_size,
-            resigned,
-        } => shred::merkle::ShredCode::get_merkle_root(shred, proof_size, resigned)?,
-        ShredVariant::MerkleData {
-            proof_size,
-            resigned,
-        } => shred::merkle::ShredData::get_merkle_root(shred, proof_size, resigned)?,
-    };
-    Some(data)
 }
 
 pub fn get_reference_tick(shred: &[u8]) -> Result<u8, Error> {
@@ -410,12 +396,12 @@ pub(crate) fn corrupt_packet<R: Rng>(
     let signature = get_signature(shred).unwrap();
     if coin_flip {
         let pubkey = keypairs[&slot].pubkey();
-        let data = get_signed_data(shred).unwrap();
+        let data = get_merkle_root(shred).unwrap();
         assert!(!signature.verify(pubkey.as_ref(), data.as_ref()));
     } else {
         // Slot may have been corrupted and no longer mapping to a keypair.
         let pubkey = keypairs.get(&slot).map(Keypair::pubkey).unwrap_or_default();
-        if let Some(data) = get_signed_data(shred) {
+        if let Some(data) = get_merkle_root(shred) {
             assert!(!signature.verify(pubkey.as_ref(), data.as_ref()));
         }
     }
@@ -426,7 +412,7 @@ mod tests {
     use {
         super::*,
         crate::shred::{
-            tests::make_merkle_shreds_for_tests, traits::ShredData, SHREDS_PER_FEC_BLOCK,
+            SHREDS_PER_FEC_BLOCK, tests::make_merkle_shreds_for_tests, traits::ShredData,
         },
         assert_matches::assert_matches,
         rand::Rng,
@@ -566,7 +552,7 @@ mod tests {
                 )
             });
             assert_eq!(
-                get_signed_data(bytes).unwrap(),
+                get_merkle_root(bytes).unwrap(),
                 shred.merkle_root().unwrap()
             );
             assert_eq!(

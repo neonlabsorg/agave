@@ -4,20 +4,21 @@
 use {
     super::leader_updater::LeaderUpdater,
     crate::{
+        SendTransactionStats,
         connection_worker::DEFAULT_MAX_CONNECTION_HANDSHAKE_TIMEOUT,
         logging::debug,
         quic_networking::{
-            create_client_config, create_client_endpoint, QuicClientCertificate, QuicError,
+            QuicClientCertificate, QuicError, create_client_config, create_client_endpoint,
         },
         transaction_batch::TransactionBatch,
-        workers_cache::{shutdown_worker, WorkersCache, WorkersCacheError},
-        SendTransactionStats,
+        workers_cache::{WorkersCache, WorkersCacheError, shutdown_worker},
     },
     async_trait::async_trait,
     quinn::{ClientConfig, Endpoint},
     solana_keypair::Keypair,
     std::{
         net::{SocketAddr, UdpSocket},
+        num::NonZeroUsize,
         sync::Arc,
     },
     thiserror::Error,
@@ -85,7 +86,7 @@ pub struct ConnectionWorkersSchedulerConfig {
     pub stake_identity: Option<StakeIdentity>,
 
     /// The number of connections to be maintained by the scheduler.
-    pub num_connections: usize,
+    pub num_connections: NonZeroUsize,
 
     /// Whether to skip checking the transaction blockhash expiration.
     pub skip_check_transaction_age: bool,
@@ -100,6 +101,10 @@ pub struct ConnectionWorkersSchedulerConfig {
 
     /// Configures the number of leaders to connect to and send transactions to.
     pub leaders_fanout: Fanout,
+
+    /// Override the initial congestion window size in bytes. If `None`, uses
+    /// INITIAL_CONGESTION_WINDOW as the default.
+    pub override_initial_congestion_window: Option<u64>,
 }
 
 /// The [`BindTarget`] enum defines how the UDP socket should be bound:
@@ -214,6 +219,7 @@ impl ConnectionWorkersScheduler {
             worker_channel_size,
             max_reconnect_attempts,
             leaders_fanout,
+            override_initial_congestion_window: initial_congestion_window,
         }: ConnectionWorkersSchedulerConfig,
         broadcaster: Box<dyn WorkersBroadcaster>,
     ) -> Result<Arc<SendTransactionStats>, ConnectionWorkersSchedulerError> {
@@ -224,7 +230,7 @@ impl ConnectionWorkersScheduler {
             cancel,
             stats,
         } = self;
-        let mut endpoint = setup_endpoint(bind, stake_identity)?;
+        let mut endpoint = setup_endpoint(bind, stake_identity, initial_congestion_window)?;
 
         debug!("Client endpoint bind address: {:?}", endpoint.local_addr());
         let mut workers = WorkersCache::new(num_connections, cancel.clone());
@@ -252,7 +258,7 @@ impl ConnectionWorkersScheduler {
                         continue;
                     };
 
-                    let client_config = build_client_config(update_identity_receiver.borrow_and_update().as_ref());
+                    let client_config = build_client_config(update_identity_receiver.borrow_and_update().as_ref(), initial_congestion_window);
                     endpoint.set_default_client_config(client_config);
                     // Flush workers since they are handling connections created
                     // with outdated certificate.
@@ -309,18 +315,22 @@ impl ConnectionWorkersScheduler {
 pub fn setup_endpoint(
     bind: BindTarget,
     stake_identity: Option<StakeIdentity>,
+    initial_congestion_window: Option<u64>,
 ) -> Result<Endpoint, ConnectionWorkersSchedulerError> {
-    let client_config = build_client_config(stake_identity.as_ref());
+    let client_config = build_client_config(stake_identity.as_ref(), initial_congestion_window);
     let endpoint = create_client_endpoint(bind, client_config)?;
     Ok(endpoint)
 }
 
-fn build_client_config(stake_identity: Option<&StakeIdentity>) -> ClientConfig {
+fn build_client_config(
+    stake_identity: Option<&StakeIdentity>,
+    initial_congestion_window: Option<u64>,
+) -> ClientConfig {
     let client_certificate = match stake_identity {
         Some(identity) => identity.as_certificate(),
         None => &QuicClientCertificate::new(None),
     };
-    create_client_config(client_certificate)
+    create_client_config(client_certificate, initial_congestion_window)
 }
 
 /// [`NonblockingBroadcaster`] attempts to immediately send transactions to all

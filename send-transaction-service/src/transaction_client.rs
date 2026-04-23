@@ -4,17 +4,18 @@ use {
     log::warn,
     solana_keypair::Keypair,
     solana_measure::measure::Measure,
-    solana_quic_definitions::NotifyKeyUpdate,
+    solana_tls_utils::NotifyKeyUpdate,
     solana_tpu_client_next::{
+        ConnectionWorkersScheduler,
         connection_workers_scheduler::{
             BindTarget, ConnectionWorkersSchedulerConfig, Fanout, StakeIdentity,
         },
         leader_updater::LeaderUpdater,
         transaction_batch::TransactionBatch,
-        ConnectionWorkersScheduler,
     },
     std::{
         net::{SocketAddr, UdpSocket},
+        num::NonZeroUsize,
         sync::atomic::Ordering,
         time::{Duration, Instant},
     },
@@ -30,7 +31,7 @@ use {
 
 /// How many connections to maintain the tpu-client-next cache. The value is
 /// chosen to match MAX_CONNECTIONS from ConnectionCache
-const MAX_CONNECTIONS: usize = 1024;
+const MAX_CONNECTIONS: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 // Alias trait to shorten function definitions.
 pub trait TpuInfoWithSendStatic: TpuInfo + std::marker::Send + 'static {}
@@ -182,6 +183,7 @@ impl TpuClientNextClient {
                 connect: leader_forward_count + 1,
                 send: leader_forward_count,
             },
+            override_initial_congestion_window: None,
         }
     }
 

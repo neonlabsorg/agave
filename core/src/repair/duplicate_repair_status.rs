@@ -530,7 +530,7 @@ impl AncestorRequestStatus {
 pub mod tests {
     use {
         super::*,
-        rand::{self, seq::SliceRandom, thread_rng},
+        rand::{self, rng, seq::SliceRandom},
         solana_ledger::get_tmp_ledger_path_auto_delete,
         std::{collections::BTreeMap, net::IpAddr},
         tempfile::TempDir,
@@ -614,9 +614,11 @@ pub mod tests {
 
         // Try adding a response from an invalid peer, should not be registered
         let rand_addr = create_rand_socket_addr();
-        assert!(status
-            .add_response(&rand_addr, vec![(99, Hash::new_unique())], &blockstore)
-            .is_none());
+        assert!(
+            status
+                .add_response(&rand_addr, vec![(99, Hash::new_unique())], &blockstore)
+                .is_none()
+        );
         assert_eq!(status.num_responses, 0);
         assert!(status.ancestor_request_responses.is_empty());
     }
@@ -647,9 +649,11 @@ pub mod tests {
             } else {
                 incorrect_ancestors_response.clone()
             };
-            assert!(status
-                .add_response(responder_addr, response, &blockstore)
-                .is_none());
+            assert!(
+                status
+                    .add_response(responder_addr, response, &blockstore)
+                    .is_none()
+            );
             assert_eq!(status.num_responses, 1);
             assert_eq!(status.ancestor_request_responses.len(), 1);
             let correct_responses = status
@@ -696,7 +700,7 @@ pub mod tests {
         assert!(total_incorrect_responses <= get_ancestor_hash_repair_sample_size());
 
         let mut event_order: Vec<usize> = (0..sampled_addresses.len()).collect();
-        event_order.shuffle(&mut thread_rng());
+        event_order.shuffle(&mut rng());
 
         for (event, responder_addr) in event_order.iter().zip(sampled_addresses.iter()) {
             let response = events

@@ -23,10 +23,10 @@ use {
     },
     itertools::Itertools,
     rand::{
-        distributions::{Distribution, WeightedIndex},
         Rng,
+        distr::{Distribution, weighted::WeightedIndex},
     },
-    rayon::{prelude::*, ThreadPool},
+    rayon::{ThreadPool, prelude::*},
     serde::{Deserialize, Serialize},
     solana_bloom::bloom::{Bloom, ConcurrentBloom},
     solana_hash::Hash,
@@ -43,8 +43,8 @@ use {
         net::SocketAddr,
         ops::Index,
         sync::{
-            atomic::{AtomicI64, AtomicUsize, Ordering},
             LazyLock, Mutex, RwLock,
+            atomic::{AtomicI64, AtomicUsize, Ordering},
         },
         time::Duration,
     },
@@ -96,7 +96,7 @@ impl CrdsFilter {
         let max_items = Self::max_items(max_bits, FALSE_RATE, KEYS);
         let mask_bits = Self::mask_bits(num_items as f64, max_items);
         let filter = Bloom::random(max_items as usize, FALSE_RATE, max_bits as usize);
-        let seed: u64 = rand::thread_rng().gen_range(0..2u64.pow(mask_bits));
+        let seed: u64 = rand::rng().random_range(0..2u64.pow(mask_bits));
         let mask = Self::compute_mask(seed, mask_bits);
         CrdsFilter {
             filter,
@@ -177,7 +177,7 @@ impl CrdsFilterSet {
         let mut indices: Vec<_> = (0..filters.len()).collect();
         let size = filters.len().div_ceil(SAMPLE_RATE);
         for _ in 0..MAX_NUM_FILTERS.min(size) {
-            let k = rng.gen_range(0..indices.len());
+            let k = rng.random_range(0..indices.len());
             let k = indices.swap_remove(k);
             let filter = Bloom::random(max_items as usize, FALSE_RATE, max_bits as usize);
             filters[k] = Some(ConcurrentBloom::<Hash>::from(filter));
@@ -260,7 +260,7 @@ impl CrdsGossipPull {
         socket_addr_space: &SocketAddrSpace,
     ) -> Result<impl Iterator<Item = (SocketAddr, CrdsFilter)> + Clone + use<>, CrdsGossipError>
     {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // Active and valid gossip nodes with matching shred-version.
         let nodes = crds_gossip::get_gossip_nodes(
             &mut rng,
@@ -286,26 +286,25 @@ impl CrdsGossipPull {
             .get(&self_keypair.pubkey())
             .copied()
             .unwrap_or_default();
-        let (weights, nodes): (Vec<u64>, Vec<ContactInfo>) =
-            crds_gossip::dedup_gossip_addresses(nodes, stakes)
-                .into_values()
-                .map(|(stake, node)| {
+        let (weights, gossips): (Vec<u64>, Vec<SocketAddr>) =
+            crds_gossip::dedup_gossip_addresses(nodes)
+                .into_iter()
+                .map(|(gossip, stake, _pubkey)| {
                     let stake = stake.min(stake_cap) / LAMPORTS_PER_SOL;
                     let weight = u64::BITS - stake.leading_zeros();
                     let weight = u64::from(weight).saturating_add(1).saturating_pow(2);
-                    (weight, node)
+                    (weight, gossip)
                 })
                 .unzip();
-        if nodes.is_empty() {
+        if gossips.is_empty() {
             return Err(CrdsGossipError::NoPeers);
         }
         let filters = self.build_crds_filters(thread_pool, crds, bloom_size);
         // Associate each pull-request filter with a randomly selected peer.
         let dist = WeightedIndex::new(weights).unwrap();
-        Ok(filters.into_iter().filter_map(move |filter| {
-            let node = &nodes[dist.sample(&mut rng)];
-            Some((node.gossip()?, filter))
-        }))
+        Ok(filters
+            .into_iter()
+            .map(move |filter| (gossips[dist.sample(&mut rng)], filter)))
     }
 
     /// Create gossip responses to pull requests
@@ -316,7 +315,6 @@ impl CrdsGossipPull {
         output_size_limit: usize, // Limit number of crds values returned.
         now: u64,
         should_retain_crds_value: impl Fn(&CrdsValue) -> bool + Sync,
-        self_shred_version: u16,
         stats: &GossipStats,
     ) -> Vec<Vec<CrdsValue>> {
         Self::filter_crds_values(
@@ -326,7 +324,6 @@ impl CrdsGossipPull {
             output_size_limit,
             now,
             should_retain_crds_value,
-            self_shred_version,
             stats,
         )
     }
@@ -447,7 +444,7 @@ impl CrdsGossipPull {
         let crds = crds.read().unwrap();
         let num_items = crds.len() + crds.num_purged() + failed_inserts.len();
         let num_items = MIN_NUM_BLOOM_ITEMS.max(num_items);
-        let filters = CrdsFilterSet::new(&mut rand::thread_rng(), num_items, bloom_size);
+        let filters = CrdsFilterSet::new(&mut rand::rng(), num_items, bloom_size);
         thread_pool.install(|| {
             crds.par_values()
                 .with_min_len(PAR_MIN_LENGTH)
@@ -475,11 +472,10 @@ impl CrdsGossipPull {
         now: u64,
         // Predicate returning false if the CRDS value should be discarded.
         should_retain_crds_value: impl Fn(&CrdsValue) -> bool + Sync,
-        self_shred_version: u16,
         stats: &GossipStats,
     ) -> Vec<Vec<CrdsValue>> {
         let msg_timeout = CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS;
-        let jitter = rand::thread_rng().gen_range(0..msg_timeout / 4);
+        let jitter = rand::rng().random_range(0..msg_timeout / 4);
         //skip filters from callers that are too old
         let caller_wallclock_window =
             now.saturating_sub(msg_timeout)..now.saturating_add(msg_timeout);
@@ -511,7 +507,7 @@ impl CrdsGossipPull {
                 }
             };
             let out: Vec<_> = crds
-                .filter_bitmask(filter.mask, filter.mask_bits, self_shred_version)
+                .filter_bitmask(filter.mask, filter.mask_bits)
                 .filter(pred)
                 .map(|entry| entry.value.clone())
                 .take(output_size_limit.load(Ordering::Relaxed).max(0) as usize)
@@ -573,11 +569,7 @@ impl CrdsGossipPull {
             now,
             &mut stats,
         );
-        (
-            stats.failed_timeout + stats.failed_insert,
-            stats.failed_timeout,
-            stats.success,
-        )
+        (stats.failed_insert, stats.failed_timeout, stats.success)
     }
 }
 
@@ -629,7 +621,7 @@ impl Index<&Pubkey> for CrdsTimeouts<'_> {
 pub(crate) fn get_max_bloom_filter_bytes(caller: &CrdsValue) -> usize {
     // Maps serialized size of CrdsFilter to max_bytes of bloom filter.
     static MAX_BYTES_CACHE: LazyLock<[u16; PACKET_DATA_SIZE + 1]> = LazyLock::new(|| {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut out = [0u16; PACKET_DATA_SIZE + 1];
         for max_bytes in 1..=PACKET_DATA_SIZE {
             let filters = CrdsFilterSet::new(&mut rng, /*num_items:*/ 1, max_bytes);
@@ -675,18 +667,14 @@ pub(crate) fn get_max_bloom_filter_bytes(caller: &CrdsValue) -> usize {
 pub(crate) mod tests {
     use {
         super::*,
-        crate::{
-            crds_data::{CrdsData, Vote},
-            protocol::Protocol,
-        },
+        crate::{crds_data::CrdsData, protocol::Protocol},
         itertools::Itertools,
-        rand::{seq::SliceRandom, SeedableRng},
+        rand::{SeedableRng, prelude::IndexedRandom as _},
         rand_chacha::ChaChaRng,
         rayon::ThreadPoolBuilder,
         solana_hash::HASH_BYTES,
         solana_keypair::keypair_from_seed,
         solana_packet::PACKET_DATA_SIZE,
-        solana_perf::test_tx::new_test_vote_tx,
         solana_sha256_hasher::hash,
         solana_time_utils::timestamp,
         std::{
@@ -748,7 +736,7 @@ pub(crate) mod tests {
 
     fn new_ping_cache() -> PingCache {
         PingCache::new(
-            &mut rand::thread_rng(),
+            &mut rand::rng(),
             Instant::now(),
             Duration::from_secs(20 * 60),      // ttl
             Duration::from_secs(20 * 60) / 64, // rate_limit_delay
@@ -791,12 +779,12 @@ pub(crate) mod tests {
 
     #[test]
     fn test_crds_filter_set_add() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let crds_filter_set = CrdsFilterSet::new(
             &mut rng, /*num_items=*/ 59672788, /*max_bytes=*/ 8196,
         );
         let hash_values: Vec<_> = repeat_with(|| {
-            let buf: [u8; 32] = rng.gen();
+            let buf: [u8; 32] = rng.random();
             solana_sha256_hasher::hashv(&[&buf])
         })
         .take(1024)
@@ -832,7 +820,7 @@ pub(crate) mod tests {
         // Validates invariances required by CrdsFilterSet::get in the
         // vector of filters generated by CrdsFilterSet::new.
         let filters = CrdsFilterSet::new(
-            &mut rand::thread_rng(),
+            &mut rand::rng(),
             55345017, // num_items
             4098,     // max_bytes
         );
@@ -869,7 +857,7 @@ pub(crate) mod tests {
             let keypair = keypairs.choose(&mut rng).unwrap();
             let value = CrdsValue::new_rand(&mut rng, Some(keypair));
             if crds
-                .insert(value, rng.gen(), GossipRoute::LocalMessage)
+                .insert(value, rng.random(), GossipRoute::LocalMessage)
                 .is_ok()
             {
                 num_inserts += 1;
@@ -1134,7 +1122,6 @@ pub(crate) mod tests {
             usize::MAX, // output_size_limit
             now,
             |_| true, // should_retain_crds_value
-            0,        // self_shred_version
             &GossipStats::default(),
         );
 
@@ -1159,7 +1146,6 @@ pub(crate) mod tests {
             usize::MAX, // output_size_limit
             now,
             |_| true, // should_retain_crds_value
-            0,        // self_shred_version
             &GossipStats::default(),
         );
         assert_eq!(rsp[0].len(), 0);
@@ -1186,7 +1172,6 @@ pub(crate) mod tests {
             usize::MAX, // output_size_limit
             now,
             |_| true, // should_retain_crds_value
-            0,        // self_shred_version
             &GossipStats::default(),
         );
         assert_eq!(rsp.len(), 2 * MIN_NUM_BLOOM_FILTERS);
@@ -1280,7 +1265,6 @@ pub(crate) mod tests {
                 usize::MAX, // output_size_limit
                 0,          // now
                 |_| true,   // should_retain_crds_value
-                0,          // self_shred_version
                 &GossipStats::default(),
             );
             // if there is a false positive this is empty
@@ -1409,8 +1393,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn test_crds_filter_complete_set_add_mask() {
-        let mut filters =
-            Vec::<CrdsFilter>::from(CrdsFilterSet::new(&mut rand::thread_rng(), 1000, 10));
+        let mut filters = Vec::<CrdsFilter>::from(CrdsFilterSet::new(&mut rand::rng(), 1000, 10));
         assert!(filters.iter().all(|f| f.mask_bits > 0));
         let mut h: Hash = Hash::default();
         // rev to make the hash::default() miss on the first few test_masks
@@ -1453,87 +1436,6 @@ pub(crate) mod tests {
         )
     }
 
-    #[test]
-    fn test_process_pull_response() {
-        let mut rng = rand::thread_rng();
-        let node_crds = RwLock::<Crds>::default();
-        let node = CrdsGossipPull::default();
-
-        let peer_pubkey = solana_pubkey::new_rand();
-        let peer_entry =
-            CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(&peer_pubkey, 0)));
-        let stakes = HashMap::from([(peer_pubkey, 1u64)]);
-        let timeouts = CrdsTimeouts::new(
-            Pubkey::new_unique(),
-            node.crds_timeout, // default_timeout
-            Duration::from_millis(node.crds_timeout + 1),
-            &stakes,
-        );
-        // inserting a fresh value should be fine.
-        assert_eq!(
-            node.process_pull_response(&node_crds, &timeouts, vec![peer_entry.clone()], 1,)
-                .0,
-            0
-        );
-
-        let node_crds = RwLock::<Crds>::default();
-        let unstaked_peer_entry =
-            CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(&peer_pubkey, 0)));
-        // check that old contact infos fail if they are too old, regardless of "timeouts"
-        assert_eq!(
-            node.process_pull_response(
-                &node_crds,
-                &timeouts,
-                vec![peer_entry.clone(), unstaked_peer_entry],
-                node.crds_timeout + 100,
-            )
-            .0,
-            4
-        );
-
-        let node_crds = RwLock::<Crds>::default();
-        // check that old contact infos can still land as long as they have a "timeouts" entry
-        assert_eq!(
-            node.process_pull_response(
-                &node_crds,
-                &timeouts,
-                vec![peer_entry],
-                node.crds_timeout + 1,
-            )
-            .0,
-            0
-        );
-
-        // construct something that's not a contact info
-        let peer_vote = Vote::new(peer_pubkey, new_test_vote_tx(&mut rng), 0).unwrap();
-        let peer_vote = CrdsValue::new_unsigned(CrdsData::Vote(0, peer_vote));
-        // check that older CrdsValues (non-ContactInfos) infos pass even if are too old,
-        // but a recent contact info (inserted above) exists
-        assert_eq!(
-            node.process_pull_response(
-                &node_crds,
-                &timeouts,
-                vec![peer_vote.clone()],
-                node.crds_timeout + 1,
-            )
-            .0,
-            0
-        );
-
-        let node_crds = RwLock::<Crds>::default();
-        // without a contact info, inserting an old value should fail
-        assert_eq!(
-            node.process_pull_response(
-                &node_crds,
-                &timeouts,
-                vec![peer_vote],
-                node.crds_timeout + 2,
-            )
-            .0,
-            2
-        );
-    }
-
     // Asserts that all bincode serialized pull requests fit in a Packet.
     fn verify_get_max_bloom_filter_bytes<R: Rng>(
         rng: &mut R,
@@ -1562,29 +1464,29 @@ pub(crate) mod tests {
     #[test_case(645043)]
     #[test_case(3873238)]
     fn test_get_max_bloom_filter_bytes(num_items: usize) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let keypair = Keypair::new();
         let node = {
             let mut node =
                 ContactInfo::new_localhost(&keypair.pubkey(), /*wallclock:*/ timestamp());
-            node.set_shred_version(rng.gen());
+            node.set_shred_version(rng.random());
             node
         };
         {
             let caller: CrdsValue = CrdsValue::new(CrdsData::from(&node), &keypair);
-            assert_eq!(get_max_bloom_filter_bytes(&caller), 1175);
+            assert_eq!(get_max_bloom_filter_bytes(&caller), 1184);
             verify_get_max_bloom_filter_bytes(&mut rng, &caller, num_items);
         }
         let node = {
             let addr = Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
             let socket = SocketAddr::new(IpAddr::from(addr), 8053);
             let mut node = ContactInfo::new_with_socketaddr(&keypair.pubkey(), &socket);
-            node.set_shred_version(rng.gen());
+            node.set_shred_version(rng.random());
             node
         };
         {
             let caller = CrdsValue::new(CrdsData::from(&node), &keypair);
-            assert_eq!(get_max_bloom_filter_bytes(&caller), 1155);
+            assert_eq!(get_max_bloom_filter_bytes(&caller), 1165);
             verify_get_max_bloom_filter_bytes(&mut rng, &caller, num_items);
         }
     }

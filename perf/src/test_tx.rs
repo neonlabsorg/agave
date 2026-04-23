@@ -4,14 +4,14 @@ use {
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_message::{
-        compiled_instruction::CompiledInstruction, v0::Message as MessageV0, AccountMeta,
-        Instruction, Message, VersionedMessage,
+        AccountMeta, Instruction, Message, VersionedMessage,
+        compiled_instruction::CompiledInstruction, v0::Message as MessageV0,
     },
     solana_pubkey::Pubkey,
     solana_sdk_ids::{stake, system_program},
     solana_signer::Signer,
     solana_system_interface::instruction::SystemInstruction,
-    solana_transaction::{versioned::VersionedTransaction, Transaction},
+    solana_transaction::{Transaction, versioned::VersionedTransaction},
     solana_vote::vote_transaction,
     solana_vote_program::vote_state::TowerSync,
 };
@@ -41,8 +41,8 @@ pub fn test_multisig_tx() -> Transaction {
     let program_ids = vec![system_program::id(), stake::id()];
 
     let instructions = vec![CompiledInstruction::new(
-        0,
-        &transfer_instruction,
+        3,
+        &bincode::serialize(&transfer_instruction).unwrap(),
         vec![0, 1],
     )];
 
@@ -59,10 +59,10 @@ pub fn new_test_vote_tx<R>(rng: &mut R) -> Transaction
 where
     R: CryptoRng + RngCore,
 {
-    let mut slots: Vec<Slot> = std::iter::repeat_with(|| rng.gen()).take(5).collect();
+    let mut slots: Vec<Slot> = std::iter::repeat_with(|| rng.random()).take(5).collect();
     slots.sort_unstable();
     slots.dedup();
-    let switch_proof_hash = rng.gen_bool(0.5).then(Hash::new_unique);
+    let switch_proof_hash = rng.random_bool(0.5).then(Hash::new_unique);
     let tower_sync = TowerSync::new_from_slots(slots, Hash::default(), None);
     vote_transaction::new_tower_sync_transaction(
         tower_sync,

@@ -2,16 +2,20 @@ use {
     super::{ComputeBudgetInstructionDetails, RuntimeTransaction},
     crate::{
         instruction_meta::InstructionMeta,
-        transaction_meta::{StaticMeta, TransactionMeta},
+        transaction_meta::{
+            CachedTransactionMeta, TransactionConfiguration, TransactionMeta,
+            VersionedTransactionConfiguration,
+        },
         transaction_with_meta::TransactionWithMeta,
     },
-    solana_message::{AddressLoader, TransactionSignatureDetails},
+    solana_message::{AddressLoader, TransactionSignatureDetails, VersionedMessage},
+    solana_program_entrypoint::HEAP_LENGTH,
     solana_pubkey::Pubkey,
     solana_svm_transaction::instruction::SVMInstruction,
     solana_transaction::{
         sanitized::{MessageHash, SanitizedTransaction},
         simple_vote_transaction_checker::is_simple_vote_transaction,
-        versioned::{sanitized::SanitizedVersionedTransaction, VersionedTransaction},
+        versioned::{VersionedTransaction, sanitized::SanitizedVersionedTransaction},
     },
     solana_transaction_error::TransactionResult as Result,
     std::{borrow::Cow, collections::HashSet},
@@ -51,20 +55,36 @@ impl RuntimeTransaction<SanitizedVersionedTransaction> {
             precompile_signature_details.num_ed25519_instruction_signatures,
             precompile_signature_details.num_secp256r1_instruction_signatures,
         );
-        let compute_budget_instruction_details = ComputeBudgetInstructionDetails::try_from(
-            sanitized_versioned_tx
-                .get_message()
-                .program_instructions_iter()
-                .map(|(program_id, ix)| (program_id, SVMInstruction::from(ix))),
-        )?;
+
+        let versioned_transaction_config = match &sanitized_versioned_tx.get_message().message {
+            VersionedMessage::V1(msg) => {
+                VersionedTransactionConfiguration::V1(TransactionConfiguration {
+                    priority_fee_lamports: msg.config.priority_fee.unwrap_or(0),
+                    compute_unit_limit: msg.config.compute_unit_limit.unwrap_or(0),
+                    loaded_accounts_data_size_limit: msg
+                        .config
+                        .loaded_accounts_data_size_limit
+                        .unwrap_or(0),
+                    updated_heap_bytes: msg.config.heap_size.unwrap_or(HEAP_LENGTH as u32),
+                })
+            }
+            _ => VersionedTransactionConfiguration::LegacyAndV0(
+                ComputeBudgetInstructionDetails::try_from(
+                    sanitized_versioned_tx
+                        .get_message()
+                        .program_instructions_iter()
+                        .map(|(program_id, ix)| (program_id, SVMInstruction::from(ix))),
+                )?,
+            ),
+        };
 
         Ok(Self {
             transaction: sanitized_versioned_tx,
-            meta: TransactionMeta {
+            meta: CachedTransactionMeta {
                 message_hash,
                 is_simple_vote_transaction: is_simple_vote_tx,
                 signature_details,
-                compute_budget_instruction_details,
+                versioned_transaction_config,
                 instruction_data_len,
             },
         })
@@ -80,14 +100,22 @@ impl RuntimeTransaction<SanitizedTransaction> {
         is_simple_vote_tx: Option<bool>,
         address_loader: impl AddressLoader,
         reserved_account_keys: &HashSet<Pubkey>,
-        enable_static_instruction_limit: bool,
+        enable_instruction_accounts_limit: bool,
     ) -> Result<Self> {
-        if enable_static_instruction_limit
-            && tx.message.instructions().len()
-                > solana_transaction_context::MAX_INSTRUCTION_TRACE_LENGTH
+        if tx.message.instructions().len()
+            > solana_transaction_context::MAX_INSTRUCTION_TRACE_LENGTH
         {
             return Err(solana_transaction_error::TransactionError::SanitizeFailure);
         }
+
+        if enable_instruction_accounts_limit {
+            for instr in tx.message.instructions() {
+                if instr.accounts.len() > solana_transaction_context::MAX_ACCOUNTS_PER_INSTRUCTION {
+                    return Err(solana_transaction_error::TransactionError::SanitizeFailure);
+                }
+            }
+        }
+
         let statically_loaded_runtime_tx =
             RuntimeTransaction::<SanitizedVersionedTransaction>::try_from(
                 SanitizedVersionedTransaction::try_from(tx)?,
@@ -119,17 +147,12 @@ impl RuntimeTransaction<SanitizedTransaction> {
             reserved_account_keys,
         )?;
 
-        let mut tx = Self {
+        let tx = Self {
             transaction: sanitized_transaction,
             meta: statically_loaded_runtime_tx.meta,
         };
-        tx.load_dynamic_metadata()?;
 
         Ok(tx)
-    }
-
-    fn load_dynamic_metadata(&mut self) -> Result<()> {
-        Ok(())
     }
 }
 
@@ -143,20 +166,25 @@ impl TransactionWithMeta for RuntimeTransaction<SanitizedTransaction> {
     fn to_versioned_transaction(&self) -> VersionedTransaction {
         self.transaction.to_versioned_transaction()
     }
+
+    fn serialized_size(&self) -> usize {
+        wincode::serialized_size(&self.to_versioned_transaction())
+            .expect("versioned transaction serialization should succeed") as usize
+    }
 }
 
 #[cfg(feature = "dev-context-only-utils")]
 impl RuntimeTransaction<SanitizedTransaction> {
     pub fn from_transaction_for_tests(transaction: solana_transaction::Transaction) -> Self {
         let versioned_transaction = VersionedTransaction::from(transaction);
-        let enable_static_instruction_limit = true;
+        let enable_instruction_accounts_limit = true;
         Self::try_create(
             versioned_transaction,
             MessageHash::Compute,
             None,
             solana_message::SimpleAddressLoader::Disabled,
             &HashSet::new(),
-            enable_static_instruction_limit,
+            enable_instruction_accounts_limit,
         )
         .expect("failed to create RuntimeTransaction from Transaction")
     }
@@ -172,10 +200,14 @@ mod tests {
         solana_hash::Hash,
         solana_instruction::Instruction,
         solana_keypair::Keypair,
-        solana_message::{Message, SimpleAddressLoader},
+        solana_message::{
+            Message, MessageHeader, SimpleAddressLoader, VersionedMessage,
+            compiled_instruction::CompiledInstruction,
+        },
+        solana_signature::Signature,
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
-        solana_transaction::{versioned::VersionedTransaction, Transaction},
+        solana_transaction::{Transaction, versioned::VersionedTransaction},
         solana_vote_interface::{self as vote, state::Vote},
     };
 
@@ -340,16 +372,102 @@ mod tests {
         assert_eq!(0, signature_details.num_ed25519_instruction_signatures());
 
         for feature_set in [FeatureSet::default(), FeatureSet::all_enabled()] {
-            let compute_budget_limits = runtime_transaction_static
-                .compute_budget_instruction_details()
-                .sanitize_and_convert_to_compute_budget_limits(&feature_set)
+            let transaction_configuration = runtime_transaction_static
+                .transaction_configuration(&feature_set)
                 .unwrap();
-            assert_eq!(compute_unit_limit, compute_budget_limits.compute_unit_limit);
-            assert_eq!(compute_unit_price, compute_budget_limits.compute_unit_price);
+            assert_eq!(
+                compute_unit_limit,
+                transaction_configuration.compute_unit_limit
+            );
+            assert_eq!(
+                compute_unit_price,
+                transaction_configuration.compute_unit_price_in_microlamports()
+            );
             assert_eq!(
                 loaded_accounts_bytes,
-                compute_budget_limits.loaded_accounts_bytes.get()
+                transaction_configuration.loaded_accounts_data_size_limit
             );
         }
+    }
+
+    #[test]
+    fn test_serialized_size() {
+        let transaction = RuntimeTransaction::<SanitizedTransaction>::try_from(
+            RuntimeTransaction::<SanitizedVersionedTransaction>::try_from(
+                non_vote_sanitized_versioned_transaction(),
+                MessageHash::Compute,
+                None,
+            )
+            .unwrap(),
+            SimpleAddressLoader::Disabled,
+            &ReservedAccountKeys::empty_key_set(),
+        )
+        .unwrap();
+
+        let expected = wincode::serialized_size(&transaction.to_versioned_transaction()).unwrap();
+        assert_eq!(transaction.serialized_size(), expected as usize);
+        assert_eq!(
+            expected,
+            wincode::serialize(&transaction.to_versioned_transaction())
+                .unwrap()
+                .len() as u64
+        );
+    }
+
+    #[test]
+    fn test_simd_406_instruction_accounts_limit() {
+        let account_keys = vec![Pubkey::new_unique(); 3];
+        let header = MessageHeader {
+            num_required_signatures: 1,
+            num_readonly_signed_accounts: 0,
+            num_readonly_unsigned_accounts: 1,
+        };
+        let mut accounts: Vec<u8> = vec![0; 254];
+        // Exactly 255 accounts must pass sanitization
+        accounts.push(1);
+        let instr = CompiledInstruction::new_from_raw_parts(2, Vec::new(), accounts.clone());
+        let transaction = VersionedTransaction {
+            signatures: vec![Signature::default(); 1],
+            message: VersionedMessage::Legacy(solana_message::Message {
+                header,
+                account_keys: account_keys.clone(),
+                recent_blockhash: Hash::default(),
+                instructions: vec![instr],
+            }),
+        };
+        let result = RuntimeTransaction::<SanitizedTransaction>::try_create(
+            transaction,
+            MessageHash::Compute,
+            None,
+            solana_message::SimpleAddressLoader::Disabled,
+            &HashSet::new(),
+            true,
+        );
+        assert!(result.is_ok());
+
+        // 256 accounts must fail
+        accounts.push(2);
+        let instr = CompiledInstruction::new_from_raw_parts(2, Vec::new(), accounts.clone());
+        let transaction = VersionedTransaction {
+            signatures: vec![Signature::default(); 1],
+            message: VersionedMessage::Legacy(solana_message::Message {
+                header,
+                account_keys,
+                recent_blockhash: Hash::default(),
+                instructions: vec![instr],
+            }),
+        };
+        let result = RuntimeTransaction::<SanitizedTransaction>::try_create(
+            transaction,
+            MessageHash::Compute,
+            None,
+            solana_message::SimpleAddressLoader::Disabled,
+            &HashSet::new(),
+            true,
+        );
+        assert_eq!(
+            result.err(),
+            Some(solana_transaction_error::TransactionError::SanitizeFailure)
+        );
     }
 }

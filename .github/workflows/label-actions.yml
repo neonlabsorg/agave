@@ -10,6 +10,6 @@ permissions:
 
 jobs:
   action:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: dessant/label-actions@v4
+      - uses: dessant/label-actions@9e5fd757ffe1e065abf55e9f74d899dbe012922a  # v5.0.0

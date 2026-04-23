@@ -9,23 +9,20 @@ use {
             packet_threshold::DynamicPacketToProcessThreshold,
             repair_service::{AncestorDuplicateSlotsSender, RepairInfo, RepairStatsGroup},
             serve_repair::{
-                self, AncestorHashesRepairType, AncestorHashesResponse, RepairProtocol, ServeRepair,
+                AncestorHashesRepairType, AncestorHashesResponse, RepairProtocol, ServeRepair,
             },
             standard_repair_handler::StandardRepairHandler,
         },
         replay_stage::DUPLICATE_THRESHOLD,
-        shred_fetch_stage::receive_quic_datagrams,
     },
-    bytes::Bytes,
-    crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
-    dashmap::{mapref::entry::Entry::Occupied, DashMap},
-    solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
-    solana_cluster_type::ClusterType,
+    crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded},
+    dashmap::{DashMap, mapref::entry::Entry::Occupied},
+    solana_clock::Slot,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol, ping_pong::Pong},
-    solana_keypair::{signable::Signable, Keypair, Signer},
+    solana_keypair::{Keypair, Signer, signable::Signable},
     solana_ledger::blockstore::Blockstore,
     solana_perf::{
-        packet::{deserialize_from_with_limit, PacketBatch, PacketFlags, PacketRef},
+        packet::{PacketBatch, PacketRef, deserialize_from_with_limit},
         recycler::Recycler,
     },
     solana_pubkey::Pubkey,
@@ -35,15 +32,14 @@ use {
     std::{
         collections::HashSet,
         io::{Cursor, Read},
-        net::{SocketAddr, UdpSocket},
+        net::UdpSocket,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, RwLock,
+            atomic::{AtomicBool, Ordering},
         },
-        thread::{self, sleep, Builder, JoinHandle},
+        thread::{self, Builder, JoinHandle, sleep},
         time::{Duration, Instant},
     },
-    tokio::sync::mpsc::Sender as AsyncSender,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -141,8 +137,6 @@ impl AncestorRepairRequestsStats {
 }
 
 pub struct AncestorHashesChannels {
-    pub ancestor_hashes_request_quic_sender: AsyncSender<(SocketAddr, Bytes)>,
-    pub ancestor_hashes_response_quic_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
     pub ancestor_hashes_replay_update_receiver: AncestorHashesReplayUpdateReceiver,
 }
 
@@ -171,30 +165,13 @@ impl AncestorHashesService {
             )),
             Some(Duration::from_millis(1)), // coalesce
             false,                          // use_pinned_memory
-            None,                           // in_vote_only_mode
             false,                          // is_staked_service
         );
 
         let AncestorHashesChannels {
-            ancestor_hashes_request_quic_sender,
-            ancestor_hashes_response_quic_receiver,
             ancestor_hashes_replay_update_receiver,
         } = ancestor_hashes_channels;
 
-        let t_receiver_quic = {
-            let exit = exit.clone();
-            Builder::new()
-                .name(String::from("solAncHashQuic"))
-                .spawn(|| {
-                    receive_quic_datagrams(
-                        ancestor_hashes_response_quic_receiver,
-                        PacketFlags::REPAIR,
-                        response_sender,
-                        exit,
-                    )
-                })
-                .unwrap()
-        };
         let ancestor_hashes_request_statuses: Arc<DashMap<Slot, AncestorRequestStatus>> =
             Arc::new(DashMap::new());
         let (retryable_slots_sender, retryable_slots_receiver) = unbounded();
@@ -217,7 +194,6 @@ impl AncestorHashesService {
             blockstore,
             ancestor_hashes_request_statuses,
             ancestor_hashes_request_socket,
-            ancestor_hashes_request_quic_sender,
             repair_info,
             outstanding_requests,
             exit,
@@ -225,12 +201,7 @@ impl AncestorHashesService {
             retryable_slots_receiver,
         );
         Self {
-            thread_hdls: vec![
-                t_receiver,
-                t_receiver_quic,
-                t_ancestor_hashes_responses,
-                t_ancestor_requests,
-            ],
+            thread_hdls: vec![t_receiver, t_ancestor_hashes_responses, t_ancestor_requests],
         }
     }
 
@@ -595,7 +566,6 @@ impl AncestorHashesService {
         blockstore: Arc<Blockstore>,
         ancestor_hashes_request_statuses: Arc<DashMap<Slot, AncestorRequestStatus>>,
         ancestor_hashes_request_socket: Arc<UdpSocket>,
-        ancestor_hashes_request_quic_sender: AsyncSender<(SocketAddr, Bytes)>,
         repair_info: RepairInfo,
         outstanding_requests: Arc<RwLock<OutstandingAncestorHashesRepairs>>,
         exit: Arc<AtomicBool>,
@@ -603,11 +573,13 @@ impl AncestorHashesService {
         retryable_slots_receiver: RetryableSlotsReceiver,
     ) -> JoinHandle<()> {
         let serve_repair = {
+            let bank_forks_r = repair_info.bank_forks.read().unwrap();
             ServeRepair::new(
                 repair_info.cluster_info.clone(),
-                repair_info.bank_forks.read().unwrap().sharable_banks(),
+                bank_forks_r.sharable_banks(),
                 repair_info.repair_whitelist.clone(),
                 Box::new(StandardRepairHandler::new(blockstore)),
+                bank_forks_r.migration_status(),
             )
         };
         let mut repair_stats = AncestorRepairRequestsStats::default();
@@ -631,27 +603,36 @@ impl AncestorHashesService {
         let mut request_throttle = vec![];
         Builder::new()
             .name("solManAncReqs".to_string())
-            .spawn(move || loop {
-                if exit.load(Ordering::Relaxed) {
-                    return;
-                }
-                Self::manage_ancestor_requests(
-                    &ancestor_hashes_request_statuses,
-                    &ancestor_hashes_request_socket,
-                    &ancestor_hashes_request_quic_sender,
-                    &repair_info,
-                    &outstanding_requests,
-                    &ancestor_hashes_replay_update_receiver,
-                    &retryable_slots_receiver,
-                    &serve_repair,
-                    &mut repair_stats,
-                    &mut dead_slot_pool,
-                    &mut repairable_dead_slot_pool,
-                    &mut popular_pruned_slot_pool,
-                    &mut request_throttle,
-                );
+            .spawn(move || {
+                loop {
+                    if exit.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    Self::manage_ancestor_requests(
+                        &ancestor_hashes_request_statuses,
+                        &ancestor_hashes_request_socket,
+                        &repair_info,
+                        &outstanding_requests,
+                        &ancestor_hashes_replay_update_receiver,
+                        &retryable_slots_receiver,
+                        &serve_repair,
+                        &mut repair_stats,
+                        &mut dead_slot_pool,
+                        &mut repairable_dead_slot_pool,
+                        &mut popular_pruned_slot_pool,
+                        &mut request_throttle,
+                    );
 
-                sleep(Duration::from_millis(DEFAULT_MS_PER_SLOT));
+                    let sleep_duration = Duration::from_nanos_u128(
+                        repair_info
+                            .bank_forks
+                            .read()
+                            .unwrap()
+                            .root_bank()
+                            .ns_per_slot,
+                    );
+                    sleep(sleep_duration);
+                }
             })
             .unwrap()
     }
@@ -660,7 +641,6 @@ impl AncestorHashesService {
     fn manage_ancestor_requests(
         ancestor_hashes_request_statuses: &DashMap<Slot, AncestorRequestStatus>,
         ancestor_hashes_request_socket: &UdpSocket,
-        ancestor_hashes_request_quic_sender: &AsyncSender<(SocketAddr, Bytes)>,
         repair_info: &RepairInfo,
         outstanding_requests: &RwLock<OutstandingAncestorHashesRepairs>,
         ancestor_hashes_replay_update_receiver: &AncestorHashesReplayUpdateReceiver,
@@ -673,7 +653,6 @@ impl AncestorHashesService {
         request_throttle: &mut Vec<u64>,
     ) {
         let root_bank = repair_info.bank_forks.read().unwrap().root_bank();
-        let cluster_type = root_bank.cluster_type();
         for (slot, request_type) in retryable_slots_receiver.try_iter() {
             datapoint_info!("ancestor-repair-retry", ("slot", slot, i64));
             if request_type.is_pruned() {
@@ -758,7 +737,6 @@ impl AncestorHashesService {
             if Self::initiate_ancestor_hashes_requests_for_duplicate_slot(
                 ancestor_hashes_request_statuses,
                 ancestor_hashes_request_socket,
-                ancestor_hashes_request_quic_sender,
                 &repair_info.cluster_slots,
                 serve_repair,
                 &repair_info.repair_validators,
@@ -767,7 +745,6 @@ impl AncestorHashesService {
                 outstanding_requests,
                 identity_keypair,
                 request_type,
-                cluster_type,
             ) {
                 request_throttle.push(timestamp());
                 if request_type.is_pruned() {
@@ -826,7 +803,6 @@ impl AncestorHashesService {
     fn initiate_ancestor_hashes_requests_for_duplicate_slot(
         ancestor_hashes_request_statuses: &DashMap<Slot, AncestorRequestStatus>,
         ancestor_hashes_request_socket: &UdpSocket,
-        ancestor_hashes_request_quic_sender: &AsyncSender<(SocketAddr, Bytes)>,
         cluster_slots: &ClusterSlots,
         serve_repair: &ServeRepair,
         repair_validators: &Option<HashSet<Pubkey>>,
@@ -835,14 +811,12 @@ impl AncestorHashesService {
         outstanding_requests: &RwLock<OutstandingAncestorHashesRepairs>,
         identity_keypair: &Keypair,
         request_type: AncestorRequestType,
-        cluster_type: ClusterType,
     ) -> bool {
-        let repair_protocol = serve_repair::get_repair_protocol(cluster_type);
         let Ok(sampled_validators) = serve_repair.repair_request_ancestor_hashes_sample_peers(
             duplicate_slot,
             cluster_slots,
             repair_validators,
-            repair_protocol,
+            Protocol::UDP,
             &identity_keypair.pubkey(),
         ) else {
             return false;
@@ -865,20 +839,7 @@ impl AncestorHashesService {
             ) else {
                 continue;
             };
-            match repair_protocol {
-                Protocol::UDP => {
-                    let _ = ancestor_hashes_request_socket.send_to(&request_bytes, socket_addr);
-                }
-                Protocol::QUIC => {
-                    if ancestor_hashes_request_quic_sender
-                        .blocking_send((*socket_addr, Bytes::from(request_bytes)))
-                        .is_err()
-                    {
-                        // The receiver end of the channel is disconnected.
-                        break;
-                    }
-                }
-            }
+            let _ = ancestor_hashes_request_socket.send_to(&request_bytes, socket_addr);
         }
 
         let ancestor_request_status = AncestorRequestStatus::new(
@@ -888,9 +849,11 @@ impl AncestorHashesService {
             duplicate_slot,
             request_type,
         );
-        assert!(ancestor_hashes_request_statuses
-            .insert(duplicate_slot, ancestor_request_status)
-            .is_none());
+        assert!(
+            ancestor_hashes_request_statuses
+                .insert(duplicate_slot, ancestor_request_status)
+                .is_none()
+        );
         true
     }
 }
@@ -905,11 +868,10 @@ mod test {
                 cluster_slot_state_verifier::{DuplicateSlotsToRepair, PurgeRepairSlotCounter},
                 duplicate_repair_status::DuplicateAncestorDecision,
                 serve_repair::MAX_ANCESTOR_RESPONSES,
-                serve_repair_service::adapt_repair_requests_packets,
             },
             replay_stage::{
-                tests::{replay_blockstore_components, ReplayBlockstoreComponents},
                 ReplayStage,
+                tests::{ReplayBlockstoreComponents, replay_blockstore_components},
             },
             vote_simulator::VoteSimulator,
         },
@@ -920,11 +882,12 @@ mod test {
         },
         solana_hash::Hash,
         solana_keypair::Keypair,
+        solana_leader_schedule::SlotLeader,
         solana_ledger::{
             blockstore::make_many_slot_entries, get_tmp_ledger_path,
             get_tmp_ledger_path_auto_delete, shred::Nonce,
         },
-        solana_net_utils::{sockets::bind_to_localhost_unique, SocketAddrSpace},
+        solana_net_utils::{SocketAddrSpace, sockets::bind_to_localhost_unique},
         solana_perf::packet::Packet,
         solana_runtime::bank_forks::BankForks,
         solana_signer::Signer,
@@ -1240,7 +1203,6 @@ mod test {
     struct ResponderThreads {
         t_request_receiver: JoinHandle<()>,
         t_listen: JoinHandle<()>,
-        t_packet_adapter: JoinHandle<()>,
         exit: Arc<AtomicBool>,
         responder_info: ContactInfo,
         response_receiver: PacketBatchReceiver,
@@ -1252,7 +1214,6 @@ mod test {
             self.exit.store(true, Ordering::Relaxed);
             self.t_request_receiver.join().unwrap();
             self.t_listen.join().unwrap();
-            self.t_packet_adapter.join().unwrap();
         }
 
         fn new(slot_to_query: Slot) -> Self {
@@ -1269,11 +1230,13 @@ mod test {
             let ledger_path = get_tmp_ledger_path!();
             let blockstore = Arc::new(Blockstore::open(&ledger_path).unwrap());
             let responder_serve_repair = {
+                let bank_forks_r = vote_simulator.bank_forks.read().unwrap();
                 ServeRepair::new(
                     Arc::new(cluster_info),
-                    vote_simulator.bank_forks.read().unwrap().sharable_banks(),
+                    bank_forks_r.sharable_banks(),
                     Arc::<RwLock<HashSet<_>>>::default(), // repair whitelist
                     Box::new(StandardRepairHandler::new(blockstore.clone())),
+                    bank_forks_r.migration_status(),
                 )
             };
 
@@ -1310,25 +1273,14 @@ mod test {
                 Arc::new(StreamerReceiveStats::new("repair_request_receiver")),
                 Some(Duration::from_millis(1)), // coalesce
                 false,
-                None,
                 false,
             );
-            let (remote_request_sender, remote_request_receiver) = unbounded();
-            let t_packet_adapter = Builder::new()
-                .spawn(|| adapt_repair_requests_packets(requests_receiver, remote_request_sender))
-                .unwrap();
-            let (repair_response_quic_sender, _) = tokio::sync::mpsc::channel(/*buffer:*/ 128);
-            let t_listen = responder_serve_repair.listen(
-                remote_request_receiver,
-                response_sender,
-                repair_response_quic_sender,
-                exit.clone(),
-            );
+            let t_listen =
+                responder_serve_repair.listen(requests_receiver, response_sender, exit.clone());
 
             Self {
                 t_request_receiver,
                 t_listen,
-                t_packet_adapter,
                 exit,
                 responder_info: responder_node.info,
                 response_receiver,
@@ -1376,11 +1328,13 @@ mod test {
             let ledger_path = get_tmp_ledger_path!();
             let blockstore = Arc::new(Blockstore::open(&ledger_path).unwrap());
             let requester_serve_repair = {
+                let bank_forks_r = bank_forks.read().unwrap();
                 ServeRepair::new(
                     requester_cluster_info.clone(),
-                    bank_forks.read().unwrap().sharable_banks(),
+                    bank_forks_r.sharable_banks(),
                     repair_whitelist.clone(),
                     Box::new(StandardRepairHandler::new(blockstore)),
+                    bank_forks_r.migration_status(),
                 )
             };
             let (ancestor_duplicate_slots_sender, _ancestor_duplicate_slots_receiver) = unbounded();
@@ -1392,7 +1346,6 @@ mod test {
                 ancestor_duplicate_slots_sender,
                 repair_validators: None,
                 repair_whitelist,
-                wen_restart_repair_slots: None,
             };
 
             let (ancestor_hashes_replay_update_sender, ancestor_hashes_replay_update_receiver) =
@@ -1520,12 +1473,9 @@ mod test {
             repair_validators,
             ..
         } = repair_info;
-        let (ancestor_hashes_request_quic_sender, _) =
-            tokio::sync::mpsc::channel(/*buffer:*/ 128);
         AncestorHashesService::initiate_ancestor_hashes_requests_for_duplicate_slot(
             &ancestor_hashes_request_statuses,
             &ancestor_hashes_request_socket,
-            &ancestor_hashes_request_quic_sender,
             &cluster_slots,
             &requester_serve_repair,
             &repair_validators,
@@ -1534,7 +1484,6 @@ mod test {
             &outstanding_requests,
             &requester_cluster_info.keypair(),
             AncestorRequestType::DeadDuplicateConfirmed,
-            ClusterType::Development,
         );
         assert!(ancestor_hashes_request_statuses.is_empty());
 
@@ -1577,7 +1526,6 @@ mod test {
         AncestorHashesService::initiate_ancestor_hashes_requests_for_duplicate_slot(
             &ancestor_hashes_request_statuses,
             &ancestor_hashes_request_socket,
-            &ancestor_hashes_request_quic_sender,
             &cluster_slots,
             &requester_serve_repair,
             &repair_validators,
@@ -1586,7 +1534,6 @@ mod test {
             &outstanding_requests,
             &requester_cluster_info.keypair(),
             AncestorRequestType::DeadDuplicateConfirmed,
-            ClusterType::Development,
         );
 
         assert_eq!(ancestor_hashes_request_statuses.len(), 1);
@@ -1639,7 +1586,6 @@ mod test {
         AncestorHashesService::initiate_ancestor_hashes_requests_for_duplicate_slot(
             &ancestor_hashes_request_statuses,
             &ancestor_hashes_request_socket,
-            &ancestor_hashes_request_quic_sender,
             &cluster_slots,
             &requester_serve_repair,
             &repair_validators,
@@ -1648,7 +1594,6 @@ mod test {
             &outstanding_requests,
             &requester_cluster_info.keypair(),
             AncestorRequestType::PopularPruned,
-            ClusterType::Development,
         );
 
         assert_eq!(ancestor_hashes_request_statuses.len(), 1);
@@ -1725,13 +1670,10 @@ mod test {
         } = repair_info;
         cluster_info.insert_info(responder_node.info);
         bank_forks.read().unwrap().root_bank().epoch_schedule();
-        let (ancestor_hashes_request_quic_sender, _) =
-            tokio::sync::mpsc::channel(/*buffer:*/ 128);
         // 1) No signals from ReplayStage, no requests should be made
         AncestorHashesService::manage_ancestor_requests(
             &ancestor_hashes_request_statuses,
             &ancestor_hashes_request_socket,
-            &ancestor_hashes_request_quic_sender,
             &repair_info,
             &outstanding_requests,
             &ancestor_hashes_replay_update_receiver,
@@ -1774,7 +1716,6 @@ mod test {
         AncestorHashesService::manage_ancestor_requests(
             &ancestor_hashes_request_statuses,
             &ancestor_hashes_request_socket,
-            &ancestor_hashes_request_quic_sender,
             &repair_info,
             &outstanding_requests,
             &ancestor_hashes_replay_update_receiver,
@@ -1814,7 +1755,6 @@ mod test {
         AncestorHashesService::manage_ancestor_requests(
             &ancestor_hashes_request_statuses,
             &ancestor_hashes_request_socket,
-            &ancestor_hashes_request_quic_sender,
             &repair_info,
             &outstanding_requests,
             &ancestor_hashes_replay_update_receiver,
@@ -1846,7 +1786,6 @@ mod test {
         AncestorHashesService::manage_ancestor_requests(
             &ancestor_hashes_request_statuses,
             &ancestor_hashes_request_socket,
-            &ancestor_hashes_request_quic_sender,
             &repair_info,
             &outstanding_requests,
             &ancestor_hashes_replay_update_receiver,
@@ -1884,7 +1823,6 @@ mod test {
         AncestorHashesService::manage_ancestor_requests(
             &ancestor_hashes_request_statuses,
             &ancestor_hashes_request_socket,
-            &ancestor_hashes_request_quic_sender,
             &repair_info,
             &outstanding_requests,
             &ancestor_hashes_replay_update_receiver,
@@ -1909,7 +1847,7 @@ mod test {
         let bank_forks = &repair_info.bank_forks;
         let root_bank = bank_forks.read().unwrap().root_bank();
         let new_root_slot = dead_duplicate_confirmed_slot_2 + 1;
-        let new_root_bank = Bank::new_from_parent(root_bank, &Pubkey::default(), new_root_slot);
+        let new_root_bank = Bank::new_from_parent(root_bank, SlotLeader::default(), new_root_slot);
         new_root_bank.freeze();
         {
             let mut w_bank_forks = bank_forks.write().unwrap();
@@ -1925,7 +1863,6 @@ mod test {
         AncestorHashesService::manage_ancestor_requests(
             &ancestor_hashes_request_statuses,
             &ancestor_hashes_request_socket,
-            &ancestor_hashes_request_quic_sender,
             &repair_info,
             &outstanding_requests,
             &ancestor_hashes_replay_update_receiver,
@@ -1963,16 +1900,18 @@ mod test {
         let mut packet = Packet::default();
         packet.meta_mut().size = 0;
 
-        assert!(AncestorHashesService::verify_and_process_ancestor_response(
-            &packet,
-            &ancestor_hashes_request_statuses,
-            &mut AncestorHashesResponsesStats::default(),
-            &outstanding_requests,
-            &blockstore,
-            &repair_info.cluster_info.keypair(),
-            &ancestor_hashes_request_socket,
-        )
-        .is_none());
+        assert!(
+            AncestorHashesService::verify_and_process_ancestor_response(
+                &packet,
+                &ancestor_hashes_request_statuses,
+                &mut AncestorHashesResponsesStats::default(),
+                &outstanding_requests,
+                &blockstore,
+                &repair_info.cluster_info.keypair(),
+                &ancestor_hashes_request_socket,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2084,13 +2023,10 @@ mod test {
             &leader_schedule_cache,
         );
 
-        let (ancestor_hashes_request_quic_sender, _) =
-            tokio::sync::mpsc::channel(/*buffer:*/ 128);
         // Simulate making a request
         AncestorHashesService::manage_ancestor_requests(
             &ancestor_hashes_request_statuses,
             &ancestor_hashes_request_socket,
-            &ancestor_hashes_request_quic_sender,
             &repair_info,
             &outstanding_requests,
             &ancestor_hashes_replay_update_receiver,
@@ -2186,8 +2122,6 @@ mod test {
             &repair_info.ancestor_duplicate_slots_sender,
             &retryable_slots_sender,
         );
-        let (ancestor_hashes_request_quic_sender, _) =
-            tokio::sync::mpsc::channel(/*buffer:*/ 128);
 
         // Simulate ancestor request thread getting the retry signal
         assert!(dead_slot_pool.is_empty());
@@ -2196,7 +2130,6 @@ mod test {
         AncestorHashesService::manage_ancestor_requests(
             &ancestor_hashes_request_statuses,
             &ancestor_hashes_request_socket,
-            &ancestor_hashes_request_quic_sender,
             &repair_info,
             &outstanding_requests,
             &ancestor_hashes_replay_update_receiver,
@@ -2235,7 +2168,6 @@ mod test {
         AncestorHashesService::manage_ancestor_requests(
             &ancestor_hashes_request_statuses,
             &ancestor_hashes_request_socket,
-            &ancestor_hashes_request_quic_sender,
             &repair_info,
             &outstanding_requests,
             &ancestor_hashes_replay_update_receiver,

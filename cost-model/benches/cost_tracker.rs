@@ -18,7 +18,7 @@ struct BenchSetup {
 fn setup(num_transactions: usize, contentious_transactions: bool) -> BenchSetup {
     let mut cost_tracker = CostTracker::default();
     // set cost_tracker with max limits to stretch testing
-    cost_tracker.set_limits(u64::MAX, u64::MAX, u64::MAX);
+    cost_tracker.set_limits_max();
 
     let max_accounts_per_tx = 128;
     let pubkey = Pubkey::new_unique();
@@ -33,7 +33,7 @@ fn setup(num_transactions: usize, contentious_transactions: bool) -> BenchSetup 
                 };
                 writable_accounts.push(writable_account_key)
             });
-            WritableKeysTransaction(writable_accounts)
+            WritableKeysTransaction::new(writable_accounts)
         })
         .collect_vec();
 

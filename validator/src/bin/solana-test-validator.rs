@@ -16,9 +16,9 @@ use {
     solana_clock::Slot,
     solana_core::consensus::tower_storage::FileTowerStorage,
     solana_epoch_schedule::EpochSchedule,
-    solana_faucet::faucet::{run_faucet, Faucet},
+    solana_faucet::faucet::{Faucet, run_faucet},
     solana_inflation::Inflation,
-    solana_keypair::{read_keypair_file, write_keypair_file, Keypair},
+    solana_keypair::{Keypair, read_keypair_file, write_keypair_file},
     solana_native_token::sol_str_to_lamports,
     solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
@@ -33,7 +33,7 @@ use {
     solana_test_validator::*,
     std::{
         collections::{HashMap, HashSet},
-        fs, io,
+        env, fs, io,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::{Path, PathBuf},
         process::exit,
@@ -43,6 +43,10 @@ use {
     },
 };
 
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 #[derive(PartialEq, Eq)]
 enum Output {
     None,
@@ -51,6 +55,12 @@ enum Output {
 }
 
 fn main() {
+    // Debugging panics is easier with a backtrace
+    if env::var_os("RUST_BACKTRACE").is_none() {
+        // Safety: env update is made before any spawned threads might access the environment
+        unsafe { env::set_var("RUST_BACKTRACE", "1") }
+    }
+
     let default_args = cli::DefaultTestArgs::new();
     let version = solana_version::version!();
     let matches = cli::test_app(version, &default_args).get_matches();
@@ -122,6 +132,15 @@ fn main() {
         None
     };
     agave_logger::initialize_logging(logfile);
+    // NB: Align with agave to exit if any thread panics.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Call the default hook.
+        default_hook(info);
+
+        // Force a process exit (no stack unwind).
+        std::process::exit(1);
+    }));
 
     info!("{} {}", crate_name!(), solana_version::version!());
     info!("Starting validator with: {:#?}", std::env::args_os());
@@ -559,7 +578,7 @@ fn main() {
             /* enable_warmup_epochs = */ false,
         ));
 
-        genesis.rent = Rent::with_slots_per_epoch(slots_per_epoch);
+        genesis.rent = Rent::default();
     }
 
     if let Some(inflation_fixed) = inflation_fixed {

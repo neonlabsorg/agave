@@ -1,6 +1,6 @@
 use {
     crate::{bank::Bank, prioritization_fee::PrioritizationFee},
-    crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError},
+    crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded},
     log::*,
     solana_accounts_db::account_locks::validate_account_locks,
     solana_clock::{BankId, Slot},
@@ -10,10 +10,10 @@ use {
     std::{
         collections::{BTreeMap, HashMap},
         sync::{
-            atomic::{AtomicU64, Ordering},
             Arc, RwLock,
+            atomic::{AtomicU64, Ordering},
         },
-        thread::{sleep, Builder, JoinHandle},
+        thread::{Builder, JoinHandle, sleep},
         time::Duration,
     },
 };
@@ -220,23 +220,21 @@ impl PrioritizationFeeCache {
                     continue;
                 }
 
-                let compute_budget_limits = sanitized_transaction
-                    .compute_budget_instruction_details()
-                    .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set);
-
+                let transaction_configuration =
+                    sanitized_transaction.transaction_configuration(&bank.feature_set);
                 let lock_result = validate_account_locks(
                     sanitized_transaction.account_keys(),
                     bank.get_transaction_account_lock_limit(),
                 );
 
-                if compute_budget_limits.is_err() || lock_result.is_err() {
+                if transaction_configuration.is_err() || lock_result.is_err() {
                     continue;
                 }
-                let compute_budget_limits = compute_budget_limits.unwrap();
+                let transaction_configuration = transaction_configuration.unwrap();
 
                 // filter out any transaction that requests zero compute_unit_limit
                 // since its priority fee amount is not instructive
-                if compute_budget_limits.compute_unit_limit == 0 {
+                if transaction_configuration.compute_unit_limit == 0 {
                     continue;
                 }
 
@@ -248,20 +246,21 @@ impl PrioritizationFeeCache {
                     .map(|(_, key)| *key)
                     .collect();
 
-                let (prioritization_fee, calculate_prioritization_fee_us) = measure_us!({
-                    solana_fee_structure::FeeBudgetLimits::from(compute_budget_limits)
-                        .prioritization_fee
-                });
+                let (prioritization_fee, calculate_prioritization_fee_us) =
+                    measure_us!(transaction_configuration.priority_fee_lamports);
                 self.metrics
                     .accumulate_total_calculate_prioritization_fee_elapsed_us(
                         calculate_prioritization_fee_us,
                     );
 
+                // See rounding note on `compute_unit_price_in_microlamports`.
+                let compute_unit_price =
+                    transaction_configuration.compute_unit_price_in_microlamports();
                 self.sender
                     .send(CacheServiceUpdate::TransactionUpdate {
                         slot: bank.slot(),
                         bank_id: bank.bank_id(),
-                        compute_unit_price: compute_budget_limits.compute_unit_price,
+                        compute_unit_price,
                         prioritization_fee,
                         writable_accounts,
                     })
@@ -295,12 +294,14 @@ impl PrioritizationFeeCache {
         writable_accounts: Vec<Pubkey>,
         metrics: &PrioritizationFeeCacheMetrics,
     ) {
-        let (_, entry_update_us) = measure_us!(unfinalized
-            .entry(slot)
-            .or_default()
-            .entry(bank_id)
-            .or_default()
-            .update(compute_unit_price, prioritization_fee, writable_accounts));
+        let (_, entry_update_us) = measure_us!(
+            unfinalized
+                .entry(slot)
+                .or_default()
+                .entry(bank_id)
+                .or_default()
+                .update(compute_unit_price, prioritization_fee, writable_accounts)
+        );
         metrics.accumulate_total_entry_update_elapsed_us(entry_update_us);
         metrics.accumulate_successful_transaction_update_count(1);
     }
@@ -322,8 +323,7 @@ impl PrioritizationFeeCache {
         // block minimum fee.
         let (slot_prioritization_fee, slot_finalize_us) = measure_us!({
             // remove unfinalized slots
-            *unfinalized =
-                unfinalized.split_off(&slot.checked_sub(MAX_UNFINALIZED_SLOTS).unwrap_or_default());
+            *unfinalized = unfinalized.split_off(&slot.saturating_sub(MAX_UNFINALIZED_SLOTS));
 
             let Some(mut slot_prioritization_fee) = unfinalized.remove(&slot) else {
                 return;
@@ -458,14 +458,15 @@ mod tests {
         crate::{
             bank::Bank,
             bank_forks::BankForks,
-            genesis_utils::{create_genesis_config, GenesisConfigInfo},
+            genesis_utils::{GenesisConfigInfo, create_genesis_config},
         },
         solana_compute_budget_interface::ComputeBudgetInstruction,
+        solana_leader_schedule::SlotLeader,
         solana_message::Message,
         solana_pubkey::Pubkey,
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_system_interface::instruction as system_instruction,
-        solana_transaction::{sanitized::SanitizedTransaction, Transaction},
+        solana_transaction::{Transaction, sanitized::SanitizedTransaction},
     };
 
     fn build_sanitized_transaction_for_test(
@@ -549,9 +550,9 @@ mod tests {
         // [2,   a,    c          ]  -->  [2,     2,         5,         2        ]
         //
         let txs = [
-            build_sanitized_transaction_for_test(5, &write_account_a, &write_account_b),
-            build_sanitized_transaction_for_test(9, &write_account_b, &write_account_c),
-            build_sanitized_transaction_for_test(2, &write_account_a, &write_account_c),
+            build_sanitized_transaction_for_test(5_000_000, &write_account_a, &write_account_b),
+            build_sanitized_transaction_for_test(9_000_000, &write_account_b, &write_account_c),
+            build_sanitized_transaction_for_test(2_000_000, &write_account_a, &write_account_c),
         ];
 
         let bank = Arc::new(Bank::default_for_tests());
@@ -571,9 +572,12 @@ mod tests {
             sync_finalize_priority_fee_for_test(&prioritization_fee_cache, slot, bank.bank_id());
             let lock = prioritization_fee_cache.cache.read().unwrap();
             let fee = lock.get(&slot).unwrap();
-            assert_eq!(2, fee.get_min_compute_unit_price().unwrap());
+            assert_eq!(2_000_000, fee.get_min_compute_unit_price().unwrap());
             assert!(fee.get_writable_account_fee(&write_account_a).is_none());
-            assert_eq!(5, fee.get_writable_account_fee(&write_account_b).unwrap());
+            assert_eq!(
+                5_000_000,
+                fee.get_writable_account_fee(&write_account_b).unwrap()
+            );
             assert!(fee.get_writable_account_fee(&write_account_c).is_none());
         }
     }
@@ -586,9 +590,9 @@ mod tests {
         let bank0 = Bank::new_for_benches(&genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank0);
         let bank = bank_forks.read().unwrap().working_bank();
-        let collector = solana_pubkey::new_rand();
+        let leader = SlotLeader::new_unique();
 
-        let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, 1));
+        let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), leader, 1));
         sync_update(
             &prioritization_fee_cache,
             bank1.clone(),
@@ -602,15 +606,15 @@ mod tests {
         sync_finalize_priority_fee_for_test(&prioritization_fee_cache, 1, bank1.bank_id());
 
         // add slot 2 entry to cache, but not finalize it
-        let bank2 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, 2));
+        let bank2 = Arc::new(Bank::new_from_parent(bank.clone(), leader, 2));
         let txs = [build_sanitized_transaction_for_test(
             1,
             &Pubkey::new_unique(),
             &Pubkey::new_unique(),
         )];
-        sync_update(&prioritization_fee_cache, bank2.clone(), txs.iter());
+        sync_update(&prioritization_fee_cache, bank2, txs.iter());
 
-        let bank3 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, 3));
+        let bank3 = Arc::new(Bank::new_from_parent(bank, leader, 3));
         sync_update(
             &prioritization_fee_cache,
             bank3.clone(),
@@ -638,88 +642,112 @@ mod tests {
         let bank0 = Bank::new_for_benches(&genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank0);
         let bank = bank_forks.read().unwrap().working_bank();
-        let collector = solana_pubkey::new_rand();
-        let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, 1));
-        let bank2 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, 2));
-        let bank3 = Arc::new(Bank::new_from_parent(bank, &collector, 3));
+        let leader = SlotLeader::new_unique();
+        let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), leader, 1));
+        let bank2 = Arc::new(Bank::new_from_parent(bank.clone(), leader, 2));
+        let bank3 = Arc::new(Bank::new_from_parent(bank, leader, 3));
 
         let prioritization_fee_cache = PrioritizationFeeCache::default();
 
         // Assert no minimum fee from empty cache
-        assert!(prioritization_fee_cache
-            .get_prioritization_fees(&[])
-            .is_empty());
-        assert!(prioritization_fee_cache
-            .get_prioritization_fees(&[write_account_a])
-            .is_empty());
-        assert!(prioritization_fee_cache
-            .get_prioritization_fees(&[write_account_b])
-            .is_empty());
-        assert!(prioritization_fee_cache
-            .get_prioritization_fees(&[write_account_c])
-            .is_empty());
-        assert!(prioritization_fee_cache
-            .get_prioritization_fees(&[write_account_a, write_account_b])
-            .is_empty());
-        assert!(prioritization_fee_cache
-            .get_prioritization_fees(&[write_account_a, write_account_b, write_account_c])
-            .is_empty());
+        assert!(
+            prioritization_fee_cache
+                .get_prioritization_fees(&[])
+                .is_empty()
+        );
+        assert!(
+            prioritization_fee_cache
+                .get_prioritization_fees(&[write_account_a])
+                .is_empty()
+        );
+        assert!(
+            prioritization_fee_cache
+                .get_prioritization_fees(&[write_account_b])
+                .is_empty()
+        );
+        assert!(
+            prioritization_fee_cache
+                .get_prioritization_fees(&[write_account_c])
+                .is_empty()
+        );
+        assert!(
+            prioritization_fee_cache
+                .get_prioritization_fees(&[write_account_a, write_account_b])
+                .is_empty()
+        );
+        assert!(
+            prioritization_fee_cache
+                .get_prioritization_fees(&[write_account_a, write_account_b, write_account_c])
+                .is_empty()
+        );
 
         // Assert after add one transaction for slot 1
         {
             let txs = [
-                build_sanitized_transaction_for_test(2, &write_account_a, &write_account_b),
+                build_sanitized_transaction_for_test(2_000_000, &write_account_a, &write_account_b),
                 build_sanitized_transaction_for_test(
-                    1,
+                    1_000_000,
                     &Pubkey::new_unique(),
                     &Pubkey::new_unique(),
                 ),
             ];
             sync_update(&prioritization_fee_cache, bank1.clone(), txs.iter());
             // before block is marked as completed
-            assert!(prioritization_fee_cache
-                .get_prioritization_fees(&[])
-                .is_empty());
-            assert!(prioritization_fee_cache
-                .get_prioritization_fees(&[write_account_a])
-                .is_empty());
-            assert!(prioritization_fee_cache
-                .get_prioritization_fees(&[write_account_b])
-                .is_empty());
-            assert!(prioritization_fee_cache
-                .get_prioritization_fees(&[write_account_c])
-                .is_empty());
-            assert!(prioritization_fee_cache
-                .get_prioritization_fees(&[write_account_a, write_account_b])
-                .is_empty());
-            assert!(prioritization_fee_cache
-                .get_prioritization_fees(&[write_account_a, write_account_b, write_account_c])
-                .is_empty());
+            assert!(
+                prioritization_fee_cache
+                    .get_prioritization_fees(&[])
+                    .is_empty()
+            );
+            assert!(
+                prioritization_fee_cache
+                    .get_prioritization_fees(&[write_account_a])
+                    .is_empty()
+            );
+            assert!(
+                prioritization_fee_cache
+                    .get_prioritization_fees(&[write_account_b])
+                    .is_empty()
+            );
+            assert!(
+                prioritization_fee_cache
+                    .get_prioritization_fees(&[write_account_c])
+                    .is_empty()
+            );
+            assert!(
+                prioritization_fee_cache
+                    .get_prioritization_fees(&[write_account_a, write_account_b])
+                    .is_empty()
+            );
+            assert!(
+                prioritization_fee_cache
+                    .get_prioritization_fees(&[write_account_a, write_account_b, write_account_c])
+                    .is_empty()
+            );
             // after block is completed
             sync_finalize_priority_fee_for_test(&prioritization_fee_cache, 1, bank1.bank_id());
             assert_eq!(
-                vec![(1, 1)],
+                vec![(1, 1_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[])
             );
             assert_eq!(
-                vec![(1, 2)],
+                vec![(1, 2_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_a])
             );
             assert_eq!(
-                vec![(1, 2)],
+                vec![(1, 2_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_b])
             );
             assert_eq!(
-                vec![(1, 1)],
+                vec![(1, 1_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_c])
             );
             assert_eq!(
-                vec![(1, 2)],
+                vec![(1, 2_000_000)],
                 prioritization_fee_cache
                     .get_prioritization_fees(&[write_account_a, write_account_b])
             );
             assert_eq!(
-                vec![(1, 2)],
+                vec![(1, 2_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[
                     write_account_a,
                     write_account_b,
@@ -731,9 +759,9 @@ mod tests {
         // Assert after add one transaction for slot 2
         {
             let txs = [
-                build_sanitized_transaction_for_test(4, &write_account_b, &write_account_c),
+                build_sanitized_transaction_for_test(4_000_000, &write_account_b, &write_account_c),
                 build_sanitized_transaction_for_test(
-                    3,
+                    3_000_000,
                     &Pubkey::new_unique(),
                     &Pubkey::new_unique(),
                 ),
@@ -741,28 +769,28 @@ mod tests {
             sync_update(&prioritization_fee_cache, bank2.clone(), txs.iter());
             // before block is marked as completed
             assert_eq!(
-                vec![(1, 1)],
+                vec![(1, 1_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[])
             );
             assert_eq!(
-                vec![(1, 2)],
+                vec![(1, 2_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_a])
             );
             assert_eq!(
-                vec![(1, 2)],
+                vec![(1, 2_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_b])
             );
             assert_eq!(
-                vec![(1, 1)],
+                vec![(1, 1_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_c])
             );
             assert_eq!(
-                vec![(1, 2)],
+                vec![(1, 2_000_000)],
                 prioritization_fee_cache
                     .get_prioritization_fees(&[write_account_a, write_account_b])
             );
             assert_eq!(
-                vec![(1, 2)],
+                vec![(1, 2_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[
                     write_account_a,
                     write_account_b,
@@ -772,28 +800,28 @@ mod tests {
             // after block is completed
             sync_finalize_priority_fee_for_test(&prioritization_fee_cache, 2, bank2.bank_id());
             assert_eq!(
-                vec![(1, 1), (2, 3)],
+                vec![(1, 1_000_000), (2, 3_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[]),
             );
             assert_eq!(
-                vec![(1, 2), (2, 3)],
+                vec![(1, 2_000_000), (2, 3_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_a]),
             );
             assert_eq!(
-                vec![(1, 2), (2, 4)],
+                vec![(1, 2_000_000), (2, 4_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_b]),
             );
             assert_eq!(
-                vec![(1, 1), (2, 4)],
+                vec![(1, 1_000_000), (2, 4_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_c]),
             );
             assert_eq!(
-                vec![(1, 2), (2, 4)],
+                vec![(1, 2_000_000), (2, 4_000_000)],
                 prioritization_fee_cache
                     .get_prioritization_fees(&[write_account_a, write_account_b]),
             );
             assert_eq!(
-                vec![(1, 2), (2, 4)],
+                vec![(1, 2_000_000), (2, 4_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[
                     write_account_a,
                     write_account_b,
@@ -805,9 +833,9 @@ mod tests {
         // Assert after add one transaction for slot 3
         {
             let txs = [
-                build_sanitized_transaction_for_test(6, &write_account_a, &write_account_c),
+                build_sanitized_transaction_for_test(6_000_000, &write_account_a, &write_account_c),
                 build_sanitized_transaction_for_test(
-                    5,
+                    5_000_000,
                     &Pubkey::new_unique(),
                     &Pubkey::new_unique(),
                 ),
@@ -815,28 +843,28 @@ mod tests {
             sync_update(&prioritization_fee_cache, bank3.clone(), txs.iter());
             // before block is marked as completed
             assert_eq!(
-                vec![(1, 1), (2, 3)],
+                vec![(1, 1_000_000), (2, 3_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[]),
             );
             assert_eq!(
-                vec![(1, 2), (2, 3)],
+                vec![(1, 2_000_000), (2, 3_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_a]),
             );
             assert_eq!(
-                vec![(1, 2), (2, 4)],
+                vec![(1, 2_000_000), (2, 4_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_b]),
             );
             assert_eq!(
-                vec![(1, 1), (2, 4)],
+                vec![(1, 1_000_000), (2, 4_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_c]),
             );
             assert_eq!(
-                vec![(1, 2), (2, 4)],
+                vec![(1, 2_000_000), (2, 4_000_000)],
                 prioritization_fee_cache
                     .get_prioritization_fees(&[write_account_a, write_account_b]),
             );
             assert_eq!(
-                vec![(1, 2), (2, 4)],
+                vec![(1, 2_000_000), (2, 4_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[
                     write_account_a,
                     write_account_b,
@@ -846,28 +874,28 @@ mod tests {
             // after block is completed
             sync_finalize_priority_fee_for_test(&prioritization_fee_cache, 3, bank3.bank_id());
             assert_eq!(
-                vec![(1, 1), (2, 3), (3, 5)],
+                vec![(1, 1_000_000), (2, 3_000_000), (3, 5_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[]),
             );
             assert_eq!(
-                vec![(1, 2), (2, 3), (3, 6)],
+                vec![(1, 2_000_000), (2, 3_000_000), (3, 6_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_a]),
             );
             assert_eq!(
-                vec![(1, 2), (2, 4), (3, 5)],
+                vec![(1, 2_000_000), (2, 4_000_000), (3, 5_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_b]),
             );
             assert_eq!(
-                vec![(1, 1), (2, 4), (3, 6)],
+                vec![(1, 1_000_000), (2, 4_000_000), (3, 6_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_c]),
             );
             assert_eq!(
-                vec![(1, 2), (2, 4), (3, 6)],
+                vec![(1, 2_000_000), (2, 4_000_000), (3, 6_000_000)],
                 prioritization_fee_cache
                     .get_prioritization_fees(&[write_account_a, write_account_b]),
             );
             assert_eq!(
-                vec![(1, 2), (2, 4), (3, 6)],
+                vec![(1, 2_000_000), (2, 4_000_000), (3, 6_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[
                     write_account_a,
                     write_account_b,
@@ -890,19 +918,19 @@ mod tests {
         let bank0 = Bank::new_for_benches(&genesis_config);
         let bank_forks = BankForks::new_rw_arc(bank0);
         let bank = bank_forks.read().unwrap().working_bank();
-        let collector = solana_pubkey::new_rand();
+        let leader = SlotLeader::new_unique();
         let slot: Slot = 999;
-        let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), &collector, slot));
-        let bank2 = Arc::new(Bank::new_from_parent(bank, &collector, slot + 1));
+        let bank1 = Arc::new(Bank::new_from_parent(bank.clone(), leader, slot));
+        let bank2 = Arc::new(Bank::new_from_parent(bank, leader, slot + 1));
 
         let prioritization_fee_cache = PrioritizationFeeCache::default();
 
         // Assert after add transactions for bank1 of slot 1
         {
             let txs = [
-                build_sanitized_transaction_for_test(2, &write_account_a, &write_account_b),
+                build_sanitized_transaction_for_test(2_000_000, &write_account_a, &write_account_b),
                 build_sanitized_transaction_for_test(
-                    1,
+                    1_000_000,
                     &Pubkey::new_unique(),
                     &Pubkey::new_unique(),
                 ),
@@ -920,7 +948,7 @@ mod tests {
                     &Pubkey::new_unique(),
                 ),
             ];
-            sync_update(&prioritization_fee_cache, bank2.clone(), txs.iter());
+            sync_update(&prioritization_fee_cache, bank2, txs.iter());
         }
 
         // Assert after finalize with bank1 of slot 1,
@@ -929,28 +957,28 @@ mod tests {
 
             // and data available for query are from bank1
             assert_eq!(
-                vec![(slot, 1)],
+                vec![(slot, 1_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[])
             );
             assert_eq!(
-                vec![(slot, 2)],
+                vec![(slot, 2_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_a])
             );
             assert_eq!(
-                vec![(slot, 2)],
+                vec![(slot, 2_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_b])
             );
             assert_eq!(
-                vec![(slot, 1)],
+                vec![(slot, 1_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[write_account_c])
             );
             assert_eq!(
-                vec![(slot, 2)],
+                vec![(slot, 2_000_000)],
                 prioritization_fee_cache
                     .get_prioritization_fees(&[write_account_a, write_account_b])
             );
             assert_eq!(
-                vec![(slot, 2)],
+                vec![(slot, 2_000_000)],
                 prioritization_fee_cache.get_prioritization_fees(&[
                     write_account_a,
                     write_account_b,

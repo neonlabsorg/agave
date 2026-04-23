@@ -1,35 +1,30 @@
-#![cfg_attr(
-    not(feature = "agave-unstable-api"),
-    deprecated(
-        since = "3.1.0",
-        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
-                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
-                acknowledge use of an interface that may break without warning."
-    )
-)]
+#![cfg(feature = "agave-unstable-api")]
 //! Core types for solana-transaction-status
 use {
     crate::option_serializer::OptionSerializer,
-    base64::{prelude::BASE64_STANDARD, Engine},
+    base64::{Engine, prelude::BASE64_STANDARD},
     core::fmt,
     serde::{
+        Deserialize, Deserializer, Serialize,
         de::{self, Deserialize as DeserializeTrait, Error as DeserializeError},
         ser::{Serialize as SerializeTrait, SerializeTupleVariant},
-        Deserialize, Deserializer, Serialize,
     },
-    serde_json::{from_value, Value},
+    serde_json::{Value, from_value},
     solana_account_decoder_client_types::token::UiTokenAmount,
     solana_commitment_config::CommitmentConfig,
     solana_instruction::error::InstructionError,
     solana_message::{
+        MessageHeader,
         compiled_instruction::CompiledInstruction,
         v0::{LoadedAddresses, MessageAddressTableLookup},
-        MessageHeader,
     },
     solana_reward_info::RewardType,
     solana_signature::Signature,
-    solana_transaction::versioned::{TransactionVersion, VersionedTransaction},
-    solana_transaction_context::TransactionReturnData,
+    solana_transaction::{
+        SchemaRead, SchemaWrite,
+        versioned::{TransactionVersion, VersionedTransaction},
+    },
+    solana_transaction_context::transaction::TransactionReturnData,
     solana_transaction_error::{TransactionError, TransactionResult},
     thiserror::Error,
 };
@@ -93,6 +88,7 @@ pub struct ConfirmedTransactionStatusWithSignature {
     pub err: Option<TransactionError>,
     pub memo: Option<String>,
     pub block_time: Option<i64>,
+    pub index: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +134,8 @@ pub struct UiParsedMessage {
     pub instructions: Vec<UiInstruction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_table_lookups: Option<Vec<UiAddressTableLookup>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_config: Option<UiTransactionConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,7 +202,7 @@ pub struct EncodedTransactionWithStatusMeta {
     pub version: Option<TransactionVersion>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 #[serde(rename_all = "camelCase")]
 pub struct Reward {
     pub pubkey: String,
@@ -212,6 +210,8 @@ pub struct Reward {
     pub post_balance: u64, // Account balance in lamports after `lamports` was applied
     pub reward_type: Option<RewardType>,
     pub commission: Option<u8>, // Vote account commission when the reward was credited, only present for voting and staking rewards
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commission_bps: Option<u16>, // Vote account commission in basis points (SIMD-0291)
 }
 
 pub type Rewards = Vec<Reward>;
@@ -231,6 +231,27 @@ impl From<&MessageAddressTableLookup> for UiAddressTableLookup {
             account_key: lookup.account_key.to_string(),
             writable_indexes: lookup.writable_indexes.clone(),
             readonly_indexes: lookup.readonly_indexes.clone(),
+        }
+    }
+}
+
+/// A duplicate representation of a TransactionConfig, in raw format, for pretty JSON serialization.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiTransactionConfig {
+    pub priority_fee: Option<u64>,
+    pub compute_unit_limit: Option<u32>,
+    pub loaded_accounts_data_size_limit: Option<u32>,
+    pub heap_size: Option<u32>,
+}
+
+impl From<&solana_message::v1::TransactionConfig> for UiTransactionConfig {
+    fn from(config: &solana_message::v1::TransactionConfig) -> Self {
+        Self {
+            priority_fee: config.priority_fee,
+            compute_unit_limit: config.compute_unit_limit,
+            loaded_accounts_data_size_limit: config.loaded_accounts_data_size_limit,
+            heap_size: config.heap_size,
         }
     }
 }
@@ -536,6 +557,8 @@ pub struct UiRawMessage {
     pub instructions: Vec<UiCompiledInstruction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_table_lookups: Option<Vec<UiAddressTableLookup>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_config: Option<UiTransactionConfig>,
 }
 
 /// A duplicate representation of a CompiledInstruction for pretty JSON serialization
@@ -622,7 +645,7 @@ impl From<InnerInstructions> for UiInnerInstructions {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct InnerInstructions {
     /// Transaction instruction index
     pub index: u8,
@@ -630,7 +653,7 @@ pub struct InnerInstructions {
     pub instructions: Vec<InnerInstruction>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, SchemaRead, SchemaWrite)]
 pub struct InnerInstruction {
     /// Compiled instruction
     pub instruction: CompiledInstruction,
@@ -675,7 +698,7 @@ impl Default for TransactionStatusMeta {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodedConfirmedBlock {
     pub previous_blockhash: String,
@@ -703,13 +726,15 @@ impl From<UiConfirmedBlock> for EncodedConfirmedBlock {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncodedConfirmedTransactionWithStatusMeta {
     pub slot: u64,
     #[serde(flatten)]
     pub transaction: EncodedTransactionWithStatusMeta,
     pub block_time: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_index: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -745,12 +770,14 @@ impl TransactionStatus {
         match &self.confirmation_status {
             Some(status) => status.clone(),
             None => {
-                if self.confirmations.is_none() {
-                    TransactionConfirmationStatus::Finalized
-                } else if self.confirmations.unwrap() > 0 {
-                    TransactionConfirmationStatus::Confirmed
+                if let Some(confirmations) = self.confirmations {
+                    if confirmations > 0 {
+                        TransactionConfirmationStatus::Confirmed
+                    } else {
+                        TransactionConfirmationStatus::Processed
+                    }
                 } else {
-                    TransactionConfirmationStatus::Processed
+                    TransactionConfirmationStatus::Finalized
                 }
             }
         }

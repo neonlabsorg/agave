@@ -9,14 +9,15 @@ use {
         bank_client::BankClient,
         epoch_stakes::VersionedEpochStakes,
         genesis_utils::{
-            create_genesis_config_with_vote_accounts, GenesisConfigInfo, ValidatorVoteKeypairs,
+            GenesisConfigInfo, ValidatorVoteKeypairs, create_genesis_config_with_vote_accounts,
         },
-        loader_utils::load_program_of_loader_v4,
+        loader_utils::load_upgradeable_program_and_advance_slot,
     },
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_signer::Signer,
     solana_transaction::Transaction,
     solana_vote::vote_account::VoteAccount,
+    solana_vote_interface::state::BLS_PUBLIC_KEY_COMPRESSED_SIZE,
     solana_vote_program::vote_state::create_v4_account_with_authorized,
     std::collections::HashMap,
 };
@@ -49,17 +50,20 @@ fn test_syscall_get_epoch_stake() {
             .iter()
             .map(|keypair| {
                 let node_id = keypair.node_keypair.pubkey();
-                let authorized_voter = keypair.vote_keypair.pubkey();
+                let vote_pubkey = keypair.vote_keypair.pubkey();
                 let vote_account = VoteAccount::try_from(create_v4_account_with_authorized(
                     &node_id,
-                    &authorized_voter,
+                    &vote_pubkey,
+                    [0u8; BLS_PUBLIC_KEY_COMPRESSED_SIZE],
                     &node_id,
-                    None,
                     0,
+                    &vote_pubkey,
+                    0,
+                    &node_id,
                     100,
                 ))
                 .unwrap();
-                (authorized_voter, (0, vote_account)) // No stake.
+                (vote_pubkey, (0, vote_account)) // No stake.
             })
             .collect::<HashMap<_, _>>(),
         0, // Leader schedule epoch 0
@@ -70,7 +74,7 @@ fn test_syscall_get_epoch_stake() {
     let mut bank_client = BankClient::new_shared(bank);
 
     let authority_keypair = Keypair::new();
-    let (bank, program_id) = load_program_of_loader_v4(
+    let (bank, program_id) = load_upgradeable_program_and_advance_slot(
         &mut bank_client,
         &bank_forks,
         &mint_keypair,

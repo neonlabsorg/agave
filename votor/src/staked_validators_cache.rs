@@ -1,10 +1,7 @@
-#![allow(dead_code)]
-
 use {
     crate::voting_service::AlpenglowPortOverride,
-    lru::LruCache,
+    lazy_lru::LruCache,
     solana_clock::{Epoch, Slot},
-    solana_epoch_schedule::EpochSchedule,
     solana_gossip::cluster_info::ClusterInfo,
     solana_pubkey::Pubkey,
     solana_runtime::bank_forks::BankForks,
@@ -27,7 +24,7 @@ struct StakedValidatorsCacheEntry {
 /// Maintain `SocketAddr`s associated with all staked validators for a particular protocol (e.g.,
 /// UDP, QUIC) over number of epochs.
 ///
-/// We employ an LRU cache with capped size, mapping Epoch to cache entries that store the socket
+/// We employ an LRU cache with a target size, mapping Epoch to cache entries that store the socket
 /// information. We also track cache entry times, forcing recalculations of cache entries that are
 /// accessed after a specified TTL.
 pub struct StakedValidatorsCache {
@@ -40,9 +37,6 @@ pub struct StakedValidatorsCache {
 
     /// Bank forks
     bank_forks: Arc<RwLock<BankForks>>,
-
-    // Cache Epoch schedule since it never changes
-    epoch_schedule: EpochSchedule,
 
     /// Whether to include the running validator's socket address in cache entries
     include_self: bool,
@@ -58,21 +52,14 @@ impl StakedValidatorsCache {
     pub fn new(
         bank_forks: Arc<RwLock<BankForks>>,
         ttl: Duration,
-        max_cache_size: usize,
+        target_cache_size: usize,
         include_self: bool,
         alpenglow_port_override: Option<AlpenglowPortOverride>,
     ) -> Self {
-        let epoch_schedule = bank_forks
-            .read()
-            .unwrap()
-            .working_bank()
-            .epoch_schedule()
-            .clone();
         Self {
-            cache: LruCache::new(max_cache_size),
+            cache: LruCache::new(target_cache_size),
             ttl,
             bank_forks,
-            epoch_schedule,
             include_self,
             alpenglow_port_override,
             alpenglow_port_override_last_modified: Instant::now(),
@@ -81,7 +68,12 @@ impl StakedValidatorsCache {
 
     #[inline]
     fn cur_epoch(&self, slot: Slot) -> Epoch {
-        self.epoch_schedule.get_epoch(slot)
+        self.bank_forks
+            .read()
+            .unwrap()
+            .working_bank()
+            .epoch_schedule()
+            .get_epoch(slot)
     }
 
     fn refresh_cache_entry(
@@ -132,7 +124,7 @@ impl StakedValidatorsCache {
             .collect();
 
         nodes.dedup_by_key(|node| node.alpenglow_socket);
-        nodes.sort_unstable_by(|a, b| a.stake.cmp(&b.stake));
+        nodes.sort_unstable_by_key(|a| a.stake);
 
         let mut alpenglow_sockets = Vec::with_capacity(nodes.len());
         let override_map = self
@@ -152,7 +144,7 @@ impl StakedValidatorsCache {
             };
             alpenglow_sockets.push(socket);
         }
-        self.cache.push(
+        self.cache.put(
             epoch,
             StakedValidatorsCacheEntry {
                 alpenglow_sockets,
@@ -167,7 +159,6 @@ impl StakedValidatorsCache {
         cluster_info: &ClusterInfo,
         access_time: Instant,
     ) -> (&[SocketAddr], bool) {
-        let epoch = self.cur_epoch(slot);
         // Check if self.alpenglow_port_override has a different last_modified.
         // Immediately refresh the cache if it does.
         if let Some(alpenglow_port_override) = &self.alpenglow_port_override {
@@ -176,14 +167,15 @@ impl StakedValidatorsCache {
                 self.alpenglow_port_override_last_modified =
                     alpenglow_port_override.last_modified();
                 trace!(
-                    "refreshing cache entry for epoch {epoch} due to alpenglow port override \
-                     last_modified change"
+                    "refreshing cache entry for epoch {} due to alpenglow port override \
+                     last_modified change",
+                    self.cur_epoch(slot)
                 );
-                self.refresh_cache_entry(epoch, cluster_info, access_time);
+                self.refresh_cache_entry(self.cur_epoch(slot), cluster_info, access_time);
             }
         }
 
-        self.get_staked_validators_by_epoch(epoch, cluster_info, access_time)
+        self.get_staked_validators_by_epoch(self.cur_epoch(slot), cluster_info, access_time)
     }
 
     fn get_staked_validators_by_epoch(
@@ -247,7 +239,7 @@ mod tests {
             bank::Bank,
             bank_forks::BankForks,
             genesis_utils::{
-                create_genesis_config_with_alpenglow_vote_accounts, ValidatorVoteKeypairs,
+                ValidatorVoteKeypairs, create_genesis_config_with_alpenglow_vote_accounts,
             },
         },
         solana_signer::Signer,
@@ -273,12 +265,14 @@ mod tests {
                 .map(|(node_ix, pubkey)| {
                     let mut contact_info = ContactInfo::new(*pubkey, 0_u64, 0_u16);
 
-                    contact_info
-                        .set_alpenglow((
-                            Ipv4Addr::LOCALHOST,
-                            8080_u16.saturating_add(node_ix as u16),
-                        ))
-                        .unwrap();
+                    assert!(
+                        contact_info
+                            .set_alpenglow((
+                                Ipv4Addr::LOCALHOST,
+                                8080_u16.saturating_add(node_ix as u16)
+                            ))
+                            .is_ok()
+                    );
 
                     contact_info
                 });
@@ -458,9 +452,9 @@ mod tests {
 
         let now = Instant::now();
 
-        // Populate the first five entries; accessing the cache once again shouldn't trigger any
-        // refreshes.
-        for entry_ix in 1_u64..=5_u64 {
+        // Populate entries 1-9; the lazy LRU cache allows growth up to 2 * target_size = 10
+        // before evicting, so all nine entries fit without any eviction.
+        for entry_ix in 1_u64..=9_u64 {
             let (_, refreshed) = svc.get_staked_validators_by_slot(
                 entry_ix.saturating_mul(base_slot),
                 &cluster_info,
@@ -478,23 +472,30 @@ mod tests {
             assert_eq!(entry_ix as usize, svc.len());
         }
 
-        // Entry 6 - this shouldn't increase the cache length.
-        let (_, refreshed) = svc.get_staked_validators_by_slot(6 * base_slot, &cluster_info, now);
+        // Entry 10 triggers lazy eviction, reducing the cache to the target size of 5.
+        let (_, refreshed) = svc.get_staked_validators_by_slot(10 * base_slot, &cluster_info, now);
         assert!(refreshed);
         assert_eq!(5, svc.len());
 
-        // Epoch 1 should have been evicted
-        assert!(!svc.cache.contains(&svc.cur_epoch(base_slot)));
-
-        // Epochs 2 - 6 should have entries
-        for entry_ix in 2_u64..=6_u64 {
-            assert!(svc
-                .cache
-                .contains(&svc.cur_epoch(entry_ix.saturating_mul(base_slot))));
+        // Epochs 1-5 should have been evicted (LRU).
+        for entry_ix in 1_u64..=5_u64 {
+            assert!(
+                !svc.cache
+                    .contains_key(&svc.cur_epoch(entry_ix.saturating_mul(base_slot)))
+            );
         }
 
-        // Accessing the cache after TTL should recalculate everything; the size remains 5, since
-        // we only ever lazily evict cache entries.
+        // Epochs 6-10 should have entries.
+        for entry_ix in 6_u64..=10_u64 {
+            assert!(
+                svc.cache
+                    .contains_key(&svc.cur_epoch(entry_ix.saturating_mul(base_slot)))
+            );
+        }
+
+        // Re-accessing entries 1-5 after TTL re-inserts them. With 5 already in cache (entries
+        // 6-10), the cache again reaches 10 entries on the last insert, triggering another
+        // eviction back to the target size of 5.
         for entry_ix in 1_u64..=5_u64 {
             let (_, refreshed) = svc.get_staked_validators_by_slot(
                 entry_ix.saturating_mul(base_slot),
@@ -502,8 +503,8 @@ mod tests {
                 now.checked_add(Duration::from_secs(10)).unwrap(),
             );
             assert!(refreshed);
-            assert_eq!(5, svc.len());
         }
+        assert_eq!(5, svc.len());
     }
 
     #[test]
@@ -555,7 +556,7 @@ mod tests {
 
         // Create our staked validators cache - set include_self to false
         let mut svc =
-            StakedValidatorsCache::new(bank_forks.clone(), Duration::from_secs(5), 5, false, None);
+            StakedValidatorsCache::new(bank_forks, Duration::from_secs(5), 5, false, None);
 
         let (sockets, _) =
             svc.get_staked_validators_by_slot(slot_num, &cluster_info, Instant::now());
@@ -575,7 +576,7 @@ mod tests {
 
         // Create our staked validators cache - set include_self to false
         let mut svc = StakedValidatorsCache::new(
-            bank_forks.clone(),
+            bank_forks,
             Duration::from_secs(5),
             5,
             false,

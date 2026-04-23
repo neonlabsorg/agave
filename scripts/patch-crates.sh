@@ -61,7 +61,6 @@ update_solana_dependencies() {
     solana-storage-bigtable
     solana-storage-proto
     solana-streamer
-    solana-svm-rent-calculator
     solana-svm-transaction
     solana-test-validator
     solana-tpu-client
@@ -69,7 +68,6 @@ update_solana_dependencies() {
     solana-transaction-status-client-types
     solana-udp-client
     solana-version
-    solana-zk-token-sdk
     solana-curve25519
   )
 
@@ -148,7 +146,6 @@ patch_crates_io_solana_no_header() {
   crates_map+=("solana-storage-bigtable storage-bigtable")
   crates_map+=("solana-storage-proto storage-proto")
   crates_map+=("solana-streamer streamer")
-  crates_map+=("solana-svm-rent-collector svm-rent-collector")
   crates_map+=("solana-svm-transaction svm-transaction")
   crates_map+=("solana-test-validator test-validator")
   crates_map+=("solana-tpu-client tpu-client")
@@ -156,7 +153,6 @@ patch_crates_io_solana_no_header() {
   crates_map+=("solana-transaction-status-client-types transaction-status-client-types")
   crates_map+=("solana-udp-client udp-client")
   crates_map+=("solana-version version")
-  crates_map+=("solana-zk-token-sdk zk-token-sdk")
   crates_map+=("solana-bn254 curves/bn254")
   crates_map+=("solana-curve25519 curves/curve25519")
   crates_map+=("solana-secp256k1-recover curves/secp256k1-recover")

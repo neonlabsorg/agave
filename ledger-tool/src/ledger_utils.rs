@@ -5,14 +5,15 @@ use {
         snapshot_config::{SnapshotConfig, SnapshotUsage},
         snapshot_hash::StartingSnapshotHashes,
     },
-    clap::{value_t, value_t_or_exit, values_t_or_exit, ArgMatches},
+    clap::{ArgMatches, value_t, value_t_or_exit, values_t_or_exit},
     crossbeam_channel::unbounded,
     log::*,
     solana_accounts_db::utils::{
         create_all_accounts_run_and_snapshot_dirs, move_and_async_delete_path_contents,
+        validate_account_paths_for_direct_io,
     },
     solana_clock::Slot,
-    solana_core::validator::BlockVerificationMethod,
+    solana_core::validator::{BlockProductionMethod, BlockVerificationMethod},
     solana_genesis_config::GenesisConfig,
     solana_genesis_utils::open_genesis_config,
     solana_geyser_plugin_manager::geyser_plugin_service::{
@@ -25,6 +26,7 @@ use {
         blockstore_processor::{
             self, BlockstoreProcessorError, ProcessOptions, TransactionStatusSender,
         },
+        leader_schedule_cache::LeaderScheduleCache,
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
     solana_measure::measure_time,
@@ -40,13 +42,12 @@ use {
         snapshot_utils::{self, clean_orphaned_account_snapshot_dirs},
     },
     solana_transaction::versioned::VersionedTransaction,
-    solana_unified_scheduler_pool::{DefaultSchedulerPool, SupportedSchedulingMode},
     std::{
         path::{Path, PathBuf},
         process::exit,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, Mutex, RwLock,
+            atomic::{AtomicBool, Ordering},
         },
     },
     thiserror::Error,
@@ -102,6 +103,9 @@ pub(crate) enum LoadAndProcessLedgerError {
 
     #[error("failed to process blockstore from root: {0}")]
     ProcessBlockstoreFromRoot(#[source] BlockstoreProcessorError),
+
+    #[error("failed to validate account paths: {0}")]
+    ValidateAccountPaths(#[source] std::io::Error),
 }
 
 pub fn load_and_process_ledger_or_exit(
@@ -166,6 +170,8 @@ pub fn load_and_process_ledger(
         }
         let usage = if arg_matches.is_present("no_snapshot") {
             SnapshotUsage::Disabled
+        } else if arg_matches.is_present("snapshot_slot") {
+            SnapshotUsage::LoadAndGenerate
         } else {
             SnapshotUsage::LoadOnly
         };
@@ -175,7 +181,7 @@ pub fn load_and_process_ledger(
             full_snapshot_archives_dir,
             incremental_snapshot_archives_dir,
             bank_snapshots_dir,
-            ..SnapshotConfig::default()
+            ..SnapshotConfig::new_load_only()
         }
     };
 
@@ -248,6 +254,13 @@ pub fn load_and_process_ledger(
             .map_err(LoadAndProcessLedgerError::CreateAllAccountsRunAndSnapshotDirectories)?;
     // From now on, use run/ paths in the same way as the previous account_paths.
     let account_paths = account_run_paths;
+
+    validate_account_paths_for_direct_io(
+        &process_options.accounts_db_config,
+        &account_paths,
+        &account_snapshot_paths,
+    )
+    .map_err(LoadAndProcessLedgerError::ValidateAccountPaths)?;
 
     let (_, measure_clean_account_paths) = measure_time!(
         account_paths.iter().for_each(|path| {
@@ -334,57 +347,63 @@ pub fn load_and_process_ledger(
             (transaction_status_sender, None)
         };
 
-    let (bank_forks, leader_schedule_cache, starting_snapshot_hashes, ..) =
-        bank_forks_utils::load_bank_forks(
+    let (bank_forks, starting_snapshot_hashes) =
+        bank_forks_utils::try_load_bank_forks_from_snapshot(
             genesis_config,
-            blockstore.as_ref(),
-            account_paths,
+            &account_paths,
             &snapshot_config,
             &process_options,
-            transaction_status_sender.as_ref(),
-            None, // Maybe support this later, though
-            accounts_update_notifier,
+            accounts_update_notifier.clone(),
             exit.clone(),
         )
+        .transpose()
+        .unwrap_or_else(|| {
+            bank_forks_utils::load_bank_forks_from_genesis(
+                genesis_config,
+                &blockstore,
+                account_paths,
+                &process_options,
+                transaction_status_sender.as_ref(),
+                None, // Maybe support this later, though
+                accounts_update_notifier,
+                exit.clone(),
+            )
+        })
         .map_err(LoadAndProcessLedgerError::LoadBankForks)?;
+    let leader_schedule_cache =
+        LeaderScheduleCache::new_from_bank(&bank_forks.read().unwrap().root_bank());
+
     let block_verification_method = value_t_or_exit!(
         arg_matches,
         "block_verification_method",
         BlockVerificationMethod
     );
-    info!("Using: block-verification-method: {block_verification_method}");
-    let unified_scheduler_handler_threads =
-        value_t!(arg_matches, "unified_scheduler_handler_threads", usize).ok();
-    match block_verification_method {
-        BlockVerificationMethod::BlockstoreProcessor => {
-            info!("no scheduler pool is installed for block verification...");
-            if let Some(count) = unified_scheduler_handler_threads {
-                warn!(
-                    "--unified-scheduler-handler-threads={count} is ignored because unified \
-                     scheduler isn't enabled"
-                );
-            }
-        }
-        BlockVerificationMethod::UnifiedScheduler => {
-            let no_replay_vote_sender = None;
-            bank_forks
-                .write()
-                .unwrap()
-                .install_scheduler_pool(DefaultSchedulerPool::new(
-                    SupportedSchedulingMode::with_verification(),
-                    unified_scheduler_handler_threads,
-                    process_options.runtime_config.log_messages_bytes_limit,
-                    transaction_status_sender.clone(),
-                    no_replay_vote_sender,
-                    None,
-                ));
-        }
-    }
+    let block_production_method = value_t!(
+        arg_matches,
+        "block_production_method",
+        BlockProductionMethod
+    )
+    .unwrap_or_default();
+    block_production_method.warn_if_deprecated_value();
+    info!(
+        "Using: block-verification-method: {block_verification_method}, block-production-method: \
+         {block_production_method}",
+    );
 
     let (snapshot_request_sender, snapshot_request_receiver) = crossbeam_channel::unbounded();
+
+    // If snapshot_slot is present, then ledger-tool is attempting to generate a snapshot. Setting
+    // new_generate_snapshots_externally ensures the accounts database retains zero lamport
+    // accounts needed to correctly generate incremental snapshots
+    let snapshot_config = if arg_matches.is_present("snapshot_slot") {
+        SnapshotConfig::new_generate_snapshots_externally()
+    } else {
+        SnapshotConfig::new_load_only()
+    };
+
     let snapshot_controller = Arc::new(SnapshotController::new(
         snapshot_request_sender,
-        SnapshotConfig::new_load_only(),
+        snapshot_config,
         bank_forks.read().unwrap().root(),
     ));
     let pending_snapshot_packages = Arc::new(Mutex::new(PendingSnapshotPackages::default()));
@@ -561,5 +580,83 @@ pub(crate) fn get_access_type(process_options: &ProcessOptions) -> AccessType {
         UseSnapshotArchivesAtStartup::Always => AccessType::ReadOnly,
         UseSnapshotArchivesAtStartup::Never => AccessType::PrimaryForMaintenance,
         UseSnapshotArchivesAtStartup::WhenNewest => AccessType::PrimaryForMaintenance,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        agave_snapshots::{paths::BANK_SNAPSHOTS_DIR, snapshot_config::SnapshotConfig},
+        clap::{App, Arg},
+        solana_ledger::{
+            blockstore::Blockstore, blockstore_processor::ProcessOptions,
+            genesis_utils::create_genesis_config,
+        },
+        solana_runtime::{bank::Bank, snapshot_bank_utils},
+        std::fs,
+        tempfile::TempDir,
+    };
+
+    /// Ensure that snapshot slot is properly loaded and set as latest_full_snapshot_slot in accounts db
+    /// when snapshot_slot is provided as an argument to load_and_process_ledger.
+    #[test]
+    fn test_load_and_process_ledger_sets_latest_full_snapshot_slot_when_snapshot_slot_present() {
+        let ledger_tmp = TempDir::new().unwrap();
+        let ledger_path = ledger_tmp.path();
+
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+
+        // Create a bank from genesis and archive a full snapshot into the ledger directory.
+        let bank_snapshots_dir = ledger_path.join(BANK_SNAPSHOTS_DIR);
+        fs::create_dir_all(&bank_snapshots_dir).unwrap();
+        let bank = Bank::new_for_tests(&genesis_config);
+        bank.fill_bank_with_ticks_for_tests();
+        Bank::calculate_and_set_block_id_for_dcou(&bank);
+        let snapshot_config = SnapshotConfig {
+            full_snapshot_archives_dir: ledger_path.to_path_buf(),
+            incremental_snapshot_archives_dir: ledger_path.to_path_buf(),
+            bank_snapshots_dir: bank_snapshots_dir.clone(),
+            ..SnapshotConfig::default()
+        };
+        snapshot_bank_utils::bank_to_full_snapshot_archive(&snapshot_config, &bank).unwrap();
+
+        // Open the blockstore so load_and_process_ledger can pass it to process_blockstore.
+        let blockstore = Arc::new(Blockstore::open(ledger_path).unwrap());
+
+        // Setup the arguments such that a new snapshot will be generated from the loaded snapshot
+        let arg_matches = App::new("test")
+            .arg(
+                Arg::with_name("block_verification_method")
+                    .long("block-verification-method")
+                    .takes_value(true)
+                    .default_value("unified-scheduler"),
+            )
+            .arg(
+                Arg::with_name("snapshot_slot")
+                    .long("snapshot-slot")
+                    .takes_value(true),
+            )
+            .get_matches_from(vec!["test", "--snapshot-slot", "0"]);
+
+        let LoadAndProcessLedgerOutput { bank_forks, .. } = load_and_process_ledger(
+            &arg_matches,
+            &genesis_config,
+            blockstore,
+            ProcessOptions::default(),
+            None,
+        )
+        .unwrap();
+
+        let root_bank = bank_forks.read().unwrap().root_bank();
+
+        // Verify that latest_full_snapshot_slot is set, which matches the assert in main.rs
+        assert!(
+            root_bank
+                .accounts()
+                .accounts_db
+                .latest_full_snapshot_slot()
+                .is_some()
+        );
     }
 }

@@ -1,16 +1,16 @@
 use {
     super::{
-        bucket_map_holder::{Age, AtomicAge, BucketMapHolder},
         AtomicRefCount, DiskIndexValue, IndexValue, RefCount, SlotList, SlotListItem,
+        bucket_map_holder::{Age, AtomicAge, BucketMapHolder},
     },
     crate::{account_info::AccountInfo, is_zero_lamport::IsZeroLamport},
     solana_clock::Slot,
     std::{
         fmt::Debug,
-        ops::Deref,
+        ops::{Deref, DerefMut},
         sync::{
-            atomic::{AtomicBool, Ordering},
             RwLock, RwLockReadGuard, RwLockWriteGuard,
+            atomic::{AtomicBool, Ordering},
         },
     },
 };
@@ -59,7 +59,7 @@ impl<T: IndexValue> AccountMapEntry<T> {
         let previous = self.ref_count.fetch_add(1, Ordering::Release);
         // ensure ref count does not overflow
         assert_ne!(previous, RefCount::MAX);
-        self.set_dirty(true);
+        self.mark_dirty();
     }
 
     /// decrement the ref count by one
@@ -73,7 +73,7 @@ impl<T: IndexValue> AccountMapEntry<T> {
     /// return the refcount prior to the ref count change
     pub fn unref_by_count(&self, count: RefCount) -> RefCount {
         let previous = self.ref_count.fetch_sub(count, Ordering::Release);
-        self.set_dirty(true);
+        self.mark_dirty();
         assert!(
             previous >= count,
             "decremented ref count below zero: {self:?}"
@@ -85,8 +85,8 @@ impl<T: IndexValue> AccountMapEntry<T> {
         self.meta.dirty.load(Ordering::Acquire)
     }
 
-    pub fn set_dirty(&self, value: bool) {
-        self.meta.dirty.store(value, Ordering::Release)
+    pub fn mark_dirty(&self) {
+        self.meta.dirty.store(true, Ordering::Release)
     }
 
     /// set dirty to false, return true if was dirty
@@ -207,6 +207,12 @@ impl<T> Deref for SlotListWriteGuard<'_, T> {
 
     fn deref(&self) -> &Self::Target {
         self.0.as_slice()
+    }
+}
+
+impl<T> DerefMut for SlotListWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut_slice()
     }
 }
 

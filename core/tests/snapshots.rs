@@ -3,8 +3,8 @@
 use {
     crate::snapshot_utils::create_tmp_accounts_dir_for_tests,
     agave_snapshots::{
-        paths as snapshot_paths, snapshot_archive_info::FullSnapshotArchiveInfo,
-        snapshot_config::SnapshotConfig, SnapshotInterval,
+        SnapshotInterval, SnapshotKind, paths as snapshot_paths,
+        snapshot_archive_info::FullSnapshotArchiveInfo, snapshot_config::SnapshotConfig,
     },
     crossbeam_channel::unbounded,
     itertools::Itertools,
@@ -14,9 +14,9 @@ use {
     solana_core::snapshot_packager_service::SnapshotPackagerService,
     solana_genesis_config::GenesisConfig,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
+    solana_hash::Hash,
     solana_keypair::Keypair,
     solana_net_utils::SocketAddrSpace,
-    solana_pubkey::Pubkey,
     solana_runtime::{
         accounts_background_service::{
             AbsRequestHandlers, AccountsBackgroundService, PendingSnapshotPackages,
@@ -24,12 +24,12 @@ use {
         },
         bank::{Bank, BankTestConfig},
         bank_forks::BankForks,
-        genesis_utils::{create_genesis_config_with_leader, GenesisConfigInfo},
+        genesis_utils::{GenesisConfigInfo, create_genesis_config_with_leader},
         runtime_config::RuntimeConfig,
         snapshot_bank_utils,
         snapshot_controller::SnapshotController,
+        snapshot_package::SnapshotPackage,
         snapshot_utils,
-        status_cache::MAX_CACHE_ENTRIES,
     },
     solana_sha256_hasher::hashv,
     solana_signer::Signer,
@@ -39,12 +39,13 @@ use {
         num::NonZeroU64,
         path::PathBuf,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, Mutex, RwLock,
+            atomic::{AtomicBool, Ordering},
         },
         time::{Duration, Instant},
     },
     tempfile::TempDir,
+    test_case::test_case,
 };
 
 struct SnapshotTestConfig {
@@ -98,7 +99,7 @@ impl SnapshotTestConfig {
             ..SnapshotConfig::default()
         };
         SnapshotTestConfig {
-            bank_forks: bank_forks_arc.clone(),
+            bank_forks: bank_forks_arc,
             genesis_config_info,
             snapshot_config,
             incremental_snapshot_archives_dir,
@@ -137,6 +138,7 @@ fn restore_from_snapshot(
         old_genesis_config,
         &RuntimeConfig::default(),
         None,
+        None, // leader_for_tests
         None,
         false,
         false,
@@ -172,7 +174,7 @@ where
     let pending_snapshot_packages = Arc::new(Mutex::new(PendingSnapshotPackages::default()));
     let (snapshot_request_sender, snapshot_request_receiver) = unbounded();
     let snapshot_controller = Arc::new(SnapshotController::new(
-        snapshot_request_sender.clone(),
+        snapshot_request_sender,
         snapshot_test_config.snapshot_config.clone(),
         bank_forks.read().unwrap().root(),
     ));
@@ -182,11 +184,8 @@ where
         pending_snapshot_packages,
     };
     for slot in 1..=last_slot {
-        let bank = Bank::new_from_parent(
-            bank_forks.read().unwrap().get(slot - 1).unwrap().clone(),
-            &Pubkey::default(),
-            slot,
-        );
+        let parent = bank_forks.read().unwrap().get(slot - 1).unwrap().clone();
+        let bank = Bank::new_from_parent(parent.clone(), *parent.leader(), slot);
         let bank = bank_forks.write().unwrap().insert(bank);
         f(bank.clone_without_scheduler().as_ref(), mint_keypair);
         // Set root to make sure we don't end up with too many account storage entries
@@ -195,6 +194,9 @@ where
         if slot % set_root_interval == 0 || slot == last_slot {
             if !bank.is_complete() {
                 bank.fill_bank_with_ticks_for_tests();
+            }
+            if bank.block_id().is_none() {
+                bank.set_block_id(Some(Hash::default()));
             }
             bank_forks.read().unwrap().prune_program_cache(bank.slot());
             // set_root should send a snapshot request
@@ -209,15 +211,7 @@ where
     // Generate a snapshot package for last bank
     let snapshot_config = snapshot_controller.snapshot_config();
     let last_bank = bank_forks.read().unwrap().get(last_slot).unwrap();
-    snapshot_bank_utils::bank_to_full_snapshot_archive(
-        &snapshot_config.bank_snapshots_dir,
-        &last_bank,
-        Some(snapshot_config.snapshot_version),
-        &snapshot_config.full_snapshot_archives_dir,
-        &snapshot_config.incremental_snapshot_archives_dir,
-        snapshot_config.archive_format,
-    )
-    .unwrap();
+    snapshot_bank_utils::bank_to_full_snapshot_archive(snapshot_config, &last_bank).unwrap();
 
     // Restore bank from snapshot
     let (_tmp_dir, temporary_accounts_dir) = create_tmp_accounts_dir_for_tests();
@@ -263,10 +257,23 @@ fn goto_end_of_slot(bank: &Bank) {
     }
 }
 
+fn get_default_max_status_cache_entries() -> u64 {
+    SnapshotTestConfig::new(SnapshotInterval::Disabled, SnapshotInterval::Disabled)
+        .bank_forks
+        .read()
+        .unwrap()
+        .root_bank()
+        .status_cache
+        .read()
+        .unwrap()
+        .max_root_entries() as u64
+}
+
 #[test]
 fn test_slots_to_snapshot() {
     agave_logger::setup();
-    let num_set_roots = MAX_CACHE_ENTRIES * 2;
+    let status_cache_max_entries = get_default_max_status_cache_entries();
+    let num_set_roots = status_cache_max_entries * 2;
 
     for add_root_interval in &[1, 3, 9] {
         let (snapshot_sender, _snapshot_receiver) = unbounded();
@@ -289,7 +296,8 @@ fn test_slots_to_snapshot() {
         for _ in 0..num_set_roots {
             for _ in 0..*add_root_interval {
                 let new_slot = current_bank.slot() + 1;
-                let new_bank = Bank::new_from_parent(current_bank, &Pubkey::default(), new_slot);
+                let leader = *current_bank.leader();
+                let new_bank = Bank::new_from_parent(current_bank, leader, new_slot);
                 current_bank = bank_forks.write().unwrap().insert(new_bank).clone();
             }
             bank_forks
@@ -303,9 +311,8 @@ fn test_slots_to_snapshot() {
             );
         }
 
-        let num_old_slots = num_set_roots * *add_root_interval - MAX_CACHE_ENTRIES + 1;
-        let expected_slots_to_snapshot =
-            num_old_slots as u64..=num_set_roots as u64 * *add_root_interval as u64;
+        let num_old_slots = num_set_roots * *add_root_interval - status_cache_max_entries + 1;
+        let expected_slots_to_snapshot = num_old_slots..=num_set_roots * *add_root_interval;
 
         let slots_to_snapshot = bank_forks
             .read()
@@ -324,15 +331,16 @@ fn test_slots_to_snapshot() {
 
 #[test]
 fn test_bank_forks_status_cache_snapshot() {
-    // create banks up to slot (MAX_CACHE_ENTRIES * 2) + 1 while transferring 1 lamport into 2 different accounts each time
+    // create banks up to slot (`max_root_entries` * 2) + 1 while transferring 1 lamport into 2 different accounts each time
     // this is done to ensure the AccountStorageEntries keep getting cleaned up as the root moves
     // ahead. Also tests the status_cache purge and status cache snapshotting.
     // Makes sure that the last bank is restored correctly
+    let status_cache_max_entries = get_default_max_status_cache_entries();
     let key1 = Keypair::new().pubkey();
     let key2 = Keypair::new().pubkey();
     for set_root_interval in &[1, 4] {
         run_bank_forks_snapshot_n(
-            (MAX_CACHE_ENTRIES * 2) as u64,
+            status_cache_max_entries + 1,
             |bank, mint_keypair| {
                 let tx = system_transaction::transfer(
                     mint_keypair,
@@ -399,7 +407,7 @@ fn test_bank_forks_incremental_snapshot() {
     let pending_snapshot_packages = Arc::new(Mutex::new(PendingSnapshotPackages::default()));
     let (snapshot_request_sender, snapshot_request_receiver) = unbounded();
     let snapshot_controller = Arc::new(SnapshotController::new(
-        snapshot_request_sender.clone(),
+        snapshot_request_sender,
         snapshot_test_config.snapshot_config.clone(),
         bank_forks.read().unwrap().root(),
     ));
@@ -414,7 +422,7 @@ fn test_bank_forks_incremental_snapshot() {
         // Make a new bank and perform some transactions
         let bank = {
             let parent = bank_forks.read().unwrap().get(slot - 1).unwrap();
-            let bank = Bank::new_from_parent(parent, &Pubkey::default(), slot);
+            let bank = Bank::new_from_parent(parent.clone(), *parent.leader(), slot);
             let bank_scheduler = bank_forks.write().unwrap().insert(bank);
             let bank = bank_scheduler.clone_without_scheduler();
 
@@ -427,6 +435,7 @@ fn test_bank_forks_incremental_snapshot() {
             assert_eq!(bank.process_transaction(&tx), Ok(()));
 
             bank.fill_bank_with_ticks_for_tests();
+            bank.set_block_id(Some(Hash::default()));
 
             bank_scheduler
         };
@@ -491,14 +500,9 @@ fn make_full_snapshot_archive(
         "Making full snapshot archive from bank at slot: {}",
         bank.slot(),
     );
-    snapshot_bank_utils::bank_to_full_snapshot_archive(
-        &snapshot_config.bank_snapshots_dir,
-        bank,
-        Some(snapshot_config.snapshot_version),
-        &snapshot_config.full_snapshot_archives_dir,
-        &snapshot_config.incremental_snapshot_archives_dir,
-        snapshot_config.archive_format,
-    )?;
+    // The bank must have a block id set to take a snapshot.
+    Bank::calculate_and_set_block_id_for_dcou(bank);
+    snapshot_bank_utils::bank_to_full_snapshot_archive(snapshot_config, bank)?;
     Ok(())
 }
 
@@ -512,14 +516,12 @@ fn make_incremental_snapshot_archive(
         bank.slot(),
         incremental_snapshot_base_slot,
     );
+    // The bank must have a block id set to take a snapshot.
+    Bank::calculate_and_set_block_id_for_dcou(bank);
     snapshot_bank_utils::bank_to_incremental_snapshot_archive(
-        &snapshot_config.bank_snapshots_dir,
+        snapshot_config,
         bank,
         incremental_snapshot_base_slot,
-        Some(snapshot_config.snapshot_version),
-        &snapshot_config.full_snapshot_archives_dir,
-        &snapshot_config.incremental_snapshot_archives_dir,
-        snapshot_config.archive_format,
     )?;
     Ok(())
 }
@@ -613,7 +615,7 @@ fn test_snapshots_with_background_services() {
     }
 
     let snapshot_controller = Arc::new(SnapshotController::new(
-        snapshot_request_sender.clone(),
+        snapshot_request_sender,
         snapshot_test_config.snapshot_config.clone(),
         bank_forks.read().unwrap().root(),
     ));
@@ -632,13 +634,14 @@ fn test_snapshots_with_background_services() {
 
     let exit = Arc::new(AtomicBool::new(false));
     let snapshot_packager_service = SnapshotPackagerService::new(
-        pending_snapshot_packages.clone(),
+        pending_snapshot_packages,
         None,
         exit.clone(),
         None,
-        cluster_info.clone(),
+        cluster_info,
         snapshot_controller.clone(),
         false,
+        0,
     );
 
     let accounts_background_service =
@@ -650,11 +653,8 @@ fn test_snapshots_with_background_services() {
     for slot in 1..=LAST_SLOT {
         // Make a new bank and process some transactions
         {
-            let bank = Bank::new_from_parent(
-                bank_forks.read().unwrap().get(slot - 1).unwrap(),
-                &Pubkey::default(),
-                slot,
-            );
+            let parent = bank_forks.read().unwrap().get(slot - 1).unwrap();
+            let bank = Bank::new_from_parent(parent.clone(), *parent.leader(), slot);
             let bank = bank_forks
                 .write()
                 .unwrap()
@@ -670,6 +670,7 @@ fn test_snapshots_with_background_services() {
             assert_eq!(bank.process_transaction(&tx), Ok(()));
 
             bank.fill_bank_with_ticks_for_tests();
+            bank.set_block_id(Some(Hash::default()));
         }
 
         // Call `BankForks::set_root()` to cause snapshots to be taken
@@ -759,4 +760,150 @@ fn test_snapshots_with_background_services() {
     exit.store(true, Ordering::Relaxed);
     _ = accounts_background_service.join();
     _ = snapshot_packager_service.join();
+}
+
+#[test_case(true)]
+#[test_case(false)]
+fn test_fastboot_snapshots_teardown(exit_backpressure: bool) {
+    agave_logger::setup();
+    const FASTBOOT_SNAPSHOT_INTERVAL_SLOTS: Slot = 4;
+    // Queue a few fastboot snapshots to make sure the newest one is processed during teardown
+    const LAST_SLOT: Slot = FASTBOOT_SNAPSHOT_INTERVAL_SLOTS * 4;
+
+    // Test injects snapshots at specific slots, so disable automatic snapshots
+    let snapshot_test_config =
+        SnapshotTestConfig::new(SnapshotInterval::Disabled, SnapshotInterval::Disabled);
+
+    let node_keypair = Arc::new(Keypair::new());
+    let cluster_info = Arc::new(ClusterInfo::new(
+        ContactInfo::new_localhost(&node_keypair.pubkey(), timestamp()),
+        node_keypair,
+        SocketAddrSpace::Unspecified,
+    ));
+
+    let (snapshot_request_sender, _snapshot_request_receiver) = unbounded();
+    let pending_snapshot_packages = Arc::new(Mutex::new(PendingSnapshotPackages::default()));
+
+    let bank_forks = snapshot_test_config.bank_forks.clone();
+
+    let snapshot_controller = Arc::new(SnapshotController::new(
+        snapshot_request_sender,
+        snapshot_test_config.snapshot_config.clone(),
+        bank_forks.read().unwrap().root(),
+    ));
+
+    // Enable or disable backpressure based on the test case parameter
+    let exit_backpressure = exit_backpressure.then(|| Arc::new(AtomicBool::new(false)));
+
+    let exit = Arc::new(AtomicBool::new(false));
+    let snapshot_packager_service = SnapshotPackagerService::new(
+        pending_snapshot_packages.clone(),
+        None,
+        exit.clone(),
+        exit_backpressure.clone(),
+        cluster_info,
+        snapshot_controller.clone(),
+        false,
+        0,
+    );
+
+    let mint_keypair = &snapshot_test_config.genesis_config_info.mint_keypair;
+    for slot in 1..=LAST_SLOT {
+        // Make a new bank and process some transactions
+        let parent_bank = bank_forks.read().unwrap().get(slot - 1).unwrap();
+        let child_bank = Bank::new_from_parent(parent_bank.clone(), *parent_bank.leader(), slot);
+        let bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(child_bank)
+            .clone_without_scheduler();
+
+        let key = solana_pubkey::new_rand();
+        let tx = system_transaction::transfer(mint_keypair, &key, 1, bank.last_blockhash());
+        assert_eq!(bank.process_transaction(&tx), Ok(()));
+
+        let key = solana_pubkey::new_rand();
+        let tx = system_transaction::transfer(mint_keypair, &key, 0, bank.last_blockhash());
+        assert_eq!(bank.process_transaction(&tx), Ok(()));
+
+        bank.fill_bank_with_ticks_for_tests();
+        bank.set_block_id(Some(Hash::default()));
+
+        // Inject a fastboot snapshot at a specific slot
+        if slot % FASTBOOT_SNAPSHOT_INTERVAL_SLOTS == 0 {
+            bank.squash();
+
+            bank.force_flush_accounts_cache();
+            let snapshot_package = SnapshotPackage::new(
+                SnapshotKind::Fastboot,
+                &bank,
+                bank.get_snapshot_storages(None),
+                bank.status_cache.read().unwrap().root_slot_deltas(),
+            );
+            pending_snapshot_packages
+                .lock()
+                .unwrap()
+                .push(snapshot_package);
+
+            // Wait while the fastboot snapshot is processed
+            while !pending_snapshot_packages.lock().unwrap().is_empty() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    let bank_snapshots = snapshot_utils::get_bank_snapshots(
+        &snapshot_test_config.snapshot_config.bank_snapshots_dir,
+    );
+
+    if exit_backpressure.is_none() {
+        // Without backpressure, the fastboot snapshot should be present
+        assert!(!bank_snapshots.is_empty());
+    } else {
+        // With backpressure, the fastboot snapshot will not be written until teardown
+        // is triggered by writing true to exit below
+        assert!(bank_snapshots.is_empty());
+    }
+
+    // Stop the background services
+    exit.store(true, Ordering::Relaxed);
+    let packager_exit_result = snapshot_packager_service.join();
+    assert!(packager_exit_result.is_ok());
+    assert_eq!(snapshot_controller.latest_bank_snapshot_slot(), LAST_SLOT);
+
+    // verify that the fastboot snapshot was written and can be restored from
+    let bank_snapshot = snapshot_utils::get_highest_bank_snapshot(
+        &snapshot_test_config.snapshot_config.bank_snapshots_dir,
+    )
+    .unwrap();
+
+    let bank_constructed = snapshot_bank_utils::bank_from_snapshot_dir(
+        &[snapshot_test_config.accounts_dir],
+        &bank_snapshot,
+        &snapshot_test_config.genesis_config_info.genesis_config,
+        &RuntimeConfig::default(),
+        None,
+        None, // leader_for_tests
+        None,
+        false,
+        ACCOUNTS_DB_CONFIG_FOR_TESTING,
+        None,
+        Arc::default(),
+    )
+    .unwrap();
+
+    // Get the slot of the last fastboot snapshot taken
+    let last_fastboot_snapshot_slot =
+        (LAST_SLOT / FASTBOOT_SNAPSHOT_INTERVAL_SLOTS) * FASTBOOT_SNAPSHOT_INTERVAL_SLOTS;
+
+    assert_eq!(bank_constructed.slot(), last_fastboot_snapshot_slot);
+    assert_eq!(
+        &bank_constructed,
+        bank_forks
+            .read()
+            .unwrap()
+            .get(bank_constructed.slot())
+            .unwrap()
+            .as_ref()
+    );
 }

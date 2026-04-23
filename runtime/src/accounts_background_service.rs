@@ -14,7 +14,7 @@ use {
         snapshot_controller::SnapshotController,
         snapshot_package::SnapshotPackage,
     },
-    agave_snapshots::{error::SnapshotError, SnapshotArchiveKind, SnapshotKind},
+    agave_snapshots::{SnapshotArchiveKind, SnapshotKind, error::SnapshotError},
     crossbeam_channel::{Receiver, SendError, Sender},
     log::*,
     rayon::iter::{IntoParallelIterator, ParallelIterator},
@@ -26,10 +26,10 @@ use {
         cmp,
         fmt::{self, Debug, Formatter},
         sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, LazyLock, Mutex, RwLock,
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
-        thread::{self, sleep, Builder, JoinHandle},
+        thread::{self, Builder, JoinHandle, sleep},
         time::{Duration, Instant},
     },
 };
@@ -127,6 +127,7 @@ impl Debug for SnapshotRequest {
 pub enum SnapshotRequestKind {
     FullSnapshot,
     IncrementalSnapshot,
+    FastbootSnapshot,
 }
 
 pub struct SnapshotRequestHandler {
@@ -137,7 +138,6 @@ pub struct SnapshotRequestHandler {
 
 impl SnapshotRequestHandler {
     // Returns the latest requested snapshot slot and storages
-    #[allow(clippy::type_complexity)]
     pub fn handle_snapshot_requests(
         &self,
         non_snapshot_time_us: u128,
@@ -258,6 +258,7 @@ impl SnapshotRequestHandler {
                     .accounts_db
                     .accounts_cache
                     .fetch_max_flush_root()
+                    .expect("Roots have been flushed")
         );
         flush_accounts_cache_time.stop();
 
@@ -402,7 +403,6 @@ pub struct AbsRequestHandlers {
 
 impl AbsRequestHandlers {
     // Returns the latest requested snapshot slot, if one exists
-    #[allow(clippy::type_complexity)]
     pub fn handle_snapshot_requests(
         &self,
         non_snapshot_time_us: u128,
@@ -543,11 +543,10 @@ impl AccountsBackgroundService {
                                 .flush_accounts_cache(force_flush, Some(max_clean_slot_inclusive));
 
                             if should_clean {
-                                bank.rc.accounts.accounts_db.clean_accounts(
-                                    Some(max_clean_slot_inclusive),
-                                    false,
-                                    bank.epoch_schedule(),
-                                );
+                                bank.rc
+                                    .accounts
+                                    .accounts_db
+                                    .clean_accounts(Some(max_clean_slot_inclusive), false);
                                 last_cleaned_slot = max_clean_slot_inclusive;
                                 previous_clean_time = Instant::now();
                             }
@@ -668,6 +667,7 @@ fn new_snapshot_kind(snapshot_request: &SnapshotRequest) -> Option<SnapshotKind>
                 None
             }
         }
+        SnapshotRequestKind::FastbootSnapshot => Some(SnapshotKind::Fastboot),
     }
 }
 
@@ -692,34 +692,36 @@ fn cmp_requests_by_priority(a: &SnapshotRequest, b: &SnapshotRequest) -> cmp::Or
 /// Priority, from highest to lowest:
 /// - Full Snapshot
 /// - Incremental Snapshot
+/// - Fastboot Snapshot
 #[must_use]
 fn cmp_snapshot_request_kinds_by_priority(
     a: &SnapshotRequestKind,
     b: &SnapshotRequestKind,
 ) -> cmp::Ordering {
     use {
-        cmp::Ordering::{Equal, Greater, Less},
         SnapshotRequestKind as Kind,
+        cmp::Ordering::{Equal, Greater, Less},
     };
     match (a, b) {
         (Kind::FullSnapshot, Kind::FullSnapshot) => Equal,
         (Kind::FullSnapshot, Kind::IncrementalSnapshot) => Greater,
+        (Kind::FullSnapshot, Kind::FastbootSnapshot) => Greater,
         (Kind::IncrementalSnapshot, Kind::FullSnapshot) => Less,
         (Kind::IncrementalSnapshot, Kind::IncrementalSnapshot) => Equal,
+        (Kind::IncrementalSnapshot, Kind::FastbootSnapshot) => Greater,
+        (Kind::FastbootSnapshot, Kind::FullSnapshot) => Less,
+        (Kind::FastbootSnapshot, Kind::IncrementalSnapshot) => Less,
+        (Kind::FastbootSnapshot, Kind::FastbootSnapshot) => Equal,
     }
 }
 
 #[cfg(test)]
 mod test {
     use {
-        super::*,
-        crate::genesis_utils::create_genesis_config,
-        agave_snapshots::{snapshot_config::SnapshotConfig, SnapshotInterval},
-        crossbeam_channel::unbounded,
-        solana_account::AccountSharedData,
-        solana_epoch_schedule::EpochSchedule,
-        solana_pubkey::Pubkey,
-        std::num::NonZeroU64,
+        super::*, crate::genesis_utils::create_genesis_config,
+        agave_snapshots::snapshot_config::SnapshotConfig, crossbeam_channel::unbounded,
+        solana_account::AccountSharedData, solana_epoch_schedule::EpochSchedule,
+        solana_leader_schedule::SlotLeader, solana_pubkey::Pubkey,
     };
 
     #[test]
@@ -758,16 +760,12 @@ mod test {
         const SLOTS_PER_EPOCH: Slot = 400;
         const FULL_SNAPSHOT_INTERVAL: Slot = 80;
         const INCREMENTAL_SNAPSHOT_INTERVAL: Slot = 30;
+        const FASTBOOT_SNAPSHOT_INTERVAL: Slot = 45;
 
-        let snapshot_config = SnapshotConfig {
-            full_snapshot_archive_interval: SnapshotInterval::Slots(
-                NonZeroU64::new(FULL_SNAPSHOT_INTERVAL).unwrap(),
-            ),
-            incremental_snapshot_archive_interval: SnapshotInterval::Slots(
-                NonZeroU64::new(INCREMENTAL_SNAPSHOT_INTERVAL).unwrap(),
-            ),
-            ..SnapshotConfig::default()
-        };
+        // This would typically configure the snapshot controller, but since `set_root` is never
+        // called, the snapshot controller is never invoked. The default configuration suffices
+        // as it does not affect the test behavior.
+        let snapshot_config = SnapshotConfig::default();
 
         let pending_snapshot_packages = Arc::new(Mutex::new(PendingSnapshotPackages::default()));
         let (snapshot_request_sender, snapshot_request_receiver) = crossbeam_channel::unbounded();
@@ -795,7 +793,8 @@ mod test {
         let mut genesis_config_info = create_genesis_config(10);
         genesis_config_info.genesis_config.epoch_schedule =
             EpochSchedule::custom(SLOTS_PER_EPOCH, SLOTS_PER_EPOCH, false);
-        let mut bank = Arc::new(Bank::new_for_tests(&genesis_config_info.genesis_config));
+        let (mut bank, _bank_forks) = Bank::new_for_tests(&genesis_config_info.genesis_config)
+            .wrap_with_bank_forks_for_tests();
 
         // We need to get and set accounts-db's latest full snapshot slot to test
         // get_next_snapshot_request().  To workaround potential borrowing issues
@@ -814,17 +813,19 @@ mod test {
         // Create new banks and send snapshot requests so that the following requests will be in
         // the channel before handling the requests:
         //
-        // fss  80
-        // iss  90
-        // iss 120
-        // iss 150
-        // fss 160
-        // iss 180
-        // iss 210
-        // fss 240 <-- handled 1st
-        // iss 270
-        // iss 300 <-- handled 2nd
-        //
+        // full          80
+        // incremental   90
+        // incremental  120
+        // fastboot     135
+        // incremental  150
+        // full         160
+        // incremental  180
+        // incremental  210
+        // fastboot     225
+        // full         240 <-- handled 1st
+        // incremental  270
+        // incremental  300 <-- handled 2nd
+        // fastboot     315 <-- handled last
         // Also, incremental snapshots before slot 240 (the first full snapshot handled), will
         // actually be skipped since the latest full snapshot slot will be `None`.
         let mut make_banks = |num_banks| {
@@ -832,7 +833,7 @@ mod test {
                 let slot = bank.slot() + 1;
                 bank = Arc::new(Bank::new_from_parent(
                     bank.clone(),
-                    &Pubkey::new_unique(),
+                    SlotLeader::new_unique(),
                     slot,
                 ));
 
@@ -848,10 +849,15 @@ mod test {
                         Arc::clone(&bank),
                         SnapshotRequestKind::IncrementalSnapshot,
                     );
+                } else if bank
+                    .block_height()
+                    .is_multiple_of(FASTBOOT_SNAPSHOT_INTERVAL)
+                {
+                    send_snapshot_request(Arc::clone(&bank), SnapshotRequestKind::FastbootSnapshot);
                 }
             }
         };
-        make_banks(303);
+        make_banks(318);
 
         // Ensure the full snapshot from slot 240 is handled 1st
         // (the older full snapshots are skipped and dropped)
@@ -878,11 +884,25 @@ mod test {
         );
         assert_eq!(snapshot_request.snapshot_root_bank.slot(), 300);
 
+        // Ensure the fastboot snapshot from slot 315 is handled last
+        // (the older fastboot snapshots are skipped and dropped)
+        assert_eq!(latest_full_snapshot_slot(&bank0), Some(240));
+        let (snapshot_request, ..) = snapshot_request_handler
+            .get_next_snapshot_request()
+            .unwrap();
+        assert_eq!(
+            snapshot_request.request_kind,
+            SnapshotRequestKind::FastbootSnapshot
+        );
+        assert_eq!(snapshot_request.snapshot_root_bank.slot(), 315);
+
         // And now ensure the snapshot request channel is empty!
         assert_eq!(latest_full_snapshot_slot(&bank0), Some(240));
-        assert!(snapshot_request_handler
-            .get_next_snapshot_request()
-            .is_none());
+        assert!(
+            snapshot_request_handler
+                .get_next_snapshot_request()
+                .is_none()
+        );
     }
 
     /// Ensure that we can prune banks with the same slot (if they were on different forks)
@@ -899,40 +919,40 @@ mod test {
             pruned_banks_sender,
         ))));
 
-        let fork0_bank0 = Arc::new(bank);
+        let (fork0_bank0, bank_forks) = bank.wrap_with_bank_forks_for_tests();
         let fork0_bank1 = Arc::new(Bank::new_from_parent(
             fork0_bank0.clone(),
-            &Pubkey::new_unique(),
+            SlotLeader::new_unique(),
             fork0_bank0.slot() + 1,
         ));
         let fork1_bank1 = Arc::new(Bank::new_from_parent(
             fork0_bank0.clone(),
-            &Pubkey::new_unique(),
+            SlotLeader::new_unique(),
             fork0_bank0.slot() + 1,
         ));
         let fork2_bank1 = Arc::new(Bank::new_from_parent(
             fork0_bank0.clone(),
-            &Pubkey::new_unique(),
+            SlotLeader::new_unique(),
             fork0_bank0.slot() + 1,
         ));
         let fork0_bank2 = Arc::new(Bank::new_from_parent(
             fork0_bank1.clone(),
-            &Pubkey::new_unique(),
+            SlotLeader::new_unique(),
             fork0_bank1.slot() + 1,
         ));
         let fork1_bank2 = Arc::new(Bank::new_from_parent(
             fork1_bank1.clone(),
-            &Pubkey::new_unique(),
+            SlotLeader::new_unique(),
             fork1_bank1.slot() + 1,
         ));
         let fork0_bank3 = Arc::new(Bank::new_from_parent(
             fork0_bank2.clone(),
-            &Pubkey::new_unique(),
+            SlotLeader::new_unique(),
             fork0_bank2.slot() + 1,
         ));
         let fork3_bank3 = Arc::new(Bank::new_from_parent(
             fork0_bank2.clone(),
-            &Pubkey::new_unique(),
+            SlotLeader::new_unique(),
             fork0_bank2.slot() + 1,
         ));
         fork0_bank3.squash();
@@ -944,6 +964,7 @@ mod test {
         drop(fork2_bank1);
         drop(fork0_bank1);
         drop(fork0_bank0);
+        drop(bank_forks);
         let num_banks_purged = pruned_banks_request_handler.handle_request(&fork0_bank3);
         assert_eq!(num_banks_purged, 7);
     }
@@ -963,6 +984,11 @@ mod test {
                 Greater,
             ),
             (
+                SnapshotRequestKind::FullSnapshot,
+                SnapshotRequestKind::FastbootSnapshot,
+                Greater,
+            ),
+            (
                 SnapshotRequestKind::IncrementalSnapshot,
                 SnapshotRequestKind::FullSnapshot,
                 Less,
@@ -970,6 +996,26 @@ mod test {
             (
                 SnapshotRequestKind::IncrementalSnapshot,
                 SnapshotRequestKind::IncrementalSnapshot,
+                Equal,
+            ),
+            (
+                SnapshotRequestKind::IncrementalSnapshot,
+                SnapshotRequestKind::FastbootSnapshot,
+                Greater,
+            ),
+            (
+                SnapshotRequestKind::FastbootSnapshot,
+                SnapshotRequestKind::FullSnapshot,
+                Less,
+            ),
+            (
+                SnapshotRequestKind::FastbootSnapshot,
+                SnapshotRequestKind::IncrementalSnapshot,
+                Less,
+            ),
+            (
+                SnapshotRequestKind::FastbootSnapshot,
+                SnapshotRequestKind::FastbootSnapshot,
                 Equal,
             ),
         ] {

@@ -6,25 +6,24 @@ use {
 fn get_sysvar<T: std::fmt::Debug + SysvarSerialize + Clone>(
     sysvar: Result<Arc<T>, InstructionError>,
     var_addr: u64,
-    check_aligned: bool,
-    memory_mapping: &mut MemoryMapping,
     invoke_context: &mut InvokeContext,
 ) -> Result<u64, Error> {
-    consume_compute_meter(
-        invoke_context,
-        invoke_context
-            .get_execution_cost()
-            .sysvar_base_cost
-            .saturating_add(size_of::<T>() as u64),
-    )?;
+    let amount = invoke_context
+        .get_execution_cost()
+        .sysvar_base_cost
+        .saturating_add(size_of::<T>() as u64);
+    invoke_context.compute_meter.consume_checked(amount)?;
 
     if var_addr >= ebpf::MM_INPUT_START
         && invoke_context
             .get_feature_set()
-            .stricter_abi_and_runtime_constraints
+            .syscall_parameter_address_restrictions
     {
         return Err(SyscallError::InvalidPointer.into());
     }
+
+    let check_aligned = invoke_context.get_check_aligned();
+    let memory_mapping = invoke_context.memory_contexts.memory_mapping_mut()?;
     translate_mut!(
         memory_mapping,
         check_aligned,
@@ -45,19 +44,16 @@ declare_builtin_function!(
     /// Get a Clock sysvar
     SyscallGetClockSysvar,
     fn rust(
-        invoke_context: &mut InvokeContext,
+        invoke_context: &mut InvokeContext<'_, '_>,
         var_addr: u64,
         _arg2: u64,
         _arg3: u64,
         _arg4: u64,
         _arg5: u64,
-        memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
         get_sysvar(
-            invoke_context.get_sysvar_cache().get_clock(),
+            invoke_context.environment_config.sysvar_cache().get_clock(),
             var_addr,
-            invoke_context.get_check_aligned(),
-            memory_mapping,
             invoke_context,
         )
     }
@@ -67,19 +63,16 @@ declare_builtin_function!(
     /// Get a EpochSchedule sysvar
     SyscallGetEpochScheduleSysvar,
     fn rust(
-        invoke_context: &mut InvokeContext,
+        invoke_context: &mut InvokeContext<'_, '_>,
         var_addr: u64,
         _arg2: u64,
         _arg3: u64,
         _arg4: u64,
         _arg5: u64,
-        memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
         get_sysvar(
-            invoke_context.get_sysvar_cache().get_epoch_schedule(),
+            invoke_context.environment_config.sysvar_cache().get_epoch_schedule(),
             var_addr,
-            invoke_context.get_check_aligned(),
-            memory_mapping,
             invoke_context,
         )
     }
@@ -89,19 +82,16 @@ declare_builtin_function!(
     /// Get a EpochRewards sysvar
     SyscallGetEpochRewardsSysvar,
     fn rust(
-        invoke_context: &mut InvokeContext,
+        invoke_context: &mut InvokeContext<'_, '_>,
         var_addr: u64,
         _arg2: u64,
         _arg3: u64,
         _arg4: u64,
         _arg5: u64,
-        memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
         get_sysvar(
-            invoke_context.get_sysvar_cache().get_epoch_rewards(),
+            invoke_context.environment_config.sysvar_cache().get_epoch_rewards(),
             var_addr,
-            invoke_context.get_check_aligned(),
-            memory_mapping,
             invoke_context,
         )
     }
@@ -111,21 +101,18 @@ declare_builtin_function!(
     /// Get a Fees sysvar
     SyscallGetFeesSysvar,
     fn rust(
-        invoke_context: &mut InvokeContext,
+        invoke_context: &mut InvokeContext<'_, '_>,
         var_addr: u64,
         _arg2: u64,
         _arg3: u64,
         _arg4: u64,
         _arg5: u64,
-        memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         {
             get_sysvar(
-                invoke_context.get_sysvar_cache().get_fees(),
+                invoke_context.environment_config.sysvar_cache().get_fees(),
                 var_addr,
-                invoke_context.get_check_aligned(),
-                memory_mapping,
                 invoke_context,
             )
         }
@@ -136,19 +123,16 @@ declare_builtin_function!(
     /// Get a Rent sysvar
     SyscallGetRentSysvar,
     fn rust(
-        invoke_context: &mut InvokeContext,
+        invoke_context: &mut InvokeContext<'_, '_>,
         var_addr: u64,
         _arg2: u64,
         _arg3: u64,
         _arg4: u64,
         _arg5: u64,
-        memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
         get_sysvar(
-            invoke_context.get_sysvar_cache().get_rent(),
+            invoke_context.environment_config.sysvar_cache().get_rent(),
             var_addr,
-            invoke_context.get_check_aligned(),
-            memory_mapping,
             invoke_context,
         )
     }
@@ -158,19 +142,16 @@ declare_builtin_function!(
     /// Get a Last Restart Slot sysvar
     SyscallGetLastRestartSlotSysvar,
     fn rust(
-        invoke_context: &mut InvokeContext,
+        invoke_context: &mut InvokeContext<'_, '_>,
         var_addr: u64,
         _arg2: u64,
         _arg3: u64,
         _arg4: u64,
         _arg5: u64,
-        memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
         get_sysvar(
-            invoke_context.get_sysvar_cache().get_last_restart_slot(),
+            invoke_context.environment_config.sysvar_cache().get_last_restart_slot(),
             var_addr,
-            invoke_context.get_check_aligned(),
-            memory_mapping,
             invoke_context,
         )
     }
@@ -185,15 +166,13 @@ declare_builtin_function!(
     /// Get a slice of a Sysvar in-memory representation
     SyscallGetSysvar,
     fn rust(
-        invoke_context: &mut InvokeContext,
+        invoke_context: &mut InvokeContext<'_, '_>,
         sysvar_id_addr: u64,
         var_addr: u64,
         offset: u64,
         length: u64,
         _arg5: u64,
-        memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
-        let check_aligned = invoke_context.get_check_aligned();
         let SVMTransactionExecutionCost {
             sysvar_base_cost,
             cpi_bytes_per_unit,
@@ -204,20 +183,21 @@ declare_builtin_function!(
         // Abort: "Compute budget is exceeded."
         let sysvar_id_cost = 32_u64.checked_div(cpi_bytes_per_unit).unwrap_or(0);
         let sysvar_buf_cost = length.checked_div(cpi_bytes_per_unit).unwrap_or(0);
-        consume_compute_meter(
-            invoke_context,
-            sysvar_base_cost
-                .saturating_add(sysvar_id_cost)
-                .saturating_add(std::cmp::max(sysvar_buf_cost, mem_op_base_cost)),
-        )?;
+        let cost = sysvar_base_cost
+            .saturating_add(sysvar_id_cost)
+            .saturating_add(std::cmp::max(sysvar_buf_cost, mem_op_base_cost));
+        invoke_context.compute_meter.consume_checked(cost)?;
 
         if var_addr >= ebpf::MM_INPUT_START
             && invoke_context
                 .get_feature_set()
-                .stricter_abi_and_runtime_constraints
+                .syscall_parameter_address_restrictions
         {
             return Err(SyscallError::InvalidPointer.into());
         }
+
+        let check_aligned = invoke_context.get_check_aligned();
+        let memory_mapping = invoke_context.memory_contexts.memory_mapping_mut()?;
         // Abort: "Not all bytes in VM memory range `[var_addr, var_addr + length)` are writable."
         translate_mut!(
             memory_mapping,
@@ -238,10 +218,12 @@ declare_builtin_function!(
             .checked_add(length)
             .ok_or(InstructionError::ArithmeticOverflow)?;
 
-        let cache = invoke_context.get_sysvar_cache();
 
         // "`2` if the sysvar data is not present in the Sysvar Cache."
-        let Some(sysvar_buf) = cache.sysvar_id_to_buffer(sysvar_id) else { return Ok(SYSVAR_NOT_FOUND) };
+        let cache = invoke_context.environment_config.sysvar_cache();
+        let Some(sysvar_buf) = cache.sysvar_id_to_buffer(sysvar_id) else {
+            return Ok(SYSVAR_NOT_FOUND)
+        };
 
         // "`1` if `offset + length` is greater than the length of the sysvar data."
         if let Some(sysvar_slice) = sysvar_buf.get(offset as usize..offset_length as usize) {

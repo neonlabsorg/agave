@@ -2,37 +2,37 @@ use {
     crate::{
         checks::{check_account_for_fee_with_commitment, check_unique_pubkeys},
         cli::{
-            log_instruction_custom_error, CliCommand, CliCommandInfo, CliConfig, CliError,
-            ProcessResult,
+            CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult,
+            log_instruction_custom_error,
         },
         compute_budget::{
-            simulate_and_update_compute_unit_limit, ComputeUnitConfig, WithComputeUnitConfig,
+            ComputeUnitConfig, WithComputeUnitConfig, simulate_and_update_compute_unit_limit,
         },
         feature::get_feature_activation_epoch,
         memo::WithMemo,
         nonce::check_nonce_account,
-        spend_utils::{resolve_spend_tx_and_check_account_balances, SpendAmount},
+        spend_utils::{SpendAmount, resolve_spend_tx_and_check_account_balances},
     },
-    clap::{value_t, App, AppSettings, Arg, ArgGroup, ArgMatches, SubCommand},
-    solana_account::{from_account, state_traits::StateMut, Account},
+    clap::{App, AppSettings, Arg, ArgGroup, ArgMatches, SubCommand, value_t},
+    solana_account::{Account, from_account, state_traits::StateMut},
     solana_clap_utils::{
-        compute_budget::{compute_unit_price_arg, ComputeUnitLimit, COMPUTE_UNIT_PRICE_ARG},
-        fee_payer::{fee_payer_arg, FEE_PAYER_ARG},
+        ArgConstant,
+        compute_budget::{COMPUTE_UNIT_PRICE_ARG, ComputeUnitLimit, compute_unit_price_arg},
+        fee_payer::{FEE_PAYER_ARG, fee_payer_arg},
         hidden_unless_forced,
         input_parsers::*,
         input_validators::*,
         keypair::{DefaultSigner, SignerIndex},
-        memo::{memo_arg, MEMO_ARG},
+        memo::{MEMO_ARG, memo_arg},
         nonce::*,
         offline::*,
-        ArgConstant,
     },
     solana_cli_output::{
-        self, display::BuildBalanceMessageConfig, return_signers_with_config, CliBalance,
-        CliEpochReward, CliStakeHistory, CliStakeHistoryEntry, CliStakeState, CliStakeType,
-        OutputFormat, ReturnSignersConfig,
+        self, CliBalance, CliEpochReward, CliStakeHistory, CliStakeHistoryEntry, CliStakeState,
+        CliStakeType, OutputFormat, ReturnSignersConfig, display::BuildBalanceMessageConfig,
+        return_signers_with_config,
     },
-    solana_clock::{Clock, Epoch, UnixTimestamp, SECONDS_PER_DAY},
+    solana_clock::{Clock, Epoch, SECONDS_PER_DAY, UnixTimestamp},
     solana_commitment_config::CommitmentConfig,
     solana_epoch_schedule::EpochSchedule,
     solana_message::Message,
@@ -817,7 +817,7 @@ pub fn parse_create_stake_account(
         )
     };
 
-    let amount = SpendAmount::new_from_matches(matches, "amount");
+    let amount = SpendAmount::new_from_matches(matches, "amount")?;
     let sign_only = matches.is_present(SIGN_ONLY_ARG.name);
     let dump_transaction_message = matches.is_present(DUMP_TRANSACTION_MESSAGE.name);
     let blockhash_query = BlockhashQuery::new_from_matches(matches);
@@ -1206,7 +1206,7 @@ pub fn parse_stake_withdraw_stake(
         pubkey_of_signer(matches, "stake_account_pubkey", wallet_manager)?.unwrap();
     let destination_account_pubkey =
         pubkey_of_signer(matches, "destination_account_pubkey", wallet_manager)?.unwrap();
-    let amount = SpendAmount::new_from_matches(matches, "amount");
+    let amount = SpendAmount::new_from_matches(matches, "amount")?;
     let sign_only = matches.is_present(SIGN_ONLY_ARG.name);
     let dump_transaction_message = matches.is_present(DUMP_TRANSACTION_MESSAGE.name);
     let blockhash_query = BlockhashQuery::new_from_matches(matches);
@@ -1499,15 +1499,24 @@ pub async fn process_create_stake_account(
             return Err(CliError::BadParameter(err_msg).into());
         }
 
-        let minimum_balance = rpc_client
+        let rent_exempt_balance = rpc_client
             .get_minimum_balance_for_rent_exemption(StakeStateV2::size_of())
             .await?;
-        if lamports < minimum_balance {
+        if lamports < rent_exempt_balance {
             return Err(CliError::BadParameter(format!(
-                "need at least {minimum_balance} lamports for stake account to be rent exempt, \
-                 provided lamports: {lamports}"
+                "need at least {rent_exempt_balance} lamports for stake account to be rent \
+                 exempt, provided lamports: {lamports}"
             ))
             .into());
+        }
+
+        let minimum_delegation = rpc_client.get_stake_minimum_delegation().await?;
+        let minimum_total_lamports = rent_exempt_balance.saturating_add(minimum_delegation);
+        if lamports < minimum_total_lamports {
+            eprintln!(
+                "Warning: need at least {minimum_total_lamports} lamports to delegate this stake \
+                 account, provided lamports: {lamports}"
+            );
         }
 
         if let Some(nonce_account) = &nonce_account {
@@ -1749,14 +1758,14 @@ pub async fn process_deactivate_stake_account(
                     return Err(CliError::BadParameter(format!(
                         "{stake_account_address} is not a delegated stake account",
                     ))
-                    .into())
+                    .into());
                 }
             },
             Err(err) => {
                 return Err(CliError::RpcRequestError(format!(
                     "Account data could not be deserialized to stake state: {err}"
                 ))
-                .into())
+                .into());
             }
         };
 
@@ -2422,11 +2431,7 @@ pub async fn process_stake_set_lockup(
 }
 
 fn u64_some_if_not_zero(n: u64) -> Option<u64> {
-    if n > 0 {
-        Some(n)
-    } else {
-        None
-    }
+    if n > 0 { Some(n) } else { None }
 }
 
 pub fn build_stake_state(
@@ -2436,12 +2441,14 @@ pub fn build_stake_state(
     stake_history: &StakeHistory,
     clock: &Clock,
     new_rate_activation_epoch: Option<Epoch>,
+    rent_exempt_reserve: u64,
     use_csv: bool,
 ) -> CliStakeState {
     match stake_state {
         StakeStateV2::Stake(
             Meta {
-                rent_exempt_reserve,
+                #[expect(deprecated)]
+                    rent_exempt_reserve: _,
                 authorized,
                 lockup,
             },
@@ -2489,7 +2496,7 @@ pub fn build_stake_state(
                 lockup,
                 use_lamports_unit,
                 current_epoch,
-                rent_exempt_reserve: Some(*rent_exempt_reserve),
+                rent_exempt_reserve: Some(rent_exempt_reserve),
                 active_stake: u64_some_if_not_zero(effective),
                 activating_stake: u64_some_if_not_zero(activating),
                 deactivating_stake: u64_some_if_not_zero(deactivating),
@@ -2507,7 +2514,8 @@ pub fn build_stake_state(
             ..CliStakeState::default()
         },
         StakeStateV2::Initialized(Meta {
-            rent_exempt_reserve,
+            #[expect(deprecated)]
+                rent_exempt_reserve: _,
             authorized,
             lockup,
         }) => {
@@ -2523,7 +2531,7 @@ pub fn build_stake_state(
                 authorized: Some(authorized.into()),
                 lockup,
                 use_lamports_unit,
-                rent_exempt_reserve: Some(*rent_exempt_reserve),
+                rent_exempt_reserve: Some(rent_exempt_reserve),
                 ..CliStakeState::default()
             }
         }
@@ -2723,7 +2731,9 @@ pub async fn get_account_stake_state(
                 &agave_feature_set::reduce_stake_warmup_cooldown::id(),
             )
             .await?;
-
+            let rent_exempt_balance = rpc_client
+                .get_minimum_balance_for_rent_exemption(stake_account.data.len())
+                .await?;
             let mut state = build_stake_state(
                 stake_account.lamports,
                 &stake_state,
@@ -2731,6 +2741,7 @@ pub async fn get_account_stake_state(
                 &stake_history,
                 &clock,
                 new_rate_activation_epoch,
+                rent_exempt_balance,
                 use_csv,
             );
 
@@ -2866,6 +2877,31 @@ pub async fn process_delegate_stake(
                 println!("--force supplied, ignoring: {err}");
             }
         }
+
+        if !force {
+            let stake_account = rpc_client.get_account(stake_account_pubkey).await?;
+            if stake_account.owner != stake::program::id() {
+                return Err(CliError::BadParameter(format!(
+                    "{stake_account_pubkey} is not a stake account",
+                ))
+                .into());
+            }
+
+            let rent_exempt_balance = rpc_client
+                .get_minimum_balance_for_rent_exemption(stake_account.data.len())
+                .await?;
+            let minimum_delegation = rpc_client.get_stake_minimum_delegation().await?;
+            let minimum_total_lamports = rent_exempt_balance.saturating_add(minimum_delegation);
+            let stake_account_lamports = stake_account.lamports;
+
+            if stake_account_lamports < minimum_total_lamports {
+                return Err(CliError::BadParameter(format!(
+                    "need at least {minimum_total_lamports} lamports to delegate this stake \
+                     account, available lamports: {stake_account_lamports}"
+                ))
+                .into());
+            }
+        }
     }
 
     let recent_blockhash = blockhash_query
@@ -2972,7 +3008,7 @@ mod tests {
         super::*,
         crate::{clap_app::get_clap_app, cli::parse_command},
         solana_hash::Hash,
-        solana_keypair::{keypair_from_seed, read_keypair_file, write_keypair, Keypair},
+        solana_keypair::{Keypair, keypair_from_seed, read_keypair_file, write_keypair},
         solana_presigner::Presigner,
         solana_rpc_client_nonce_utils::nonblocking::blockhash_query::Source,
         solana_signer::Signer,

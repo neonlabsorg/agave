@@ -1,30 +1,23 @@
-#![cfg_attr(
-    not(feature = "agave-unstable-api"),
-    deprecated(
-        since = "3.1.0",
-        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
-                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
-                acknowledge use of an interface that may break without warning."
-    )
-)]
+#![cfg(feature = "agave-unstable-api")]
 use {
     solana_bincode::limited_deserialize,
-    solana_bpf_loader_program::{deploy_program, execute},
     solana_instruction::error::InstructionError,
     solana_loader_v3_interface::state::UpgradeableLoaderState,
     solana_loader_v4_interface::{
+        DEPLOYMENT_COOLDOWN_IN_SLOTS,
         instruction::LoaderV4Instruction,
         state::{LoaderV4State, LoaderV4Status},
-        DEPLOYMENT_COOLDOWN_IN_SLOTS,
     },
     solana_program_runtime::{
+        deploy_program,
         invoke_context::InvokeContext,
-        loaded_programs::{ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType},
+        program_cache_entry::{ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType},
+        vm::execute,
     },
     solana_pubkey::Pubkey,
-    solana_sbpf::{declare_builtin_function, memory_region::MemoryMapping},
+    solana_sbpf::declare_builtin_function,
     solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4},
-    solana_svm_log_collector::{ic_logger_msg, LogCollector},
+    solana_svm_log_collector::{LogCollector, ic_logger_msg},
     solana_svm_measure::measure::Measure,
     solana_svm_type_overrides::sync::Arc,
     solana_transaction_context::{
@@ -219,7 +212,10 @@ fn process_instruction_set_program_length(
     let required_lamports = if new_size == 0 {
         0
     } else {
-        let rent = invoke_context.get_sysvar_cache().get_rent()?;
+        let rent = invoke_context
+            .environment_config
+            .sysvar_cache()
+            .get_rent()?;
         rent.minimum_balance(LoaderV4State::program_data_offset().saturating_add(new_size as usize))
             .max(1)
     };
@@ -281,7 +277,11 @@ fn process_instruction_deploy(invoke_context: &mut InvokeContext) -> Result<(), 
         &program,
         authority_address,
     )?;
-    let current_slot = invoke_context.get_sysvar_cache().get_clock()?.slot;
+    let current_slot = invoke_context
+        .environment_config
+        .sysvar_cache()
+        .get_clock()?
+        .slot;
 
     // Slot = 0 indicates that the program hasn't been deployed yet. So no need to check for the cooldown slots.
     // (Without this check, the program deployment is failing in freshly started test validators. That's
@@ -330,7 +330,11 @@ fn process_instruction_retract(invoke_context: &mut InvokeContext) -> Result<(),
         &program,
         authority_address,
     )?;
-    let current_slot = invoke_context.get_sysvar_cache().get_clock()?.slot;
+    let current_slot = invoke_context
+        .environment_config
+        .sysvar_cache()
+        .get_clock()?
+        .slot;
     if state.slot.saturating_add(DEPLOYMENT_COOLDOWN_IN_SLOTS) > current_slot {
         ic_logger_msg!(
             log_collector,
@@ -436,7 +440,6 @@ declare_builtin_function!(
         _arg2: u64,
         _arg3: u64,
         _arg4: u64,
-        _memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Box<dyn std::error::Error>> {
         process_instruction_inner(invoke_context)
     }
@@ -451,7 +454,9 @@ fn process_instruction_inner<'a>(
     let instruction_data = instruction_context.get_instruction_data();
     let program_id = instruction_context.get_program_key()?;
     if loader_v4::check_id(program_id) {
-        invoke_context.consume_checked(DEFAULT_COMPUTE_UNITS)?;
+        invoke_context
+            .compute_meter
+            .consume_checked(DEFAULT_COMPUTE_UNITS)?;
         match limited_deserialize(instruction_data, solana_packet::PACKET_DATA_SIZE as u64)? {
             LoaderV4Instruction::Write { offset, bytes } => {
                 process_instruction_write(invoke_context, offset, bytes)
@@ -492,7 +497,9 @@ fn process_instruction_inner<'a>(
                 ic_logger_msg!(log_collector, "Program is not deployed");
                 Err(Box::new(InstructionError::UnsupportedProgramId) as Box<dyn std::error::Error>)
             }
-            ProgramCacheEntryType::Loaded(executable) => execute(executable, invoke_context),
+            ProgramCacheEntryType::Loaded(executable) => {
+                execute(executable, invoke_context, &loaded_program)
+            }
             _ => {
                 Err(Box::new(InstructionError::UnsupportedProgramId) as Box<dyn std::error::Error>)
             }
@@ -506,20 +513,36 @@ mod tests {
     use {
         super::*,
         solana_account::{
-            create_account_shared_data_for_test, AccountSharedData, ReadableAccount,
-            WritableAccount,
+            AccountSharedData, ReadableAccount, WritableAccount,
+            create_account_shared_data_for_test,
         },
         solana_bpf_loader_program::test_utils,
         solana_clock::Slot,
         solana_instruction::AccountMeta,
         solana_program_runtime::invoke_context::mock_process_instruction,
+        solana_sbpf::program::BuiltinFunctionDefinition,
         solana_sysvar::{clock, rent},
         solana_transaction_context::IndexOfAccount,
         std::{fs::File, io::Read, path::Path},
     };
 
     fn process_instruction(
-        program_index: Option<IndexOfAccount>,
+        instruction_data: &[u8],
+        transaction_accounts: Vec<(Pubkey, AccountSharedData)>,
+        instruction_accounts: &[(IndexOfAccount, bool, bool)],
+        expected_result: Result<(), InstructionError>,
+    ) -> Vec<AccountSharedData> {
+        process_instruction_with_program_id(
+            &loader_v4::id(),
+            instruction_data,
+            transaction_accounts,
+            instruction_accounts,
+            expected_result,
+        )
+    }
+
+    fn process_instruction_with_program_id(
+        program_id: &Pubkey,
         instruction_data: &[u8],
         transaction_accounts: Vec<(Pubkey, AccountSharedData)>,
         instruction_accounts: &[(IndexOfAccount, bool, bool)],
@@ -537,13 +560,12 @@ mod tests {
             .collect::<Vec<_>>();
 
         mock_process_instruction(
-            &loader_v4::id(),
-            program_index,
+            program_id,
             instruction_data,
             transaction_accounts,
             instruction_accounts,
             expected_result,
-            Entrypoint::vm,
+            Entrypoint::register,
             |invoke_context| {
                 test_utils::load_all_invoked_programs(invoke_context);
             },
@@ -622,7 +644,6 @@ mod tests {
 
         // Error: Missing program account
         process_instruction(
-            None,
             &instruction,
             transaction_accounts.clone(),
             &[],
@@ -631,7 +652,6 @@ mod tests {
 
         // Error: Missing authority account
         process_instruction(
-            None,
             &instruction,
             transaction_accounts.clone(),
             &[(0, false, true)],
@@ -640,7 +660,6 @@ mod tests {
 
         // Error: Program not owned by loader
         process_instruction(
-            None,
             &instruction,
             transaction_accounts.clone(),
             &[(1, false, true), (1, true, false), (2, true, true)],
@@ -649,7 +668,6 @@ mod tests {
 
         // Error: Program is not writeable
         process_instruction(
-            None,
             &instruction,
             transaction_accounts.clone(),
             &[(0, false, false), (1, true, false), (2, true, true)],
@@ -658,7 +676,6 @@ mod tests {
 
         // Error: Authority did not sign
         process_instruction(
-            None,
             &instruction,
             transaction_accounts.clone(),
             &[(0, false, true), (1, false, false), (2, true, true)],
@@ -667,7 +684,6 @@ mod tests {
 
         // Error: Program is finalized
         process_instruction(
-            None,
             &instruction,
             transaction_accounts.clone(),
             &[(2, false, true), (1, true, false), (0, true, true)],
@@ -676,7 +692,6 @@ mod tests {
 
         // Error: Incorrect authority provided
         process_instruction(
-            None,
             &instruction,
             transaction_accounts,
             &[(0, false, true), (2, true, false), (2, true, true)],
@@ -720,7 +735,6 @@ mod tests {
 
         // Overwrite existing data
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Write {
                 offset: 2,
                 bytes: vec![8, 8, 8, 8],
@@ -733,7 +747,6 @@ mod tests {
 
         // Empty write
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Write {
                 offset: 2,
                 bytes: Vec::new(),
@@ -746,7 +759,6 @@ mod tests {
 
         // Error: Program is not retracted
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Write {
                 offset: 8,
                 bytes: vec![8, 8, 8, 8],
@@ -759,7 +771,6 @@ mod tests {
 
         // Error: Write out of bounds
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Write {
                 offset: transaction_accounts[0]
                     .1
@@ -817,7 +828,6 @@ mod tests {
 
         // Overwrite existing data
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Copy {
                 destination_offset: 1,
                 source_offset: 2,
@@ -831,7 +841,6 @@ mod tests {
 
         // Empty copy
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Copy {
                 destination_offset: 1,
                 source_offset: 2,
@@ -845,7 +854,6 @@ mod tests {
 
         // Error: Program is not retracted
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Copy {
                 destination_offset: 1,
                 source_offset: 2,
@@ -859,7 +867,6 @@ mod tests {
 
         // Error: Destination and source collide
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Copy {
                 destination_offset: 1,
                 source_offset: 2,
@@ -873,7 +880,6 @@ mod tests {
 
         // Error: Read out of bounds
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Copy {
                 destination_offset: 1,
                 source_offset: transaction_accounts[2]
@@ -892,7 +898,6 @@ mod tests {
 
         // Error: Write out of bounds
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Copy {
                 destination_offset: transaction_accounts[0]
                     .1
@@ -971,7 +976,6 @@ mod tests {
 
         // No change
         let accounts = process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength {
                 new_size: transaction_accounts[0]
                     .1
@@ -996,7 +1000,6 @@ mod tests {
             .1
             .set_lamports(smaller_program_lamports);
         let accounts = process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength {
                 new_size: transaction_accounts[0]
                     .1
@@ -1020,7 +1023,6 @@ mod tests {
             .1
             .set_lamports(larger_program_lamports);
         let accounts = process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength {
                 new_size: transaction_accounts[4]
                     .1
@@ -1041,7 +1043,6 @@ mod tests {
 
         // Decrease program account size, with a recipient
         let accounts = process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength {
                 new_size: transaction_accounts[0]
                     .1
@@ -1071,7 +1072,6 @@ mod tests {
 
         // Decrease program account size, without a recipient
         let accounts = process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength {
                 new_size: transaction_accounts[0]
                     .1
@@ -1093,7 +1093,6 @@ mod tests {
 
         // Close program account
         let accounts = process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 0 }).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (1, true, false), (2, false, true)],
@@ -1112,7 +1111,6 @@ mod tests {
 
         // Close uninitialized program account
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 0 }).unwrap(),
             transaction_accounts.clone(),
             &[(3, false, true), (1, true, false), (2, true, true)],
@@ -1121,7 +1119,6 @@ mod tests {
 
         // Error: Program not owned by loader
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 8 }).unwrap(),
             transaction_accounts.clone(),
             &[(1, false, true), (1, true, false), (2, true, true)],
@@ -1130,7 +1127,6 @@ mod tests {
 
         // Error: Program is not writeable
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 8 }).unwrap(),
             transaction_accounts.clone(),
             &[(3, false, false), (1, true, false), (2, true, true)],
@@ -1139,7 +1135,6 @@ mod tests {
 
         // Error: Close program account without a recipient
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 0 }).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (1, true, false)],
@@ -1148,7 +1143,6 @@ mod tests {
 
         // Error: Authority did not sign
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 8 }).unwrap(),
             transaction_accounts.clone(),
             &[(3, true, true), (1, false, false), (2, true, true)],
@@ -1157,7 +1151,6 @@ mod tests {
 
         // Error: Program is not retracted
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 8 }).unwrap(),
             transaction_accounts.clone(),
             &[(5, false, true), (1, true, false), (2, false, true)],
@@ -1166,7 +1159,6 @@ mod tests {
 
         // Error: Recipient is not writeable
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength { new_size: 0 }).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (1, true, false), (2, false, false)],
@@ -1175,7 +1167,6 @@ mod tests {
 
         // Error: Insufficient funds
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::SetProgramLength {
                 new_size: transaction_accounts[4]
                     .1
@@ -1240,7 +1231,6 @@ mod tests {
 
         // Deploy from its own data
         let accounts = process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Deploy).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (1, true, false)],
@@ -1256,7 +1246,6 @@ mod tests {
 
         // Error: Program was deployed recently, cooldown still in effect
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Deploy).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (1, true, false)],
@@ -1266,7 +1255,6 @@ mod tests {
 
         // Error: Program is uninitialized
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Deploy).unwrap(),
             transaction_accounts.clone(),
             &[(3, false, true), (1, true, false)],
@@ -1275,7 +1263,6 @@ mod tests {
 
         // Error: Program fails verification
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Deploy).unwrap(),
             transaction_accounts.clone(),
             &[(4, false, true), (1, true, false)],
@@ -1284,7 +1271,6 @@ mod tests {
 
         // Error: Program is deployed already
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Deploy).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (1, true, false)],
@@ -1331,7 +1317,6 @@ mod tests {
 
         // Retract program
         let accounts = process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Retract).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (1, true, false)],
@@ -1345,7 +1330,6 @@ mod tests {
 
         // Error: Program is uninitialized
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Retract).unwrap(),
             transaction_accounts.clone(),
             &[(2, false, true), (1, true, false)],
@@ -1354,7 +1338,6 @@ mod tests {
 
         // Error: Program is not deployed
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Retract).unwrap(),
             transaction_accounts.clone(),
             &[(3, false, true), (1, true, false)],
@@ -1364,7 +1347,6 @@ mod tests {
         // Error: Program was deployed recently, cooldown still in effect
         transaction_accounts[4].1 = clock(0);
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Retract).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (1, true, false)],
@@ -1418,7 +1400,6 @@ mod tests {
 
         // Transfer authority
         let accounts = process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::TransferAuthority).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (3, true, false), (4, true, false)],
@@ -1432,7 +1413,6 @@ mod tests {
 
         // Error: No new authority provided
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::TransferAuthority).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (3, true, false)],
@@ -1441,7 +1421,6 @@ mod tests {
 
         // Error: Program is uninitialized
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::TransferAuthority).unwrap(),
             transaction_accounts.clone(),
             &[(2, false, true), (3, true, false), (4, true, false)],
@@ -1450,7 +1429,6 @@ mod tests {
 
         // Error: New authority did not sign
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::TransferAuthority).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (3, true, false), (4, false, false)],
@@ -1459,7 +1437,6 @@ mod tests {
 
         // Error: Authority did not change
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::TransferAuthority).unwrap(),
             transaction_accounts,
             &[(0, false, true), (3, true, false), (3, true, false)],
@@ -1525,7 +1502,6 @@ mod tests {
 
         // Finalize program with a next version
         let accounts = process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Finalize).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (5, true, false), (1, false, false)],
@@ -1539,7 +1515,6 @@ mod tests {
 
         // Finalize program with itself as next version
         let accounts = process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Finalize).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (5, true, false), (0, false, false)],
@@ -1553,7 +1528,6 @@ mod tests {
 
         // Error: Program must be deployed to be finalized
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Finalize).unwrap(),
             transaction_accounts.clone(),
             &[(1, false, true), (5, true, false)],
@@ -1562,7 +1536,6 @@ mod tests {
 
         // Error: Program is uninitialized
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Finalize).unwrap(),
             transaction_accounts.clone(),
             &[(4, false, true), (5, true, false)],
@@ -1571,7 +1544,6 @@ mod tests {
 
         // Error: Next version not owned by loader
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Finalize).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (5, true, false), (5, false, false)],
@@ -1580,7 +1552,6 @@ mod tests {
 
         // Error: Program is uninitialized
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Finalize).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (5, true, false), (4, false, false)],
@@ -1589,7 +1560,6 @@ mod tests {
 
         // Error: Next version is finalized
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Finalize).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (5, true, false), (2, false, false)],
@@ -1598,7 +1568,6 @@ mod tests {
 
         // Error: Incorrect authority of next version
         process_instruction(
-            None,
             &bincode::serialize(&LoaderV4Instruction::Finalize).unwrap(),
             transaction_accounts.clone(),
             &[(0, false, true), (5, true, false), (3, false, false)],
@@ -1612,84 +1581,67 @@ mod tests {
     fn test_execute_program() {
         let program_address = Pubkey::new_unique();
         let authority_address = Pubkey::new_unique();
-        let transaction_accounts = vec![
-            (
-                program_address,
-                load_program_account_from_elf(
-                    authority_address,
-                    LoaderV4Status::Finalized,
-                    "sbpfv3_return_ok",
-                ),
-            ),
-            (
-                Pubkey::new_unique(),
-                AccountSharedData::new(10000000, 32, &program_address),
-            ),
-            (
-                Pubkey::new_unique(),
-                AccountSharedData::new(0, 0, &loader_v4::id()),
-            ),
-            (
-                Pubkey::new_unique(),
-                load_program_account_from_elf(
-                    authority_address,
-                    LoaderV4Status::Retracted,
-                    "sbpfv3_return_ok",
-                ),
-            ),
-            (
-                Pubkey::new_unique(),
-                load_program_account_from_elf(
-                    authority_address,
-                    LoaderV4Status::Finalized,
-                    "sbpfv0_verifier_err",
-                ),
-            ),
-        ];
 
         // Execute program
-        process_instruction(
-            Some(0),
+        let program_account = load_program_account_from_elf(
+            authority_address,
+            LoaderV4Status::Finalized,
+            "sbpfv3_return_ok",
+        );
+        process_instruction_with_program_id(
+            &program_address,
             &[0, 1, 2, 3],
-            transaction_accounts.clone(),
-            &[(1, false, true)],
+            vec![(program_address, program_account)],
+            &[(0, false, true)],
             Ok(()),
         );
 
         // Error: Program not owned by loader
-        process_instruction(
-            Some(1),
+        let program_account = AccountSharedData::new(10000000, 32, &program_address);
+        process_instruction_with_program_id(
+            &program_address,
             &[0, 1, 2, 3],
-            transaction_accounts.clone(),
-            &[(1, false, true)],
+            vec![(program_address, program_account)],
+            &[(0, false, true)],
             Err(InstructionError::UnsupportedProgramId),
         );
 
         // Error: Program is uninitialized
-        process_instruction(
-            Some(2),
+        let program_account = AccountSharedData::new(0, 0, &loader_v4::id());
+        process_instruction_with_program_id(
+            &program_address,
             &[0, 1, 2, 3],
-            transaction_accounts.clone(),
-            &[(1, false, true)],
+            vec![(program_address, program_account)],
+            &[(0, false, true)],
             Err(InstructionError::UnsupportedProgramId),
         );
 
         // Error: Program is not deployed
         // This is only checked in integration with load_program_accounts() in the SVM
-        process_instruction(
-            Some(3),
+        let program_account = load_program_account_from_elf(
+            authority_address,
+            LoaderV4Status::Retracted,
+            "sbpfv3_return_ok",
+        );
+        process_instruction_with_program_id(
+            &program_address,
             &[0, 1, 2, 3],
-            transaction_accounts.clone(),
-            &[(1, false, true)],
+            vec![(program_address, program_account)],
+            &[(0, false, true)],
             Ok(()),
         );
 
         // Error: Program fails verification
-        process_instruction(
-            Some(4),
+        let program_account = load_program_account_from_elf(
+            authority_address,
+            LoaderV4Status::Finalized,
+            "sbpfv0_verifier_err",
+        );
+        process_instruction_with_program_id(
+            &program_address,
             &[0, 1, 2, 3],
-            transaction_accounts,
-            &[(1, false, true)],
+            vec![(program_address, program_account)],
+            &[(0, false, true)],
             Err(InstructionError::UnsupportedProgramId),
         );
     }

@@ -1,6 +1,6 @@
 use {
     solana_builtins_default_costs::{
-        get_builtin_migration_feature_index, BuiltinMigrationFeatureIndex, MAYBE_BUILTIN_KEY,
+        BuiltinMigrationFeatureIndex, MAYBE_BUILTIN_KEY, get_builtin_migration_feature_index,
     },
     solana_packet::PACKET_DATA_SIZE,
     solana_pubkey::Pubkey,
@@ -66,7 +66,7 @@ mod test {
     use {
         super::*,
         solana_builtins_default_costs::{
-            get_migration_feature_id, BuiltinCost, MigratingBuiltinCost, MIGRATING_BUILTINS_COSTS,
+            BuiltinCost, MIGRATING_BUILTINS_COSTS, MigratingBuiltinCost, get_migration_feature_id,
         },
     };
 
@@ -93,14 +93,14 @@ mod test {
         // lookup same `index` will return cached data, will not lookup `program_id`
         // again
         assert_eq!(
-            test_store.get_program_kind(index, &solana_sdk_ids::loader_v4::id()),
+            test_store.get_program_kind(index, &solana_sdk_ids::bpf_loader_upgradeable::id()),
             ProgramKind::NotBuiltin
         );
 
         // not-migrating builtin
         index += 1;
         assert_eq!(
-            test_store.get_program_kind(index, &solana_sdk_ids::loader_v4::id()),
+            test_store.get_program_kind(index, &solana_sdk_ids::bpf_loader_upgradeable::id()),
             ProgramKind::Builtin,
         );
 

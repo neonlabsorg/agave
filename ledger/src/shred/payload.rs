@@ -1,7 +1,7 @@
 #[cfg(any(test, feature = "dev-context-only-utils"))]
 use {
     crate::shred::Nonce,
-    solana_perf::packet::{bytes::BufMut, BytesPacket, Meta, Packet},
+    solana_perf::packet::{BytesPacket, Meta, Packet, bytes::BufMut},
 };
 use {
     bytes::{Bytes, BytesMut},
@@ -10,9 +10,10 @@ use {
         ops::{Bound, Deref, DerefMut, RangeBounds, RangeFull},
         slice::SliceIndex,
     },
+    wincode::{SchemaRead, SchemaWrite},
 };
 
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug, Eq, SchemaRead, SchemaWrite)]
 pub struct Payload {
     pub bytes: Bytes,
 }
@@ -95,30 +96,6 @@ impl Payload {
             buffer.put_u32_le(nonce);
         }
         BytesPacket::new(buffer.freeze(), Meta::default())
-    }
-}
-
-pub(crate) mod serde_bytes_payload {
-    use {
-        super::Payload,
-        serde::{Deserialize, Deserializer, Serializer},
-        serde_bytes::ByteBuf,
-    };
-
-    pub(crate) fn serialize<S: Serializer>(
-        payload: &Payload,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(payload)
-    }
-
-    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Payload, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Deserialize::deserialize(deserializer)
-            .map(ByteBuf::into_vec)
-            .map(Payload::from)
     }
 }
 

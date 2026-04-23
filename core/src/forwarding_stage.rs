@@ -8,37 +8,35 @@ use {
     async_trait::async_trait,
     crossbeam_channel::{Receiver, RecvTimeoutError},
     packet_container::PacketContainer,
-    solana_client::connection_cache::ConnectionCache,
-    solana_connection_cache::client_connection::ClientConnection,
     solana_cost_model::cost_model::CostModel,
-    solana_fee_structure::{FeeBudgetLimits, FeeDetails},
+    solana_fee_structure::FeeDetails,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol, node::NodeMultihoming},
     solana_keypair::Keypair,
-    solana_net_utils::multihomed_sockets::BindIpAddrs,
+    solana_net_utils::{multihomed_sockets::BindIpAddrs, token_bucket::TokenBucket},
     solana_packet as packet,
-    solana_perf::data_budget::DataBudget,
     solana_poh::poh_recorder::PohRecorder,
-    solana_quic_definitions::NotifyKeyUpdate,
     solana_runtime::{
         bank::{Bank, CollectorFeeDetails},
         bank_forks::SharableBanks,
     },
     solana_runtime_transaction::{
-        runtime_transaction::RuntimeTransaction, transaction_meta::StaticMeta,
+        runtime_transaction::RuntimeTransaction, transaction_meta::TransactionMeta,
     },
-    solana_streamer::sendmmsg::{batch_send, SendPktsError},
+    solana_streamer::sendmmsg::{SendPktsError, batch_send},
+    solana_tls_utils::NotifyKeyUpdate,
     solana_tpu_client_next::{
+        ConnectionWorkersScheduler,
         connection_workers_scheduler::{
             BindTarget, ConnectionWorkersSchedulerConfig, Fanout, StakeIdentity,
         },
         leader_updater::LeaderUpdater,
         transaction_batch::TransactionBatch,
-        ConnectionWorkersScheduler,
     },
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransportError,
     std::{
         net::{SocketAddr, UdpSocket},
+        num::NonZeroUsize,
         sync::{Arc, RwLock},
         thread::{Builder, JoinHandle},
         time::{Duration, Instant},
@@ -52,23 +50,17 @@ use {
 
 mod packet_container;
 
-/// [`ForwardingClientOption`] enum represents the available client types for
-/// TPU communication:
-/// * [`ConnectionCacheClient`]: Uses a shared [`ConnectionCache`] to manage
-///   connections.
-/// * [`TpuClientNextClient`]: Relies on the `tpu-client-next` crate.
-pub enum ForwardingClientOption<'a> {
-    ConnectionCache(Arc<ConnectionCache>),
-    TpuClientNext(
-        (
-            &'a Keypair,
-            Box<[UdpSocket]>,
-            RuntimeHandle,
-            CancellationToken,
-            Arc<NodeMultihoming>,
-        ),
-    ),
+/// [`ForwardingClientConfig`] is the config for `tpu-client-next` instance.
+pub struct ForwardingClientConfig<'a> {
+    pub stake_identity: &'a Keypair,
+    pub tpu_client_sockets: Box<[UdpSocket]>,
+    pub runtime_handle: RuntimeHandle,
+    pub cancel: CancellationToken,
+    pub node_multihoming: Arc<NodeMultihoming>,
 }
+
+/// Maximum forwarding rate in bytes per second.
+const MAX_BYTES_PER_SECOND: u64 = 12_000_000;
 
 /// Value chosen because it was used historically, at some point
 /// was found to be optimal. If we need to improve performance
@@ -132,72 +124,50 @@ pub(crate) struct SpawnForwardingStageResult {
 
 pub(crate) fn spawn_forwarding_stage(
     receiver: Receiver<(BankingPacketBatch, bool)>,
-    client: ForwardingClientOption<'_>,
+    tpu_forwarding_client_config: ForwardingClientConfig<'_>,
     vote_client_udp_socket: UdpSocket,
     sharable_banks: SharableBanks,
     forward_address_getter: ForwardAddressGetter,
-    data_budget: DataBudget,
 ) -> SpawnForwardingStageResult {
     let vote_client = VoteClient::new(vote_client_udp_socket, forward_address_getter.clone());
-    match client {
-        ForwardingClientOption::ConnectionCache(connection_cache) => {
-            let non_vote_client =
-                ConnectionCacheClient::new(connection_cache.clone(), forward_address_getter);
-            let forwarding_stage = ForwardingStage::new(
-                receiver,
-                vote_client,
-                Box::new([non_vote_client]),
-                sharable_banks,
-                data_budget,
-                None,
-            );
-            SpawnForwardingStageResult {
-                join_handle: Builder::new()
-                    .name("solFwdStage".to_string())
-                    .spawn(move || forwarding_stage.run())
-                    .unwrap(),
-                client_updater: connection_cache as Arc<dyn NotifyKeyUpdate + Send + Sync>,
-            }
-        }
-        ForwardingClientOption::TpuClientNext((
-            stake_identity,
-            tpu_client_sockets,
-            runtime_handle,
-            cancel,
-            node_multihoming,
-        )) => {
-            // Create TPU clients for each socket provided.
-            // Number of clients is same as number of bind IP addresses.
-            let non_vote_clients: Box<[TpuClientNextClient]> = tpu_client_sockets
-                .into_vec()
-                .into_iter()
-                .map(|socket| {
-                    TpuClientNextClient::new(
-                        runtime_handle.clone(),
-                        forward_address_getter.clone(),
-                        Some(stake_identity),
-                        socket,
-                        cancel.clone(),
-                    )
-                })
-                .collect();
-            let forwarding_stage = ForwardingStage::new(
-                receiver,
-                vote_client,
-                non_vote_clients.clone(),
-                sharable_banks,
-                data_budget,
-                Some(node_multihoming.bind_ip_addrs.clone()),
-            );
-            SpawnForwardingStageResult {
-                join_handle: Builder::new()
-                    .name("solFwdStage".to_string())
-                    .spawn(move || forwarding_stage.run())
-                    .unwrap(),
-                client_updater: Arc::new(UpdateHandles(non_vote_clients))
-                    as Arc<dyn NotifyKeyUpdate + Send + Sync>,
-            }
-        }
+
+    let ForwardingClientConfig {
+        stake_identity,
+        tpu_client_sockets,
+        runtime_handle,
+        cancel,
+        node_multihoming,
+    } = tpu_forwarding_client_config;
+
+    // Create TPU clients for each socket provided.
+    // Number of clients is same as number of bind IP addresses.
+    let non_vote_clients: Box<[TpuClientNextClient]> = tpu_client_sockets
+        .into_vec()
+        .into_iter()
+        .map(|socket| {
+            TpuClientNextClient::new(
+                runtime_handle.clone(),
+                forward_address_getter.clone(),
+                Some(stake_identity),
+                socket,
+                cancel.clone(),
+            )
+        })
+        .collect();
+    let forwarding_stage = ForwardingStage::new(
+        receiver,
+        vote_client,
+        non_vote_clients.clone(),
+        sharable_banks,
+        Some(node_multihoming.bind_ip_addrs.clone()),
+    );
+    SpawnForwardingStageResult {
+        join_handle: Builder::new()
+            .name("solFwdStage".to_string())
+            .spawn(move || forwarding_stage.run())
+            .unwrap(),
+        client_updater: Arc::new(UpdateHandles(non_vote_clients))
+            as Arc<dyn NotifyKeyUpdate + Send + Sync>,
     }
 }
 
@@ -215,7 +185,7 @@ struct ForwardingStage<VoteClient: ForwardingClient, NonVoteClient: ForwardingCl
     sharable_banks: SharableBanks,
     vote_client: VoteClient,
     non_vote_clients: Box<[NonVoteClient]>,
-    data_budget: DataBudget,
+    data_budget: TokenBucket,
     metrics: ForwardingStageMetrics,
     bind_ip_addrs: Option<Arc<BindIpAddrs>>,
 }
@@ -228,9 +198,13 @@ impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
         vote_client: VoteClient,
         non_vote_clients: Box<[NonVoteClient]>,
         sharable_banks: SharableBanks,
-        data_budget: DataBudget,
         bind_ip_addrs: Option<Arc<BindIpAddrs>>,
     ) -> Self {
+        let data_budget = TokenBucket::new(
+            MAX_BYTES_PER_SECOND,
+            MAX_BYTES_PER_SECOND,
+            MAX_BYTES_PER_SECOND as f64,
+        );
         Self {
             receiver,
             packet_container: PacketContainer::with_capacity(4 * 4096),
@@ -291,9 +265,8 @@ impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
         is_tpu_vote_batch: bool,
         bank: &Bank,
     ) {
-        let enable_static_instruction_limit = bank
-            .feature_set
-            .is_active(&agave_feature_set::static_instruction_limit::id());
+        let enable_instruction_accounts_limit =
+            bank.feature_set.snapshot().limit_instruction_accounts;
         for batch in packet_batches.iter() {
             for packet in batch
                 .iter()
@@ -316,7 +289,7 @@ impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
                 // If any steps fail, drop the packet.
                 let Some(priority) = SanitizedTransactionView::try_new_sanitized(
                     packet_data,
-                    enable_static_instruction_limit,
+                    enable_instruction_accounts_limit,
                 )
                 .map_err(|_| ())
                 .and_then(|transaction| {
@@ -363,7 +336,6 @@ impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
     /// dropped.
     fn forward_buffered_packets(&mut self) {
         self.metrics.did_something |= !self.packet_container.is_empty();
-        self.refresh_data_budget();
 
         let mut non_vote_batch = Vec::with_capacity(FORWARD_BATCH_SIZE);
         let mut vote_batch = Vec::with_capacity(FORWARD_BATCH_SIZE);
@@ -381,7 +353,11 @@ impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
         // Loop through packets creating batches of packets to forward.
         while let Some(packet) = self.packet_container.pop_max() {
             // If it exceeds our data-budget, drop.
-            if !self.data_budget.take(packet.meta().size) {
+            if self
+                .data_budget
+                .consume_tokens(packet.meta().size as u64)
+                .is_err()
+            {
                 self.metrics.votes_dropped_on_data_budget +=
                     usize::from(packet.meta().is_simple_vote_tx());
                 self.metrics.non_votes_dropped_on_data_budget +=
@@ -432,21 +408,6 @@ impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
                 self.metrics.non_votes_dropped_on_send += num_non_votes;
             }
         }
-    }
-
-    /// Re-fill the data budget if enough time has passed
-    fn refresh_data_budget(&self) {
-        const INTERVAL_MS: u64 = 100;
-        // 12 MB outbound limit per second
-        const MAX_BYTES_PER_SECOND: usize = 12_000_000;
-        const MAX_BYTES_PER_INTERVAL: usize = MAX_BYTES_PER_SECOND * INTERVAL_MS as usize / 1000;
-        const MAX_BYTES_BUDGET: usize = MAX_BYTES_PER_INTERVAL * 5;
-        self.data_budget.update(INTERVAL_MS, |bytes| {
-            std::cmp::min(
-                bytes.saturating_add(MAX_BYTES_PER_INTERVAL),
-                MAX_BYTES_BUDGET,
-            )
-        });
     }
 }
 
@@ -521,47 +482,6 @@ impl ForwardingClient for VoteClient {
     }
 }
 
-#[derive(Clone)]
-struct ConnectionCacheClient {
-    connection_cache: Arc<ConnectionCache>,
-    forward_address_getter: ForwardAddressGetter,
-}
-
-impl ConnectionCacheClient {
-    fn new(
-        connection_cache: Arc<ConnectionCache>,
-        forward_address_getter: ForwardAddressGetter,
-    ) -> Self {
-        Self {
-            connection_cache,
-            forward_address_getter,
-        }
-    }
-    fn get_next_valid_leader(&self) -> Option<SocketAddr> {
-        let node_addresses = self
-            .forward_address_getter
-            .get_non_vote_forwarding_addresses(
-                NUM_LOOKAHEAD_LEADERS,
-                self.connection_cache.protocol(),
-            );
-        node_addresses.first().copied()
-    }
-}
-
-impl ForwardingClient for ConnectionCacheClient {
-    fn send_transactions_in_batch(
-        &self,
-        wire_transactions: Vec<Vec<u8>>,
-    ) -> Result<(), ForwardingClientError> {
-        let Some(current_address) = self.get_next_valid_leader() else {
-            return Err(ForwardingClientError::LeaderContactMissing);
-        };
-        let conn = self.connection_cache.get_connection(&current_address);
-        conn.send_data_batch_async(wire_transactions)?;
-        Ok(())
-    }
-}
-
 #[async_trait]
 impl LeaderUpdater for ForwardAddressGetter {
     fn next_leaders(&mut self, lookahead_slots: usize) -> Vec<SocketAddr> {
@@ -589,7 +509,7 @@ impl TpuClientNextClient {
     ) -> Self {
         // For now use large channel, the more suitable size to be found later.
         let (sender, receiver) = mpsc::channel(128);
-        let leader_updater = forward_address_getter.clone();
+        let leader_updater = forward_address_getter;
 
         let config = Self::create_config(bind_socket, stake_identity);
         let (update_certificate_sender, update_certificate_receiver) = watch::channel(None);
@@ -603,7 +523,7 @@ impl TpuClientNextClient {
         runtime_handle.spawn(scheduler.get_stats().report_to_influxdb(
             "forwarding-stage-tpu-client",
             METRICS_REPORTING_INTERVAL,
-            cancel.clone(),
+            cancel,
         ));
         let _handle = runtime_handle.spawn(scheduler.run(config));
         Self {
@@ -621,7 +541,7 @@ impl TpuClientNextClient {
             stake_identity: stake_identity.map(StakeIdentity::new),
             // Cache size of 128 covers all nodes above the P90 slot count threshold,
             // which together account for ~75% of total slots in the epoch.
-            num_connections: 128,
+            num_connections: NonZeroUsize::new(128).unwrap(),
             skip_check_transaction_age: true,
             worker_channel_size: 2,
             max_reconnect_attempts: 4,
@@ -631,6 +551,7 @@ impl TpuClientNextClient {
                 send: 1,
                 connect: 4,
             },
+            override_initial_congestion_window: None,
         }
     }
 }
@@ -673,15 +594,13 @@ fn calculate_priority(
     transaction: &RuntimeTransaction<SanitizedTransactionView<&[u8]>>,
     bank: &Bank,
 ) -> Option<u64> {
-    let compute_budget_limits = transaction
-        .compute_budget_instruction_details()
-        .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set)
+    let transaction_configuration = transaction
+        .transaction_configuration(&bank.feature_set)
         .ok()?;
-    let fee_budget_limits = FeeBudgetLimits::from(compute_budget_limits);
 
     // Manually estimate fee here since currently interface doesn't allow a on SVM type.
     // Doesn't need to be 100% accurate so long as close and consistent.
-    let prioritization_fee = fee_budget_limits.prioritization_fee;
+    let prioritization_fee = transaction_configuration.priority_fee_lamports;
     let signature_details = transaction.signature_details();
     let signature_fee = signature_details
         .total_signatures()
@@ -935,7 +854,6 @@ mod tests {
             vote_mock_client.clone(),
             Box::new([non_vote_mock_client.clone()]),
             sharable_banks,
-            DataBudget::default(),
             None,
         );
 

@@ -1,17 +1,18 @@
 //! The `bigtable` subcommand
 use {
     crate::{
+        LoadAndProcessLedgerOutput,
         args::{load_genesis_arg, snapshot_args},
         ledger_path::canonicalize_ledger_path,
         load_and_process_ledger_or_exit, open_genesis_config_by,
         output::{
-            encode_confirmed_block, CliBlockWithEntries, CliEntries,
-            EncodedConfirmedBlockWithEntries,
+            CliBlockWithEntries, CliEntries, EncodedConfirmedBlockWithEntries,
+            encode_confirmed_block,
         },
-        parse_process_options, LoadAndProcessLedgerOutput,
+        parse_process_options,
     },
     clap::{
-        value_t, value_t_or_exit, values_t_or_exit, App, AppSettings, Arg, ArgMatches, SubCommand,
+        App, AppSettings, Arg, ArgMatches, SubCommand, value_t, value_t_or_exit, values_t_or_exit,
     },
     crossbeam_channel::unbounded,
     futures::stream::FuturesUnordered,
@@ -22,11 +23,11 @@ use {
         input_validators::{is_parsable, is_slot, is_valid_pubkey},
     },
     solana_cli_output::{
-        display::println_transaction, CliBlock, CliTransaction, CliTransactionConfirmation,
-        OutputFormat,
+        CliBlock, CliTransaction, CliTransactionConfirmation, OutputFormat,
+        display::println_transaction,
     },
     solana_clock::Slot,
-    solana_entry::entry::{create_ticks, Entry},
+    solana_entry::entry::{Entry, create_ticks},
     solana_hash::Hash,
     solana_keypair::keypair_from_seed,
     solana_ledger::{
@@ -47,7 +48,7 @@ use {
         process::exit,
         result::Result,
         str::FromStr,
-        sync::{atomic::AtomicBool, Arc, Mutex},
+        sync::{Arc, Mutex, atomic::AtomicBool},
     },
 };
 
@@ -350,7 +351,7 @@ async fn shreds(
                     let parent_blockhash = Hash::from_str(&block.previous_blockhash)?;
                     let virtual_ticks_entries =
                         create_ticks(num_virtual_ticks, num_hashes_per_tick, parent_blockhash);
-                    entries.extend(virtual_ticks_entries.into_iter());
+                    entries.extend(virtual_ticks_entries);
                 }
 
                 // Create transaction entries
@@ -361,7 +362,7 @@ async fn shreds(
                     hash: Hash::default(),
                     transactions: vec![tx_with_meta.get_transaction()],
                 });
-                entries.extend(transaction_entries.into_iter());
+                entries.extend(transaction_entries);
 
                 // Create the tick entries for this slot
                 //
@@ -382,7 +383,7 @@ async fn shreds(
                         transactions: vec![],
                     }
                 });
-                entries.extend(tick_entries.into_iter());
+                entries.extend(tick_entries);
 
                 entries
             }

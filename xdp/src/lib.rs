@@ -1,12 +1,4 @@
-#![cfg_attr(
-    not(feature = "agave-unstable-api"),
-    deprecated(
-        since = "3.1.0",
-        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
-                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
-                acknowledge use of an interface that may break without warning."
-    )
-)]
+#![cfg(feature = "agave-unstable-api")]
 // Activate some of the Rust 2024 lints to make the future migration easier.
 #![warn(if_let_rescope)]
 #![warn(keyword_idents_2024)]
@@ -17,6 +9,10 @@
 
 #[cfg(target_os = "linux")]
 pub mod device;
+#[cfg(target_os = "linux")]
+pub mod gre;
+#[cfg(target_os = "linux")]
+pub(crate) mod lpm;
 #[cfg(target_os = "linux")]
 pub mod netlink;
 #[cfg(target_os = "linux")]
@@ -34,9 +30,11 @@ pub mod tx_loop;
 #[cfg(target_os = "linux")]
 pub mod umem;
 
+pub mod transmitter;
+
 #[cfg(target_os = "linux")]
 pub use program::load_xdp_program;
-use std::io;
+use std::{io, net::Ipv4Addr};
 
 #[cfg(target_os = "linux")]
 pub fn set_cpu_affinity(cpus: impl IntoIterator<Item = usize>) -> Result<(), io::Error> {
@@ -62,5 +60,51 @@ pub fn set_cpu_affinity(cpus: impl IntoIterator<Item = usize>) -> Result<(), io:
 
 #[cfg(not(target_os = "linux"))]
 pub fn set_cpu_affinity(_cpus: impl IntoIterator<Item = usize>) -> Result<(), io::Error> {
+    unimplemented!()
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_cpu() -> Result<usize, io::Error> {
+    unsafe {
+        let result = libc::sched_getcpu();
+        if result < 0 {
+            assert_eq!(result, -1);
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result as usize)
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_cpu() -> Result<usize, io::Error> {
+    unimplemented!()
+}
+
+/// Returns the IPv4 address of the specified network interface.
+///
+/// If the interface is part of a bonded interface, returns the master's IPv4 address.
+#[cfg(target_os = "linux")]
+pub fn interface_ipv4(interface: &str) -> Result<Ipv4Addr, io::Error> {
+    if let Some(ip) = crate::transmitter::master_ip_if_bonded(interface) {
+        Ok(ip)
+    } else {
+        crate::device::NetworkDevice::new(interface)?.ipv4_addr()
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn interface_ipv4(_interface: &str) -> Result<Ipv4Addr, io::Error> {
+    unimplemented!()
+}
+
+/// Returns the IPv4 address of the device associated with the default route.
+#[cfg(target_os = "linux")]
+pub fn default_device_ipv4() -> Result<Ipv4Addr, io::Error> {
+    crate::device::NetworkDevice::new_from_default_route()?.ipv4_addr()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn default_device_ipv4() -> Result<Ipv4Addr, io::Error> {
     unimplemented!()
 }

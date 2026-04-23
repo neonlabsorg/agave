@@ -7,6 +7,7 @@ use {
     solana_message::AccountKeys,
     solana_pubkey::Pubkey,
     solana_sdk_ids::{ed25519_program, secp256k1_program, secp256r1_program, system_program},
+    solana_transaction::versioned::TransactionVersion,
 };
 
 mod sanitized_message;
@@ -20,6 +21,9 @@ static_assertions::const_assert_eq!(
 const NONCED_TX_MARKER_IX_INDEX: u8 = 0;
 
 pub trait SVMStaticMessage {
+    /// Get the transaction version.
+    fn version(&self) -> TransactionVersion;
+
     /// Return the number of transaction-level signatures in the message.
     fn num_transaction_signatures(&self) -> u64;
     /// Return the number of ed25519 precompile signatures in the message.
@@ -96,7 +100,7 @@ pub trait SVMMessage: Debug + SVMStaticMessage {
     }
 
     /// If the message uses a durable nonce, return the pubkey of the nonce account
-    fn get_durable_nonce(&self, require_static_nonce_account: bool) -> Option<&Pubkey> {
+    fn get_durable_nonce(&self) -> Option<&Pubkey> {
         let account_keys = self.account_keys();
         self.instructions_iter()
             .nth(usize::from(NONCED_TX_MARKER_IX_INDEX))
@@ -119,9 +123,7 @@ pub trait SVMMessage: Debug + SVMStaticMessage {
             .and_then(|ix| {
                 ix.accounts.first().and_then(|idx| {
                     let index = usize::from(*idx);
-                    if (require_static_nonce_account && index >= self.static_account_keys().len())
-                        || !self.is_writable(index)
-                    {
+                    if index >= self.static_account_keys().len() || !self.is_writable(index) {
                         None
                     } else {
                         account_keys.get(index)

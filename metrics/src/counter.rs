@@ -143,21 +143,13 @@ impl Counter {
         let v = env::var("SOLANA_DEFAULT_METRICS_RATE")
             .map(|x| x.parse().unwrap_or(0))
             .unwrap_or(0);
-        if v == 0 {
-            DEFAULT_METRICS_RATE
-        } else {
-            v
-        }
+        if v == 0 { DEFAULT_METRICS_RATE } else { v }
     }
     fn default_log_rate() -> usize {
         let v = env::var("SOLANA_DEFAULT_LOG_RATE")
             .map(|x| x.parse().unwrap_or(DEFAULT_LOG_RATE))
             .unwrap_or(DEFAULT_LOG_RATE);
-        if v == 0 {
-            DEFAULT_LOG_RATE
-        } else {
-            v
-        }
+        if v == 0 { DEFAULT_LOG_RATE } else { v }
     }
     pub fn init(&mut self) {
         #![allow(deprecated)]
@@ -207,7 +199,7 @@ mod tests {
         serial_test::serial,
         std::{
             env,
-            sync::{atomic::Ordering, RwLock},
+            sync::{RwLock, atomic::Ordering},
         },
     };
 
@@ -258,7 +250,7 @@ mod tests {
     fn test_metricsrate() {
         try_init_logger_at_level_info().ok();
         let _readlock = get_env_lock().read();
-        env::remove_var("SOLANA_DEFAULT_METRICS_RATE");
+        unsafe { env::remove_var("SOLANA_DEFAULT_METRICS_RATE") };
         let mut counter = create_counter!("test", 1000, 0);
         counter.init();
         assert_eq!(
@@ -272,7 +264,7 @@ mod tests {
     fn test_metricsrate_env() {
         try_init_logger_at_level_info().ok();
         let _writelock = get_env_lock().write();
-        env::set_var("SOLANA_DEFAULT_METRICS_RATE", "50");
+        unsafe { env::set_var("SOLANA_DEFAULT_METRICS_RATE", "50") };
         let mut counter = create_counter!("test", 1000, 0);
         counter.init();
         assert_eq!(counter.metricsrate.load(Ordering::Relaxed), 50);
@@ -314,12 +306,12 @@ mod tests {
         assert_ne!(DEFAULT_LOG_RATE, 0);
         let _writelock = get_env_lock().write();
         let mut counter = create_counter!("test_lograte_env", 0, 1);
-        env::set_var("SOLANA_DEFAULT_LOG_RATE", "50");
+        unsafe { env::set_var("SOLANA_DEFAULT_LOG_RATE", "50") };
         counter.init();
         assert_eq!(counter.lograte.load(Ordering::Relaxed), 50);
 
         let mut counter2 = create_counter!("test_lograte_env", 0, 1);
-        env::set_var("SOLANA_DEFAULT_LOG_RATE", "0");
+        unsafe { env::set_var("SOLANA_DEFAULT_LOG_RATE", "0") };
         counter2.init();
         assert_eq!(counter2.lograte.load(Ordering::Relaxed), DEFAULT_LOG_RATE);
     }

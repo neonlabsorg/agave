@@ -11,25 +11,24 @@ use {
 pub use {
     serde_json::Value, // used in ParsedInstruction
     solana_account_decoder_client_types::{
-        token::UiTokenAmount,
         ParsedAccount, // used in UiAccountData
         UiAccount,
         UiAccountData,     // used in UiAccount
         UiAccountEncoding, // used in UiAccountData
+        token::UiTokenAmount,
     },
     solana_fee_calculator::{FeeCalculator, FeeRateGovernor},
     solana_reward_info::RewardType,    // used in Reward
     solana_transaction as transaction, // used in EncodedTransaction (may as well re-export the whole crate)
     solana_transaction_error::{TransactionError, TransactionResult},
     solana_transaction_status_client_types::{
-        option_serializer::OptionSerializer, // used in UiTransactionStatusMeta
-        EncodedTransaction,                  // used in EncodedTransactionWithStatusMeta
-        EncodedTransactionWithStatusMeta,    // used in UiConfirmedBlock
+        EncodedTransaction,               // used in EncodedTransactionWithStatusMeta
+        EncodedTransactionWithStatusMeta, // used in UiConfirmedBlock
         ParsedAccount as TransactionParsedAccount, // used in UiAccountsList
-        ParsedInstruction,                   // used in UiParsedInstruction
-        Reward,                              // used in Rewards
-        Rewards,                             // used in UiConfirmedBlock
-        TransactionBinaryEncoding,           // used in EncodedTransaction
+        ParsedInstruction,                // used in UiParsedInstruction
+        Reward,                           // used in Rewards
+        Rewards,                          // used in UiConfirmedBlock
+        TransactionBinaryEncoding,        // used in EncodedTransaction
         TransactionConfirmationStatus,
         UiAccountsList,        // used in EncodedTransaction
         UiCompiledInstruction, // used in UiInstruction
@@ -44,6 +43,7 @@ pub use {
         UiTransactionReturnData,
         UiTransactionStatusMeta, // used in EncodedTransactionWithStatusMeta
         UiTransactionTokenBalance,
+        option_serializer::OptionSerializer, // used in UiTransactionStatusMeta
     },
 };
 
@@ -317,6 +317,8 @@ pub struct RpcContactInfo {
     pub pubsub: Option<SocketAddr>,
     /// Software version
     pub version: Option<String>,
+    /// Client ID
+    pub client_id: Option<String>,
     /// First 4 bytes of the FeatureSet identifier
     pub feature_set: Option<u32>,
     /// Shred version
@@ -404,8 +406,20 @@ pub struct RpcVoteAccountInfo {
     /// The current stake, in lamports, delegated to this vote account
     pub activated_stake: u64,
 
-    /// An 8-bit integer used as a fraction (commission/MAX_U8) for rewards payout
+    /// An 8-bit unsigned integer used as a fraction (commission/100) for
+    /// rewards payout. Before SIMD-0291 activation, this is the native
+    /// commission value. After activation, this is derived from basis
+    /// points with: `bps.div_ceil(100).min(255)`.
     pub commission: u8,
+
+    /// A 16-bit unsigned integer used as the raw basis points for rewards
+    /// payout. Before SIMD-0291 activation, this is derived from the
+    /// percentage commission: `percent * 100`. After activation, this is the
+    /// native basis points value stored in vote state.
+    ///
+    /// Note: Field is `None` when querying a node that predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inflation_rewards_commission_bps: Option<u16>,
 
     /// Whether this account is staked for the current epoch
     pub epoch_vote_account: bool,
@@ -496,6 +510,8 @@ pub struct RpcConfirmedTransactionStatusWithSignature {
     pub memo: Option<String>,
     pub block_time: Option<UnixTimestamp>,
     pub confirmation_status: Option<TransactionConfirmationStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_index: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,6 +532,8 @@ pub struct RpcInflationReward {
     pub amount: u64,            // lamports
     pub post_balance: u64,      // lamports
     pub commission: Option<u8>, // Vote account commission when the reward was credited
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commission_bps: Option<u16>, // Vote account commission in basis points (SIMD-0291)
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug, Error, Eq, PartialEq)]
@@ -543,6 +561,7 @@ impl From<ConfirmedTransactionStatusWithSignature> for RpcConfirmedTransactionSt
             err,
             memo,
             block_time,
+            index,
         } = value;
         Self {
             signature: signature.to_string(),
@@ -551,6 +570,7 @@ impl From<ConfirmedTransactionStatusWithSignature> for RpcConfirmedTransactionSt
             memo,
             block_time,
             confirmation_status: None,
+            transaction_index: Some(index),
         }
     }
 }
@@ -630,5 +650,28 @@ pub mod tests {
         });
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_rpc_confirmed_transaction_status_with_signature_from() {
+        let signature = solana_signature::Signature::from([1u8; 64]);
+        let input = ConfirmedTransactionStatusWithSignature {
+            signature,
+            slot: 123,
+            err: None,
+            memo: Some("test memo".to_string()),
+            block_time: Some(1234567890),
+            index: 42,
+        };
+
+        let result: RpcConfirmedTransactionStatusWithSignature = input.into();
+
+        assert_eq!(result.signature, signature.to_string());
+        assert_eq!(result.slot, 123);
+        assert_eq!(result.err, None);
+        assert_eq!(result.memo, Some("test memo".to_string()));
+        assert_eq!(result.block_time, Some(1234567890));
+        assert_eq!(result.confirmation_status, None);
+        assert_eq!(result.transaction_index, Some(42));
     }
 }

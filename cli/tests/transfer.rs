@@ -2,17 +2,17 @@
 use {
     solana_cli::{
         check_balance,
-        cli::{process_command, request_and_confirm_airdrop, CliCommand, CliConfig},
+        cli::{CliCommand, CliConfig, process_command, request_and_confirm_airdrop},
         spend_utils::SpendAmount,
         test_utils::check_ready,
     },
-    solana_cli_output::{parse_sign_only_reply_string, OutputFormat},
+    solana_cli_output::{OutputFormat, parse_sign_only_reply_string},
     solana_client::nonblocking::blockhash_query::Source,
     solana_commitment_config::CommitmentConfig,
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_faucet::faucet::run_local_faucet_with_unique_port_for_tests,
     solana_fee_structure::FeeStructure,
-    solana_keypair::{keypair_from_seed, Keypair},
+    solana_keypair::{Keypair, keypair_from_seed},
     solana_message::Message,
     solana_native_token::LAMPORTS_PER_SOL,
     solana_net_utils::SocketAddrSpace,
@@ -20,25 +20,24 @@ use {
     solana_pubkey::Pubkey,
     solana_rpc_client::nonblocking::rpc_client::RpcClient,
     solana_rpc_client_nonce_utils::nonblocking::blockhash_query::BlockhashQuery,
-    solana_signer::{null_signer::NullSigner, Signer},
+    solana_signer::{Signer, null_signer::NullSigner},
     solana_stake_interface as stake,
     solana_system_interface::instruction as system_instruction,
     solana_test_validator::TestValidator,
     test_case::test_case,
 };
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[test_case(true; "Skip Preflight")]
 #[test_case(false; "Don`t skip Preflight")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_transfer(skip_preflight: bool) {
     agave_logger::setup();
     let fee_one_sig = FeeStructure::default().get_max_fee(1, 0);
     let fee_two_sig = FeeStructure::default().get_max_fee(2, 0);
     let mint_keypair = Keypair::new();
     let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair.insecure_clone());
-    let test_validator = TestValidator::async_with_custom_fees(
+    let test_validator = TestValidator::async_start_with_config(
         &mint_keypair,
-        fee_one_sig,
         Some(faucet_addr),
         SocketAddrSpace::Unspecified,
     )
@@ -337,13 +336,11 @@ async fn test_transfer(skip_preflight: bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_transfer_multisession_signing() {
     agave_logger::setup();
-    let fee_one_sig = FeeStructure::default().get_max_fee(1, 0);
     let fee_two_sig = FeeStructure::default().get_max_fee(2, 0);
     let mint_keypair = Keypair::new();
     let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair.insecure_clone());
-    let test_validator = TestValidator::async_with_custom_fees(
+    let test_validator = TestValidator::async_start_with_config(
         &mint_keypair,
-        fee_one_sig,
         Some(faucet_addr),
         SocketAddrSpace::Unspecified,
     )
@@ -485,17 +482,15 @@ async fn test_transfer_multisession_signing() {
     check_balance!(42 * LAMPORTS_PER_SOL, &rpc_client, &to_pubkey);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[test_case(None; "default")]
 #[test_case(Some(100_000); "with_compute_unit_price")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_transfer_all(compute_unit_price: Option<u64>) {
     agave_logger::setup();
-    let lamports_per_signature = FeeStructure::default().get_max_fee(1, 0);
     let mint_keypair = Keypair::new();
     let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair.insecure_clone());
-    let test_validator = TestValidator::async_with_custom_fees(
+    let test_validator = TestValidator::async_start_with_config(
         &mint_keypair,
-        lamports_per_signature,
         Some(faucet_addr),
         SocketAddrSpace::Unspecified,
     )
@@ -575,9 +570,8 @@ async fn test_transfer_unfunded_recipient() {
     agave_logger::setup();
     let mint_keypair = Keypair::new();
     let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair.insecure_clone());
-    let test_validator = TestValidator::async_with_custom_fees(
+    let test_validator = TestValidator::async_start_with_config(
         &mint_keypair,
-        1,
         Some(faucet_addr),
         SocketAddrSpace::Unspecified,
     )
@@ -633,9 +627,8 @@ async fn test_transfer_with_seed() {
     let fee = FeeStructure::default().get_max_fee(1, 0);
     let mint_keypair = Keypair::new();
     let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair.insecure_clone());
-    let test_validator = TestValidator::async_with_custom_fees(
+    let test_validator = TestValidator::async_start_with_config(
         &mint_keypair,
-        fee,
         Some(faucet_addr),
         SocketAddrSpace::Unspecified,
     )

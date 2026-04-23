@@ -7,7 +7,7 @@ authors = { workspace = true }
 repository = { workspace = true }
 homepage = { workspace = true }
 license = { workspace = true }
-edition = { workspace = true }
+edition = "2024"
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
@@ -42,8 +42,8 @@ solana-time-utils = { workspace = true }
 bencher = { workspace = true }
 rayon = { workspace = true }
 solana-bloom = { path = ".", features = ["agave-unstable-api"] }
-solana-hash = { workspace = true }
-solana-sha256-hasher = { workspace = true }
+solana-hash = { workspace = true, features = ["atomic"] }
+solana-sha256-hasher = { workspace = true, features = ["sha2"] }
 solana-signature = { workspace = true, features = ["std"] }
 
 [[bench]]

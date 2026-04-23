@@ -2,15 +2,15 @@
 use {
     solana_cli::{
         check_balance,
-        cli::{process_command, request_and_confirm_airdrop, CliCommand, CliConfig},
+        cli::{CliCommand, CliConfig, process_command, request_and_confirm_airdrop},
         spend_utils::SpendAmount,
         test_utils::check_ready,
     },
-    solana_cli_output::{parse_sign_only_reply_string, OutputFormat},
+    solana_cli_output::{OutputFormat, parse_sign_only_reply_string},
     solana_commitment_config::CommitmentConfig,
     solana_faucet::faucet::run_local_faucet_with_unique_port_for_tests,
     solana_hash::Hash,
-    solana_keypair::{keypair_from_seed, Keypair},
+    solana_keypair::{Keypair, keypair_from_seed},
     solana_native_token::LAMPORTS_PER_SOL,
     solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
@@ -22,11 +22,11 @@ use {
     test_case::test_case,
 };
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[test_case(None, false, None; "base")]
 #[test_case(Some(String::from("seed")), false, None; "with_seed")]
 #[test_case(None, true, None; "with_authority")]
 #[test_case(None, false, Some(1_000_000); "with_compute_unit_price")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_nonce(
     seed: Option<String>,
     use_nonce_authority: bool,
@@ -34,7 +34,7 @@ async fn test_nonce(
 ) {
     let mint_keypair = Keypair::new();
     let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair.insecure_clone());
-    let test_validator = TestValidator::async_with_no_fees(
+    let test_validator = TestValidator::async_start_with_config(
         &mint_keypair,
         Some(faucet_addr),
         SocketAddrSpace::Unspecified,
@@ -227,9 +227,8 @@ async fn test_create_account_with_seed() {
     agave_logger::setup();
     let mint_keypair = Keypair::new();
     let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair.insecure_clone());
-    let test_validator = TestValidator::async_with_custom_fees(
+    let test_validator = TestValidator::async_start_with_config(
         &mint_keypair,
-        ONE_SIG_FEE,
         Some(faucet_addr),
         SocketAddrSpace::Unspecified,
     )

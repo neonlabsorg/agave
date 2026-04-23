@@ -1,6 +1,6 @@
 use {
     crate::snapshot_package::{
-        are_snapshot_packages_the_same_kind, cmp_snapshot_packages_by_priority, SnapshotPackage,
+        SnapshotPackage, are_snapshot_packages_the_same_kind, cmp_snapshot_packages_by_priority,
     },
     agave_snapshots::{SnapshotArchiveKind, SnapshotKind},
     log::*,
@@ -112,6 +112,11 @@ impl PendingSnapshotPackages {
             }
             (None, None) => None,
         }
+    }
+
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn is_empty(&self) -> bool {
+        self.incremental.is_none() && self.full.is_none() && self.fastboot.is_none()
     }
 }
 

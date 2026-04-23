@@ -1,5 +1,3 @@
-#[cfg(feature = "dev-context-only-utils")]
-use qualifier_attr::qualifiers;
 use {
     super::{
         in_flight_tracker::InFlightTracker, scheduler_error::SchedulerError,
@@ -9,7 +7,7 @@ use {
         ConsumeWork, FinishedConsumeWork, MaxAge, TransactionBatchId, TransactionId,
     },
     agave_scheduling_utils::thread_aware_account_locks::{
-        ThreadAwareAccountLocks, ThreadId, ThreadSet, MAX_THREADS,
+        MAX_THREADS, ThreadAwareAccountLocks, ThreadId, ThreadSet,
     },
     crossbeam_channel::{Receiver, Sender, TryRecvError},
     itertools::izip,
@@ -144,7 +142,6 @@ pub fn select_thread<Tx>(
 }
 
 /// Common scheduler communication structure.
-#[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 pub(crate) struct SchedulingCommon<Tx> {
     pub(crate) consume_work_senders: Vec<Sender<ConsumeWork<Tx>>>,
     pub(crate) finished_consume_work_receiver: Receiver<FinishedConsumeWork<Tx>>,
