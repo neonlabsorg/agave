@@ -119,7 +119,7 @@ struct SolSignerSeedsC {
 }
 
 /// Maximum number of account info structs that can be used in a single CPI invocation
-const MAX_CPI_ACCOUNT_INFOS: usize = 128;
+pub const MAX_CPI_ACCOUNT_INFOS: usize = 128;
 /// Maximum number of account info structs that can be used in a single CPI invocation with SIMD-0339 active
 const MAX_CPI_ACCOUNT_INFOS_SIMD_0339: usize = 255;
 

@@ -351,6 +351,7 @@ dependencies = [
  "solana-svm-measure",
  "solana-svm-timings",
  "solana-svm-type-overrides",
+ "solana-system-interface",
  "solana-sysvar",
  "solana-sysvar-id",
  "solana-transaction-context",
