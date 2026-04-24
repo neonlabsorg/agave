@@ -28,6 +28,7 @@ declare_builtin_function!(
             signers_seeds_addr,
             signers_seeds_len,
             memory_mapping,
+            Vec::new(),
         )
     }
 );
@@ -95,6 +96,7 @@ declare_builtin_function!(
             signers_seeds_addr,
             signers_seeds_len,
             memory_mapping,
+            Vec::new(),
         )
     }
 );
