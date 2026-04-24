@@ -263,6 +263,7 @@ fn create_vm<'a, 'b>(
     program: &'a Executable<InvokeContext<'b, 'b>>,
     regions: Vec<MemoryRegion>,
     accounts_metadata: Vec<SerializedAccountMetadata>,
+    subaccounts_metadata: Vec<SerializedAccountMetadata>,
     invoke_context: &'a mut InvokeContext<'b, 'b>,
     stack: &mut [u8],
     heap: &mut [u8],
@@ -283,10 +284,10 @@ fn create_vm<'a, 'b>(
     invoke_context.set_syscall_context(SyscallContext {
         allocator: BpfAllocator::new(heap_size as u64),
         accounts_metadata,
-        // F10 placeholders — actual data flows in when serialize_parameters is
-        // extended to produce subaccount regions and the 4 new syscalls are
-        // registered. Until then, every slot is empty/default.
-        subaccounts_metadata: Vec::new(),
+        // F10: serialize_parameters populates subaccounts_metadata only when
+        // the instruction carries subaccounts (Wave 7+). For top-level invoke
+        // and regular CPIs the Vec is empty.
+        subaccounts_metadata,
         subaccounts_infos: UntypedVmSlice::default(),
         trace_log: Vec::new(),
         dynamic_cpi_accounts: Vec::new(),
@@ -303,7 +304,7 @@ fn create_vm<'a, 'b>(
 /// Create the SBF virtual machine
 #[macro_export]
 macro_rules! create_vm {
-    ($vm:ident, $program:expr, $regions:expr, $accounts_metadata:expr, $invoke_context:expr $(,)?) => {
+    ($vm:ident, $program:expr, $regions:expr, $accounts_metadata:expr, $subaccounts_metadata:expr, $invoke_context:expr $(,)?) => {
         let invoke_context = &*$invoke_context;
         let stack_size = $program.get_config().stack_size();
         let heap_size = invoke_context.get_compute_budget().heap_size;
@@ -318,6 +319,7 @@ macro_rules! create_vm {
                 $program,
                 $regions,
                 $accounts_metadata,
+                $subaccounts_metadata,
                 $invoke_context,
                 stack
                     .as_slice_mut()
@@ -1493,7 +1495,7 @@ fn execute<'a, 'b: 'a>(
         parameter_bytes,
         regions,
         accounts_metadata,
-        _subaccounts_metadata,
+        subaccounts_metadata,
         instruction_data_offset,
     ) = serialization::serialize_parameters(
         &instruction_context,
@@ -1523,7 +1525,14 @@ fn execute<'a, 'b: 'a>(
     let mut create_vm_time = Measure::start("create_vm");
     let execution_result = {
         let compute_meter_prev = invoke_context.get_remaining();
-        create_vm!(vm, executable, regions, accounts_metadata, invoke_context);
+        create_vm!(
+            vm,
+            executable,
+            regions,
+            accounts_metadata,
+            subaccounts_metadata,
+            invoke_context
+        );
         let (mut vm, stack, heap) = match vm {
             Ok(info) => info,
             Err(e) => {
@@ -1682,8 +1691,7 @@ fn execute<'a, 'b: 'a>(
             account_data_direct_mapping,
             parameter_bytes,
             &invoke_context.get_syscall_context()?.accounts_metadata,
-            // F10: subaccounts_metadata is empty until Wave 6 threads it from create_vm.
-            &[],
+            &invoke_context.get_syscall_context()?.subaccounts_metadata,
         )
     }
 
