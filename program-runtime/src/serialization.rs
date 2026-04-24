@@ -19,6 +19,19 @@ use {
     std::mem::{self, size_of},
 };
 
+/// Return shape of `serialize_parameters` and its aligned/unaligned helpers.
+///
+/// Fields, in order: the VM input buffer, its memory regions, per-account
+/// metadata, F10 per-subaccount metadata (empty until subaccount syscalls
+/// wire in), and the instruction-data offset in the buffer.
+type SerializedParameters = (
+    AlignedMemory<HOST_ALIGN>,
+    Vec<MemoryRegion>,
+    Vec<SerializedAccountMetadata>,
+    Vec<SerializedAccountMetadata>,
+    usize,
+);
+
 /// Modifies the memory mapping in serialization and CPI return for stricter_abi_and_runtime_constraints
 pub fn modify_memory_region_of_account(
     account: &mut BorrowedInstructionAccount<'_, '_>,
@@ -224,15 +237,7 @@ pub fn serialize_parameters(
     stricter_abi_and_runtime_constraints: bool,
     account_data_direct_mapping: bool,
     mask_out_rent_epoch_in_vm_serialization: bool,
-) -> Result<
-    (
-        AlignedMemory<HOST_ALIGN>,
-        Vec<MemoryRegion>,
-        Vec<SerializedAccountMetadata>,
-        usize,
-    ),
-    InstructionError,
-> {
+) -> Result<SerializedParameters, InstructionError> {
     let num_ix_accounts = instruction_context.get_number_of_instruction_accounts();
     if num_ix_accounts > MAX_ACCOUNTS_PER_INSTRUCTION as IndexOfAccount {
         return Err(InstructionError::MaxAccountsExceeded);
@@ -262,9 +267,17 @@ pub fn serialize_parameters(
         // time it's iterated on.
         .collect::<Vec<_>>();
 
+    // F10: instruction-scope subaccount serialization is Wave 7+. No current
+    // code path populates subaccounts at this level, so the loop iterates
+    // zero times; the u64 subaccount count + aligned-path padding are still
+    // emitted so the ABI shape matches parasol-dev.
+    debug_assert_eq!(instruction_context.get_number_of_subaccounts(), 0);
+    let subaccounts: Vec<SerializeAccount> = Vec::new();
+
     if is_loader_deprecated {
         serialize_parameters_unaligned(
             accounts,
+            subaccounts,
             instruction_context.get_instruction_data(),
             &program_id,
             stricter_abi_and_runtime_constraints,
@@ -274,6 +287,7 @@ pub fn serialize_parameters(
     } else {
         serialize_parameters_aligned(
             accounts,
+            subaccounts,
             instruction_context.get_instruction_data(),
             &program_id,
             stricter_abi_and_runtime_constraints,
@@ -289,10 +303,12 @@ pub fn deserialize_parameters(
     account_data_direct_mapping: bool,
     buffer: &[u8],
     accounts_metadata: &[SerializedAccountMetadata],
+    subaccounts_metadata: &[SerializedAccountMetadata],
 ) -> Result<(), InstructionError> {
     let is_loader_deprecated =
         instruction_context.get_program_owner()? == bpf_loader_deprecated::id();
     let account_lengths = accounts_metadata.iter().map(|a| a.original_data_len);
+    let subaccount_lengths = subaccounts_metadata.iter().map(|a| a.original_data_len);
     if is_loader_deprecated {
         deserialize_parameters_unaligned(
             instruction_context,
@@ -300,6 +316,7 @@ pub fn deserialize_parameters(
             account_data_direct_mapping,
             buffer,
             account_lengths,
+            subaccount_lengths,
         )
     } else {
         deserialize_parameters_aligned(
@@ -308,26 +325,20 @@ pub fn deserialize_parameters(
             account_data_direct_mapping,
             buffer,
             account_lengths,
+            subaccount_lengths,
         )
     }
 }
 
 fn serialize_parameters_unaligned(
     accounts: Vec<SerializeAccount>,
+    _subaccounts: Vec<SerializeAccount>,
     instruction_data: &[u8],
     program_id: &Pubkey,
     stricter_abi_and_runtime_constraints: bool,
     account_data_direct_mapping: bool,
     mask_out_rent_epoch_in_vm_serialization: bool,
-) -> Result<
-    (
-        AlignedMemory<HOST_ALIGN>,
-        Vec<MemoryRegion>,
-        Vec<SerializedAccountMetadata>,
-        usize,
-    ),
-    InstructionError,
-> {
+) -> Result<SerializedParameters, InstructionError> {
     // Calculate size in order to alloc once
     let mut size = size_of::<u64>();
     for account in &accounts {
@@ -351,7 +362,8 @@ fn serialize_parameters_unaligned(
     }
     size += size_of::<u64>() // instruction data len
          + instruction_data.len() // instruction data
-         + size_of::<Pubkey>(); // program id
+         + size_of::<Pubkey>() // program id
+         + size_of::<u64>(); // F10: subaccount count — TODO: serialize actual subaccounts
 
     let mut s = Serializer::new(
         size,
@@ -399,23 +411,31 @@ fn serialize_parameters_unaligned(
     s.write::<u64>((instruction_data.len() as u64).to_le());
     let instruction_data_offset = s.write_all(instruction_data);
     s.write_all(program_id.as_ref());
+    // F10: subaccount count placeholder. Wave 7+ populates actual subaccounts.
+    s.write::<u64>(0u64.to_le());
 
     let (mem, regions) = s.finish();
     Ok((
         mem,
         regions,
         accounts_metadata,
+        Vec::new(), // F10: subaccounts_metadata, wired in Wave 7+
         instruction_data_offset as usize,
     ))
 }
 
-fn deserialize_parameters_unaligned<I: IntoIterator<Item = usize>>(
+fn deserialize_parameters_unaligned<I, J>(
     instruction_context: &InstructionContext,
     stricter_abi_and_runtime_constraints: bool,
     account_data_direct_mapping: bool,
     buffer: &[u8],
     account_lengths: I,
-) -> Result<(), InstructionError> {
+    _subaccount_lengths: J,
+) -> Result<(), InstructionError>
+where
+    I: IntoIterator<Item = usize>,
+    J: IntoIterator<Item = usize>,
+{
     let mut start = size_of::<u64>(); // number of accounts
     for (instruction_account_index, pre_len) in (0..instruction_context
         .get_number_of_instruction_accounts())
@@ -473,21 +493,16 @@ fn deserialize_parameters_unaligned<I: IntoIterator<Item = usize>>(
 
 fn serialize_parameters_aligned(
     accounts: Vec<SerializeAccount>,
+    subaccounts: Vec<SerializeAccount>,
     instruction_data: &[u8],
     program_id: &Pubkey,
     stricter_abi_and_runtime_constraints: bool,
     account_data_direct_mapping: bool,
     mask_out_rent_epoch_in_vm_serialization: bool,
-) -> Result<
-    (
-        AlignedMemory<HOST_ALIGN>,
-        Vec<MemoryRegion>,
-        Vec<SerializedAccountMetadata>,
-        usize,
-    ),
-    InstructionError,
-> {
+) -> Result<SerializedParameters, InstructionError> {
     let mut accounts_metadata = Vec::with_capacity(accounts.len());
+    let mut subaccounts_metadata: Vec<SerializedAccountMetadata> =
+        Vec::with_capacity(subaccounts.len());
     // Calculate size in order to alloc once
     let mut size = size_of::<u64>();
     for account in &accounts {
@@ -517,7 +532,36 @@ fn serialize_parameters_aligned(
     }
     size += size_of::<u64>() // data len
     + instruction_data.len()
-    + size_of::<Pubkey>(); // program id;
+    + size_of::<Pubkey>() // program id
+    // F10: alignment padding so the u64 subaccount count lands on BPF_ALIGN_OF_U128
+    // boundary, matching parasol-dev PRS-153 layout.
+    + (instruction_data.len() as *const u8).align_offset(BPF_ALIGN_OF_U128)
+    + size_of::<u64>(); // F10: subaccount count
+    for subaccount in &subaccounts {
+        size += 1; // dup
+        match subaccount {
+            SerializeAccount::Duplicate(_) => size += 7, // padding to 64-bit aligned
+            SerializeAccount::Account(_, account) => {
+                let data_len = account.get_data().len();
+                size += size_of::<u8>() // is_signer
+                + size_of::<u8>() // is_writable
+                + size_of::<u8>() // executable
+                + size_of::<u32>() // original_data_len
+                + size_of::<Pubkey>()  // key
+                + size_of::<Pubkey>() // owner
+                + size_of::<u64>()  // lamports
+                + size_of::<u64>()  // data len
+                + size_of::<u64>(); // rent epoch
+                if !(stricter_abi_and_runtime_constraints && account_data_direct_mapping) {
+                    size += data_len
+                        + MAX_PERMITTED_DATA_INCREASE
+                        + (data_len as *const u8).align_offset(BPF_ALIGN_OF_U128);
+                } else {
+                    size += BPF_ALIGN_OF_U128;
+                }
+            }
+        }
+    }
 
     let mut s = Serializer::new(
         size,
@@ -567,23 +611,71 @@ fn serialize_parameters_aligned(
     s.write::<u64>((instruction_data.len() as u64).to_le());
     let instruction_data_offset = s.write_all(instruction_data);
     s.write_all(program_id.as_ref());
+    // F10: alignment padding so the u64 subaccount count + subaccount records
+    // land on BPF_ALIGN_OF_U128 boundary.
+    let align_offset = (instruction_data.len() as *const u8).align_offset(BPF_ALIGN_OF_U128);
+    s.fill_write(align_offset, 0)
+        .map_err(|_| InstructionError::InvalidArgument)?;
+    s.write::<u64>((subaccounts.len() as u64).to_le());
+    for subaccount in subaccounts {
+        match subaccount {
+            SerializeAccount::Account(_, mut borrowed_account) => {
+                s.write::<u8>(NON_DUP_MARKER);
+                s.write::<u8>(borrowed_account.is_signer() as u8);
+                s.write::<u8>(borrowed_account.is_writable() as u8);
+                #[allow(deprecated)]
+                s.write::<u8>(borrowed_account.is_executable() as u8);
+                s.write_all(&[0u8, 0, 0, 0]);
+                let vm_key_addr = s.write_all(borrowed_account.get_key().as_ref());
+                let vm_owner_addr = s.write_all(borrowed_account.get_owner().as_ref());
+                let vm_lamports_addr = s.write::<u64>(borrowed_account.get_lamports().to_le());
+                s.write::<u64>((borrowed_account.get_data().len() as u64).to_le());
+                let vm_data_addr = s.write_account(&mut borrowed_account)?;
+                let rent_epoch = if mask_out_rent_epoch_in_vm_serialization {
+                    u64::MAX
+                } else {
+                    borrowed_account.get_rent_epoch()
+                };
+                s.write::<u64>(rent_epoch.to_le());
+                subaccounts_metadata.push(SerializedAccountMetadata {
+                    original_data_len: borrowed_account.get_data().len(),
+                    vm_key_addr,
+                    vm_owner_addr,
+                    vm_lamports_addr,
+                    vm_data_addr,
+                });
+            }
+            SerializeAccount::Duplicate(position) => {
+                subaccounts_metadata
+                    .push(subaccounts_metadata.get(position as usize).unwrap().clone());
+                s.write::<u8>(position as u8);
+                s.write_all(&[0u8, 0, 0, 0, 0, 0, 0]);
+            }
+        };
+    }
 
     let (mem, regions) = s.finish();
     Ok((
         mem,
         regions,
         accounts_metadata,
+        subaccounts_metadata,
         instruction_data_offset as usize,
     ))
 }
 
-fn deserialize_parameters_aligned<I: IntoIterator<Item = usize>>(
+fn deserialize_parameters_aligned<I, J>(
     instruction_context: &InstructionContext,
     stricter_abi_and_runtime_constraints: bool,
     account_data_direct_mapping: bool,
     buffer: &[u8],
     account_lengths: I,
-) -> Result<(), InstructionError> {
+    _subaccount_lengths: J,
+) -> Result<(), InstructionError>
+where
+    I: IntoIterator<Item = usize>,
+    J: IntoIterator<Item = usize>,
+{
     let mut start = size_of::<u64>(); // number of accounts
     for (instruction_account_index, pre_len) in (0..instruction_context
         .get_number_of_instruction_accounts())
@@ -827,8 +919,13 @@ mod tests {
                     continue;
                 }
 
-                let (mut serialized, regions, _account_lengths, _instruction_data_offset) =
-                    serialization_result.unwrap();
+                let (
+                    mut serialized,
+                    regions,
+                    _account_lengths,
+                    _subaccounts_metadata,
+                    _instruction_data_offset,
+                ) = serialization_result.unwrap();
                 let mut serialized_regions = concat_regions(&regions);
                 let (de_program_id, de_accounts, de_instruction_data) = unsafe {
                     deserialize(
@@ -973,14 +1070,19 @@ mod tests {
                 .unwrap();
 
             // check serialize_parameters_aligned
-            let (mut serialized, regions, accounts_metadata, _instruction_data_offset) =
-                serialize_parameters(
-                    &instruction_context,
-                    stricter_abi_and_runtime_constraints,
-                    false, // account_data_direct_mapping
-                    true,  // mask_out_rent_epoch_in_vm_serialization
-                )
-                .unwrap();
+            let (
+                mut serialized,
+                regions,
+                accounts_metadata,
+                _subaccounts_metadata,
+                _instruction_data_offset,
+            ) = serialize_parameters(
+                &instruction_context,
+                stricter_abi_and_runtime_constraints,
+                false, // account_data_direct_mapping
+                true,  // mask_out_rent_epoch_in_vm_serialization
+            )
+            .unwrap();
 
             let mut serialized_regions = concat_regions(&regions);
             if !stricter_abi_and_runtime_constraints {
@@ -1044,6 +1146,7 @@ mod tests {
                 false, // account_data_direct_mapping
                 serialized.as_slice(),
                 &accounts_metadata,
+                &[],
             )
             .unwrap();
             for (index_in_transaction, (_key, original_account)) in
@@ -1072,14 +1175,19 @@ mod tests {
                 .get_current_instruction_context()
                 .unwrap();
 
-            let (mut serialized, regions, account_lengths, _instruction_data_offset) =
-                serialize_parameters(
-                    &instruction_context,
-                    stricter_abi_and_runtime_constraints,
-                    false, // account_data_direct_mapping
-                    true,  // mask_out_rent_epoch_in_vm_serialization
-                )
-                .unwrap();
+            let (
+                mut serialized,
+                regions,
+                account_lengths,
+                _subaccounts_metadata,
+                _instruction_data_offset,
+            ) = serialize_parameters(
+                &instruction_context,
+                stricter_abi_and_runtime_constraints,
+                false, // account_data_direct_mapping
+                true,  // mask_out_rent_epoch_in_vm_serialization
+            )
+            .unwrap();
             let mut serialized_regions = concat_regions(&regions);
 
             let (de_program_id, de_accounts, de_instruction_data) = unsafe {
@@ -1121,6 +1229,7 @@ mod tests {
                 false, // account_data_direct_mapping
                 serialized.as_slice(),
                 &account_lengths,
+                &[],
             )
             .unwrap();
             for (index_in_transaction, (_key, original_account)) in
@@ -1235,14 +1344,19 @@ mod tests {
                 .unwrap();
 
             // check serialize_parameters_aligned
-            let (_serialized, regions, _accounts_metadata, _instruction_data_offset) =
-                serialize_parameters(
-                    &instruction_context,
-                    true,
-                    false, // account_data_direct_mapping
-                    mask_out_rent_epoch_in_vm_serialization,
-                )
-                .unwrap();
+            let (
+                _serialized,
+                regions,
+                _accounts_metadata,
+                _subaccounts_metadata,
+                _instruction_data_offset,
+            ) = serialize_parameters(
+                &instruction_context,
+                true,
+                false, // account_data_direct_mapping
+                mask_out_rent_epoch_in_vm_serialization,
+            )
+            .unwrap();
 
             let mut serialized_regions = concat_regions(&regions);
             let (_de_program_id, de_accounts, _de_instruction_data) = unsafe {
@@ -1268,14 +1382,19 @@ mod tests {
                 .get_current_instruction_context()
                 .unwrap();
 
-            let (_serialized, regions, _account_lengths, _instruction_data_offset) =
-                serialize_parameters(
-                    &instruction_context,
-                    true,
-                    false, // account_data_direct_mapping
-                    mask_out_rent_epoch_in_vm_serialization,
-                )
-                .unwrap();
+            let (
+                _serialized,
+                regions,
+                _account_lengths,
+                _subaccounts_metadata,
+                _instruction_data_offset,
+            ) = serialize_parameters(
+                &instruction_context,
+                true,
+                false, // account_data_direct_mapping
+                mask_out_rent_epoch_in_vm_serialization,
+            )
+            .unwrap();
             let mut serialized_regions = concat_regions(&regions);
 
             let (_de_program_id, de_accounts, _de_instruction_data) = unsafe {

@@ -1489,13 +1489,18 @@ fn execute<'a, 'b: 'a>(
         .provide_instruction_data_offset_in_vm_r2;
 
     let mut serialize_time = Measure::start("serialize");
-    let (parameter_bytes, regions, accounts_metadata, instruction_data_offset) =
-        serialization::serialize_parameters(
-            &instruction_context,
-            stricter_abi_and_runtime_constraints,
-            account_data_direct_mapping,
-            mask_out_rent_epoch_in_vm_serialization,
-        )?;
+    let (
+        parameter_bytes,
+        regions,
+        accounts_metadata,
+        _subaccounts_metadata,
+        instruction_data_offset,
+    ) = serialization::serialize_parameters(
+        &instruction_context,
+        stricter_abi_and_runtime_constraints,
+        account_data_direct_mapping,
+        mask_out_rent_epoch_in_vm_serialization,
+    )?;
     serialize_time.stop();
 
     // save the account addresses so in case we hit an AccessViolation error we
@@ -1677,6 +1682,8 @@ fn execute<'a, 'b: 'a>(
             account_data_direct_mapping,
             parameter_bytes,
             &invoke_context.get_syscall_context()?.accounts_metadata,
+            // F10: subaccounts_metadata is empty until Wave 6 threads it from create_vm.
+            &[],
         )
     }
 

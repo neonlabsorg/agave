@@ -370,8 +370,7 @@ impl<'ix_data> TransactionContext<'ix_data> {
         let mut dedup_subaccounts = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
         let number_of_subaccounts = self.accounts.number_of_subaccounts() as usize;
         for (position, subaccount) in subaccounts.iter().enumerate() {
-            let index_in_transaction =
-                subaccount.index_in_transaction & !SUBACCOUNT_MARKER;
+            let index_in_transaction = subaccount.index_in_transaction & !SUBACCOUNT_MARKER;
             if (index_in_transaction as usize) >= number_of_subaccounts {
                 return Err(InstructionError::MissingAccount);
             }
