@@ -311,18 +311,22 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         instruction: Instruction,
         signers: &[Pubkey],
     ) -> Result<(), InstructionError> {
-        self.prepare_next_instruction(instruction, signers)?;
+        self.prepare_next_instruction(instruction, signers, Vec::new())?;
         let mut compute_units_consumed = 0;
         self.process_instruction(&mut compute_units_consumed, &mut ExecuteTimings::default())?;
         Ok(())
     }
 
     /// Helper to prepare for process_instruction() when the instruction is not a top level one,
-    /// and depends on `AccountMeta`s
+    /// and depends on `AccountMeta`s.
+    ///
+    /// `subaccounts` is the F10 subaccount account list for this CPI. Top-level
+    /// and non-subaccount-bearing invokes pass `Vec::new()`.
     pub fn prepare_next_instruction(
         &mut self,
         instruction: Instruction,
         signers: &[Pubkey],
+        _subaccounts: Vec<InstructionAccount>,
     ) -> Result<(), InstructionError> {
         // We reference accounts by an u8 index, so we have a total of 256 accounts.
         let mut transaction_callee_map: Vec<u16> = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
@@ -1328,7 +1332,7 @@ mod tests {
             metas.clone(),
         );
         invoke_context
-            .prepare_next_instruction(inner_instruction, &[])
+            .prepare_next_instruction(inner_instruction, &[], Vec::new())
             .unwrap();
 
         let mut compute_units_consumed = 0;
@@ -1556,13 +1560,13 @@ mod tests {
 
         invoke_context.transaction_context.push().unwrap();
         invoke_context
-            .prepare_next_instruction(instruction_1, &[fee_payer.pubkey()])
+            .prepare_next_instruction(instruction_1, &[fee_payer.pubkey()], Vec::new())
             .unwrap();
         test_case_1(&invoke_context);
 
         invoke_context.transaction_context.push().unwrap();
         invoke_context
-            .prepare_next_instruction(instruction_2, &[fee_payer.pubkey()])
+            .prepare_next_instruction(instruction_2, &[fee_payer.pubkey()], Vec::new())
             .unwrap();
         test_case_2(&invoke_context);
     }
@@ -1647,7 +1651,7 @@ mod tests {
         );
 
         invoke_context
-            .prepare_next_instruction(instruction, &[fee_payer.pubkey()])
+            .prepare_next_instruction(instruction, &[fee_payer.pubkey()], Vec::new())
             .unwrap();
         let instruction_context = invoke_context
             .transaction_context

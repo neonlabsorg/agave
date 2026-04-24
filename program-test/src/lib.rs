@@ -284,7 +284,7 @@ impl solana_sysvar::program_stubs::SyscallStubs for SyscallStubs {
             .collect::<Vec<_>>();
 
         invoke_context
-            .prepare_next_instruction(instruction.clone(), &signers)
+            .prepare_next_instruction(instruction.clone(), &signers, Vec::new())
             .unwrap();
 
         // Copy caller's account_info modifications into invoke_context accounts

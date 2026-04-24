@@ -2520,6 +2520,10 @@ mod tests {
                 .set_syscall_context(SyscallContext {
                     allocator: BpfAllocator::new(solana_program_entrypoint::HEAP_LENGTH as u64),
                     accounts_metadata: Vec::new(),
+                    subaccounts_metadata: Vec::new(),
+                    subaccounts_infos: solana_program_runtime::invoke_context::UntypedVmSlice::default(),
+                    trace_log: Vec::new(),
+                    dynamic_cpi_accounts: Vec::new(),
                 })
                 .unwrap();
             let config = Config {
