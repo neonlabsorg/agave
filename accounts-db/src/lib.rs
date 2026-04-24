@@ -12,6 +12,7 @@
 
 pub mod account_info;
 pub mod account_locks;
+pub(crate) mod account_utils;
 pub mod account_storage;
 pub mod account_storage_reader;
 pub mod accounts;

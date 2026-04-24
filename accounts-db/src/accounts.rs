@@ -244,10 +244,11 @@ impl Accounts {
         program_id: Option<&Pubkey>,
     ) -> Vec<KeyedAccountSharedData> {
         self.scan_slot(slot, |stored_account| {
-            program_id
-                .map(|program_id| program_id == stored_account.owner())
-                .unwrap_or(true)
-                .then(|| (*stored_account.pubkey(), stored_account.take_account()))
+            (stored_account.is_loadable()
+                && program_id
+                    .map(|program_id| program_id == stored_account.owner())
+                    .unwrap_or(true))
+            .then(|| (*stored_account.pubkey(), stored_account.take_account()))
         })
     }
 

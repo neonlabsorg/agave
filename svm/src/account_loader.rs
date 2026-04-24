@@ -27,8 +27,9 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_rent::Rent,
+    solana_clock::Epoch,
     solana_sdk_ids::{
-        bpf_loader_upgradeable, native_loader,
+        bpf_loader_upgradeable, native_loader, system_program,
         sysvar::{self, slot_history},
     },
     solana_svm_callback::{AccountState, TransactionProcessingCallback},
@@ -38,6 +39,22 @@ use {
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::num::{NonZeroU32, Saturating},
 };
+
+// F8: an account is considered "deallocated" (a tombstone) iff either
+//   1. it is a classic default tombstone (lamports=0, data=[], owner=default,
+//      !executable, rent_epoch=0), or
+//   2. it is a system-program-owned zero-lamport account with empty data.
+// All other zero-lamport accounts are valid and persistent.
+pub(crate) fn is_deallocated_account_local(account: &AccountSharedData) -> bool {
+    (account.lamports() == 0
+        && account.data().is_empty()
+        && !account.executable()
+        && account.rent_epoch() == Epoch::default()
+        && account.owner() == &Pubkey::default())
+        || (account.lamports() == 0
+            && account.data().is_empty()
+            && account.owner() == &system_program::id())
+}
 
 // Per SIMD-0186, all accounts are assigned a base size of 64 bytes to cover
 // the storage cost of metadata.
@@ -258,10 +275,18 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
     // &mut self to insert the account. Wrappers with &self ignore it.
     fn do_load(&self, account_key: &Pubkey) -> (Option<AccountSharedData>, bool) {
         if let Some(account) = self.loaded_accounts.get(account_key) {
-            // If lamports is 0, a previous transaction deallocated this account.
-            // We return None instead of the account we found so it can be created fresh.
-            // We *never* remove accounts, or else we would fetch stale state from accounts-db.
-            let option_account = if account.lamports() == 0 {
+            // F8: only treat *cleanable* zero-lamport accounts (classic default
+            // tombstones + system-program-owned empty zero-lamport) as deallocated.
+            // Valid zero-lamport accounts (non-default data/owner) stay loadable.
+            // We *never* remove accounts, or else we would fetch stale state from
+            // accounts-db.
+            // Original:
+            // let option_account = if account.lamports() == 0 {
+            //     None
+            // } else {
+            //     Some(account.clone())
+            // };
+            let option_account = if is_deallocated_account_local(account) {
                 None
             } else {
                 Some(account.clone())
@@ -374,9 +399,17 @@ pub fn validate_fee_payer(
     rent: &Rent,
     fee: u64,
 ) -> Result<()> {
-    if payer_account.lamports() == 0 {
-        error_metrics.account_not_found += 1;
-        return Err(TransactionError::AccountNotFound);
+    // F2 (gasless): allow zero-lamport fee-payer when fee == 0 (fee-payer synthesis
+    // from transaction_processor). Non-zero-fee transactions still require a funded
+    // fee-payer — defence-in-depth.
+    // Original:
+    // if payer_account.lamports() == 0 {
+    //     error_metrics.account_not_found += 1;
+    //     return Err(TransactionError::AccountNotFound);
+    // }
+    if fee != 0 && payer_account.lamports() == 0 {
+        error_metrics.insufficient_funds += 1;
+        return Err(TransactionError::InsufficientFundsForFee);
     }
     let system_account_kind = get_system_account_kind(payer_account).ok_or_else(|| {
         error_metrics.invalid_account_for_fee += 1;
