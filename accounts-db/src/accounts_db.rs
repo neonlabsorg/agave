@@ -1813,7 +1813,17 @@ impl AccountsDb {
                             .accounts
                             .scan_accounts_without_data(|_offset, account| {
                                 let pubkey = *account.pubkey();
-                                let is_zero_lamport = account.is_zero_lamport();
+                                // F8: narrow the "zero-lamport clean candidate" flag to
+                                // tombstone-like accounts only (default-empty or system-program
+                                // owned empty zero-lamport). Valid zero-lamport accounts stay
+                                // out of the clean sweep.
+                                let is_zero_lamport = crate::account_utils::is_cleanable_zero_lamport_account_meta(
+                                    account.lamports,
+                                    account.data_len,
+                                    account.owner,
+                                    account.executable,
+                                    account.rent_epoch,
+                                );
                                 insert_candidate(pubkey, is_zero_lamport);
                             })
                             .expect("must scan accounts storage");
@@ -4264,7 +4274,12 @@ impl AccountsDb {
             if !in_write_cache {
                 let result = self.read_only_accounts_cache.load(*pubkey, slot);
                 if let Some(account) = result {
-                    if load_zero_lamports == LoadZeroLamports::None && account.is_zero_lamport() {
+                    // F8: hide cleanable-tombstone accounts (default-empty or
+                    // system-program-owned empty zero-lamport). Valid zero-lamport
+                    // accounts with non-default metadata stay visible.
+                    if load_zero_lamports == LoadZeroLamports::None
+                        && crate::account_utils::is_cleanable_zero_lamport_account(&account)
+                    {
                         return None;
                     }
                     return Some((account, slot));
@@ -4294,7 +4309,10 @@ impl AccountsDb {
         // since the cache could be flushed in between the 2 calls.
         let in_write_cache = matches!(account_accessor, LoadedAccountAccessor::Cached(_));
         let account = account_accessor.check_and_get_loaded_account_shared_data();
-        if load_zero_lamports == LoadZeroLamports::None && account.is_zero_lamport() {
+        // F8: hide cleanable-tombstone accounts (see above).
+        if load_zero_lamports == LoadZeroLamports::None
+            && crate::account_utils::is_cleanable_zero_lamport_account(&account)
+        {
             return None;
         }
 
