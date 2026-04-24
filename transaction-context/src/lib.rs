@@ -12,18 +12,15 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 use {
-    crate::transaction_accounts::{AccountRefMut, KeyedAccountSharedData, TransactionAccounts},
+    crate::transaction_accounts::{
+        AccountRef, AccountRefMut, KeyedAccountSharedData, TransactionAccounts,
+    },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_instruction::error::InstructionError,
     solana_instructions_sysvar as instructions,
     solana_pubkey::Pubkey,
     solana_sbpf::memory_region::{AccessType, AccessViolationHandler, MemoryRegion},
-    std::{
-        borrow::Cow,
-        cell::{Cell, RefMut},
-        collections::HashSet,
-        rc::Rc,
-    },
+    std::{borrow::Cow, cell::Cell, collections::HashSet, rc::Rc},
 };
 #[cfg(not(target_os = "solana"))]
 use {solana_account::WritableAccount, solana_rent::Rent};
@@ -251,11 +248,17 @@ impl<'ix_data> TransactionContext<'ix_data> {
     }
 
     /// F10: borrow a subaccount by its (unmarked) index — read-only view.
+    ///
+    /// Returns `AccountRef<'_>` — the same uniform borrow type main-lane
+    /// accounts use. The subaccount lane is backed by the split
+    /// `AccountSharedFields`/`AccountPrivateFields` storage format, so
+    /// `BorrowedInstructionAccount` can wrap these borrows without an enum
+    /// split (see `InstructionContext::try_borrow_subaccount`).
     #[cfg(not(target_os = "solana"))]
     pub fn try_borrow_subaccount(
         &self,
         index: IndexOfAccount,
-    ) -> Result<std::cell::Ref<'_, AccountSharedData>, InstructionError> {
+    ) -> Result<AccountRef<'_>, InstructionError> {
         self.accounts.try_borrow_subaccount(index)
     }
 
@@ -264,7 +267,7 @@ impl<'ix_data> TransactionContext<'ix_data> {
     pub fn try_borrow_mut_subaccount(
         &self,
         index: IndexOfAccount,
-    ) -> Result<std::cell::RefMut<'_, AccountSharedData>, InstructionError> {
+    ) -> Result<AccountRefMut<'_>, InstructionError> {
         self.accounts.try_borrow_mut_subaccount(index)
     }
 
@@ -831,29 +834,39 @@ impl<'a> InstructionContext<'a, '_> {
 
     /// F10: borrow a subaccount referenced by this instruction (instruction-scope).
     ///
-    /// Returns a direct `RefMut<AccountSharedData>` — **not** a
-    /// `BorrowedInstructionAccount`, which in v3.1.13 is backed by the split
-    /// `AccountSharedFields`/`AccountPrivateFields` representation that the
-    /// subaccount lane does not use. Wave 8's CPI translation helpers will need
-    /// to adapt between the two borrow shapes (see
-    /// `.bgv/shared/knowledge/entries/architecture-subaccount-borrow-adapter.md`).
+    /// Returns a `BorrowedInstructionAccount<'_, '_>` — the same uniform
+    /// wrapper type that `try_borrow_instruction_account` returns for main
+    /// accounts. The subaccount lane uses the same
+    /// `AccountSharedFields`/`AccountPrivateFields` split-storage format as
+    /// main accounts (W8b-agave), so no enum dispatch or parallel borrow type
+    /// is required.
     ///
-    /// The `index_in_instruction` refers to the position within this
-    /// instruction's subaccount list (as returned by `instruction_subaccounts`),
-    /// not the transaction-level subaccount index.
+    /// `index_in_instruction` refers to the position within this instruction's
+    /// subaccount list (as returned by `instruction_subaccounts`), not the
+    /// transaction-level subaccount index. The high-bit `SUBACCOUNT_MARKER`
+    /// on the stored `index_in_transaction` is stripped before dispatching to
+    /// the subaccount lane.
     #[cfg(not(target_os = "solana"))]
     pub fn try_borrow_subaccount(
         &self,
         index_in_instruction: IndexOfAccount,
-    ) -> Result<RefMut<'a, AccountSharedData>, InstructionError> {
+    ) -> Result<BorrowedInstructionAccount<'_, '_>, InstructionError> {
         let instruction_account = *self
             .subaccounts
             .get(index_in_instruction as usize)
             .ok_or(InstructionError::NotEnoughAccountKeys)?;
-        let index_in_transaction = instruction_account.index_in_transaction & !SUBACCOUNT_MARKER;
-        self.transaction_context
+        let index_in_transaction_unmarked =
+            instruction_account.index_in_transaction & !SUBACCOUNT_MARKER;
+        let account = self
+            .transaction_context
             .accounts
-            .try_borrow_mut_subaccount(index_in_transaction)
+            .try_borrow_mut_subaccount(index_in_transaction_unmarked)?;
+        Ok(BorrowedInstructionAccount {
+            transaction_context: self.transaction_context,
+            instruction_account,
+            account,
+            index_in_transaction_of_instruction_program: self.program_account_index_in_tx,
+        })
     }
 
     /// F10: Returns `Some(instruction_subaccount_index)` if this is a duplicate

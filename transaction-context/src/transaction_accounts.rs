@@ -9,7 +9,7 @@ use {
     solana_instruction::error::InstructionError,
     solana_pubkey::Pubkey,
     std::{
-        cell::{Cell, Ref, RefCell, RefMut, UnsafeCell},
+        cell::{Cell, RefCell, UnsafeCell},
         ops::{Deref, DerefMut},
         ptr,
         sync::Arc,
@@ -245,13 +245,34 @@ pub struct TransactionAccounts {
     touched_flags: Box<[Cell<bool>]>,
     resize_delta: Cell<i64>,
     lamports_delta: Cell<i128>,
-    /// F10 subaccount lane. Dynamic, grown at runtime by the
-    /// `sol_create_subaccount` syscall — unlike the fixed-size
-    /// `shared_account_fields` / `private_account_fields` which are built once
-    /// at transaction load. Subaccounts are ephemeral (not snapshotted, not
-    /// ABI-v2-serialized) so a simple (key, account) RefCell Vec is enough.
+    /// F10 subaccount lane — split-storage mirror of the main-account
+    /// representation so `try_borrow_subaccount` / `try_borrow_mut_subaccount`
+    /// return `AccountRef`/`AccountRefMut` uniformly with the main lane, and
+    /// `BorrowedInstructionAccount` wraps them without an enum split.
+    ///
+    /// Dynamic, grown at runtime by the `sol_create_subaccount` syscall
+    /// (append-only — entries are never removed during a transaction). Each
+    /// element is boxed so the heap address of the inner cells is stable
+    /// across `Vec::push` reallocations, which is what keeps outstanding
+    /// `AccountRef`/`AccountRefMut` borrows sound after further subaccount
+    /// creation.
+    // The Box layer is load-bearing: `Vec::push` may reallocate the Vec's
+    // internal buffer, invalidating any raw pointers into element storage.
+    // Box puts each element on its own heap allocation, so
+    // `try_borrow_subaccount` / `try_borrow_mut_subaccount` can hand out
+    // references tied to `&self` lifetime that stay valid across subsequent
+    // `add_subaccount` calls. Clippy's `vec_box` lint doesn't model this
+    // invariant — the Box is not "unnecessary indirection" but a stability
+    // guarantee.
     #[cfg(not(target_os = "solana"))]
-    subaccounts: RefCell<Vec<(Pubkey, Box<RefCell<AccountSharedData>>)>>,
+    #[allow(clippy::vec_box)]
+    subaccount_shared_fields: RefCell<Vec<Box<UnsafeCell<AccountSharedFields>>>>,
+    #[cfg(not(target_os = "solana"))]
+    #[allow(clippy::vec_box)]
+    subaccount_private_fields: RefCell<Vec<Box<UnsafeCell<AccountPrivateFields>>>>,
+    #[cfg(not(target_os = "solana"))]
+    #[allow(clippy::vec_box)]
+    subaccount_borrow_counters: RefCell<Vec<Box<BorrowCounter>>>,
     #[cfg(not(target_os = "solana"))]
     touched_subaccounts: RefCell<Vec<bool>>,
 }
@@ -295,7 +316,9 @@ impl TransactionAccounts {
             touched_flags,
             resize_delta: Cell::new(0),
             lamports_delta: Cell::new(0),
-            subaccounts: RefCell::new(Vec::new()),
+            subaccount_shared_fields: RefCell::new(Vec::new()),
+            subaccount_private_fields: RefCell::new(Vec::new()),
+            subaccount_borrow_counters: RefCell::new(Vec::new()),
             touched_subaccounts: RefCell::new(Vec::new()),
         }
     }
@@ -322,9 +345,16 @@ impl TransactionAccounts {
         }
     }
 
-    /// F10: append a new (pubkey, account) pair to the subaccount lane. Caller
-    /// is responsible for deduplication — `TransactionContext::add_subaccount`
-    /// does the find-index check before this.
+    /// F10: append a new subaccount into the split-storage lane. Populates
+    /// the three parallel Vecs (shared fields, private fields, borrow
+    /// counter) plus `touched_subaccounts`. Caller is responsible for
+    /// deduplication — `TransactionContext::add_subaccount` does the
+    /// find-index check before this.
+    ///
+    /// The VmSlice in `AccountSharedFields::payload` is initialized with a
+    /// placeholder base address of `0` — real VM addresses are assigned later
+    /// by `serialize_parameters` when the subaccount region is laid out for a
+    /// CPI invoke.
     #[cfg(not(target_os = "solana"))]
     #[allow(dead_code)] // wired in by later F10 waves (syscalls + TransactionContext helpers)
     pub(crate) fn add_subaccount(
@@ -332,63 +362,146 @@ impl TransactionAccounts {
         pubkey: Pubkey,
         account: AccountSharedData,
     ) -> IndexOfAccount {
-        let mut subaccounts = self.subaccounts.borrow_mut();
-        let index = subaccounts.len() as IndexOfAccount;
-        subaccounts.push((pubkey, Box::new(RefCell::new(account))));
-        self.touched_subaccounts.borrow_mut().push(false);
+        let mut shared = self.subaccount_shared_fields.borrow_mut();
+        let mut private = self.subaccount_private_fields.borrow_mut();
+        let mut counters = self.subaccount_borrow_counters.borrow_mut();
+        let mut touched = self.touched_subaccounts.borrow_mut();
+        let index = shared.len() as IndexOfAccount;
+        shared.push(Box::new(UnsafeCell::new(AccountSharedFields {
+            key: pubkey,
+            owner: *account.owner(),
+            lamports: account.lamports(),
+            payload: crate::vm_slice::VmSlice::new(0, account.data().len() as u64),
+        })));
+        private.push(Box::new(UnsafeCell::new(AccountPrivateFields {
+            rent_epoch: account.rent_epoch(),
+            executable: account.executable(),
+            payload: account.data_clone(),
+        })));
+        counters.push(Box::new(BorrowCounter::default()));
+        touched.push(false);
         index
     }
 
     #[cfg(not(target_os = "solana"))]
     pub fn number_of_subaccounts(&self) -> IndexOfAccount {
-        self.subaccounts.borrow().len() as IndexOfAccount
+        self.subaccount_shared_fields.borrow().len() as IndexOfAccount
     }
 
     #[cfg(not(target_os = "solana"))]
     pub fn find_index_of_subaccount(&self, pubkey: &Pubkey) -> Option<IndexOfAccount> {
-        self.subaccounts
-            .borrow()
+        let shared = self.subaccount_shared_fields.borrow();
+        shared
             .iter()
-            .position(|(k, _)| k == pubkey)
+            .position(|boxed| {
+                // SAFETY: subaccount lane is append-only; no concurrent
+                // mutable borrow via AccountRefMut can be live while we read
+                // just the immutable `key` field — it is never mutated after
+                // construction.
+                unsafe { (*boxed.get()).key == *pubkey }
+            })
             .map(|i| i as IndexOfAccount)
     }
 
     #[cfg(not(target_os = "solana"))]
     pub fn subaccount_key(&self, index: IndexOfAccount) -> Option<Pubkey> {
-        self.subaccounts.borrow().get(index as usize).map(|(k, _)| *k)
-    }
-
-    #[cfg(not(target_os = "solana"))]
-    fn _subaccount_cell_ptr(
-        &self,
-        index: IndexOfAccount,
-    ) -> Result<*const RefCell<AccountSharedData>, InstructionError> {
-        let subaccounts = self.subaccounts.borrow();
-        let entry = subaccounts
+        let shared = self.subaccount_shared_fields.borrow();
+        // SAFETY: `key` is set at construction and never mutated; immutable
+        // read is safe regardless of outstanding AccountRef/AccountRefMut.
+        shared
             .get(index as usize)
-            .ok_or(InstructionError::MissingAccount)?;
-        Ok(&*entry.1)
+            .map(|boxed| unsafe { (*boxed.get()).key })
     }
 
+    /// F10: borrow a subaccount (immutable) via the split-storage format.
+    ///
+    /// Mirrors `try_borrow` for main accounts — returns `AccountRef<'_>` so
+    /// callers see a uniform borrow type.
     #[cfg(not(target_os = "solana"))]
     pub fn try_borrow_subaccount(
         &self,
         index: IndexOfAccount,
-    ) -> Result<Ref<'_, AccountSharedData>, InstructionError> {
-        let ptr = self._subaccount_cell_ptr(index)?;
-        // Safe: each subaccount is boxed, so the cell address is stable even if
-        // the outer Vec reallocates. The returned Ref keeps a dynamic borrow
-        // over the cell, not the Vec.
-        unsafe { (*ptr).try_borrow() }.map_err(|_| InstructionError::AccountBorrowFailed)
+    ) -> Result<AccountRef<'_>, InstructionError> {
+        let (shared_ptr, private_ptr, counter_ptr) = self.subaccount_raw_ptrs(index)?;
+
+        // SAFETY: pointers obtained from `Box<_>`-owned entries in append-only
+        // Vecs — heap addresses are stable for the life of `self`. The borrow
+        // counter below guarantees no live `AccountRefMut` exists for this
+        // slot.
+        let borrow_counter = unsafe { &*counter_ptr };
+        borrow_counter.try_borrow()?;
+        let abi_account = unsafe { &*(*shared_ptr).get() };
+        let private_fields = unsafe { &*(*private_ptr).get() };
+        let account = TransactionAccountView {
+            abi_account,
+            private_fields,
+        };
+        Ok(AccountRef {
+            account,
+            borrow_counter,
+        })
     }
 
+    /// F10: borrow a subaccount (mutable) via the split-storage format.
+    ///
+    /// Mirrors `try_borrow_mut` for main accounts — returns
+    /// `AccountRefMut<'_>` so callers see a uniform borrow type.
     #[cfg(not(target_os = "solana"))]
     pub fn try_borrow_mut_subaccount(
         &self,
         index: IndexOfAccount,
-    ) -> Result<RefMut<'_, AccountSharedData>, InstructionError> {
-        let ptr = self._subaccount_cell_ptr(index)?;
-        unsafe { (*ptr).try_borrow_mut() }.map_err(|_| InstructionError::AccountBorrowFailed)
+    ) -> Result<AccountRefMut<'_>, InstructionError> {
+        let (shared_ptr, private_ptr, counter_ptr) = self.subaccount_raw_ptrs(index)?;
+
+        // SAFETY: see `try_borrow_subaccount`; the borrow counter here excludes
+        // any concurrent `AccountRef`/`AccountRefMut` for this slot.
+        let borrow_counter = unsafe { &*counter_ptr };
+        borrow_counter.try_borrow_mut()?;
+        let abi_account = unsafe { &mut *(*shared_ptr).get() };
+        let private_fields = unsafe { &mut *(*private_ptr).get() };
+        let account = TransactionAccountViewMut {
+            abi_account,
+            private_fields,
+        };
+        Ok(AccountRefMut {
+            account,
+            borrow_counter,
+        })
+    }
+
+    /// Extracts stable raw pointers to the three split-storage cells of the
+    /// subaccount at `index`. The RefCell borrows on the outer Vecs are
+    /// dropped before returning because the Box-owned heap addresses are
+    /// stable for the life of `self` (append-only invariant).
+    #[cfg(not(target_os = "solana"))]
+    fn subaccount_raw_ptrs(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<
+        (
+            *mut UnsafeCell<AccountSharedFields>,
+            *mut UnsafeCell<AccountPrivateFields>,
+            *const BorrowCounter,
+        ),
+        InstructionError,
+    > {
+        let shared = self.subaccount_shared_fields.borrow();
+        let private = self.subaccount_private_fields.borrow();
+        let counters = self.subaccount_borrow_counters.borrow();
+        let shared_box = shared
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        let private_box = private
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        let counter_box = counters
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        let shared_ptr: *mut UnsafeCell<AccountSharedFields> = &**shared_box as *const _ as *mut _;
+        let private_ptr: *mut UnsafeCell<AccountPrivateFields> =
+            &**private_box as *const _ as *mut _;
+        let counter_ptr: *const BorrowCounter = &**counter_box;
+        Ok((shared_ptr, private_ptr, counter_ptr))
     }
 
     pub(crate) fn update_accounts_resize_delta(
@@ -567,6 +680,20 @@ impl TransactionAccounts {
     }
 
     pub(crate) fn account_key(&self, index: IndexOfAccount) -> Option<&Pubkey> {
+        // F10: subaccount-marker bit redirects to the subaccount lane.
+        #[cfg(not(target_os = "solana"))]
+        if index & SUBACCOUNT_MARKER != 0 {
+            let sub_index = (index & !SUBACCOUNT_MARKER) as usize;
+            let shared = self.subaccount_shared_fields.borrow();
+            let boxed = shared.get(sub_index)?;
+            // SAFETY: subaccount keys are set at `add_subaccount` and never
+            // mutated afterward; `Box<UnsafeCell<_>>` gives a stable heap
+            // address, so extending the `Ref`-scoped borrow to `&self`
+            // lifetime is sound against the append-only invariant.
+            let key_ptr: *const Pubkey = unsafe { &(*boxed.get()).key };
+            drop(shared);
+            return Some(unsafe { &*key_ptr });
+        }
         // SAFETY: We never modify an account key, so returning a reference to it is safe.
         unsafe {
             self.shared_account_fields
@@ -690,8 +817,10 @@ impl DerefMut for AccountRefMut<'_> {
 #[cfg(test)]
 mod tests {
     use {
-        crate::transaction_accounts::TransactionAccounts, solana_account::AccountSharedData,
-        solana_instruction::error::InstructionError, solana_pubkey::Pubkey,
+        crate::transaction_accounts::TransactionAccounts,
+        solana_account::{AccountSharedData, ReadableAccount},
+        solana_instruction::error::InstructionError,
+        solana_pubkey::Pubkey,
     };
 
     #[test]
@@ -817,5 +946,124 @@ mod tests {
                 assert_eq!(acc.err(), Some(InstructionError::AccountBorrowFailed));
             }
         }
+    }
+
+    fn make_tx_accounts() -> TransactionAccounts {
+        TransactionAccounts::new(vec![(
+            Pubkey::new_unique(),
+            AccountSharedData::new(2, 1, &Pubkey::new_unique()),
+        )])
+    }
+
+    #[test]
+    fn test_add_subaccount_populates_split_storage() {
+        let tx_accounts = make_tx_accounts();
+        assert_eq!(tx_accounts.number_of_subaccounts(), 0);
+
+        let sub_key = Pubkey::new_unique();
+        let sub_owner = Pubkey::new_unique();
+        let sub_account = AccountSharedData::new(42, 8, &sub_owner);
+        let index = tx_accounts.add_subaccount(sub_key, sub_account);
+
+        assert_eq!(index, 0);
+        assert_eq!(tx_accounts.number_of_subaccounts(), 1);
+        assert_eq!(tx_accounts.find_index_of_subaccount(&sub_key), Some(0));
+        assert_eq!(tx_accounts.subaccount_key(0), Some(sub_key));
+        assert_eq!(
+            tx_accounts.find_index_of_subaccount(&Pubkey::new_unique()),
+            None
+        );
+
+        let borrowed = tx_accounts.try_borrow_subaccount(0).unwrap();
+        assert_eq!(borrowed.lamports(), 42);
+        assert_eq!(borrowed.owner(), &sub_owner);
+        assert_eq!(borrowed.data().len(), 8);
+    }
+
+    #[test]
+    fn test_subaccount_borrow_counter_enforced() {
+        let tx_accounts = make_tx_accounts();
+        let sub_key = Pubkey::new_unique();
+        tx_accounts.add_subaccount(sub_key, AccountSharedData::new(1, 0, &Pubkey::new_unique()));
+
+        // Two immutable borrows succeed.
+        {
+            let a = tx_accounts.try_borrow_subaccount(0);
+            let b = tx_accounts.try_borrow_subaccount(0);
+            assert!(a.is_ok() && b.is_ok());
+        }
+
+        // Second mutable borrow must fail while the first is alive.
+        {
+            let a = tx_accounts.try_borrow_mut_subaccount(0).unwrap();
+            let b = tx_accounts.try_borrow_mut_subaccount(0);
+            assert_eq!(b.err(), Some(InstructionError::AccountBorrowFailed));
+            drop(a);
+        }
+
+        // Mutable-after-immutable must fail.
+        {
+            let a = tx_accounts.try_borrow_subaccount(0).unwrap();
+            let b = tx_accounts.try_borrow_mut_subaccount(0);
+            assert_eq!(b.err(), Some(InstructionError::AccountBorrowFailed));
+            drop(a);
+        }
+
+        // Immutable-after-mutable must fail.
+        {
+            let a = tx_accounts.try_borrow_mut_subaccount(0).unwrap();
+            let b = tx_accounts.try_borrow_subaccount(0);
+            assert_eq!(b.err(), Some(InstructionError::AccountBorrowFailed));
+            drop(a);
+        }
+
+        // Borrow counter resets once previous borrow is dropped.
+        let _fresh = tx_accounts.try_borrow_mut_subaccount(0).unwrap();
+    }
+
+    #[test]
+    fn test_subaccount_heap_stability_across_add() {
+        let tx_accounts = make_tx_accounts();
+        // Grow subaccount lane beyond Vec's initial capacity so a subsequent
+        // `add_subaccount` triggers reallocation of the Vec's internal buffer.
+        let first_key = Pubkey::new_unique();
+        tx_accounts.add_subaccount(
+            first_key,
+            AccountSharedData::new(7, 4, &Pubkey::new_unique()),
+        );
+
+        // Hold a borrow into slot 0 across many pushes.
+        let borrowed = tx_accounts.try_borrow_subaccount(0).unwrap();
+        let lamports_before = borrowed.lamports();
+        let data_len_before = borrowed.data().len();
+        // Force multiple reallocations.
+        for _ in 0..64 {
+            tx_accounts.add_subaccount(
+                Pubkey::new_unique(),
+                AccountSharedData::new(1, 0, &Pubkey::new_unique()),
+            );
+        }
+        // Borrow must still point at the same data — heap address of the
+        // Box'd slot 0 did not move even after the Vec reallocated.
+        assert_eq!(borrowed.lamports(), lamports_before);
+        assert_eq!(borrowed.lamports(), 7);
+        assert_eq!(borrowed.data().len(), data_len_before);
+        assert_eq!(borrowed.data().len(), 4);
+        // Lookup still resolves through the split-storage key.
+        assert_eq!(tx_accounts.find_index_of_subaccount(&first_key), Some(0));
+    }
+
+    #[test]
+    fn test_subaccount_missing_index() {
+        let tx_accounts = make_tx_accounts();
+        assert_eq!(
+            tx_accounts.try_borrow_subaccount(0).err(),
+            Some(InstructionError::MissingAccount),
+        );
+        assert_eq!(
+            tx_accounts.try_borrow_mut_subaccount(5).err(),
+            Some(InstructionError::MissingAccount),
+        );
+        assert_eq!(tx_accounts.subaccount_key(0), None);
     }
 }
