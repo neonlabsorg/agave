@@ -7,7 +7,7 @@ use {
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_transaction_context::{IndexOfAccount, TransactionContext},
-    solana_transaction_error::{TransactionError, TransactionResult},
+    solana_transaction_error::TransactionResult,
 };
 
 /// When rent is collected from an exempt account, rent_epoch is set to this
@@ -34,22 +34,23 @@ pub enum RentState {
 /// This method has a default implementation that calls into
 /// `check_rent_state_with_account`.
 pub fn check_rent_state(
-    pre_rent_state: Option<&RentState>,
-    post_rent_state: Option<&RentState>,
-    transaction_context: &TransactionContext,
-    index: IndexOfAccount,
+    _pre_rent_state: Option<&RentState>,
+    _post_rent_state: Option<&RentState>,
+    _transaction_context: &TransactionContext,
+    _index: IndexOfAccount,
 ) -> TransactionResult<()> {
-    if let Some((pre_rent_state, post_rent_state)) = pre_rent_state.zip(post_rent_state) {
-        let expect_msg = "account must exist at TransactionContext index if rent-states are Some";
-        check_rent_state_with_account(
-            pre_rent_state,
-            post_rent_state,
-            transaction_context
-                .get_key_of_account_at_index(index)
-                .expect(expect_msg),
-            index,
-        )?;
-    }
+    // F2+F3: neutralized per snapshot
+    // if let Some((pre_rent_state, post_rent_state)) = pre_rent_state.zip(post_rent_state) {
+    //     let expect_msg = "account must exist at TransactionContext index if rent-states are Some";
+    //     check_rent_state_with_account(
+    //         pre_rent_state,
+    //         post_rent_state,
+    //         transaction_context
+    //             .get_key_of_account_at_index(index)
+    //             .expect(expect_msg),
+    //         index,
+    //     )?;
+    // }
     Ok(())
 }
 
@@ -59,19 +60,21 @@ pub fn check_rent_state(
 /// transition is allowed and returns an error if it is not. It also
 /// verifies that the account is not the incinerator.
 pub fn check_rent_state_with_account(
-    pre_rent_state: &RentState,
-    post_rent_state: &RentState,
-    address: &Pubkey,
-    account_index: IndexOfAccount,
+    _pre_rent_state: &RentState,
+    _post_rent_state: &RentState,
+    _address: &Pubkey,
+    _account_index: IndexOfAccount,
 ) -> TransactionResult<()> {
-    if !solana_sdk_ids::incinerator::check_id(address)
-        && !transition_allowed(pre_rent_state, post_rent_state)
-    {
-        let account_index = account_index as u8;
-        Err(TransactionError::InsufficientFundsForRent { account_index })
-    } else {
-        Ok(())
-    }
+    // F2+F3: neutralized per snapshot
+    // if !solana_sdk_ids::incinerator::check_id(address)
+    //     && !transition_allowed(pre_rent_state, post_rent_state)
+    // {
+    //     let account_index = account_index as u8;
+    //     Err(TransactionError::InsufficientFundsForRent { account_index })
+    // } else {
+    //     Ok(())
+    // }
+    Ok(())
 }
 
 /// Determine the rent state of an account.

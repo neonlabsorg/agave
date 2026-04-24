@@ -276,7 +276,7 @@ fn add_validator_accounts(
                 identity_pubkey,
                 bls_pubkey_compressed_bytes,
                 u16::from(commission) * 100,
-                rent.minimum_balance(VoteStateV4::size_of()).max(1),
+                rent.minimum_balance(VoteStateV4::size_of()),
             )
         } else {
             vote_state::create_v3_account_with_authorized(
@@ -284,7 +284,7 @@ fn add_validator_accounts(
                 identity_pubkey,
                 identity_pubkey,
                 commission,
-                rent.minimum_balance(VoteStateV3::size_of()).max(1),
+                rent.minimum_balance(VoteStateV3::size_of()),
             )
         };
 

@@ -2403,7 +2403,7 @@ fn main() {
                                 identity_pubkey,
                                 None,
                                 10000,
-                                rent.minimum_balance(VoteStateV4::size_of()).max(1),
+                                rent.minimum_balance(VoteStateV4::size_of()),
                             );
 
                             bank.store_account(

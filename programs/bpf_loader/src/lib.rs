@@ -1362,7 +1362,7 @@ fn common_extend_program(
     let required_payment = {
         let balance = programdata_account.get_lamports();
         let rent = invoke_context.get_sysvar_cache().get_rent()?;
-        let min_balance = rent.minimum_balance(new_len).max(1);
+        let min_balance = rent.minimum_balance(new_len);
         min_balance.saturating_sub(balance)
     };
 

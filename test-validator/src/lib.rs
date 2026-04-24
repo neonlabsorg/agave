@@ -901,7 +901,7 @@ impl TestValidator {
             accounts.insert(
                 programdata_address,
                 AccountSharedData::from(Account {
-                    lamports: Rent::default().minimum_balance(program_data.len()).max(1),
+                    lamports: Rent::default().minimum_balance(program_data.len()),
                     data: program_data,
                     owner: upgradeable_program.loader,
                     executable: false,
@@ -916,7 +916,7 @@ impl TestValidator {
             accounts.insert(
                 upgradeable_program.program_id,
                 AccountSharedData::from(Account {
-                    lamports: Rent::default().minimum_balance(data.len()).max(1),
+                    lamports: Rent::default().minimum_balance(data.len()),
                     data,
                     owner: upgradeable_program.loader,
                     executable: true,

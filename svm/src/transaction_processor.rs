@@ -2,8 +2,9 @@ use {
     crate::{
         account_loader::{
             load_transaction, update_rent_exempt_status_for_account, validate_fee_payer,
-            AccountLoader, CheckedTransactionDetails, LoadedTransaction, TransactionCheckResult,
-            TransactionLoadResult, ValidatedTransactionDetails,
+            AccountLoader, CheckedTransactionDetails, LoadedTransaction, LoadedTransactionAccount,
+            TransactionCheckResult, TransactionLoadResult, ValidatedTransactionDetails,
+            TRANSACTION_ACCOUNT_BASE_SIZE,
         },
         account_overrides::AccountOverrides,
         message_processor::process_message,
@@ -45,6 +46,7 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_rent::Rent,
+    solana_sdk_ids::system_program,
     solana_svm_callback::TransactionProcessingCallback,
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_log_collector::LogCollector,
@@ -635,9 +637,29 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         // We *must* use load_transaction_account() here because *this* is when the fee-payer
         // is loaded for the transaction. Transaction loading skips the first account and
         // loads (and thus inspects) all others normally.
-        let Some(mut loaded_fee_payer) =
+        //
+        // F2 (gasless): if total_fee == 0 and the fee-payer account does not exist
+        // on-chain, synthesize a temporary system-owned zero-lamport account so the
+        // validation path continues. Non-zero-fee transactions still require the fee-payer
+        // to exist (defence-in-depth).
+        let mut loaded_fee_payer = if let Some(loaded_fee_payer) =
             account_loader.load_transaction_account(fee_payer_address, true)
-        else {
+        {
+            loaded_fee_payer
+        } else if compute_budget_and_limits.fee_details.total_fee() == 0 {
+            let base_account_size = if account_loader
+                .feature_set
+                .formalize_loaded_transaction_data_size
+            {
+                TRANSACTION_ACCOUNT_BASE_SIZE
+            } else {
+                0
+            };
+            LoadedTransactionAccount {
+                loaded_size: base_account_size,
+                account: AccountSharedData::new(0, 0, &system_program::id()),
+            }
+        } else {
             error_counters.account_not_found += 1;
             return Err(TransactionError::AccountNotFound);
         };
