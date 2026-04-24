@@ -267,12 +267,25 @@ pub fn serialize_parameters(
         // time it's iterated on.
         .collect::<Vec<_>>();
 
-    // F10: instruction-scope subaccount serialization is Wave 7+. No current
-    // code path populates subaccounts at this level, so the loop iterates
-    // zero times; the u64 subaccount count + aligned-path padding are still
-    // emitted so the ABI shape matches parasol-dev.
-    debug_assert_eq!(instruction_context.get_number_of_subaccounts(), 0);
-    let subaccounts: Vec<SerializeAccount> = Vec::new();
+    // F10: build `SerializeAccount` entries for the subaccount lane so the
+    // aligned-path loop body serializes real subaccount headers + data.
+    // Self-invoke syscalls populate `instruction_subaccounts()` via
+    // `prepare_next_instruction`; regular invokes leave it empty.
+    let subaccounts = (0..instruction_context.get_number_of_subaccounts())
+        .map(|subaccount_index| {
+            if let Some(duplicate_position) = instruction_context
+                .is_instruction_subaccount_duplicate(subaccount_index)
+                .unwrap()
+            {
+                SerializeAccount::Duplicate(duplicate_position)
+            } else {
+                let account = instruction_context
+                    .try_borrow_subaccount(subaccount_index)
+                    .unwrap();
+                SerializeAccount::Account(subaccount_index, account)
+            }
+        })
+        .collect::<Vec<_>>();
 
     if is_loader_deprecated {
         serialize_parameters_unaligned(

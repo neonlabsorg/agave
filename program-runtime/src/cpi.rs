@@ -105,7 +105,7 @@ pub struct SolAccountInfo {
 /// Rust representation of C's SolSignerSeed
 #[derive(Debug)]
 #[repr(C)]
-struct SolSignerSeedC {
+pub struct SolSignerSeedC {
     pub addr: u64,
     pub len: u64,
 }
@@ -113,7 +113,7 @@ struct SolSignerSeedC {
 /// Rust representation of C's SolSignerSeeds
 #[derive(Debug)]
 #[repr(C)]
-struct SolSignerSeedsC {
+pub struct SolSignerSeedsC {
     pub addr: u64,
     pub len: u64,
 }

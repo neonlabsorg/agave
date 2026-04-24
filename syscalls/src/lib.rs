@@ -33,7 +33,12 @@ use {
     solana_keccak_hasher as keccak, solana_poseidon as poseidon,
     solana_program_entrypoint::{BPF_ALIGN_OF_U128, SUCCESS},
     solana_program_runtime::{
-        cpi::CpiError,
+        cpi::{
+            cpi_common, translate_account_infos, translate_accounts_c, translate_accounts_rust,
+            translate_instruction_c, translate_instruction_rust, translate_subaccounts_common,
+            update_caller_account, update_caller_account_region, CallerAccount, CpiError,
+            SolAccountInfo, SolSignerSeedsC, SyscallInvokeSigned, TranslatedAccount,
+        },
         execution_budget::{SVMTransactionExecutionBudget, SVMTransactionExecutionCost},
         invoke_context::InvokeContext,
         memory::MemoryTranslationError,
@@ -56,7 +61,7 @@ use {
     solana_svm_type_overrides::sync::Arc,
     solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
     solana_sysvar::SysvarSerialize,
-    solana_transaction_context::{vm_slice::VmSlice, InstructionAccount},
+    solana_transaction_context::{vm_slice::VmSlice, InstructionAccount, SUBACCOUNT_MARKER},
     std::{
         alloc::Layout,
         mem::{align_of, size_of},
@@ -2258,14 +2263,86 @@ declare_builtin_function!(
             .try_borrow_mut_subaccount(subaccount_index)?
             .set_subaccount_mark();
 
-        // W8d: sync the newly-created subaccount with the caller's
-        // `AccountInfo` entry so CPI write-back sees the allocation. The sync
-        // path needs `cpi::CallerAccount::from_sol_account_info`,
-        // `cpi::update_caller_account`, and `cpi::update_caller_account_region`
-        // — all currently private to `program-runtime/src/cpi.rs`. Until W8d
-        // exposes them, `instruction_subaccounts()` is always empty at this
-        // point (CPI never populates it), so skipping the sync is observably
-        // identical to the parasol-dev `position == None` branch.
+        // Sync the newly-created subaccount with the caller's AccountInfo
+        // entry so a subsequent CPI read-back sees the allocation. Matches
+        // parasol-dev's `position == Some(_)` branch; for top-level
+        // invocations `instruction_subaccounts()` is empty and the sync
+        // skips cleanly.
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_current_instruction_context()?;
+        let position = instruction_context
+            .instruction_subaccounts()
+            .iter()
+            .position(|account| {
+                account.index_in_transaction == subaccount_index | SUBACCOUNT_MARKER
+            });
+        if let Some(position) = position {
+            let stricter_abi_and_runtime_constraints = invoke_context
+                .get_feature_set()
+                .stricter_abi_and_runtime_constraints;
+            let account_data_direct_mapping =
+                invoke_context.get_feature_set().account_data_direct_mapping;
+
+            let syscall_context = invoke_context.get_syscall_context()?;
+            let subaccount_infos_addr = syscall_context.subaccounts_infos.vm_data_addr;
+            let subaccount_infos_len = syscall_context.subaccounts_infos.vm_data_len;
+            let subaccount_infos = translate_slice::<SolAccountInfo>(
+                memory_mapping,
+                subaccount_infos_addr,
+                subaccount_infos_len,
+                check_aligned,
+            )?;
+            let subaccount_info = subaccount_infos.get(position).ok_or_else(|| {
+                ic_msg!(
+                    invoke_context,
+                    "InstructionError: missing AccountInfo for subaccount"
+                );
+                InstructionError::MissingAccount
+            })?;
+
+            let serialized_metadata = syscall_context
+                .subaccounts_metadata
+                .get(position)
+                .ok_or_else(|| {
+                    ic_msg!(
+                        invoke_context,
+                        "InstructionError: missing metadata for subaccount"
+                    );
+                    InstructionError::MissingAccount
+                })?;
+
+            let mut caller_account = CallerAccount::from_sol_account_info(
+                invoke_context,
+                memory_mapping,
+                check_aligned,
+                subaccount_infos_addr.checked_add(
+                    (position as u64).saturating_mul(std::mem::size_of::<SolAccountInfo>() as u64),
+                ).ok_or(SyscallError::ArithmeticOverflow)?,
+                subaccount_info,
+                serialized_metadata,
+            )?;
+
+            let mut subaccount =
+                instruction_context.try_borrow_subaccount(position as u16)?;
+
+            update_caller_account(
+                invoke_context,
+                memory_mapping,
+                check_aligned,
+                &mut caller_account,
+                &mut subaccount,
+                stricter_abi_and_runtime_constraints,
+                account_data_direct_mapping,
+            )?;
+            update_caller_account_region(
+                memory_mapping,
+                check_aligned,
+                &caller_account,
+                &mut subaccount,
+                account_data_direct_mapping,
+            )?;
+        }
 
         Ok(SUCCESS)
     }
@@ -2310,43 +2387,410 @@ declare_builtin_function!(
 );
 
 declare_builtin_function!(
-    /// F10: CPI where caller program == callee program (Rust ABI).
-    /// Stub — full implementation deferred to Wave 8e (paired with cpi.rs
-    /// translation helpers in W8d).
+    /// F10: CPI where caller program == callee program (Rust ABI). The 5th/6th
+    /// syscall arguments carry `subaccounts_seeds` instead of `signers_seeds`
+    /// — self-invokes cannot sign for the callee (same program) but declare
+    /// the subaccount seed set that routes through the subaccount lane.
     SyscallSelfInvokeRust,
     fn rust(
         invoke_context: &mut InvokeContext,
-        _instruction_addr: u64,
-        _account_infos_addr: u64,
-        _account_infos_len: u64,
-        _signers_seeds_addr: u64,
-        _signers_seeds_len: u64,
-        _memory_mapping: &mut MemoryMapping,
+        instruction_addr: u64,
+        account_infos_addr: u64,
+        account_infos_len: u64,
+        subaccounts_seeds_addr: u64,
+        subaccounts_seeds_len: u64,
+        memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
-        let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
-        consume_compute_meter(invoke_context, syscall_base_cost)?;
-        Err(SyscallError::SubaccountsNotSupported.into())
+        let check_aligned = invoke_context.get_check_aligned();
+
+        let caller_program_id = *invoke_context
+            .transaction_context
+            .get_current_instruction_context()?
+            .get_program_key()?;
+        let subaccounts_seeds = SyscallSelfInvokeRust::translate_subaccounts_seeds(
+            &caller_program_id,
+            subaccounts_seeds_addr,
+            subaccounts_seeds_len,
+            memory_mapping,
+            check_aligned,
+            invoke_context,
+        )?;
+
+        let next_instruction_subaccounts =
+            build_next_instruction_subaccounts(invoke_context, &subaccounts_seeds)?;
+
+        cpi_common::<Self>(
+            invoke_context,
+            instruction_addr,
+            account_infos_addr,
+            account_infos_len,
+            0u64,
+            0u64,
+            memory_mapping,
+            next_instruction_subaccounts,
+        )?;
+
+        Ok(SUCCESS)
     }
 );
 
+impl SyscallSelfInvokeRust {
+    /// F10 Rust-ABI: translate a `&[&[&[u8]]]` seeds slice into the list of
+    /// (subaccount PDA, writable) pairs the self-invoke attaches to the
+    /// callee frame.
+    fn translate_subaccounts_seeds(
+        program_id: &Pubkey,
+        subaccount_seeds_addr: u64,
+        subaccount_seeds_len: u64,
+        memory_mapping: &MemoryMapping,
+        check_aligned: bool,
+        invoke_context: &InvokeContext,
+    ) -> Result<Vec<(Pubkey, bool)>, Error> {
+        if subaccount_seeds_len == 0 {
+            return Ok(Vec::new());
+        }
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_current_instruction_context()?;
+        let subaccounts_seeds = translate_slice::<VmSlice<VmSlice<u8>>>(
+            memory_mapping,
+            subaccount_seeds_addr,
+            subaccount_seeds_len,
+            check_aligned,
+        )?;
+        let mut subaccounts = Vec::with_capacity(subaccounts_seeds.len());
+        for subaccount_seeds in subaccounts_seeds.iter() {
+            let (subaccount_pubkey, is_writable) = Self::translate_subaccount_seeds(
+                program_id,
+                subaccount_seeds.ptr(),
+                subaccount_seeds.len(),
+                memory_mapping,
+                check_aligned,
+                invoke_context,
+                &instruction_context,
+            )?;
+            subaccounts.push((subaccount_pubkey, is_writable));
+        }
+        Ok(subaccounts)
+    }
+}
+
+impl SyscallInvokeSigned for SyscallSelfInvokeRust {
+    fn translate_instruction(
+        addr: u64,
+        memory_mapping: &MemoryMapping,
+        invoke_context: &mut InvokeContext,
+        check_aligned: bool,
+    ) -> Result<solana_instruction::Instruction, Error> {
+        let instruction =
+            translate_instruction_rust(addr, memory_mapping, invoke_context, check_aligned)?;
+        let caller_program_id = *invoke_context
+            .transaction_context
+            .get_current_instruction_context()?
+            .get_program_key()?;
+        if instruction.program_id != caller_program_id {
+            return Err(Box::new(SyscallError::InvalidSelfInvokeProgramId));
+        }
+        Ok(instruction)
+    }
+
+    fn translate_accounts<'a>(
+        account_infos_addr: u64,
+        account_infos_len: u64,
+        memory_mapping: &MemoryMapping<'_>,
+        invoke_context: &mut InvokeContext,
+        check_aligned: bool,
+    ) -> Result<Vec<TranslatedAccount<'a>>, Error> {
+        translate_accounts_rust(
+            account_infos_addr,
+            account_infos_len,
+            memory_mapping,
+            invoke_context,
+            check_aligned,
+        )
+    }
+
+    fn translate_subaccounts<'a>(
+        subaccount_infos_addr: u64,
+        subaccount_infos_len: u64,
+        memory_mapping: &MemoryMapping<'_>,
+        invoke_context: &mut InvokeContext,
+        check_aligned: bool,
+    ) -> Result<Vec<TranslatedAccount<'a>>, Error> {
+        let (subaccount_infos, _subaccount_info_keys) = translate_account_infos(
+            subaccount_infos_addr,
+            subaccount_infos_len,
+            |subaccount_info: &AccountInfo| subaccount_info.key as *const _ as u64,
+            memory_mapping,
+            invoke_context,
+            check_aligned,
+        )?;
+        translate_subaccounts_common(
+            subaccount_infos,
+            subaccount_infos_addr,
+            invoke_context,
+            memory_mapping,
+            check_aligned,
+            CallerAccount::from_account_info,
+        )
+    }
+
+    fn translate_signers(
+        _program_id: &Pubkey,
+        _signers_seeds_addr: u64,
+        _signers_seeds_len: u64,
+        _memory_mapping: &MemoryMapping,
+        _check_aligned: bool,
+    ) -> Result<Vec<Pubkey>, Error> {
+        Ok(Vec::new())
+    }
+}
+
 declare_builtin_function!(
-    /// F10: CPI where caller program == callee program (C ABI).
-    /// Stub — full implementation deferred to Wave 8e.
+    /// F10: CPI where caller program == callee program (C ABI). Same shape
+    /// as [`SyscallSelfInvokeRust`] but with C-layout seeds + AccountInfos.
     SyscallSelfInvokeC,
     fn rust(
         invoke_context: &mut InvokeContext,
-        _instruction_addr: u64,
-        _account_infos_addr: u64,
-        _account_infos_len: u64,
-        _signers_seeds_addr: u64,
-        _signers_seeds_len: u64,
-        _memory_mapping: &mut MemoryMapping,
+        instruction_addr: u64,
+        account_infos_addr: u64,
+        account_infos_len: u64,
+        subaccounts_seeds_addr: u64,
+        subaccounts_seeds_len: u64,
+        memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
-        let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
-        consume_compute_meter(invoke_context, syscall_base_cost)?;
-        Err(SyscallError::SubaccountsNotSupported.into())
+        let check_aligned = invoke_context.get_check_aligned();
+
+        let caller_program_id = *invoke_context
+            .transaction_context
+            .get_current_instruction_context()?
+            .get_program_key()?;
+        let subaccounts_seeds = SyscallSelfInvokeC::translate_subaccounts_seeds(
+            &caller_program_id,
+            subaccounts_seeds_addr,
+            subaccounts_seeds_len,
+            memory_mapping,
+            check_aligned,
+            invoke_context,
+        )?;
+
+        let next_instruction_subaccounts =
+            build_next_instruction_subaccounts(invoke_context, &subaccounts_seeds)?;
+
+        cpi_common::<Self>(
+            invoke_context,
+            instruction_addr,
+            account_infos_addr,
+            account_infos_len,
+            0u64,
+            0u64,
+            memory_mapping,
+            next_instruction_subaccounts,
+        )?;
+
+        Ok(SUCCESS)
     }
 );
+
+impl SyscallSelfInvokeC {
+    /// F10 C-ABI variant of `translate_subaccount_seeds`. Uses `SolSignerSeedsC`
+    /// (pair of `{addr, len}`) entries in place of Rust's `VmSlice<u8>`.
+    fn translate_subaccount_seeds(
+        program_id: &Pubkey,
+        seeds_addr: u64,
+        seeds_len: u64,
+        memory_mapping: &MemoryMapping,
+        check_aligned: bool,
+        invoke_context: &InvokeContext,
+        instruction_context: &solana_transaction_context::InstructionContext,
+    ) -> Result<(Pubkey, bool), Error> {
+        let seeds = translate_slice::<SolSignerSeedsC>(
+            memory_mapping,
+            seeds_addr,
+            seeds_len,
+            check_aligned,
+        )?;
+        if seeds.len() > MAX_SEEDS {
+            return Err(Box::new(InstructionError::MaxSeedLengthExceeded));
+        }
+        let seeds_bytes = seeds
+            .iter()
+            .map(|seed| translate_slice::<u8>(memory_mapping, seed.addr, seed.len, check_aligned))
+            .collect::<Result<Vec<_>, Error>>()?;
+        let base_seed: [u8; 32] = (*seeds_bytes
+            .first()
+            .ok_or(InstructionError::InvalidArgument)?)
+        .try_into()
+        .map_err(|_| InstructionError::InvalidArgument)?;
+        let base_pubkey = Pubkey::new_from_array(base_seed);
+        let base_index_in_transaction = invoke_context
+            .transaction_context
+            .find_index_of_account(&base_pubkey)
+            .ok_or(InstructionError::InvalidArgument)?;
+        let base_index_in_instruction = instruction_context
+            .get_index_of_account_in_instruction(base_index_in_transaction)
+            .map_err(|_| InstructionError::InvalidArgument)?;
+
+        let is_writable = instruction_context
+            .is_instruction_account_writable(base_index_in_instruction)
+            .map_err(|_| InstructionError::InvalidArgument)?;
+
+        let (subaccount_pubkey, _) = Pubkey::try_find_program_address(&seeds_bytes, program_id)
+            .ok_or_else(|| {
+                ic_msg!(
+                    invoke_context,
+                    "Unable to find a viable program address bump seed"
+                );
+                InstructionError::InvalidSeeds
+            })
+            .map_err(|_| InstructionError::InvalidArgument)?;
+
+        Ok((subaccount_pubkey, is_writable))
+    }
+
+    fn translate_subaccounts_seeds(
+        program_id: &Pubkey,
+        subaccount_seeds_addr: u64,
+        subaccount_seeds_len: u64,
+        memory_mapping: &MemoryMapping,
+        check_aligned: bool,
+        invoke_context: &InvokeContext,
+    ) -> Result<Vec<(Pubkey, bool)>, Error> {
+        if subaccount_seeds_len == 0 {
+            return Ok(Vec::new());
+        }
+        let instruction_context = invoke_context
+            .transaction_context
+            .get_current_instruction_context()?;
+        let subaccounts_seeds = translate_slice::<SolSignerSeedsC>(
+            memory_mapping,
+            subaccount_seeds_addr,
+            subaccount_seeds_len,
+            check_aligned,
+        )?;
+        let mut subaccounts = Vec::with_capacity(subaccounts_seeds.len());
+        for subaccount_seeds in subaccounts_seeds.iter() {
+            let (subaccount_pubkey, is_writable) = Self::translate_subaccount_seeds(
+                program_id,
+                subaccount_seeds.addr,
+                subaccount_seeds.len,
+                memory_mapping,
+                check_aligned,
+                invoke_context,
+                &instruction_context,
+            )?;
+            subaccounts.push((subaccount_pubkey, is_writable));
+        }
+        Ok(subaccounts)
+    }
+}
+
+impl SyscallInvokeSigned for SyscallSelfInvokeC {
+    fn translate_instruction(
+        addr: u64,
+        memory_mapping: &MemoryMapping,
+        invoke_context: &mut InvokeContext,
+        check_aligned: bool,
+    ) -> Result<solana_instruction::Instruction, Error> {
+        let instruction =
+            translate_instruction_c(addr, memory_mapping, invoke_context, check_aligned)?;
+        let caller_program_id = *invoke_context
+            .transaction_context
+            .get_current_instruction_context()?
+            .get_program_key()?;
+        if instruction.program_id != caller_program_id {
+            return Err(Box::new(SyscallError::InvalidSelfInvokeProgramId));
+        }
+        Ok(instruction)
+    }
+
+    fn translate_accounts<'a>(
+        account_infos_addr: u64,
+        account_infos_len: u64,
+        memory_mapping: &MemoryMapping<'_>,
+        invoke_context: &mut InvokeContext,
+        check_aligned: bool,
+    ) -> Result<Vec<TranslatedAccount<'a>>, Error> {
+        translate_accounts_c(
+            account_infos_addr,
+            account_infos_len,
+            memory_mapping,
+            invoke_context,
+            check_aligned,
+        )
+    }
+
+    fn translate_subaccounts<'a>(
+        subaccount_infos_addr: u64,
+        subaccount_infos_len: u64,
+        memory_mapping: &MemoryMapping<'_>,
+        invoke_context: &mut InvokeContext,
+        check_aligned: bool,
+    ) -> Result<Vec<TranslatedAccount<'a>>, Error> {
+        let (subaccount_infos, _subaccount_info_keys) = translate_account_infos(
+            subaccount_infos_addr,
+            subaccount_infos_len,
+            |account_info: &SolAccountInfo| account_info.key_addr,
+            memory_mapping,
+            invoke_context,
+            check_aligned,
+        )?;
+        translate_subaccounts_common(
+            subaccount_infos,
+            subaccount_infos_addr,
+            invoke_context,
+            memory_mapping,
+            check_aligned,
+            CallerAccount::from_sol_account_info,
+        )
+    }
+
+    fn translate_signers(
+        _program_id: &Pubkey,
+        _signers_seeds_addr: u64,
+        _signers_seeds_len: u64,
+        _memory_mapping: &MemoryMapping,
+        _check_aligned: bool,
+    ) -> Result<Vec<Pubkey>, Error> {
+        Ok(Vec::new())
+    }
+}
+
+/// Shared self-invoke helper: for each `(subaccount_pubkey, is_writable)` seed
+/// resolution, either re-use the existing subaccount index in the transaction
+/// context or register a fresh slot (with default `AccountSharedData`) via
+/// `add_subaccount`, then wrap into an `InstructionAccount::new_subaccount`.
+/// Pre-loading existing on-chain state for a subaccount address is deferred
+/// until `InvokeContext` grows a `get_account_shared_data` accessor.
+fn build_next_instruction_subaccounts(
+    invoke_context: &mut InvokeContext,
+    subaccounts_seeds: &[(Pubkey, bool)],
+) -> Result<Vec<InstructionAccount>, Error> {
+    let mut next_instruction_subaccounts = Vec::with_capacity(subaccounts_seeds.len());
+    for (subaccount_pubkey, is_writable) in subaccounts_seeds {
+        let subaccount_index = if let Some(subaccount_index) = invoke_context
+            .transaction_context
+            .find_index_of_subaccount(subaccount_pubkey)
+        {
+            subaccount_index
+        } else {
+            let subaccount = AccountSharedData::default();
+            let data_len_cost = (subaccount.data().len() as u64)
+                .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
+                .unwrap_or(u64::MAX);
+            consume_compute_meter(invoke_context, data_len_cost)?;
+            invoke_context
+                .transaction_context
+                .add_subaccount(*subaccount_pubkey, subaccount)?
+        };
+        next_instruction_subaccounts.push(InstructionAccount::new_subaccount(
+            subaccount_index,
+            false,
+            *is_writable,
+        ));
+    }
+    Ok(next_instruction_subaccounts)
+}
 
 #[cfg(test)]
 #[allow(clippy::arithmetic_side_effects)]
