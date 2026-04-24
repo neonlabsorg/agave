@@ -121,6 +121,10 @@ pub enum SyscallError {
     InvalidPointer,
     #[error("Arithmetic overflow")]
     ArithmeticOverflow,
+    #[error("Invalid self-invoke program ID")]
+    InvalidSelfInvokeProgramId,
+    #[error("Subaccounts are not supported")]
+    SubaccountsNotSupported,
 }
 
 impl From<MemoryTranslationError> for SyscallError {
@@ -442,6 +446,12 @@ pub fn create_program_runtime_environment_v1<'a, 'ix_data>(
     // Cross-program invocation
     result.register_function("sol_invoke_signed_c", SyscallInvokeSignedC::vm)?;
     result.register_function("sol_invoke_signed_rust", SyscallInvokeSignedRust::vm)?;
+
+    // F10: subaccount syscalls (Wave 7 — stubbed names; Wave 8 implements bodies)
+    result.register_function("sol_create_subaccount", SyscallCreateSubaccount::vm)?;
+    result.register_function("sol_set_subaccount_slice", SyscallSetSubaccountSlice::vm)?;
+    result.register_function("sol_self_invoke_rust", SyscallSelfInvokeRust::vm)?;
+    result.register_function("sol_self_invoke_c", SyscallSelfInvokeC::vm)?;
 
     // Memory allocator
     register_feature_gated_function!(
@@ -2039,6 +2049,97 @@ declare_builtin_function!(
     }
 );
 
+// ============================================================================
+// F10 — Subaccounts syscalls (PRS-153)
+//
+// Wave 7: register the four syscall names so on-chain programs that link
+// against them resolve cleanly at verification time. The bodies are stubs
+// that consume the syscall base cost and return `SubaccountsNotSupported`.
+// The real implementations land in Wave 8 alongside the CPI translation
+// helpers in `program-runtime/src/cpi.rs` — parasol-dev's `sol_create_subaccount`
+// and `sol_set_subaccount_slice` both depend on `translate_subaccount_seeds`
+// and `CallerAccount::from_sol_account_info`, which are part of the Wave 8
+// port. See `.bgv/shared/plans/2026-04-24/170000-F10-subaccounts-reimplement-plan.md`
+// for the full deferred impl scope.
+// ============================================================================
+
+declare_builtin_function!(
+    /// F10: allocate a subaccount and return its (unmarked) index.
+    /// Stub — full implementation deferred to Wave 8.
+    SyscallCreateSubaccount,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        _payer_pubkey_addr: u64,
+        _seeds_addr: u64,
+        _seeds_len: u64,
+        _space: u64,
+        _lamports: u64,
+        _memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+        Err(SyscallError::SubaccountsNotSupported.into())
+    }
+);
+
+declare_builtin_function!(
+    /// F10: register the AccountInfo slice that CPI write-back will sync.
+    /// Stub — full implementation deferred to Wave 8.
+    SyscallSetSubaccountSlice,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        _subaccounts_info_addr: u64,
+        _subaccounts_info_len: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+        _memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+        Err(SyscallError::SubaccountsNotSupported.into())
+    }
+);
+
+declare_builtin_function!(
+    /// F10: CPI where caller program == callee program (Rust ABI).
+    /// Stub — full implementation deferred to Wave 8 (cpi.rs translation
+    /// helpers for subaccount-bearing self-invoke).
+    SyscallSelfInvokeRust,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        _instruction_addr: u64,
+        _account_infos_addr: u64,
+        _account_infos_len: u64,
+        _signers_seeds_addr: u64,
+        _signers_seeds_len: u64,
+        _memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+        Err(SyscallError::SubaccountsNotSupported.into())
+    }
+);
+
+declare_builtin_function!(
+    /// F10: CPI where caller program == callee program (C ABI).
+    /// Stub — full implementation deferred to Wave 8.
+    SyscallSelfInvokeC,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        _instruction_addr: u64,
+        _account_infos_addr: u64,
+        _account_infos_len: u64,
+        _signers_seeds_addr: u64,
+        _signers_seeds_len: u64,
+        _memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+        Err(SyscallError::SubaccountsNotSupported.into())
+    }
+);
+
 #[cfg(test)]
 #[allow(clippy::arithmetic_side_effects)]
 #[allow(clippy::indexing_slicing)]
@@ -2521,7 +2622,8 @@ mod tests {
                     allocator: BpfAllocator::new(solana_program_entrypoint::HEAP_LENGTH as u64),
                     accounts_metadata: Vec::new(),
                     subaccounts_metadata: Vec::new(),
-                    subaccounts_infos: solana_program_runtime::invoke_context::UntypedVmSlice::default(),
+                    subaccounts_infos:
+                        solana_program_runtime::invoke_context::UntypedVmSlice::default(),
                     trace_log: Vec::new(),
                     dynamic_cpi_accounts: Vec::new(),
                 })
