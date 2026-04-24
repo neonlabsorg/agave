@@ -18,7 +18,12 @@ use {
     solana_instructions_sysvar as instructions,
     solana_pubkey::Pubkey,
     solana_sbpf::memory_region::{AccessType, AccessViolationHandler, MemoryRegion},
-    std::{borrow::Cow, cell::Cell, collections::HashSet, rc::Rc},
+    std::{
+        borrow::Cow,
+        cell::{Cell, RefMut},
+        collections::HashSet,
+        rc::Rc,
+    },
 };
 #[cfg(not(target_os = "solana"))]
 use {solana_account::WritableAccount, solana_rent::Rent};
@@ -822,6 +827,33 @@ impl<'a> InstructionContext<'a, '_> {
     /// F10: Subaccount list for this Instruction.
     pub fn instruction_subaccounts(&self) -> &[InstructionAccount] {
         self.subaccounts
+    }
+
+    /// F10: borrow a subaccount referenced by this instruction (instruction-scope).
+    ///
+    /// Returns a direct `RefMut<AccountSharedData>` — **not** a
+    /// `BorrowedInstructionAccount`, which in v3.1.13 is backed by the split
+    /// `AccountSharedFields`/`AccountPrivateFields` representation that the
+    /// subaccount lane does not use. Wave 8's CPI translation helpers will need
+    /// to adapt between the two borrow shapes (see
+    /// `.bgv/shared/knowledge/entries/architecture-subaccount-borrow-adapter.md`).
+    ///
+    /// The `index_in_instruction` refers to the position within this
+    /// instruction's subaccount list (as returned by `instruction_subaccounts`),
+    /// not the transaction-level subaccount index.
+    #[cfg(not(target_os = "solana"))]
+    pub fn try_borrow_subaccount(
+        &self,
+        index_in_instruction: IndexOfAccount,
+    ) -> Result<RefMut<'a, AccountSharedData>, InstructionError> {
+        let instruction_account = *self
+            .subaccounts
+            .get(index_in_instruction as usize)
+            .ok_or(InstructionError::NotEnoughAccountKeys)?;
+        let index_in_transaction = instruction_account.index_in_transaction & !SUBACCOUNT_MARKER;
+        self.transaction_context
+            .accounts
+            .try_borrow_mut_subaccount(index_in_transaction)
     }
 
     /// F10: Returns `Some(instruction_subaccount_index)` if this is a duplicate
