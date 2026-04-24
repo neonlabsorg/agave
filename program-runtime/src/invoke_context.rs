@@ -326,7 +326,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         &mut self,
         instruction: Instruction,
         signers: &[Pubkey],
-        _subaccounts: Vec<InstructionAccount>,
+        subaccounts: Vec<InstructionAccount>,
     ) -> Result<(), InstructionError> {
         // We reference accounts by an u8 index, so we have a total of 256 accounts.
         let mut transaction_callee_map: Vec<u16> = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
@@ -460,6 +460,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             instruction_accounts,
             transaction_callee_map,
             Cow::Owned(instruction.data),
+            subaccounts,
         )?;
         Ok(())
     }
@@ -502,6 +503,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             instruction_accounts,
             transaction_callee_map,
             Cow::Borrowed(data),
+            Vec::new(),
         )?;
         Ok(())
     }

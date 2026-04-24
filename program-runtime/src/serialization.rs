@@ -793,6 +793,7 @@ mod tests {
                             instruction_accounts,
                             dedup_map,
                             Cow::Owned(instruction_data.clone()),
+                            Vec::new(),
                         )
                         .unwrap();
                 } else {
