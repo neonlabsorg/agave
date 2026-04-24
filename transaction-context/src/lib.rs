@@ -64,6 +64,13 @@ static_assertions::const_assert_eq!(
 /// Index of an account inside of the transaction or an instruction.
 pub type IndexOfAccount = u16;
 
+/// F10: high bit of an `IndexOfAccount` flags a subaccount entry (see
+/// `InstructionAccount::new_subaccount`). Subaccount lanes are stored in a
+/// parallel Vec in `TransactionAccounts`, and instruction account indices with
+/// this marker set are de-referenced via the subaccount lane instead of the
+/// main account lane.
+pub const SUBACCOUNT_MARKER: u16 = 1 << 15;
+
 /// Contains account meta data which varies between instruction.
 ///
 /// It also contains indices to other structures for faster lookup.
@@ -89,6 +96,20 @@ impl InstructionAccount {
     ) -> InstructionAccount {
         InstructionAccount {
             index_in_transaction,
+            is_signer: is_signer as u8,
+            is_writable: is_writable as u8,
+        }
+    }
+
+    /// F10: build an instruction account pointing into the subaccount lane
+    /// (sets the high-bit `SUBACCOUNT_MARKER`).
+    pub fn new_subaccount(
+        index_in_transaction: IndexOfAccount,
+        is_signer: bool,
+        is_writable: bool,
+    ) -> InstructionAccount {
+        InstructionAccount {
+            index_in_transaction: index_in_transaction | SUBACCOUNT_MARKER,
             is_signer: is_signer as u8,
             is_writable: is_writable as u8,
         }

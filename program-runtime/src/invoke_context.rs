@@ -169,6 +169,35 @@ impl<'a> EnvironmentConfig<'a> {
 pub struct SyscallContext {
     pub allocator: BpfAllocator,
     pub accounts_metadata: Vec<SerializedAccountMetadata>,
+    /// F10: per-instruction subaccount metadata parallel to `accounts_metadata`.
+    pub subaccounts_metadata: Vec<SerializedAccountMetadata>,
+    /// F10: pointer+length into VM memory describing the subaccount-info array
+    /// that CPI translation helpers populate at runtime.
+    pub subaccounts_infos: UntypedVmSlice,
+    /// PRS-103 stub: execution trace log (minimal placeholder so SyscallContext
+    /// shape matches parasol-dev).
+    pub trace_log: Vec<[u64; 12]>,
+    /// PRS-103 stub: dynamically-loaded CPI accounts (minimal placeholder; not
+    /// populated in this port — sol_cpi_load_account syscalls are not ported).
+    pub dynamic_cpi_accounts: Vec<DynamicCpiAccount>,
+}
+
+/// F10: untyped (pointer, length) description of an array in VM memory.
+/// Parallel to `agave_syscalls::VmVmSlice<T>` but without the type parameter.
+#[derive(Default)]
+pub struct UntypedVmSlice {
+    pub vm_data_addr: u64,
+    pub vm_data_len: u64,
+}
+
+/// PRS-103 stub struct: describes a dynamically-added CPI account.
+/// Retained in shape so that PRS-103 code paths can be ported later without
+/// a second infrastructure refactor. Not populated by this F10 port.
+#[derive(Debug, Clone, Copy)]
+pub struct DynamicCpiAccount {
+    pub index_in_transaction: IndexOfAccount,
+    pub is_signer: bool,
+    pub is_writable: bool,
 }
 
 #[derive(Debug, Clone)]

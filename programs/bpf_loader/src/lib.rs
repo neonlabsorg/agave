@@ -22,7 +22,9 @@ use {
     solana_program_entrypoint::{MAX_PERMITTED_DATA_INCREASE, SUCCESS},
     solana_program_runtime::{
         execution_budget::MAX_INSTRUCTION_STACK_DEPTH,
-        invoke_context::{BpfAllocator, InvokeContext, SerializedAccountMetadata, SyscallContext},
+        invoke_context::{
+            BpfAllocator, InvokeContext, SerializedAccountMetadata, SyscallContext, UntypedVmSlice,
+        },
         loaded_programs::{
             LoadProgramMetrics, ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
             ProgramCacheForTxBatch, ProgramRuntimeEnvironment, DELAY_VISIBILITY_SLOT_OFFSET,
@@ -281,6 +283,13 @@ fn create_vm<'a, 'b>(
     invoke_context.set_syscall_context(SyscallContext {
         allocator: BpfAllocator::new(heap_size as u64),
         accounts_metadata,
+        // F10 placeholders — actual data flows in when serialize_parameters is
+        // extended to produce subaccount regions and the 4 new syscalls are
+        // registered. Until then, every slot is empty/default.
+        subaccounts_metadata: Vec::new(),
+        subaccounts_infos: UntypedVmSlice::default(),
+        trace_log: Vec::new(),
+        dynamic_cpi_accounts: Vec::new(),
     })?;
     Ok(EbpfVm::new(
         program.get_loader().clone(),
