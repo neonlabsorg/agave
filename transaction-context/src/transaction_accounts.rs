@@ -3,13 +3,13 @@ use qualifier_attr::qualifiers;
 use {
     crate::{
         vm_slice::VmSlice, IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION,
-        MAX_ACCOUNT_DATA_LEN,
+        MAX_ACCOUNT_DATA_LEN, SUBACCOUNT_MARKER,
     },
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_instruction::error::InstructionError,
     solana_pubkey::Pubkey,
     std::{
-        cell::{Cell, UnsafeCell},
+        cell::{Cell, Ref, RefCell, RefMut, UnsafeCell},
         ops::{Deref, DerefMut},
         ptr,
         sync::Arc,
@@ -245,6 +245,15 @@ pub struct TransactionAccounts {
     touched_flags: Box<[Cell<bool>]>,
     resize_delta: Cell<i64>,
     lamports_delta: Cell<i128>,
+    /// F10 subaccount lane. Dynamic, grown at runtime by the
+    /// `sol_create_subaccount` syscall — unlike the fixed-size
+    /// `shared_account_fields` / `private_account_fields` which are built once
+    /// at transaction load. Subaccounts are ephemeral (not snapshotted, not
+    /// ABI-v2-serialized) so a simple (key, account) RefCell Vec is enough.
+    #[cfg(not(target_os = "solana"))]
+    subaccounts: RefCell<Vec<(Pubkey, Box<RefCell<AccountSharedData>>)>>,
+    #[cfg(not(target_os = "solana"))]
+    touched_subaccounts: RefCell<Vec<bool>>,
 }
 
 impl TransactionAccounts {
@@ -286,6 +295,8 @@ impl TransactionAccounts {
             touched_flags,
             resize_delta: Cell::new(0),
             lamports_delta: Cell::new(0),
+            subaccounts: RefCell::new(Vec::new()),
+            touched_subaccounts: RefCell::new(Vec::new()),
         }
     }
 
@@ -295,11 +306,89 @@ impl TransactionAccounts {
 
     #[cfg(not(target_os = "solana"))]
     pub fn touch(&self, index: IndexOfAccount) -> Result<(), InstructionError> {
-        self.touched_flags
+        if index & SUBACCOUNT_MARKER != 0 {
+            let subaccount_index = (index & !SUBACCOUNT_MARKER) as usize;
+            let mut touched = self.touched_subaccounts.borrow_mut();
+            *touched
+                .get_mut(subaccount_index)
+                .ok_or(InstructionError::NotEnoughAccountKeys)? = true;
+            Ok(())
+        } else {
+            self.touched_flags
+                .get(index as usize)
+                .ok_or(InstructionError::MissingAccount)?
+                .set(true);
+            Ok(())
+        }
+    }
+
+    /// F10: append a new (pubkey, account) pair to the subaccount lane. Caller
+    /// is responsible for deduplication — `TransactionContext::add_subaccount`
+    /// does the find-index check before this.
+    #[cfg(not(target_os = "solana"))]
+    #[allow(dead_code)] // wired in by later F10 waves (syscalls + TransactionContext helpers)
+    pub(crate) fn add_subaccount(
+        &self,
+        pubkey: Pubkey,
+        account: AccountSharedData,
+    ) -> IndexOfAccount {
+        let mut subaccounts = self.subaccounts.borrow_mut();
+        let index = subaccounts.len() as IndexOfAccount;
+        subaccounts.push((pubkey, Box::new(RefCell::new(account))));
+        self.touched_subaccounts.borrow_mut().push(false);
+        index
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn number_of_subaccounts(&self) -> IndexOfAccount {
+        self.subaccounts.borrow().len() as IndexOfAccount
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn find_index_of_subaccount(&self, pubkey: &Pubkey) -> Option<IndexOfAccount> {
+        self.subaccounts
+            .borrow()
+            .iter()
+            .position(|(k, _)| k == pubkey)
+            .map(|i| i as IndexOfAccount)
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn subaccount_key(&self, index: IndexOfAccount) -> Option<Pubkey> {
+        self.subaccounts.borrow().get(index as usize).map(|(k, _)| *k)
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    fn _subaccount_cell_ptr(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<*const RefCell<AccountSharedData>, InstructionError> {
+        let subaccounts = self.subaccounts.borrow();
+        let entry = subaccounts
             .get(index as usize)
-            .ok_or(InstructionError::MissingAccount)?
-            .set(true);
-        Ok(())
+            .ok_or(InstructionError::MissingAccount)?;
+        Ok(&*entry.1)
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn try_borrow_subaccount(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<Ref<'_, AccountSharedData>, InstructionError> {
+        let ptr = self._subaccount_cell_ptr(index)?;
+        // Safe: each subaccount is boxed, so the cell address is stable even if
+        // the outer Vec reallocates. The returned Ref keeps a dynamic borrow
+        // over the cell, not the Vec.
+        unsafe { (*ptr).try_borrow() }.map_err(|_| InstructionError::AccountBorrowFailed)
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn try_borrow_mut_subaccount(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<RefMut<'_, AccountSharedData>, InstructionError> {
+        let ptr = self._subaccount_cell_ptr(index)?;
+        unsafe { (*ptr).try_borrow_mut() }.map_err(|_| InstructionError::AccountBorrowFailed)
     }
 
     pub(crate) fn update_accounts_resize_delta(
