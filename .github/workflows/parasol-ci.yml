@@ -1,0 +1,79 @@
+name: Parasol ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.2.3)"
+        required: true
+        type: string
+      release_name:
+        description: "Release title (optional)"
+        required: false
+        type: string
+
+
+permissions:
+  contents: write
+
+jobs:
+  build_and_release:
+    runs-on: ["gha-runner-scale-set-large"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install zip
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      - name: Build artifacts via Docker
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf ./bin
+          mkdir -p ./bin
+
+          DOCKER_BUILDKIT=1 docker build \
+            -f docker/Dockerfile.ubuntu24-build \
+            --target artifacts \
+            --output type=local,dest=./bin \
+            --build-arg AGAVE_REF=$(git rev-parse --abbrev-ref HEAD) \
+            --no-cache \
+            .
+
+          echo "Build output:"
+          ls -la ./bin
+
+      - name: Archive binaries (zip, add branch name)
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF_NAME}"
+          SAFE_BRANCH="${BRANCH//\//-}"
+          TAG="${{ inputs.tag }}"
+
+          ARCHIVE="bin-${SAFE_BRANCH}-${TAG}.zip"
+
+          cd bin
+          zip -r "../${ARCHIVE}" .
+          cd ..
+
+          echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+
+          echo "Created archive: ${ARCHIVE}"
+          ls -la "${ARCHIVE}"
+
+      - name: Create GitHub Release and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.release_name != '' && inputs.release_name || format('Release {0}', inputs.tag) }}
+          files: ${{ steps.pack.outputs.archive }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
