@@ -11,6 +11,8 @@ target/
 
 /config/
 
+.bgv/
+.bgv
 .cache
 
 # log files
