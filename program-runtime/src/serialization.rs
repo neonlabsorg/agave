@@ -683,12 +683,91 @@ fn deserialize_parameters_aligned<I, J>(
     account_data_direct_mapping: bool,
     buffer: &[u8],
     account_lengths: I,
-    _subaccount_lengths: J,
+    subaccount_lengths: J,
 ) -> Result<(), InstructionError>
 where
     I: IntoIterator<Item = usize>,
     J: IntoIterator<Item = usize>,
 {
+    // Deserialize a single account record starting at `start` into
+    // `borrowed_account`, returning the offset past the record. Shared by the
+    // main-account lane and the F10 subaccount lane — both lanes use the
+    // identical `BorrowedInstructionAccount` borrow type (see Path A split-
+    // storage migration in `transaction-context`).
+    fn deserialize_account(
+        stricter_abi_and_runtime_constraints: bool,
+        account_data_direct_mapping: bool,
+        buffer: &[u8],
+        mut start: usize,
+        borrowed_account: &mut BorrowedInstructionAccount<'_, '_>,
+        pre_len: usize,
+    ) -> Result<usize, InstructionError> {
+        start += size_of::<u8>() // is_signer
+            + size_of::<u8>() // is_writable
+            + size_of::<u8>() // executable
+            + size_of::<u32>() // original_data_len
+            + size_of::<Pubkey>(); // key
+        let owner = buffer
+            .get(start..start + size_of::<Pubkey>())
+            .ok_or(InstructionError::InvalidArgument)?;
+        start += size_of::<Pubkey>(); // owner
+        let lamports = buffer
+            .get(start..start.saturating_add(8))
+            .map(<[u8; 8]>::try_from)
+            .and_then(Result::ok)
+            .map(u64::from_le_bytes)
+            .ok_or(InstructionError::InvalidArgument)?;
+        if borrowed_account.get_lamports() != lamports {
+            borrowed_account.set_lamports(lamports)?;
+        }
+        start += size_of::<u64>(); // lamports
+        let post_len = buffer
+            .get(start..start.saturating_add(8))
+            .map(<[u8; 8]>::try_from)
+            .and_then(Result::ok)
+            .map(u64::from_le_bytes)
+            .ok_or(InstructionError::InvalidArgument)? as usize;
+        start += size_of::<u64>(); // data length
+        if post_len.saturating_sub(pre_len) > MAX_PERMITTED_DATA_INCREASE
+            || post_len > MAX_PERMITTED_DATA_LENGTH as usize
+        {
+            return Err(InstructionError::InvalidRealloc);
+        }
+        if !stricter_abi_and_runtime_constraints {
+            let data = buffer
+                .get(start..start + post_len)
+                .ok_or(InstructionError::InvalidArgument)?;
+            // The redundant check helps to avoid the expensive data comparison if we can
+            match borrowed_account.can_data_be_resized(post_len) {
+                Ok(()) => borrowed_account.set_data_from_slice(data)?,
+                Err(err) if borrowed_account.get_data() != data => return Err(err),
+                _ => {}
+            }
+        } else if !account_data_direct_mapping && borrowed_account.can_data_be_changed().is_ok() {
+            let data = buffer
+                .get(start..start + post_len)
+                .ok_or(InstructionError::InvalidArgument)?;
+            borrowed_account.set_data_from_slice(data)?;
+        } else if borrowed_account.get_data().len() != post_len {
+            borrowed_account.set_data_length(post_len)?;
+        }
+        start += if !(stricter_abi_and_runtime_constraints && account_data_direct_mapping) {
+            let alignment_offset = (pre_len as *const u8).align_offset(BPF_ALIGN_OF_U128);
+            pre_len // data
+                .saturating_add(MAX_PERMITTED_DATA_INCREASE) // realloc padding
+                .saturating_add(alignment_offset)
+        } else {
+            // See Serializer::write_account() as to why we have this
+            BPF_ALIGN_OF_U128
+        };
+        start += size_of::<u64>(); // rent_epoch
+        if borrowed_account.get_owner().to_bytes() != owner {
+            // Change the owner at the end so that we are allowed to change the lamports and data before
+            borrowed_account.set_owner(owner)?;
+        }
+        Ok(start)
+    }
+
     let mut start = size_of::<u64>(); // number of accounts
     for (instruction_account_index, pre_len) in (0..instruction_context
         .get_number_of_instruction_accounts())
@@ -702,72 +781,56 @@ where
         } else {
             let mut borrowed_account =
                 instruction_context.try_borrow_instruction_account(instruction_account_index)?;
-            start += size_of::<u8>() // is_signer
-                + size_of::<u8>() // is_writable
-                + size_of::<u8>() // executable
-                + size_of::<u32>() // original_data_len
-                + size_of::<Pubkey>(); // key
-            let owner = buffer
-                .get(start..start + size_of::<Pubkey>())
-                .ok_or(InstructionError::InvalidArgument)?;
-            start += size_of::<Pubkey>(); // owner
-            let lamports = buffer
-                .get(start..start.saturating_add(8))
-                .map(<[u8; 8]>::try_from)
-                .and_then(Result::ok)
-                .map(u64::from_le_bytes)
-                .ok_or(InstructionError::InvalidArgument)?;
-            if borrowed_account.get_lamports() != lamports {
-                borrowed_account.set_lamports(lamports)?;
-            }
-            start += size_of::<u64>(); // lamports
-            let post_len = buffer
-                .get(start..start.saturating_add(8))
-                .map(<[u8; 8]>::try_from)
-                .and_then(Result::ok)
-                .map(u64::from_le_bytes)
-                .ok_or(InstructionError::InvalidArgument)? as usize;
-            start += size_of::<u64>(); // data length
-            if post_len.saturating_sub(pre_len) > MAX_PERMITTED_DATA_INCREASE
-                || post_len > MAX_PERMITTED_DATA_LENGTH as usize
-            {
-                return Err(InstructionError::InvalidRealloc);
-            }
-            if !stricter_abi_and_runtime_constraints {
-                let data = buffer
-                    .get(start..start + post_len)
-                    .ok_or(InstructionError::InvalidArgument)?;
-                // The redundant check helps to avoid the expensive data comparison if we can
-                match borrowed_account.can_data_be_resized(post_len) {
-                    Ok(()) => borrowed_account.set_data_from_slice(data)?,
-                    Err(err) if borrowed_account.get_data() != data => return Err(err),
-                    _ => {}
-                }
-            } else if !account_data_direct_mapping && borrowed_account.can_data_be_changed().is_ok()
-            {
-                let data = buffer
-                    .get(start..start + post_len)
-                    .ok_or(InstructionError::InvalidArgument)?;
-                borrowed_account.set_data_from_slice(data)?;
-            } else if borrowed_account.get_data().len() != post_len {
-                borrowed_account.set_data_length(post_len)?;
-            }
-            start += if !(stricter_abi_and_runtime_constraints && account_data_direct_mapping) {
-                let alignment_offset = (pre_len as *const u8).align_offset(BPF_ALIGN_OF_U128);
-                pre_len // data
-                    .saturating_add(MAX_PERMITTED_DATA_INCREASE) // realloc padding
-                    .saturating_add(alignment_offset)
-            } else {
-                // See Serializer::write_account() as to why we have this
-                BPF_ALIGN_OF_U128
-            };
-            start += size_of::<u64>(); // rent_epoch
-            if borrowed_account.get_owner().to_bytes() != owner {
-                // Change the owner at the end so that we are allowed to change the lamports and data before
-                borrowed_account.set_owner(owner)?;
-            }
+            start = deserialize_account(
+                stricter_abi_and_runtime_constraints,
+                account_data_direct_mapping,
+                buffer,
+                start,
+                &mut borrowed_account,
+                pre_len,
+            )?;
         }
     }
+
+    // F10: walk past the instruction data / program id / alignment padding,
+    // then deserialize the subaccount region the VM wrote into shared memory.
+    // This mirrors `serialize_parameters_aligned`'s write order — any host-side
+    // skew here corrupts the VM → host write-back of direct subaccount writes.
+    let instruction_len = buffer
+        .get(start..start.saturating_add(8))
+        .map(<[u8; 8]>::try_from)
+        .and_then(Result::ok)
+        .map(u64::from_le_bytes)
+        .ok_or(InstructionError::InvalidArgument)?;
+    start += size_of::<u64>(); // instruction data length
+    start += instruction_len as usize; // instruction data
+    start += size_of::<Pubkey>(); // program id
+    let align_offset = (instruction_len as *const u8).align_offset(BPF_ALIGN_OF_U128);
+    start += align_offset; // padding to align subaccounts region
+    start += size_of::<u64>(); // subaccounts len
+
+    for (subaccount_index, pre_len) in
+        (0..instruction_context.get_number_of_subaccounts()).zip(subaccount_lengths.into_iter())
+    {
+        let duplicate =
+            instruction_context.is_instruction_subaccount_duplicate(subaccount_index)?;
+        start += size_of::<u8>(); // NON_DUP_MARKER / position
+        if duplicate.is_some() {
+            start += 7; // padding to 64-bit aligned
+        } else {
+            let mut borrowed_account =
+                instruction_context.try_borrow_subaccount(subaccount_index)?;
+            start = deserialize_account(
+                stricter_abi_and_runtime_constraints,
+                account_data_direct_mapping,
+                buffer,
+                start,
+                &mut borrowed_account,
+                pre_len,
+            )?;
+        }
+    }
+
     Ok(())
 }
 
