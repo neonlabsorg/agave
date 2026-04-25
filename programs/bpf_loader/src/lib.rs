@@ -1506,9 +1506,12 @@ fn execute<'a, 'b: 'a>(
     serialize_time.stop();
 
     // save the account addresses so in case we hit an AccessViolation error we
-    // can map to a more specific error
+    // can map to a more specific error. F10: include the subaccount region so
+    // a violation inside a subaccount's VM range maps to the subaccount pubkey
+    // instead of falling through to a generic access-violation message.
     let account_region_addrs = accounts_metadata
         .iter()
+        .chain(subaccounts_metadata.iter())
         .map(|m| {
             let vm_end = m
                 .vm_data_addr
