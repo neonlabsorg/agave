@@ -15,6 +15,7 @@ use {
         state_traits::StateMut, Account, AccountSharedData, ReadableAccount, WritableAccount,
         PROGRAM_OWNERS,
     },
+    solana_clock::Epoch,
     solana_clock::Slot,
     solana_fee_structure::FeeDetails,
     solana_instruction::{BorrowedAccountMeta, BorrowedInstruction},
@@ -27,7 +28,6 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_rent::Rent,
-    solana_clock::Epoch,
     solana_sdk_ids::{
         bpf_loader_upgradeable, native_loader, system_program,
         sysvar::{self, slot_history},
