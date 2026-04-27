@@ -25,8 +25,12 @@ pub mod sysvar_cache;
 // re-exports for macros
 pub mod __private {
     pub use {
-        solana_account::ReadableAccount, solana_hash::Hash,
-        solana_instruction::error::InstructionError, solana_rent::Rent,
+        solana_account::{AccountSharedData, ReadableAccount},
+        solana_clock::Slot,
+        solana_hash::Hash,
+        solana_instruction::error::InstructionError,
+        solana_pubkey::Pubkey,
+        solana_rent::Rent,
         solana_transaction_context::TransactionContext,
     };
 }

@@ -840,8 +840,11 @@ macro_rules! with_mock_invoke_context_with_feature_set {
         impl TransactionProcessingCallback for MockInvokeContextCallback {
             fn get_account_shared_data(
                 &self,
-                _pubkey: &solana_pubkey::Pubkey,
-            ) -> Option<(solana_account::AccountSharedData, solana_clock::Slot)> {
+                _pubkey: &$crate::__private::Pubkey,
+            ) -> Option<(
+                $crate::__private::AccountSharedData,
+                $crate::__private::Slot,
+            )> {
                 None
             }
         }

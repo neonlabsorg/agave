@@ -18,7 +18,7 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_rent::Rent,
-    solana_svm_callback::InvokeContextCallback,
+    solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
     solana_svm_log_collector::LogCollector,
     solana_svm_timings::ExecuteTimings,
     solana_transaction_context::{
@@ -52,6 +52,24 @@ impl InvokeContextCallback for InstrContextCallback<'_> {
         } else {
             Err(PrecompileError::InvalidPublicKey)
         }
+    }
+}
+
+// F10 W9: subaccount syscalls reach into accounts-db via this callback to
+// load pre-existing on-chain state. The instr-fixture harness models
+// accounts-db with the fixture-supplied account list — return whichever
+// matching entry the fixture carries so F10 self-invokes can be exercised
+// against deterministic state.
+impl TransactionProcessingCallback for InstrContextCallback<'_> {
+    fn get_account_shared_data(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<(AccountSharedData, solana_clock::Slot)> {
+        self.0
+            .accounts
+            .iter()
+            .find(|(addr, _)| addr == pubkey)
+            .map(|(_, account)| (AccountSharedData::from(account.clone()), 0))
     }
 }
 
