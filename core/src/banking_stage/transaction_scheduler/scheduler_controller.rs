@@ -151,12 +151,17 @@ where
     ) -> Result<(), SchedulerError> {
         match decision {
             BufferedPacketsDecision::Consume(bank) => {
+                let relax_intrabatch_account_locks = bank
+                    .feature_set
+                    .is_active(&agave_feature_set::relax_intrabatch_account_locks::id());
+
                 let (scheduling_summary, schedule_time_us) = measure_us!(self.scheduler.schedule(
                     &mut self.container,
                     |txs, results| {
                         Self::pre_graph_filter(txs, results, bank, MAX_PROCESSING_AGE)
                     },
-                    |_| PreLockFilterAction::AttemptToSchedule // no pre-lock filter for now
+                    |_| PreLockFilterAction::AttemptToSchedule, // no pre-lock filter for now
+                    relax_intrabatch_account_locks,
                 )?);
 
                 self.count_metrics.update(|count_metrics| {
