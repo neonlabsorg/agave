@@ -21,7 +21,7 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_sdk_ids::bpf_loader_upgradeable,
-    solana_svm_callback::InvokeContextCallback,
+    solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
     solana_transaction_context::TransactionContext,
     source_buffer::SourceBuffer,
     std::{cmp::Ordering, sync::atomic::Ordering::Relaxed},
@@ -165,6 +165,15 @@ impl Bank {
 
             struct MockCallback {}
             impl InvokeContextCallback for MockCallback {}
+            impl TransactionProcessingCallback for MockCallback {
+                fn get_account_shared_data(
+                    &self,
+                    _pubkey: &solana_pubkey::Pubkey,
+                ) -> Option<(solana_account::AccountSharedData, solana_clock::Slot)>
+                {
+                    None
+                }
+            }
             let feature_set = self.feature_set.runtime_features();
             let mut dummy_invoke_context = InvokeContext::new(
                 &mut dummy_transaction_context,

@@ -2170,22 +2170,22 @@ declare_builtin_function!(
             (program_id, subaccount_pubkey)
         };
 
-        // W8c: pre-existing on-chain state for a subaccount address is not
-        // loaded (v3.1.13 `InvokeContext` has no direct `get_account_shared_data`
-        // accessor the way parasol-dev does). The parasol-dev code path falls
-        // back to `AccountSharedData::default()` whenever the lookup misses,
-        // which is the common case for freshly-derived subaccounts. Pre-load
-        // from accounts-db is deferred to W8e together with the full
-        // self-invoke path. `subaccount_address` is kept in scope so the
-        // forthcoming pre-load hook plugs straight in.
-        let _subaccount_address = subaccount_address(&subaccount_pubkey);
+        // F10 W9: load any pre-existing on-chain state for the subaccount
+        // address through the SVM `TransactionProcessingCallback`. Mirrors
+        // the parasol-dev reference implementation — fresh allocations fall
+        // back to `AccountSharedData::default()` (the common case), while
+        // already-allocated subaccounts re-enter with their full payload so
+        // self-invoke deserialization sees real data instead of empty bytes.
         let subaccount_index = if let Some(subaccount_index) = invoke_context
             .transaction_context
             .find_index_of_subaccount(&subaccount_pubkey)
         {
             subaccount_index
         } else {
-            let subaccount = AccountSharedData::default();
+            let subaccount_address = subaccount_address(&subaccount_pubkey);
+            let (subaccount, _slot) = invoke_context
+                .get_account_shared_data(&subaccount_address)
+                .unwrap_or_else(|| (AccountSharedData::default(), 0));
             let data_len_cost = (subaccount.data().len() as u64)
                 .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
                 .unwrap_or(u64::MAX);
@@ -2758,10 +2758,12 @@ impl SyscallInvokeSigned for SyscallSelfInvokeC {
 
 /// Shared self-invoke helper: for each `(subaccount_pubkey, is_writable)` seed
 /// resolution, either re-use the existing subaccount index in the transaction
-/// context or register a fresh slot (with default `AccountSharedData`) via
-/// `add_subaccount`, then wrap into an `InstructionAccount::new_subaccount`.
-/// Pre-loading existing on-chain state for a subaccount address is deferred
-/// until `InvokeContext` grows a `get_account_shared_data` accessor.
+/// context or register a fresh slot via `add_subaccount`, then wrap into an
+/// `InstructionAccount::new_subaccount`. F10 W9: when the subaccount is not
+/// yet present in `transaction_context`, the helper now pulls existing
+/// on-chain state from `InvokeContext::get_account_shared_data` (storage key
+/// derived via `subaccount_address`); fresh allocations still fall back to
+/// `AccountSharedData::default()`.
 fn build_next_instruction_subaccounts(
     invoke_context: &mut InvokeContext,
     subaccounts_seeds: &[(Pubkey, bool)],
@@ -2774,7 +2776,10 @@ fn build_next_instruction_subaccounts(
         {
             subaccount_index
         } else {
-            let subaccount = AccountSharedData::default();
+            let storage_address = subaccount_address(subaccount_pubkey);
+            let (subaccount, _slot) = invoke_context
+                .get_account_shared_data(&storage_address)
+                .unwrap_or_else(|| (AccountSharedData::default(), 0));
             let data_len_cost = (subaccount.data().len() as u64)
                 .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
                 .unwrap_or(u64::MAX);
@@ -5515,6 +5520,14 @@ mod tests {
             }
             // Vote accounts are not needed for this test.
         }
+        impl solana_svm_callback::TransactionProcessingCallback for MockCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, solana_clock::Slot)> {
+                None
+            }
+        }
 
         // Compute units, as specified by SIMD-0133.
         // cu = syscall_base_cost
@@ -5574,6 +5587,14 @@ mod tests {
                 } else {
                     0
                 }
+            }
+        }
+        impl solana_svm_callback::TransactionProcessingCallback for MockCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, solana_clock::Slot)> {
+                None
             }
         }
 
@@ -5905,5 +5926,119 @@ mod tests {
             &mut memory_mapping,
         );
         assert_access_violation!(result, 0x100000000, 4);
+    }
+
+    /// F10 W9 regression — `build_next_instruction_subaccounts` must materialize
+    /// pre-existing on-chain state (looked up at the derived storage address)
+    /// instead of registering a default-empty `AccountSharedData`. Models the
+    /// `admin_update_oracle` failure mode where parasol-dex's `MarketConfig`
+    /// subaccount was loaded as empty bytes and the program returned
+    /// `InvalidAccountData`.
+    #[test]
+    fn test_build_next_instruction_subaccounts_loads_onchain_state() {
+        const SUBACCOUNT_DATA_LEN: usize = 96;
+        const SUBACCOUNT_LAMPORTS: u64 = 0;
+        const SUBACCOUNT_FILL: u8 = 0xAB;
+
+        let subaccount_pubkey = Pubkey::new_from_array([7u8; 32]);
+        let derived_storage_pubkey = {
+            let h = solana_sha256_hasher::hashv(&[&[1u8], subaccount_pubkey.as_ref()]);
+            Pubkey::new_from_array(h.to_bytes())
+        };
+        let mut payload = vec![SUBACCOUNT_FILL; SUBACCOUNT_DATA_LEN];
+        // First 8 bytes simulate parasol-dex domain discriminator so a real
+        // program would deserialize successfully.
+        payload[..8].copy_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
+        let owner = Pubkey::new_from_array([42u8; 32]);
+        let preloaded = AccountSharedData::create(
+            SUBACCOUNT_LAMPORTS,
+            payload.clone(),
+            owner,
+            false,
+            0,
+        );
+
+        struct LoadingMockCallback {
+            address: Pubkey,
+            account: AccountSharedData,
+        }
+        impl InvokeContextCallback for LoadingMockCallback {}
+        impl solana_svm_callback::TransactionProcessingCallback for LoadingMockCallback {
+            fn get_account_shared_data(
+                &self,
+                pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, solana_clock::Slot)> {
+                if *pubkey == self.address {
+                    Some((self.account.clone(), 0))
+                } else {
+                    None
+                }
+            }
+        }
+
+        let mock_callback = LoadingMockCallback {
+            address: derived_storage_pubkey,
+            account: preloaded.clone(),
+        };
+
+        with_mock_invoke_context!(invoke_context, transaction_context, vec![]);
+        let feature_set = SVMFeatureSet::default();
+        let program_runtime_environments = ProgramRuntimeEnvironments::default();
+        let sysvar_cache = Arc::<SysvarCache>::default();
+        invoke_context.environment_config = EnvironmentConfig::new(
+            Hash::default(),
+            0,
+            &mock_callback,
+            &feature_set,
+            &program_runtime_environments,
+            &program_runtime_environments,
+            &sysvar_cache,
+        );
+
+        let seeds = [(subaccount_pubkey, true)];
+        let result = build_next_instruction_subaccounts(&mut invoke_context, &seeds)
+            .expect("build_next_instruction_subaccounts must succeed");
+        assert_eq!(result.len(), 1, "exactly one subaccount expected");
+
+        {
+            let subaccount_index = invoke_context
+                .transaction_context
+                .find_index_of_subaccount(&subaccount_pubkey)
+                .expect("subaccount must be registered in transaction_context");
+            let loaded = invoke_context
+                .transaction_context
+                .accounts()
+                .try_borrow_subaccount(subaccount_index)
+                .unwrap();
+            assert_eq!(
+                loaded.data().len(),
+                SUBACCOUNT_DATA_LEN,
+                "subaccount data length must match preloaded on-chain state",
+            );
+            assert_eq!(
+                loaded.data(),
+                payload.as_slice(),
+                "subaccount payload must match preloaded on-chain bytes (regression on AccountSharedData::default fallback)",
+            );
+            assert_eq!(loaded.owner().as_ref(), owner.as_ref());
+        }
+
+        // Sanity: when no on-chain state exists, fallback still yields a
+        // default-empty subaccount (gasless allocation path stays intact).
+        let unknown_pubkey = Pubkey::new_from_array([99u8; 32]);
+        let seeds = [(unknown_pubkey, false)];
+        let result = build_next_instruction_subaccounts(&mut invoke_context, &seeds)
+            .expect("fallback to default must succeed");
+        assert_eq!(result.len(), 1);
+        let unknown_index = invoke_context
+            .transaction_context
+            .find_index_of_subaccount(&unknown_pubkey)
+            .unwrap();
+        let unknown = invoke_context
+            .transaction_context
+            .accounts()
+            .try_borrow_subaccount(unknown_index)
+            .unwrap();
+        assert!(unknown.data().is_empty(), "unknown subaccount stays empty");
     }
 }
