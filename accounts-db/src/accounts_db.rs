@@ -6017,8 +6017,19 @@ impl AccountsDb {
                 accounts_and_meta_to_store.account_default_if_zero_lamport(index, |account| {
                     let account_shared_data = account.take_account();
                     let pubkey = account.pubkey();
-                    let account_info =
-                        AccountInfo::new(StorageLocation::Cached, account.is_zero_lamport());
+                    // F8: narrow the `is_zero_lamport` flag stored in the
+                    // in-memory `AccountInfo` index entry to *cleanable*
+                    // zero-lamport accounts only. A raw `account.is_zero_lamport()`
+                    // would mark every 0-lamport account as a clean candidate
+                    // — including valid program-owned accounts with non-empty
+                    // data — and `clean_accounts` would later purge them from
+                    // the index, making them invisible to RPC `getAccountInfo`.
+                    // Originally:
+                    //     AccountInfo::new(StorageLocation::Cached, account.is_zero_lamport());
+                    let account_info = AccountInfo::new(
+                        StorageLocation::Cached,
+                        crate::account_utils::is_cleanable_zero_lamport_account(&account),
+                    );
 
                     self.notify_account_at_accounts_update(
                         slot,
@@ -6072,9 +6083,17 @@ impl AccountsDb {
 
             let store_id = storage.id();
             for (i, offset) in stored_accounts_info.offsets.iter().enumerate() {
+                // F8: narrow the `is_zero_lamport` flag in the persisted
+                // `AccountInfo` to *cleanable* zero-lamport accounts only.
+                // `StorableAccounts::is_tombstone(i)` already implements that
+                // F8 predicate (default-tombstone OR system-program-owned
+                // empty zero-lamport). A raw `is_zero_lamport(i)` here would
+                // tag every 0-lamport account as a clean candidate.
+                // Originally:
+                //     accounts_and_meta_to_store.is_zero_lamport(i),
                 infos.push(AccountInfo::new(
                     StorageLocation::AppendVec(store_id, *offset),
-                    accounts_and_meta_to_store.is_zero_lamport(i),
+                    accounts_and_meta_to_store.is_tombstone(i),
                 ));
             }
             storage.add_accounts(

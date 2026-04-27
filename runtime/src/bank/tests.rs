@@ -3424,6 +3424,119 @@ fn test_bank_get_program_accounts() {
     );
 }
 
+// F8: program-owned zero-lamport account is NOT a cleanable tombstone and MUST
+// remain visible via bank.get_account() (the path used by RPC getAccountInfo).
+// Pinpoints the user-reported regression where program-owned accounts looked
+// "deleted immediately after creation" through the RPC.
+// Ported from parasol-dev e2435ccf76 ("Fix cleanable zero-lamport account
+// visibility"). Slot-local view (get_program_accounts_modified_since_parent)
+// must hide the canonical `(0, 0, system)` tombstone but keep a live
+// system-owned non-zero-lamport account.
+#[test]
+fn test_bank_get_program_accounts_modified_since_parent_filters_cleanable_system_account() {
+    let (genesis_config, _mint_keypair) = create_genesis_config(500);
+    let parent = Arc::new(Bank::new_for_tests(&genesis_config));
+    let bank = Arc::new(new_from_parent(parent));
+
+    let live_pubkey = solana_pubkey::new_rand();
+    let live_account = AccountSharedData::new(1, 0, &solana_sdk_ids::system_program::id());
+    bank.store_account(&live_pubkey, &live_account);
+
+    let dead_pubkey = solana_pubkey::new_rand();
+    let mut dead_account = AccountSharedData::default();
+    dead_account.set_owner(solana_sdk_ids::system_program::id());
+    dead_account.set_rent_epoch(u64::MAX - 1);
+    bank.store_account(&dead_pubkey, &dead_account);
+
+    assert_eq!(
+        bank.get_program_accounts_modified_since_parent(&solana_sdk_ids::system_program::id()),
+        vec![(live_pubkey, live_account)]
+    );
+}
+
+// Ported from parasol-dev e2435ccf76. A system-owned zero-lamport account
+// with non-empty data is NOT a cleanable tombstone (data_len > 0) and must
+// stay visible from the slot-local view.
+#[test]
+fn test_bank_get_program_accounts_modified_since_parent_keeps_noncleanable_zero_lamport_system_account(
+) {
+    let (genesis_config, _mint_keypair) = create_genesis_config(500);
+    let parent = Arc::new(Bank::new_for_tests(&genesis_config));
+    let bank = Arc::new(new_from_parent(parent));
+
+    let pubkey = solana_pubkey::new_rand();
+    let account = AccountSharedData::new(0, 1, &solana_sdk_ids::system_program::id());
+    bank.store_account(&pubkey, &account);
+
+    assert_eq!(
+        bank.get_program_accounts_modified_since_parent(&solana_sdk_ids::system_program::id()),
+        vec![(pubkey, account)]
+    );
+}
+
+#[test]
+fn test_bank_get_account_keeps_program_owned_zero_lamport_empty_account() {
+    let (genesis_config, _mint_keypair) = create_genesis_config(500);
+    let bank = Bank::new_for_tests(&genesis_config);
+
+    let pubkey = solana_pubkey::new_rand();
+    let program_id = Pubkey::new_unique();
+    let account = AccountSharedData::new(0, 0, &program_id);
+    bank.store_account(&pubkey, &account);
+
+    assert_eq!(bank.get_account(&pubkey), Some(account));
+}
+
+#[test]
+fn test_bank_get_account_keeps_program_owned_zero_lamport_with_data() {
+    let (genesis_config, _mint_keypair) = create_genesis_config(500);
+    let bank = Bank::new_for_tests(&genesis_config);
+
+    let pubkey = solana_pubkey::new_rand();
+    let program_id = Pubkey::new_unique();
+    let mut account = AccountSharedData::new(0, 16, &program_id);
+    account.set_data(vec![0xAB; 16]);
+    bank.store_account(&pubkey, &account);
+
+    assert_eq!(bank.get_account(&pubkey), Some(account));
+}
+
+#[test]
+fn test_bank_get_account_hides_system_owned_zero_lamport_empty_tombstone() {
+    let (genesis_config, _mint_keypair) = create_genesis_config(500);
+    let bank = Bank::new_for_tests(&genesis_config);
+
+    let pubkey = solana_pubkey::new_rand();
+    let mut account = AccountSharedData::default();
+    account.set_owner(solana_sdk_ids::system_program::id());
+    account.set_rent_epoch(u64::MAX - 1);
+    bank.store_account(&pubkey, &account);
+
+    // (lamports=0, data_len=0, owner=system_program) is the canonical cleanable
+    // tombstone — bank.get_account() must hide it.
+    assert_eq!(bank.get_account(&pubkey), None);
+}
+
+#[test]
+fn test_bank_get_account_keeps_program_owned_zero_lamport_after_squash() {
+    let (genesis_config, _mint_keypair) = create_genesis_config(500);
+    let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
+    let bank1 = Arc::new(new_from_parent(bank0));
+
+    let pubkey = solana_pubkey::new_rand();
+    let program_id = Pubkey::new_unique();
+    let account = AccountSharedData::new(0, 0, &program_id);
+    bank1.store_account(&pubkey, &account);
+
+    bank1.freeze();
+    bank1.squash();
+    bank1.force_flush_accounts_cache();
+
+    // After squash + cache flush the account moves through the storage path —
+    // verify it survives there too.
+    assert_eq!(bank1.get_account(&pubkey), Some(account));
+}
+
 #[test]
 fn test_get_filtered_indexed_accounts_limit_exceeded() {
     let (genesis_config, _mint_keypair) = create_genesis_config(500);
@@ -11328,6 +11441,250 @@ fn test_create_zero_lamport_without_clean() {
     with_create_zero_lamport(|_| {
         // just do nothing; this should behave identically with test_create_zero_lamport_with_clean
     });
+}
+
+// Reproduces the live-validator symptom: parasol-dex `admin_create_market`
+// allocates 4 accounts with `(lamports=0, data_len=N>0, owner=parasol_dex)`.
+// They MUST survive a full freeze/squash/flush/clean cycle — those accounts
+// are NOT cleanable tombstones (only `(0, 0, system_program)` is). Empirical
+// observation on dexstand.neontest.xyz showed all 4 accounts vanish ~100k
+// slots after creation; this test isolates whether the regression is in the
+// agave clean path or somewhere else.
+#[test]
+fn test_program_owned_zero_lamport_with_data_survives_clean_cycle() {
+    let account_key = Pubkey::new_unique();
+    let custom_program = Pubkey::new_unique();
+    let collector = Pubkey::new_unique();
+
+    let (genesis_config, _mint_keypair) = create_genesis_config_no_tx_fee_no_rent(LAMPORTS_PER_SOL);
+    let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+
+    let slot1 = bank0.slot() + 1;
+    let bank1 =
+        Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank0, &collector, slot1);
+    // Mirror the parasol-dex shape: allocated space + custom program owner +
+    // zero lamports.
+    let mut market_account = AccountSharedData::new(0, 64, &custom_program);
+    market_account.set_data(vec![0xAB; 64]);
+    bank1.store_account(&account_key, &market_account);
+    bank1.freeze();
+    bank1.squash();
+    bank1.force_flush_accounts_cache();
+
+    assert_eq!(
+        bank1.get_account(&account_key),
+        Some(market_account.clone()),
+        "after freeze+squash+flush, program-owned zero-lamport account must \
+         remain visible"
+    );
+
+    // Drive several follow-up slots to trigger any async clean / shrink.
+    let mut bank = bank1;
+    for i in 0..5 {
+        let slot = bank.slot() + 1;
+        let next =
+            Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &collector, slot);
+        next.freeze();
+        next.squash();
+        next.force_flush_accounts_cache();
+        next.clean_accounts();
+        assert_eq!(
+            next.get_account(&account_key),
+            Some(market_account.clone()),
+            "after {} clean cycles the account must still be visible",
+            i + 1
+        );
+        bank = next;
+    }
+}
+
+// Direct check: what `is_zero_lamport` flag does `bank.store_account()`
+// record in the in-memory index for a `(lamports=0, data_len=N>0,
+// owner=custom_program)` account? F8 says this account is NOT a cleanable
+// tombstone, so the flag MUST be FALSE — otherwise `clean_accounts:2078`
+// later marks it for purge.
+#[test]
+fn test_index_flag_is_f8_narrowed_for_program_owned_zero_lamport_with_data() {
+    let collector = Pubkey::new_unique();
+    let custom_program = Pubkey::new_unique();
+    let key = Pubkey::new_unique();
+
+    let (genesis_config, _mint_keypair) = create_genesis_config_no_tx_fee_no_rent(LAMPORTS_PER_SOL);
+    let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let slot1 = bank0.slot() + 1;
+    let bank1 =
+        Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank0, &collector, slot1);
+
+    let mut acc = AccountSharedData::new(0, 64, &custom_program);
+    acc.set_data(vec![0xAB; 64]);
+    bank1.store_account(&key, &acc);
+    bank1.freeze();
+    bank1.squash();
+    bank1.force_flush_accounts_cache();
+
+    use solana_accounts_db::IsZeroLamport;
+    let flag = bank1
+        .rc
+        .accounts
+        .accounts_db
+        .accounts_index
+        .get_and_then(&key, |entry| {
+            let account_info = entry
+                .expect("account must be in index after store+flush")
+                .slot_list_read_lock()[0]
+                .1;
+            (false, account_info.is_zero_lamport())
+        });
+
+    assert!(
+        !flag,
+        "AccountInfo.is_zero_lamport_flag must be FALSE for a non-cleanable \
+         (0, N>0, custom_program) account — otherwise clean_accounts will \
+         purge it later (got flag={flag})"
+    );
+}
+
+// Tighter repro of the live-validator vanish: when the program-owned
+// zero-lamport account lives in a STORAGE WHERE ALL ENTRIES are also
+// zero-lamport, `clean_accounts` + `filter_zero_lamport_clean_for_incremental_
+// snapshots` lets the storage's `store_count` go to 0 and `purge_keys_exact`
+// removes the account from the index. Surface symptom: `getAccountInfo` on
+// a perfectly-valid `(0, N>0, custom_program)` account starts returning
+// `null` after enough slots / shrink+clean cycles.
+//
+// The on-chain repro on dexstand.neontest.xyz showed exactly this for the
+// 4 accounts created by parasol-dex `admin_create_market` at slot 9259;
+// they all returned null at slot ~111400.
+#[test]
+fn test_program_owned_zero_lamport_with_data_survives_clean_when_storage_has_only_zero_lamport_accounts(
+) {
+    let collector = Pubkey::new_unique();
+    let custom_program = Pubkey::new_unique();
+
+    let (genesis_config, _mint_keypair) = create_genesis_config_no_tx_fee_no_rent(LAMPORTS_PER_SOL);
+    let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+
+    // Put 4 program-owned zero-lamport accounts (with non-empty data) into a
+    // child slot whose storage will contain ONLY these 4 accounts. This is
+    // the critical condition for `filter_zero_lamport_clean_for_incremental_
+    // snapshots` to let the storage's store_count fall to 0.
+    let slot1 = bank0.slot() + 1;
+    let bank1 =
+        Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank0, &collector, slot1);
+
+    let market_keys: Vec<Pubkey> = (0..4).map(|_| Pubkey::new_unique()).collect();
+    let mut market_account = AccountSharedData::new(0, 64, &custom_program);
+    market_account.set_data(vec![0xAB; 64]);
+    for k in &market_keys {
+        bank1.store_account(k, &market_account);
+    }
+    bank1.freeze();
+    bank1.squash();
+    bank1.force_flush_accounts_cache();
+
+    // Sanity: right after freeze/squash/flush all 4 are visible.
+    for k in &market_keys {
+        assert_eq!(
+            bank1.get_account(k),
+            Some(market_account.clone()),
+            "account {k} must be visible immediately after flush"
+        );
+    }
+
+    // Drive ~10 follow-up slots, with full clean + shrink each time. The
+    // shrink pass is what the live validator runs as part of snapshot
+    // creation; without it, the test is too weak to expose the cleanup
+    // ordering that actually nukes the dex accounts in production.
+    let mut bank = bank1;
+    for i in 0..10 {
+        let slot = bank.slot() + 1;
+        let next =
+            Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank, &collector, slot);
+        next.freeze();
+        next.squash();
+        next.force_flush_accounts_cache();
+        next.clean_accounts();
+        // Mirror what Bank::clean_accounts_for_tests + shrink does at
+        // snapshot time on the live validator.
+        next.rc.accounts.accounts_db.shrink_all_slots(
+            false,
+            next.epoch_schedule(),
+            Some(next.slot()),
+        );
+        next.clean_accounts();
+        for k in &market_keys {
+            assert_eq!(
+                next.get_account(k),
+                Some(market_account.clone()),
+                "iteration {i}: account {k} must NOT be cleaned away"
+            );
+        }
+        bank = next;
+    }
+}
+
+// Ported from parasol-dev e2435ccf76. Full clean cycle: store a live
+// account, replace it with the canonical `(0, 0, system_program)` tombstone,
+// verify it disappears from get_account/get_all_accounts, then verify the
+// clean pass actually removes it from the index.
+#[test]
+fn test_system_zero_lamport_empty_account_is_hidden_and_cleaned() {
+    let account_key = Pubkey::new_unique();
+    let initial_owner = Pubkey::new_unique();
+    let collector = Pubkey::new_unique();
+
+    let (genesis_config, _mint_keypair) = create_genesis_config_no_tx_fee_no_rent(LAMPORTS_PER_SOL);
+    let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+
+    let slot1 = bank0.slot() + 1;
+    let bank1 =
+        Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank0, &collector, slot1);
+    let mut initial_account = AccountSharedData::new(10, 3, &initial_owner);
+    initial_account.set_data(vec![1, 2, 3]);
+    bank1.store_account(&account_key, &initial_account);
+    bank1.freeze();
+    bank1.squash();
+
+    let slot2 = bank1.slot() + 1;
+    let bank2 =
+        Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank1, &collector, slot2);
+    let zero_system_account =
+        AccountSharedData::new(0, 0, &solana_sdk_ids::system_program::id());
+    bank2.store_account(&account_key, &zero_system_account);
+
+    assert_eq!(bank2.get_account(&account_key), None);
+    assert!(!bank2
+        .get_all_accounts(false)
+        .unwrap()
+        .iter()
+        .any(|(pubkey, _, _slot)| pubkey == &account_key));
+
+    bank2.freeze();
+    bank2.squash();
+
+    let slot3 = bank2.slot() + 1;
+    let bank3 =
+        Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank2, &collector, slot3);
+    bank3.freeze();
+    bank3.squash();
+    bank3.force_flush_accounts_cache();
+
+    assert!(bank3
+        .rc
+        .accounts
+        .accounts_db
+        .accounts_index
+        .contains(&account_key));
+
+    bank3.clean_accounts();
+
+    assert_eq!(bank3.get_account(&account_key), None);
+    assert!(!bank3
+        .rc
+        .accounts
+        .accounts_db
+        .accounts_index
+        .contains(&account_key));
 }
 
 #[test]

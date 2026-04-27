@@ -33,6 +33,7 @@ pub mod blockhash_queue;
 pub mod contains;
 pub mod is_loadable;
 mod is_zero_lamport;
+pub use is_zero_lamport::IsZeroLamport;
 mod obsolete_accounts;
 pub mod partitioned_rewards;
 pub mod pubkey_bins;

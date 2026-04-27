@@ -987,6 +987,43 @@ mod tests {
         SanitizedMessage::Legacy(LegacyMessage::new(message, &HashSet::new()))
     }
 
+    // Ported from parasol-dev e2435ccf76. Direct AccountLoader-level
+    // verification of the F8 cleanable predicate: a `(0, 0, system_program)`
+    // entry sitting in the AccountLoader's scratch must be treated as
+    // deallocated, while a `(0, 0, custom_program)` entry must be returned
+    // unchanged.
+    #[test]
+    fn test_account_loader_treats_system_zero_lamport_empty_account_as_deallocated() {
+        let callbacks = TestCallbacks::default();
+        let mut account_loader: AccountLoader<TestCallbacks> = (&callbacks).into();
+        let account_key = Pubkey::new_unique();
+
+        let mut account = AccountSharedData::default();
+        account.set_owner(system_program::id());
+        account.set_rent_epoch(u64::MAX - 1);
+
+        account_loader.loaded_accounts.insert(account_key, account);
+
+        assert_eq!(account_loader.load_account(&account_key), None);
+    }
+
+    #[test]
+    fn test_account_loader_keeps_non_system_zero_lamport_empty_account_alive() {
+        let callbacks = TestCallbacks::default();
+        let mut account_loader: AccountLoader<TestCallbacks> = (&callbacks).into();
+        let account_key = Pubkey::new_unique();
+
+        let mut account = AccountSharedData::default();
+        account.set_owner(Pubkey::new_unique());
+        account.set_rent_epoch(u64::MAX - 1);
+
+        account_loader
+            .loaded_accounts
+            .insert(account_key, account.clone());
+
+        assert_eq!(account_loader.load_account(&account_key), Some(account));
+    }
+
     #[test_case(false; "informal_loaded_size")]
     #[test_case(true; "simd186_loaded_size")]
     fn test_load_accounts_unknown_program_id(formalize_loaded_transaction_data_size: bool) {
