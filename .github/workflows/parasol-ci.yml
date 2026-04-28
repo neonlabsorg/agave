@@ -85,7 +85,7 @@ jobs:
     with:
       target-repository: neonlabsorg/agave
       artifact-name: parasol-validator
-      gha-artifact-name: ${{ steps.pack.outputs.archive }}
+      gha-artifact-name: ${{ needs.build_and_release.pack.outputs.archive }}
       artifact-media-type: application/zip
       source-repository: neonlabsorg/agave
     secrets:
