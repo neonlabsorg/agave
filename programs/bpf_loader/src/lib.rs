@@ -1525,6 +1525,11 @@ fn execute<'a, 'b: 'a>(
         })
         .collect::<Vec<_>>();
 
+    // F10: capture the main-account count before `accounts_metadata` is moved into
+    // `create_vm!` so the AccessViolation handler below can route subaccount-region
+    // indices (>= main count) through `try_borrow_subaccount` instead of
+    // unconditionally falling into the main lane (which produces `MissingAccount`).
+    let n_main_account_regions = accounts_metadata.len();
     let mut create_vm_time = Measure::start("create_vm");
     let execution_result = {
         let compute_meter_prev = invoke_context.get_remaining();
@@ -1628,9 +1633,26 @@ fn execute<'a, 'b: 'a>(
                             let transaction_context = &invoke_context.transaction_context;
                             let instruction_context =
                                 transaction_context.get_current_instruction_context()?;
-                            let account = instruction_context.try_borrow_instruction_account(
-                                instruction_account_index as IndexOfAccount,
-                            )?;
+                            // F10: `account_region_addrs` chains main accounts then
+                            // subaccounts. Indices `>= n_main_account_regions` belong
+                            // to the subaccount lane and must be borrowed through
+                            // `try_borrow_subaccount` — the original code unconditionally
+                            // routed to `try_borrow_instruction_account` which returns
+                            // `MissingAccount` for out-of-range indices, masking the real
+                            // access-violation classification (admin_update_oracle on
+                            // a previously-persisted subaccount surfaced as
+                            // `InstructionError::MissingAccount`).
+                            let account = if instruction_account_index < n_main_account_regions {
+                                instruction_context.try_borrow_instruction_account(
+                                    instruction_account_index as IndexOfAccount,
+                                )?
+                            } else {
+                                instruction_context.try_borrow_subaccount(
+                                    instruction_account_index
+                                        .saturating_sub(n_main_account_regions)
+                                        as IndexOfAccount,
+                                )?
+                            };
                             if vm_addr.saturating_add(len) <= vm_addr_range.end {
                                 // The access was within the range of the accounts address space,
                                 // but it might not be within the range of the actual data.
