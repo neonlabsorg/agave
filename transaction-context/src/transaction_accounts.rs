@@ -565,6 +565,21 @@ impl TransactionAccounts {
         &self,
         index: IndexOfAccount,
     ) -> Result<AccountRefMut<'_>, InstructionError> {
+        // F10: route subaccount-lane indices (high bit set) into the subaccount
+        // storage. Without this, `access_violation_handler` (lib.rs) silently
+        // bails when a write hits a shared subaccount: it calls
+        // `accounts.try_borrow_mut(index_in_transaction)` where
+        // `index_in_transaction` carries `SUBACCOUNT_MARKER`, that bit pushes
+        // the value past `borrow_counters.len()`, the lookup returns
+        // `MissingAccount`, and the handler `return`s before unsharing the
+        // Arc / flipping the region writable. The first program write on a
+        // freshly-loaded subaccount then surfaces as `EbpfError::AccessViolation`
+        // and bpf_loader maps it to `InstructionError::InvalidRealloc`. Mirrors
+        // parasol-dev `TransactionAccounts::try_borrow_mut` SUBACCOUNT_MARKER
+        // dispatch.
+        if index & SUBACCOUNT_MARKER != 0 {
+            return self.try_borrow_mut_subaccount(index & !SUBACCOUNT_MARKER);
+        }
         let borrow_counter = self
             .borrow_counters
             .get(index as usize)
@@ -888,7 +903,7 @@ impl DerefMut for AccountRefMut<'_> {
 mod tests {
     use {
         crate::transaction_accounts::TransactionAccounts,
-        solana_account::{AccountSharedData, ReadableAccount},
+        solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
         solana_instruction::error::InstructionError,
         solana_pubkey::Pubkey,
     };
@@ -1050,6 +1065,40 @@ mod tests {
         assert_eq!(borrowed.data().len(), 8);
     }
 
+    /// F10 W11 regression: `try_borrow_mut` must accept SUBACCOUNT_MARKER-tagged
+    /// indices and route to the subaccount lane. Without this routing the
+    /// `access_violation_handler` (lib.rs) silently bails on subaccount writes,
+    /// which surfaces as `InstructionError::InvalidRealloc` from the bpf_loader
+    /// AccessViolation classifier even when the program is just writing inside
+    /// the existing data length.
+    #[test]
+    fn test_try_borrow_mut_routes_subaccount_marker_to_subaccount_lane() {
+        use crate::SUBACCOUNT_MARKER;
+
+        let tx_accounts = make_tx_accounts();
+        let sub_key = Pubkey::new_unique();
+        let sub_owner = Pubkey::new_unique();
+        let sub_account = AccountSharedData::new(99, 16, &sub_owner);
+        let sub_index = tx_accounts.add_subaccount(sub_key, sub_account);
+
+        // Pre-fix this returned `MissingAccount` because the subaccount index
+        // (with SUBACCOUNT_MARKER bit set) overflowed `borrow_counters.len()`.
+        let tagged = sub_index | SUBACCOUNT_MARKER;
+        let mut borrowed = tx_accounts
+            .try_borrow_mut(tagged)
+            .expect("subaccount-marker index must reach the subaccount lane");
+        assert_eq!(borrowed.lamports(), 99);
+        assert_eq!(borrowed.owner(), &sub_owner);
+        assert_eq!(borrowed.data().len(), 16);
+
+        // Mutating through the routed handle must not error and must be
+        // observable on the next read.
+        borrowed.set_lamports(123);
+        drop(borrowed);
+        let again = tx_accounts.try_borrow_subaccount(sub_index).unwrap();
+        assert_eq!(again.lamports(), 123);
+    }
+
     #[test]
     fn test_subaccount_borrow_counter_enforced() {
         let tx_accounts = make_tx_accounts();
@@ -1148,8 +1197,7 @@ mod tests {
         let main_pubkey = Pubkey::new_from_array([1u8; 32]);
         let main_account = AccountSharedData::new(100, 4, &Pubkey::new_unique());
 
-        let tx_accounts =
-            TransactionAccounts::new(vec![(main_pubkey, main_account.clone())]);
+        let tx_accounts = TransactionAccounts::new(vec![(main_pubkey, main_account.clone())]);
 
         let subaccount_pda = Pubkey::new_from_array([7u8; 32]);
         let owner = Pubkey::new_from_array([42u8; 32]);
@@ -1177,7 +1225,10 @@ mod tests {
         let (main_key, _) = accounts.first().unwrap();
         assert_eq!(*main_key, main_pubkey, "main account preserved");
         let (sub_key, sub_account) = accounts.get(1).unwrap();
-        assert_eq!(*sub_key, derived_storage, "subaccount mapped to storage address");
+        assert_eq!(
+            *sub_key, derived_storage,
+            "subaccount mapped to storage address"
+        );
         assert_eq!(sub_account.lamports(), 1_000);
         assert_eq!(sub_account.data(), subaccount.data());
         assert_eq!(sub_account.owner(), &owner);
