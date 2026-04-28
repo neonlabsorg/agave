@@ -2,19 +2,20 @@ name: Parasol ci
 
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag (e.g. v1.2.3)"
-        required: true
-        type: string
-      release_name:
-        description: "Release title (optional)"
-        required: false
-        type: string
+    # inputs:
+    #   tag:
+    #     description: "Release tag (e.g. v1.2.3)"
+    #     required: true
+    #     type: string
+    #   release_name:
+    #     description: "Release title (optional)"
+    #     required: false
+    #     type: string
 
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build_and_release:
@@ -69,11 +70,23 @@ jobs:
           echo "Created archive: ${ARCHIVE}"
           ls -la "${ARCHIVE}"
 
-      - name: Create GitHub Release and upload asset
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag }}
-          name: ${{ inputs.release_name != '' && inputs.release_name || format('Release {0}', inputs.tag) }}
-          files: ${{ steps.pack.outputs.archive }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # - name: Create GitHub Release and upload asset
+      #   uses: softprops/action-gh-release@v2
+      #   with:
+      #     tag_name: ${{ inputs.tag }}
+      #     name: ${{ inputs.release_name != '' && inputs.release_name || format('Release {0}', inputs.tag) }}
+      #     files: ${{ steps.pack.outputs.archive }}
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    needs: build_and_release
+    uses: ./.github/workflows/push-via-oras.yml
+    with:
+      target-repository: neonlabsorg/agave
+      artifact-name: parasol-validator
+      gha-artifact-name: ${{ steps.pack.outputs.archive }}
+      artifact-media-type: application/zip
+      source-repository: neonlabsorg/agave
+    secrets:
+      GITHUB_ORAS_TOKEN: ${{ secrets.GITHUB_TOKEN }}

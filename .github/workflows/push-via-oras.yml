@@ -1,0 +1,149 @@
+name: Push artifact to GHCR via ORAS
+
+on:
+  workflow_call:
+    inputs:
+      target-repository:
+        description: "Target repository in owner/repo format (where the artifact is published in GHCR)"
+        required: true
+        type: string
+      artifact-name:
+        description: "Artifact name in GHCR (e.g. my-app)"
+        required: true
+        type: string
+      gha-artifact-name:
+        description: "Name of the GitHub Actions artifact (uploaded via actions/upload-artifact in a previous job) to download and push to GHCR."
+        required: true
+        type: string
+      gha-artifact-file:
+        description: "File name inside the downloaded GHA artifact to push. If empty, the workflow expects exactly one file in the artifact and pushes that."
+        required: false
+        type: string
+        default: ""
+      artifact-media-type:
+        description: "Media type of the OCI artifact layer. Override to match the actual file type (e.g. application/zip, application/octet-stream)."
+        required: false
+        type: string
+        default: "application/octet-stream"
+      artifact-config-media-type:
+        description: "artifactType of the OCI artifact"
+        required: false
+        type: string
+        default: "application/vnd.acme.app.config.v1+json"
+      source-repository:
+        description: "Repository in owner/repo format used for the org.opencontainers.image.source annotation. Set this to the target-repository if you want GHCR to auto-link the package there. Defaults to the calling repository (github.repository)."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      GITHUB_ORAS_TOKEN:
+        description: "PAT with write:packages scope on the target repository"
+        required: true
+    outputs:
+      image-ref:
+        description: "Full reference of the published artifact"
+        value: ${{ jobs.push.outputs.image-ref }}
+      tag:
+        description: "Tag under which the artifact was published"
+        value: ${{ jobs.push.outputs.tag }}
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    outputs:
+      image-ref: ${{ steps.meta.outputs.tags }}
+      tag: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Docker meta (Renovate-friendly tag + OCI annotations)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ inputs.target-repository }}/${{ inputs.artifact-name }}
+          tags: |
+            type=raw,value=0.0.0-{{branch}}.${{ github.run_number }}.{{sha}}
+          annotations: |
+            org.opencontainers.image.title=${{ inputs.artifact-name }}
+            org.opencontainers.image.source=https://github.com/${{ inputs.source-repository != '' && inputs.source-repository || github.repository }}
+
+      - name: Download GHA artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.gha-artifact-name }}
+          path: ./_artifact
+
+      - name: Resolve artifact file
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="./_artifact"
+          if [ -n "${{ inputs.gha-artifact-file }}" ]; then
+            FILE="${DIR}/${{ inputs.gha-artifact-file }}"
+          else
+            # Ожидаем ровно один файл в артефакте.
+            mapfile -t FILES < <(find "${DIR}" -maxdepth 1 -type f)
+            if [ "${#FILES[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly 1 file in '${{ inputs.gha-artifact-name }}', got ${#FILES[@]}. Pass 'gha-artifact-file' to disambiguate."
+              ls -lah "${DIR}" || true
+              exit 1
+            fi
+            FILE="${FILES[0]}"
+          fi
+          if [ ! -s "${FILE}" ]; then
+            echo "::error::Artifact file '${FILE}' not found or empty"
+            exit 1
+          fi
+          ls -lah "${FILE}"
+          echo "file=${FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        shell: bash
+        env:
+          ORAS_TOKEN: ${{ secrets.GITHUB_ORAS_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "${ORAS_TOKEN}" | oras login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Push artifact to GHCR
+        id: push
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.tags }}
+          ANNOTATIONS_JSON: ${{ steps.meta.outputs.annotations }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json, os
+          raw = os.environ.get("ANNOTATIONS_JSON", "").strip()
+          pairs = []
+          if raw.startswith("["):
+              pairs = json.loads(raw)
+          else:
+              pairs = [line for line in raw.splitlines() if line.strip()]
+          manifest = {}
+          for p in pairs:
+              if "=" in p:
+                  k, v = p.split("=", 1)
+                  manifest[k] = v
+          manifest.setdefault("org.opencontainers.image.revision", os.environ.get("GITHUB_SHA", ""))
+          manifest.setdefault("org.opencontainers.image.ref.name", os.environ.get("GITHUB_REF_NAME", ""))
+          json.dump({"$manifest": manifest}, open("annotations.json", "w"), indent=2)
+          PY
+
+          oras push "${IMAGE_REF}" \
+            --artifact-type "${{ inputs.artifact-config-media-type }}" \
+            --annotation-file annotations.json \
+            "${{ steps.resolve.outputs.file }}:${{ inputs.artifact-media-type }}"
+
+          echo "Published: ${IMAGE_REF}"
+
+      - name: Logout from GHCR
+        if: always()
+        shell: bash
+        run: oras logout ghcr.io || true
