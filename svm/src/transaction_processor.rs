@@ -986,6 +986,16 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     .ok()
             });
 
+        // F10 W10: snapshot the lamports introduced by `add_subaccount`
+        // (i.e. `sol_create_subaccount` allocations not present in the
+        // original tx account list) before the transaction context is
+        // consumed by `deconstruct_transaction`. The runtime balance check
+        // below adds this delta to `lamports_before_tx` so funded subaccount
+        // allocations don't trigger `UnbalancedTransaction`.
+        let dynamic_accounts_lamports_sum = transaction_context
+            .accounts()
+            .get_dynamic_accounts_lamports_sum();
+
         let (execution_record, inner_instructions) = Self::deconstruct_transaction(
             transaction_context,
             config.recording_config.enable_cpi_recording,
@@ -1000,7 +1010,10 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
         if status.is_ok()
             && transaction_accounts_lamports_sum(&accounts)
-                .filter(|lamports_after_tx| lamports_before_tx == *lamports_after_tx)
+                .filter(|lamports_after_tx| {
+                    lamports_before_tx.saturating_add(dynamic_accounts_lamports_sum)
+                        == *lamports_after_tx
+                })
                 .is_none()
         {
             status = Err(TransactionError::UnbalancedTransaction);

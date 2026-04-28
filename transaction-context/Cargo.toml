@@ -33,6 +33,7 @@ solana-sbpf = { workspace = true }
 bincode = { workspace = true, optional = true }
 solana-rent = { workspace = true }
 solana-sdk-ids = { workspace = true }
+solana-sha256-hasher = { workspace = true, features = ["sha2"] }
 solana-signature = { workspace = true, optional = true }
 
 [dev-dependencies]

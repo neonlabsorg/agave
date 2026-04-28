@@ -245,6 +245,13 @@ pub struct TransactionAccounts {
     touched_flags: Box<[Cell<bool>]>,
     resize_delta: Cell<i64>,
     lamports_delta: Cell<i128>,
+    /// F10 W10: running sum of lamports introduced by `add_subaccount`
+    /// (i.e. by the `sol_create_subaccount` syscall) for accounts that did
+    /// not exist in the original transaction account list. The runtime adds
+    /// this delta to the expected `lamports_after_tx` so funded subaccount
+    /// allocations don't trigger `UnbalancedTransaction`.
+    #[cfg(not(target_os = "solana"))]
+    dynamic_accounts_lamports_sum: Cell<u128>,
     /// F10 subaccount lane — split-storage mirror of the main-account
     /// representation so `try_borrow_subaccount` / `try_borrow_mut_subaccount`
     /// return `AccountRef`/`AccountRefMut` uniformly with the main lane, and
@@ -320,6 +327,7 @@ impl TransactionAccounts {
             subaccount_private_fields: RefCell::new(Vec::new()),
             subaccount_borrow_counters: RefCell::new(Vec::new()),
             touched_subaccounts: RefCell::new(Vec::new()),
+            dynamic_accounts_lamports_sum: Cell::new(0),
         }
     }
 
@@ -362,6 +370,7 @@ impl TransactionAccounts {
         pubkey: Pubkey,
         account: AccountSharedData,
     ) -> IndexOfAccount {
+        let lamports = account.lamports();
         let mut shared = self.subaccount_shared_fields.borrow_mut();
         let mut private = self.subaccount_private_fields.borrow_mut();
         let mut counters = self.subaccount_borrow_counters.borrow_mut();
@@ -370,7 +379,7 @@ impl TransactionAccounts {
         shared.push(Box::new(UnsafeCell::new(AccountSharedFields {
             key: pubkey,
             owner: *account.owner(),
-            lamports: account.lamports(),
+            lamports,
             payload: crate::vm_slice::VmSlice::new(0, account.data().len() as u64),
         })));
         private.push(Box::new(UnsafeCell::new(AccountPrivateFields {
@@ -380,7 +389,23 @@ impl TransactionAccounts {
         })));
         counters.push(Box::new(BorrowCounter::default()));
         touched.push(false);
+        // F10 W10: track lamports introduced by dynamic subaccount allocations
+        // so the runtime balance check can adjust `lamports_after_tx`.
+        self.dynamic_accounts_lamports_sum.set(
+            self.dynamic_accounts_lamports_sum
+                .get()
+                .saturating_add(lamports as u128),
+        );
         index
+    }
+
+    /// F10 W10: lamports introduced by `add_subaccount` for accounts not
+    /// present in the original tx account list. SVM/runtime callers add
+    /// this to the expected post-tx lamport sum to avoid false
+    /// `UnbalancedTransaction` errors.
+    #[cfg(not(target_os = "solana"))]
+    pub fn get_dynamic_accounts_lamports_sum(&self) -> u128 {
+        self.dynamic_accounts_lamports_sum.get()
     }
 
     #[cfg(not(target_os = "solana"))]
@@ -630,7 +655,7 @@ impl TransactionAccounts {
     fn deconstruct_into_keyed_account_shared_data(&mut self) -> Vec<KeyedAccountSharedData> {
         let mut shared_account_fields = std::mem::take(&mut self.shared_account_fields);
         let mut private_account_fields = std::mem::take(&mut self.private_account_fields);
-        shared_account_fields
+        let mut accounts: Vec<_> = shared_account_fields
             .iter_mut()
             .zip(private_account_fields.iter_mut())
             .map(|(shared_fields_cell, private_fields_cell)| {
@@ -647,13 +672,41 @@ impl TransactionAccounts {
                     ),
                 )
             })
-            .collect()
+            .collect();
+        // F10 W10: drain the subaccount lane and append entries to the main
+        // accounts vec under the *storage* address (`hashv(&[&[1u8], pda])`).
+        // Without this, subaccount data created by `sol_create_subaccount`
+        // is silently dropped at tx commit and accounts-db never receives
+        // any state — the next transaction's `get_account_shared_data` then
+        // returns `None` and downstream programs see empty payloads.
+        // Mirrors the parasol-dev `From<TransactionContext> for ExecutionRecord`
+        // contract.
+        let sub_shared = std::mem::take(&mut *self.subaccount_shared_fields.borrow_mut());
+        let sub_private = std::mem::take(&mut *self.subaccount_private_fields.borrow_mut());
+        for (shared_box, private_box) in sub_shared.into_iter().zip(sub_private.into_iter()) {
+            let shared = (*shared_box).into_inner();
+            let private = (*private_box).into_inner();
+            let storage_address = Pubkey::new_from_array(
+                solana_sha256_hasher::hashv(&[&[1u8], shared.key.as_ref()]).to_bytes(),
+            );
+            accounts.push((
+                storage_address,
+                AccountSharedData::create_from_existing_shared_data(
+                    shared.lamports,
+                    private.payload,
+                    shared.owner,
+                    private.executable,
+                    private.rent_epoch,
+                ),
+            ));
+        }
+        accounts
     }
 
     pub(crate) fn deconstruct_into_account_shared_data(&mut self) -> Vec<AccountSharedData> {
         let mut shared_account_fields = std::mem::take(&mut self.shared_account_fields);
         let mut private_account_fields = std::mem::take(&mut self.private_account_fields);
-        shared_account_fields
+        let mut accounts: Vec<_> = shared_account_fields
             .iter_mut()
             .zip(private_account_fields.iter_mut())
             .map(|(shared_fields_cell, private_fields_cell)| {
@@ -667,7 +720,24 @@ impl TransactionAccounts {
                     private_fields.rent_epoch,
                 )
             })
-            .collect()
+            .collect();
+        // F10 W10: mirror the keyed variant — drain subaccount lane so
+        // mock_process_instruction (and any other no-keys deconstruct
+        // consumer) sees subaccount state instead of dropping it.
+        let sub_shared = std::mem::take(&mut *self.subaccount_shared_fields.borrow_mut());
+        let sub_private = std::mem::take(&mut *self.subaccount_private_fields.borrow_mut());
+        for (shared_box, private_box) in sub_shared.into_iter().zip(sub_private.into_iter()) {
+            let shared = (*shared_box).into_inner();
+            let private = (*private_box).into_inner();
+            accounts.push(AccountSharedData::create_from_existing_shared_data(
+                shared.lamports,
+                private.payload,
+                shared.owner,
+                private.executable,
+                private.rent_epoch,
+            ));
+        }
+        accounts
     }
 
     pub(crate) fn take(mut self) -> DeconstructedTransactionAccounts {
@@ -1065,5 +1135,51 @@ mod tests {
             Some(InstructionError::MissingAccount),
         );
         assert_eq!(tx_accounts.subaccount_key(0), None);
+    }
+
+    /// F10 W10 regression — subaccount lane MUST be drained into the main
+    /// accounts vec at deconstruct time, mapping each PDA pubkey to its
+    /// derived storage address (`hashv(&[&[1u8], pubkey])`). Without this,
+    /// accounts-db never receives subaccount state on tx commit and the
+    /// next tx's `get_account_shared_data` returns `None` — the live
+    /// `admin_update_oracle` -> `InvalidAccountData` failure mode.
+    #[test]
+    fn test_deconstruct_merges_subaccount_lane_into_main_accounts() {
+        let main_pubkey = Pubkey::new_from_array([1u8; 32]);
+        let main_account = AccountSharedData::new(100, 4, &Pubkey::new_unique());
+
+        let tx_accounts =
+            TransactionAccounts::new(vec![(main_pubkey, main_account.clone())]);
+
+        let subaccount_pda = Pubkey::new_from_array([7u8; 32]);
+        let owner = Pubkey::new_from_array([42u8; 32]);
+        let mut subaccount = AccountSharedData::new(1_000, 0, &owner);
+        subaccount.set_data(vec![0xAB; 96]);
+        tx_accounts.add_subaccount(subaccount_pda, subaccount.clone());
+
+        // Lamport delta exposed for the runtime balance check.
+        assert_eq!(
+            tx_accounts.get_dynamic_accounts_lamports_sum(),
+            1_000u128,
+            "dynamic_accounts_lamports_sum must reflect added subaccount lamports",
+        );
+
+        let derived_storage = Pubkey::new_from_array(
+            solana_sha256_hasher::hashv(&[&[1u8], subaccount_pda.as_ref()]).to_bytes(),
+        );
+
+        let (accounts, _touched, _resize) = tx_accounts.take();
+        assert_eq!(
+            accounts.len(),
+            2,
+            "deconstruct must include both main account and subaccount entry",
+        );
+        let (main_key, _) = accounts.first().unwrap();
+        assert_eq!(*main_key, main_pubkey, "main account preserved");
+        let (sub_key, sub_account) = accounts.get(1).unwrap();
+        assert_eq!(*sub_key, derived_storage, "subaccount mapped to storage address");
+        assert_eq!(sub_account.lamports(), 1_000);
+        assert_eq!(sub_account.data(), subaccount.data());
+        assert_eq!(sub_account.owner(), &owner);
     }
 }
