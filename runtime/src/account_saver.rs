@@ -127,6 +127,24 @@ fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
                 .push(transaction_ref.expect("transaction ref must exist if collecting"));
         }
     }
+
+    // F10 W10: subaccount lane entries appended by
+    // `TransactionAccounts::deconstruct_into_keyed_account_shared_data`
+    // sit after `transaction.account_keys().len()`. They are always
+    // writable and not part of the original tx account list, so the
+    // `is_writable` / `is_invoked` checks above do not apply — persist
+    // them unconditionally so accounts-db carries subaccount state to
+    // subsequent transactions. Mirrors the parasol-dev account_saver.
+    for (address, account) in transaction_accounts
+        .iter()
+        .skip(transaction.account_keys().len())
+    {
+        collected_accounts.push((address, account));
+        if let Some(collected_account_transactions) = collected_account_transactions {
+            collected_account_transactions
+                .push(transaction_ref.expect("transaction ref must exist if collecting"));
+        }
+    }
 }
 
 fn collect_accounts_for_failed_tx<'a>(
