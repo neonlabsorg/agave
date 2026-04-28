@@ -1286,6 +1286,11 @@ impl ConsumeWorkerMetrics {
             Ordering::Relaxed,
         );
 
+        self.timing_metrics.execute_load_subaccounts_us.fetch_add(
+            execute_timings.details.load_subaccounts_us.0,
+            Ordering::Relaxed,
+        );
+
         self.timing_metrics.execute_collect_logs_us.fetch_add(
             execute_timings.metrics.index(ExecuteTimingType::CollectLogsUs).0,
             Ordering::Relaxed,
@@ -1552,6 +1557,7 @@ struct ConsumeWorkerTimingMetrics {
     execute_vm_create_us: AtomicU64,
     execute_vm_execute_us: AtomicU64,
     execute_vm_deserialize_us: AtomicU64,
+    execute_load_subaccounts_us: AtomicU64,
     execute_collect_logs_us: AtomicU64,
 
     record_results_us: AtomicU64,
@@ -1623,6 +1629,7 @@ impl ConsumeWorkerTimingMetrics {
             ("execute_vm_create_us", self.execute_vm_create_us.swap(0, Ordering::Relaxed), i64),
             ("execute_vm_execute_us", self.execute_vm_execute_us.swap(0, Ordering::Relaxed), i64),
             ("execute_vm_deserialize_us", self.execute_vm_deserialize_us.swap(0, Ordering::Relaxed), i64),
+            ("execute_load_subaccounts_us", self.execute_load_subaccounts_us.swap(0, Ordering::Relaxed), i64),
             ("execute_collect_logs_us", self.execute_collect_logs_us.swap(0, Ordering::Relaxed), i64),
 
             ("record_results_us", self.record_results_us.swap(0, Ordering::Relaxed), i64),

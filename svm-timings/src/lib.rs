@@ -393,6 +393,7 @@ pub struct ExecuteDetailsTimings {
     pub create_vm_us: Saturating<u64>,
     pub execute_us: Saturating<u64>,
     pub deserialize_us: Saturating<u64>,
+    pub load_subaccounts_us: Saturating<u64>,
     pub get_or_create_executor_us: Saturating<u64>,
     pub changed_account_count: Saturating<u64>,
     pub total_account_count: Saturating<u64>,
@@ -409,6 +410,7 @@ impl ExecuteDetailsTimings {
         self.create_vm_us += other.create_vm_us;
         self.execute_us += other.execute_us;
         self.deserialize_us += other.deserialize_us;
+        self.load_subaccounts_us += other.load_subaccounts_us;
         self.get_or_create_executor_us += other.get_or_create_executor_us;
         self.changed_account_count += other.changed_account_count;
         self.total_account_count += other.total_account_count;
