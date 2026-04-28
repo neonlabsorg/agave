@@ -1173,7 +1173,8 @@ impl ConsumeWorkerMetrics {
             record_us,
             commit_us,
             find_and_send_votes_us,
-            ..
+            record_transactions_timings,
+            execute_timings,
         }: &LeaderExecuteAndCommitTimings,
     ) {
         self.timing_metrics
@@ -1200,6 +1201,131 @@ impl ConsumeWorkerMetrics {
         self.timing_metrics
             .num_batches_processed
             .fetch_add(1, Ordering::Relaxed);
+
+        use solana_svm_timings::ExecuteTimingType;
+        use std::ops::Index;
+        self.timing_metrics
+            .load_check_us
+            .fetch_add(
+                execute_timings.metrics.index(ExecuteTimingType::CheckUs).0, 
+                Ordering::Relaxed,
+            );
+
+        self.timing_metrics.load_program_cache_us.fetch_add(
+            execute_timings.metrics.index(ExecuteTimingType::ProgramCacheUs).0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.load_program_cache_us.fetch_add(
+            execute_timings.metrics.index(ExecuteTimingType::ProgramCacheUs).0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.load_validate_fees_us.fetch_add(
+            execute_timings.metrics.index(ExecuteTimingType::ValidateFeesUs).0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.load_accounts_us.fetch_add(
+            execute_timings.metrics.index(ExecuteTimingType::LoadUs).0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.load_collect_balances_us.fetch_add(
+            execute_timings.metrics.index(ExecuteTimingType::CollectBalancesUs).0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.execute_us.fetch_add(
+            execute_timings.metrics.index(ExecuteTimingType::ExecuteUs).0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.execute_filter_executable_us.fetch_add(
+            execute_timings.metrics.index(ExecuteTimingType::FilterExecutableUs).0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.execute_process_message_us.fetch_add(
+            execute_timings.execute_accessories.process_message_us.0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.execute_process_instructions_us.fetch_add(
+            execute_timings.execute_accessories.process_instructions.total_us.0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.execute_process_chain_us.fetch_add(
+            execute_timings.execute_accessories.process_instructions.process_executable_chain_us.0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.execute_vm_create_executor_us.fetch_add(
+            execute_timings.details.get_or_create_executor_us.0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.execute_vm_serialize_us.fetch_add(
+            execute_timings.details.serialize_us.0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.execute_vm_create_us.fetch_add(
+            execute_timings.details.create_vm_us.0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.execute_vm_execute_us.fetch_add(
+            execute_timings.details.execute_us.0,
+            Ordering::Relaxed,
+        );
+
+         self.timing_metrics.execute_vm_deserialize_us.fetch_add(
+            execute_timings.details.deserialize_us.0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.execute_collect_logs_us.fetch_add(
+            execute_timings.metrics.index(ExecuteTimingType::CollectLogsUs).0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.record_results_us.fetch_add(
+            record_transactions_timings.processing_results_to_transactions_us.0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.record_hash_us.fetch_add(
+            record_transactions_timings.hash_us.0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.record_poh_us.fetch_add(
+            record_transactions_timings.poh_record_us.0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.commit_store_us.fetch_add(
+            execute_timings.metrics.index(ExecuteTimingType::StoreUs).0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.commit_update_stake_us.fetch_add(
+            execute_timings.metrics.index(ExecuteTimingType::UpdateStakesCacheUs).0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.commit_update_executors_us.fetch_add(
+            execute_timings.metrics.index(ExecuteTimingType::UpdateExecutorsUs).0,
+            Ordering::Relaxed,
+        );
+
+        self.timing_metrics.commit_update_statuses_us.fetch_add(
+            execute_timings.metrics.index(ExecuteTimingType::UpdateTransactionStatuses).0,
+            Ordering::Relaxed,
+        );
+        
     }
 
     fn update_on_error_counters(
@@ -1409,6 +1535,33 @@ struct ConsumeWorkerTimingMetrics {
     commit_us: AtomicU64,
     find_and_send_votes_us: AtomicU64,
     num_batches_processed: AtomicU64,
+
+    load_check_us: AtomicU64,
+    load_program_cache_us: AtomicU64,
+    load_validate_fees_us: AtomicU64,
+    load_accounts_us: AtomicU64,
+    load_collect_balances_us: AtomicU64,
+
+    execute_us: AtomicU64,
+    execute_filter_executable_us: AtomicU64,
+    execute_process_message_us: AtomicU64,
+    execute_process_instructions_us: AtomicU64,
+    execute_process_chain_us: AtomicU64,
+    execute_vm_create_executor_us: AtomicU64,
+    execute_vm_serialize_us: AtomicU64,
+    execute_vm_create_us: AtomicU64,
+    execute_vm_execute_us: AtomicU64,
+    execute_vm_deserialize_us: AtomicU64,
+    execute_collect_logs_us: AtomicU64,
+
+    record_results_us: AtomicU64,
+    record_hash_us: AtomicU64,
+    record_poh_us: AtomicU64,
+
+    commit_store_us: AtomicU64,
+    commit_update_stake_us: AtomicU64,
+    commit_update_executors_us: AtomicU64,
+    commit_update_statuses_us: AtomicU64,
 }
 
 impl ConsumeWorkerTimingMetrics {
@@ -1453,6 +1606,33 @@ impl ConsumeWorkerTimingMetrics {
                 self.find_and_send_votes_us.swap(0, Ordering::Relaxed),
                 i64
             ),
+
+            ("load_check_us", self.load_check_us.swap(0, Ordering::Relaxed), i64),
+            ("load_program_cache_us", self.load_program_cache_us.swap(0, Ordering::Relaxed), i64),
+            ("load_validate_fees_us", self.load_validate_fees_us.swap(0, Ordering::Relaxed), i64),
+            ("load_accounts_us", self.load_accounts_us.swap(0, Ordering::Relaxed), i64),
+            ("load_collect_balances_us", self.load_collect_balances_us.swap(0, Ordering::Relaxed), i64),
+
+            ("execute_us", self.execute_us.swap(0, Ordering::Relaxed), i64),
+            ("execute_filter_executable_us", self.execute_filter_executable_us.swap(0, Ordering::Relaxed), i64),
+            ("execute_process_message_us", self.execute_process_message_us.swap(0, Ordering::Relaxed), i64),
+            ("execute_process_instructions_us", self.execute_process_instructions_us.swap(0, Ordering::Relaxed), i64),
+            ("execute_process_chain_us", self.execute_process_chain_us.swap(0, Ordering::Relaxed), i64),
+            ("execute_vm_create_executor_us", self.execute_vm_create_executor_us.swap(0, Ordering::Relaxed), i64),
+            ("execute_vm_serialize_us", self.execute_vm_serialize_us.swap(0, Ordering::Relaxed), i64),
+            ("execute_vm_create_us", self.execute_vm_create_us.swap(0, Ordering::Relaxed), i64),
+            ("execute_vm_execute_us", self.execute_vm_execute_us.swap(0, Ordering::Relaxed), i64),
+            ("execute_vm_deserialize_us", self.execute_vm_deserialize_us.swap(0, Ordering::Relaxed), i64),
+            ("execute_collect_logs_us", self.execute_collect_logs_us.swap(0, Ordering::Relaxed), i64),
+
+            ("record_results_us", self.record_results_us.swap(0, Ordering::Relaxed), i64),
+            ("record_hash_us", self.record_hash_us.swap(0, Ordering::Relaxed), i64),
+            ("record_poh_us", self.record_poh_us.swap(0, Ordering::Relaxed), i64),
+
+            ("commit_store_us", self.commit_store_us.swap(0, Ordering::Relaxed), i64),
+            ("commit_update_stake_us", self.commit_update_stake_us.swap(0, Ordering::Relaxed), i64),
+            ("commit_update_executor_us", self.commit_update_executors_us.swap(0, Ordering::Relaxed), i64),
+            ("commit_update_statuses_us", self.commit_update_statuses_us.swap(0, Ordering::Relaxed), i64),
         );
     }
 }
