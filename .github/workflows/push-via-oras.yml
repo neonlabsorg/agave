@@ -118,7 +118,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
+          FILE="${{ steps.resolve.outputs.file }}"
+          DIR="$(dirname "${FILE}")"
+          BASENAME="$(basename "${FILE}")"
+
+          python3 - <<PY
           import json, os
           raw = os.environ.get("ANNOTATIONS_JSON", "").strip()
           pairs = []
@@ -133,13 +137,15 @@ jobs:
                   manifest[k] = v
           manifest.setdefault("org.opencontainers.image.revision", os.environ.get("GITHUB_SHA", ""))
           manifest.setdefault("org.opencontainers.image.ref.name", os.environ.get("GITHUB_REF_NAME", ""))
-          json.dump({"$manifest": manifest}, open("annotations.json", "w"), indent=2)
+          json.dump({"\$manifest": manifest}, open("${DIR}/annotations.json", "w"), indent=2)
           PY
+
+          cd "${DIR}"
 
           oras push "${IMAGE_REF}" \
             --artifact-type "${{ inputs.artifact-config-media-type }}" \
             --annotation-file annotations.json \
-            "${{ steps.resolve.outputs.file }}:${{ inputs.artifact-media-type }}"
+            "${BASENAME}:${{ inputs.artifact-media-type }}"
 
           echo "Published: ${IMAGE_REF}"
 
