@@ -7,7 +7,7 @@ use {
     }, std::mem
 };
 
-pub(crate) const MAX_CPI_ACCOUNT_INFOS: usize = 256;
+pub(crate) const MAX_CPI_ACCOUNT_INFOS: usize = 128;
 
 fn check_account_info_pointer(
     invoke_context: &InvokeContext,
@@ -1528,17 +1528,16 @@ fn check_instruction_size(num_accounts: usize, data_len: usize) -> Result<(), Er
 
 fn check_account_infos(
     num_account_infos: usize,
-    _invoke_context: &mut InvokeContext,
+    invoke_context: &mut InvokeContext,
 ) -> Result<(), Error> {
-    // let max_cpi_account_infos = if invoke_context
-    //     .get_feature_set()
-    //     .increase_tx_account_lock_limit
-    // {
-    //     MAX_CPI_ACCOUNT_INFOS
-    // } else {
-    //     64
-    // };
-    let max_cpi_account_infos = MAX_CPI_ACCOUNT_INFOS;
+    let max_cpi_account_infos = if invoke_context
+        .get_feature_set()
+        .increase_tx_account_lock_limit
+    {
+        MAX_CPI_ACCOUNT_INFOS
+    } else {
+        64
+    };
     let num_account_infos = num_account_infos as u64;
     let max_account_infos = max_cpi_account_infos as u64;
     if num_account_infos > max_account_infos {
