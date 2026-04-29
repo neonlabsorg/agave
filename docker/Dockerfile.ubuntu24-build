@@ -46,7 +46,15 @@ RUN cargo build --release
 
 # Collect binaries in a clean location for copying out of the image
 FROM scratch AS artifacts
-COPY --from=builder /opt/agave/target/release/ /out/
+COPY --from=builder /opt/agave/target/release/agave-* /out/
+COPY --from=builder /opt/agave/target/release/cargo-* /out/
+COPY --from=builder /opt/agave/target/release/deps/ /out/
+COPY --from=builder /opt/agave/target/release/perf-libs/ /out/
+COPY --from=builder /opt/agave/target/release/platform-tools-sdk/ /out/
+COPY --from=builder /opt/agave/target/release/rbpf-* /out/
+COPY --from=builder /opt/agave/target/release/solana /out/
+COPY --from=builder /opt/agave/target/release/solana-* /out/
+
 
 # Minimal runtime image with the compiled binaries
 FROM ubuntu:24.04 AS runtime
@@ -62,7 +70,14 @@ RUN apt-get update && \
       libgcc-s1 && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /opt/agave/target/release/ /usr/local/bin/
+COPY --from=builder /opt/agave/target/release/agave-* /out/
+COPY --from=builder /opt/agave/target/release/cargo-* /out/
+COPY --from=builder /opt/agave/target/release/deps/ /out/
+COPY --from=builder /opt/agave/target/release/perf-libs/ /out/
+COPY --from=builder /opt/agave/target/release/platform-tools-sdk/ /out/
+COPY --from=builder /opt/agave/target/release/rbpf-* /out/
+COPY --from=builder /opt/agave/target/release/solana /out/
+COPY --from=builder /opt/agave/target/release/solana-* /out/
 
 # Default to showing available binaries; override entrypoint/command as needed
 CMD ["solana-validator", "--version"]
