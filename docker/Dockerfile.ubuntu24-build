@@ -49,9 +49,6 @@ FROM scratch AS artifacts
 
 COPY --from=builder /opt/agave/target/release/agave-* /out/
 COPY --from=builder /opt/agave/target/release/cargo-* /out/
-# COPY --from=builder /opt/agave/target/release/deps/ /out/
-# COPY --from=builder /opt/agave/target/release/perf-libs/ /out/
-# COPY --from=builder /opt/agave/target/release/platform-tools-sdk/ /out/
 COPY --from=builder /opt/agave/target/release/rbpf-* /out/
 COPY --from=builder /opt/agave/target/release/solana /out/
 COPY --from=builder /opt/agave/target/release/solana-* /out/
@@ -73,9 +70,6 @@ RUN apt-get update && \
 
 COPY --from=builder /opt/agave/target/release/agave-* /out/
 COPY --from=builder /opt/agave/target/release/cargo-* /out/
-# COPY --from=builder /opt/agave/target/release/deps/ /out/
-# COPY --from=builder /opt/agave/target/release/perf-libs/ /out/
-# COPY --from=builder /opt/agave/target/release/platform-tools-sdk/ /out/
 COPY --from=builder /opt/agave/target/release/rbpf-* /out/
 COPY --from=builder /opt/agave/target/release/solana /out/
 COPY --from=builder /opt/agave/target/release/solana-* /out/
