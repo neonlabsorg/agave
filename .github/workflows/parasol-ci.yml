@@ -2,15 +2,10 @@ name: Parasol ci
 
 on:
   workflow_dispatch:
-    # inputs:
-    #   tag:
-    #     description: "Release tag (e.g. v1.2.3)"
-    #     required: true
-    #     type: string
-    #   release_name:
-    #     description: "Release title (optional)"
-    #     required: false
-    #     type: string
+  push:
+    branches:
+      - parasol-dev
+      - parasol-fork-dev-ci
 
 
 permissions:
@@ -59,9 +54,8 @@ jobs:
 
           BRANCH="${GITHUB_REF_NAME}"
           SAFE_BRANCH="${BRANCH//\//-}"
-          TAG="${{ inputs.tag }}"
 
-          ARCHIVE="bin-${SAFE_BRANCH}-${TAG}.zip"
+          ARCHIVE="bin-${SAFE_BRANCH}.zip"
 
           cd bin
           zip -r "../${ARCHIVE}" .
