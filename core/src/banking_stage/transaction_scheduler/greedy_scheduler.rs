@@ -76,7 +76,6 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
         container: &mut S,
         _pre_graph_filter: impl Fn(&[&Tx], &mut [bool]),
         pre_lock_filter: impl Fn(&TransactionState<Tx>) -> PreLockFilterAction,
-        relax_intrabatch_account_locks: bool,
     ) -> Result<SchedulingSummary, SchedulerError> {
         let starting_queue_size = container.queue_size();
         let starting_buffer_size = container.buffer_size();
@@ -131,12 +130,9 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
 
             // If there is a conflict with any of the transactions in the current batches,
             // we should immediately send out the batches, so this transaction may be scheduled.
-            // Skipped when SIMD-0083 is active: the consumer's batch lock now serializes
-            // intra-batch conflicts, so we don't need to break batches to avoid them.
-            if !relax_intrabatch_account_locks
-                && !self
-                    .working_account_set
-                    .check_locks(transaction_state.transaction())
+            if !self
+                .working_account_set
+                .check_locks(transaction_state.transaction())
             {
                 self.working_account_set.clear();
                 num_sent += self.common.send_batches()?;
@@ -172,12 +168,10 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                     max_age,
                     cost,
                 }) => {
-                    if !relax_intrabatch_account_locks {
-                        assert!(
-                            self.working_account_set.take_locks(&transaction),
-                            "locks must be available"
-                        );
-                    }
+                    assert!(
+                        self.working_account_set.take_locks(&transaction),
+                        "locks must be available"
+                    );
                     num_scheduled += 1;
                     self.common.batches.add_transaction_to_batch(
                         thread_id,
@@ -415,12 +409,7 @@ mod test {
 
         drop(work_receivers); // explicitly drop receivers
         assert_matches!(
-            scheduler.schedule(
-                &mut container,
-                test_pre_graph_filter,
-                test_pre_lock_filter,
-                false
-            ),
+            scheduler.schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter),
             Err(SchedulerError::DisconnectedSendChannel(_))
         );
     }
@@ -435,12 +424,7 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(
-                &mut container,
-                test_pre_graph_filter,
-                test_pre_lock_filter,
-                false,
-            )
+            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 2);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
@@ -462,12 +446,7 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(
-                &mut container,
-                test_pre_graph_filter,
-                test_pre_lock_filter,
-                false,
-            )
+            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 1);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
@@ -489,12 +468,7 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(
-                &mut container,
-                test_pre_graph_filter,
-                test_pre_lock_filter,
-                false,
-            )
+            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 1);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
@@ -516,12 +490,7 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(
-                &mut container,
-                test_pre_graph_filter,
-                test_pre_lock_filter,
-                false,
-            )
+            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 2);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
@@ -539,12 +508,7 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(
-                &mut container,
-                test_pre_graph_filter,
-                test_pre_lock_filter,
-                false,
-            )
+            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 2);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
@@ -559,12 +523,7 @@ mod test {
             create_container((0..4).map(|i| (Keypair::new(), [Pubkey::new_unique()], 1, i)));
 
         let scheduling_summary = scheduler
-            .schedule(
-                &mut container,
-                test_pre_graph_filter,
-                test_pre_lock_filter,
-                false,
-            )
+            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 4);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
@@ -600,12 +559,7 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(
-                &mut container,
-                test_pre_graph_filter,
-                test_pre_lock_filter,
-                false,
-            )
+            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 3);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 1);
@@ -637,12 +591,7 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(
-                &mut container,
-                test_pre_graph_filter,
-                test_pre_lock_filter,
-                false,
-            )
+            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 3);
         assert_eq!(scheduling_summary.num_unschedulable_threads, 3);
