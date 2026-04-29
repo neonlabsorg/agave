@@ -283,7 +283,7 @@ fn test_builtin_ix_cost_adjustment_with_memo_no_cu_limit() {
 
     // A simple transfer ix, and a bpf ix (memo_ix) that needs 356_963 CUs
     // Cost model & Compute budget: reserve/allocate CU for 1 builtin and 1 non-builtin
-    //   (3_000 + 2_000_000) = 2_003_000 CUs (note: less than memo_ix needs)
+    //   (3_000 + 200_000) = 203_000 CUs (note: less than memo_ix needs)
     // VM Execution: consume all allocated CUs, then fail
     // Result: no adjustment
     let expected = TestResult {
