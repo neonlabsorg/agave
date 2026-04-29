@@ -20,6 +20,8 @@ permissions:
 jobs:
   build_and_release:
     runs-on: ["gha-runner-scale-set-large"]
+    outputs:
+      archive: ${{ steps.pack.outputs.archive }}
 
     steps:
       - name: Checkout
@@ -70,6 +72,14 @@ jobs:
           echo "Created archive: ${ARCHIVE}"
           ls -la "${ARCHIVE}"
 
+      - name: Upload archive as GHA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.archive }}
+          path: ${{ steps.pack.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
       # - name: Create GitHub Release and upload asset
       #   uses: softprops/action-gh-release@v2
       #   with:
@@ -85,7 +95,7 @@ jobs:
     with:
       target-repository: neonlabsorg/agave
       artifact-name: parasol-validator
-      gha-artifact-name: ${{ needs.build_and_release.pack.outputs.archive }}
+      gha-artifact-name: ${{ needs.build_and_release.outputs.archive }}
       artifact-media-type: application/zip
       source-repository: neonlabsorg/agave
     secrets:
