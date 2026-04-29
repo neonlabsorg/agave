@@ -42,18 +42,21 @@ RUN git clone --recursive "${AGAVE_REPO}" agave && \
 WORKDIR /opt/agave
 
 # Release build
-RUN cargo build --release
+# RUN cargo build --release
+RUN ./scripts/cargo-install-all.sh /opt/agave/target/release/
+RUN ls -lah /opt/agave/target/release/
 
 # Collect binaries in a clean location for copying out of the image
 FROM scratch AS artifacts
-COPY --from=builder /opt/agave/target/release/agave-* /out/
-COPY --from=builder /opt/agave/target/release/cargo-* /out/
-COPY --from=builder /opt/agave/target/release/deps/ /out/
-# COPY --from=builder /opt/agave/target/release/perf-libs/ /out/
-# COPY --from=builder /opt/agave/target/release/platform-tools-sdk/ /out/
-COPY --from=builder /opt/agave/target/release/rbpf-* /out/
-COPY --from=builder /opt/agave/target/release/solana /out/
-COPY --from=builder /opt/agave/target/release/solana-* /out/
+COPY --from=builder /opt/agave/target/release/ /out/
+# COPY --from=builder /opt/agave/target/release/agave-* /out/
+# COPY --from=builder /opt/agave/target/release/cargo-* /out/
+# # COPY --from=builder /opt/agave/target/release/deps/ /out/
+# # COPY --from=builder /opt/agave/target/release/perf-libs/ /out/
+# # COPY --from=builder /opt/agave/target/release/platform-tools-sdk/ /out/
+# COPY --from=builder /opt/agave/target/release/rbpf-* /out/
+# COPY --from=builder /opt/agave/target/release/solana /out/
+# COPY --from=builder /opt/agave/target/release/solana-* /out/
 
 
 # Minimal runtime image with the compiled binaries
@@ -72,7 +75,7 @@ RUN apt-get update && \
 
 COPY --from=builder /opt/agave/target/release/agave-* /out/
 COPY --from=builder /opt/agave/target/release/cargo-* /out/
-COPY --from=builder /opt/agave/target/release/deps/ /out/
+# COPY --from=builder /opt/agave/target/release/deps/ /out/
 # COPY --from=builder /opt/agave/target/release/perf-libs/ /out/
 # COPY --from=builder /opt/agave/target/release/platform-tools-sdk/ /out/
 COPY --from=builder /opt/agave/target/release/rbpf-* /out/
