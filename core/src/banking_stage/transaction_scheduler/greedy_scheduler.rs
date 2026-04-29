@@ -79,7 +79,6 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
         budget: u64,
         _pre_graph_filter: impl Fn(&[&Tx], &mut [bool]),
         pre_lock_filter: impl Fn(&TransactionState<Tx>) -> PreLockFilterAction,
-        relax_intrabatch_account_locks: bool,
     ) -> Result<SchedulingSummary, SchedulerError> {
         // Subtract any in-flight compute units from the budget.
         let mut budget = budget.saturating_sub(
@@ -144,12 +143,9 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
 
             // If there is a conflict with any of the transactions in the current batches,
             // we should immediately send out the batches, so this transaction may be scheduled.
-            // Skipped when SIMD-0083 is active: the consumer's batch lock now serializes
-            // intra-batch conflicts, so we don't need to break batches to avoid them.
-            if !relax_intrabatch_account_locks
-                && !self
-                    .working_account_set
-                    .check_locks(transaction_state.transaction())
+            if !self
+                .working_account_set
+                .check_locks(transaction_state.transaction())
             {
                 self.working_account_set.clear();
                 num_sent += self.common.send_batches()?;
@@ -185,12 +181,10 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                     max_age,
                     cost,
                 }) => {
-                    if !relax_intrabatch_account_locks {
-                        assert!(
-                            self.working_account_set.take_locks(&transaction),
-                            "locks must be available"
-                        );
-                    }
+                    assert!(
+                        self.working_account_set.take_locks(&transaction),
+                        "locks must be available"
+                    );
                     num_scheduled += 1;
                     self.common.batches.add_transaction_to_batch(
                         thread_id,
@@ -433,8 +427,7 @@ mod test {
                 &mut container,
                 u64::MAX, // no budget
                 test_pre_graph_filter,
-                test_pre_lock_filter,
-                false, // relax_intrabatch_account_locks
+                test_pre_lock_filter
             ),
             Err(SchedulerError::DisconnectedSendChannel(_))
         );
@@ -455,7 +448,6 @@ mod test {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
-                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 2);
@@ -478,7 +470,6 @@ mod test {
                 0, // zero budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
-                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 0);
@@ -505,7 +496,6 @@ mod test {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
-                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 1);
@@ -533,7 +523,6 @@ mod test {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
-                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 1);
@@ -561,7 +550,6 @@ mod test {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
-                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 2);
@@ -585,7 +573,6 @@ mod test {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
-                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 2);
@@ -606,7 +593,6 @@ mod test {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
-                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 4);
@@ -648,7 +634,6 @@ mod test {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
-                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 3);
@@ -686,7 +671,6 @@ mod test {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
-                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 3);
