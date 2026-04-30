@@ -46,19 +46,16 @@ jobs:
           echo "Build output:"
           ls -la ./bin
 
-      - name: Archive binaries (zip, add branch name)
+      - name: Archive binaries
         id: pack
         shell: bash
         run: |
           set -euo pipefail
 
-          BRANCH="${GITHUB_REF_NAME}"
-          SAFE_BRANCH="${BRANCH//\//-}"
-
-          ARCHIVE="bin-${SAFE_BRANCH}.zip"
+          ARCHIVE="parasol-validator.zip"
 
           cd bin
-          zip -r "../${ARCHIVE}" .
+          zip -r "../${ARCHIVE}" . -x '*.d'
           cd ..
 
           echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
