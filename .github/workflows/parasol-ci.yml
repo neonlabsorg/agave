@@ -54,9 +54,9 @@ jobs:
 
           ARCHIVE="parasol-validator.zip"
 
-          cd bin
-          zip -r "../${ARCHIVE}" . -x '*.d'
-          cd ..
+          cd bin/out
+          zip -r "../../${ARCHIVE}" . -x '*.d'
+          cd ../..
 
           echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
 
