@@ -20,7 +20,6 @@ pub(crate) trait Scheduler<Tx: TransactionWithMeta> {
         budget: u64,
         pre_graph_filter: impl Fn(&[&Tx], &mut [bool]),
         pre_lock_filter: impl Fn(&TransactionState<Tx>) -> PreLockFilterAction,
-        relax_intrabatch_account_locks: bool,
     ) -> Result<SchedulingSummary, SchedulerError>;
 
     /// Receive completed batches of transactions without blocking.

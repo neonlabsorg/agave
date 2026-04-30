@@ -344,7 +344,14 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
 
             self.loaded_accounts.insert(*address, account.clone());
         }
+        for (address, account) in transaction_accounts
+            .iter()
+            .skip(message.account_keys().len())
+        {
+            self.loaded_accounts.insert(*address, account.clone());
+        }
     }
+
 }
 
 // Program loaders and parsers require a type that impls TransactionProcessingCallback,
