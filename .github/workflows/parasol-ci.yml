@@ -2,23 +2,21 @@ name: Parasol ci
 
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag (e.g. v1.2.3)"
-        required: true
-        type: string
-      release_name:
-        description: "Release title (optional)"
-        required: false
-        type: string
+  push:
+    branches:
+      - parasol-dev
+      - parasol-fork-dev-ci
 
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build_and_release:
     runs-on: ["gha-runner-scale-set-large"]
+    outputs:
+      archive: ${{ steps.pack.outputs.archive }}
 
     steps:
       - name: Checkout
@@ -48,32 +46,40 @@ jobs:
           echo "Build output:"
           ls -la ./bin
 
-      - name: Archive binaries (zip, add branch name)
+      - name: Archive binaries
         id: pack
         shell: bash
         run: |
           set -euo pipefail
 
-          BRANCH="${GITHUB_REF_NAME}"
-          SAFE_BRANCH="${BRANCH//\//-}"
-          TAG="${{ inputs.tag }}"
+          ARCHIVE="parasol-validator.zip"
 
-          ARCHIVE="bin-${SAFE_BRANCH}-${TAG}.zip"
-
-          cd bin
-          zip -r "../${ARCHIVE}" .
-          cd ..
+          cd bin/out
+          zip -r "../../${ARCHIVE}" . -x '*.d'
+          cd ../..
 
           echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
 
           echo "Created archive: ${ARCHIVE}"
           ls -la "${ARCHIVE}"
 
-      - name: Create GitHub Release and upload asset
-        uses: softprops/action-gh-release@v2
+      - name: Upload archive as GHA artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ inputs.tag }}
-          name: ${{ inputs.release_name != '' && inputs.release_name || format('Release {0}', inputs.tag) }}
-          files: ${{ steps.pack.outputs.archive }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ steps.pack.outputs.archive }}
+          path: ${{ steps.pack.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build_and_release
+    uses: ./.github/workflows/push-via-oras.yml
+    with:
+      dockerhub-namespace: neonlabsorg
+      artifact-name: parasol-validator-bin
+      gha-artifact-name: ${{ needs.build_and_release.outputs.archive }}
+      artifact-media-type: application/zip
+      source-repository: neonlabsorg/agave
+    secrets:
+      ORAS_DOCKER_USERNAME: ${{ secrets.ORAS_DOCKER_USERNAME }}
+      ORAS_DOCKER_PASSWORD: ${{ secrets.ORAS_DOCKER_PASSWORD }}

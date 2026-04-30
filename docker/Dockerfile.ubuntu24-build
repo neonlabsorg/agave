@@ -1,0 +1,78 @@
+FROM ubuntu:24.04 AS builder
+ARG AGAVE_REF=gasless-parameters
+ARG AGAVE_REPO=https://github.com/neonlabsorg/agave.git
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC \
+    CARGO_TARGET_DIR=/opt/agave/target
+
+# System dependencies required to compile Solana/Agave
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      curl \
+      git \
+      pkg-config \
+      libssl-dev \
+      libudev-dev \
+      zlib1g-dev \
+      llvm \
+      clang \
+      cmake \
+      make \
+      libprotobuf-dev \
+      protobuf-compiler \
+      libclang-dev \
+      openssh-client && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Rust (rustup chooses the toolchain from rust-toolchain.toml)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- --profile minimal --component rustfmt --component clippy -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /opt
+
+# Clone source; defaults to HTTPS. To use SSH, pass --build-arg AGAVE_REPO=git@github.com:... and --ssh default.
+RUN git clone --recursive "${AGAVE_REPO}" agave && \
+    cd agave && \
+    git checkout "${AGAVE_REF}" && \
+    git submodule update --init --recursive
+
+WORKDIR /opt/agave
+
+# Release build
+RUN cargo build --release
+
+# Collect binaries in a clean location for copying out of the image
+FROM scratch AS artifacts
+
+COPY --from=builder /opt/agave/target/release/agave-* /out/
+COPY --from=builder /opt/agave/target/release/cargo-* /out/
+COPY --from=builder /opt/agave/target/release/rbpf-* /out/
+COPY --from=builder /opt/agave/target/release/solana /out/
+COPY --from=builder /opt/agave/target/release/solana-* /out/
+
+
+# Minimal runtime image with the compiled binaries
+FROM ubuntu:24.04 AS runtime
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      libssl3 \
+      libudev1 \
+      zlib1g \
+      libclang1 \
+      libstdc++6 \
+      libgcc-s1 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/agave/target/release/agave-* /out/
+COPY --from=builder /opt/agave/target/release/cargo-* /out/
+COPY --from=builder /opt/agave/target/release/rbpf-* /out/
+COPY --from=builder /opt/agave/target/release/solana /out/
+COPY --from=builder /opt/agave/target/release/solana-* /out/
+
+# Default to showing available binaries; override entrypoint/command as needed
+CMD ["solana-validator", "--version"]
