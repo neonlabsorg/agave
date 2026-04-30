@@ -1,14 +1,14 @@
-name: Push artifact to GHCR via ORAS
+name: Push artifact to Docker Hub via ORAS
 
 on:
   workflow_call:
     inputs:
-      target-repository:
-        description: "Target repository in owner/repo format (where the artifact is published in GHCR)"
+      dockerhub-namespace:
+        description: "Docker Hub namespace (user or org), e.g. neonlabsorg"
         required: true
         type: string
       artifact-name:
-        description: "Artifact name in GHCR (e.g. my-app)"
+        description: "Repository name on Docker Hub (e.g. parasol-validator). Final ref: docker.io/<namespace>/<artifact-name>"
         required: true
         type: string
       gha-artifact-name:
@@ -36,8 +36,11 @@ on:
         type: string
         default: ""
     secrets:
-      GITHUB_ORAS_TOKEN:
-        description: "PAT with write:packages scope on the target repository"
+      DOCKERHUB_USERNAME:
+        description: "Docker Hub username for login"
+        required: true
+      DOCKER_PASSWORD:
+        description: "Docker Hub Personal Access Token (Read/Write/Delete scope)"
         required: true
     outputs:
       image-ref:
@@ -61,7 +64,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ inputs.target-repository }}/${{ inputs.artifact-name }}
+          images: docker.io/${{ inputs.dockerhub-namespace }}/${{ inputs.artifact-name }}
           tags: |
             type=raw,value=0.0.0-{{branch}}.${{ github.run_number }}.{{sha}}
           annotations: |
@@ -83,7 +86,6 @@ jobs:
           if [ -n "${{ inputs.gha-artifact-file }}" ]; then
             FILE="${DIR}/${{ inputs.gha-artifact-file }}"
           else
-            # Ожидаем ровно один файл в артефакте.
             mapfile -t FILES < <(find "${DIR}" -maxdepth 1 -type f)
             if [ "${#FILES[@]}" -ne 1 ]; then
               echo "::error::Expected exactly 1 file in '${{ inputs.gha-artifact-name }}', got ${#FILES[@]}. Pass 'gha-artifact-file' to disambiguate."
@@ -99,17 +101,18 @@ jobs:
           ls -lah "${FILE}"
           echo "file=${FILE}" >> "$GITHUB_OUTPUT"
 
-      - name: Login to GHCR
+      - name: Login to Docker Hub
         shell: bash
         env:
-          ORAS_TOKEN: ${{ secrets.GITHUB_ORAS_TOKEN }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           set -euo pipefail
-          echo "${ORAS_TOKEN}" | oras login ghcr.io \
-            --username "${{ github.actor }}" \
+          echo "${DOCKER_PASSWORD}" | oras login docker.io \
+            --username "${DOCKERHUB_USERNAME}" \
             --password-stdin
 
-      - name: Push artifact to GHCR
+      - name: Push artifact to Docker Hub
         id: push
         shell: bash
         env:
@@ -149,7 +152,7 @@ jobs:
 
           echo "Published: ${IMAGE_REF}"
 
-      - name: Logout from GHCR
+      - name: Logout from Docker Hub
         if: always()
         shell: bash
-        run: oras logout ghcr.io || true
+        run: oras logout docker.io || true

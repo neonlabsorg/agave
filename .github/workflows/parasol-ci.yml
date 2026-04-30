@@ -78,10 +78,11 @@ jobs:
     needs: build_and_release
     uses: ./.github/workflows/push-via-oras.yml
     with:
-      target-repository: neonlabsorg/agave
-      artifact-name: parasol-validator
+      dockerhub-namespace: neonlabsorg
+      artifact-name: parasol-validator-bin
       gha-artifact-name: ${{ needs.build_and_release.outputs.archive }}
       artifact-media-type: application/zip
       source-repository: neonlabsorg/agave
     secrets:
-      GITHUB_ORAS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
