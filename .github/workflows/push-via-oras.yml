@@ -36,10 +36,10 @@ on:
         type: string
         default: ""
     secrets:
-      DOCKERHUB_USERNAME:
+      ORAS_DOCKER_USERNAME:
         description: "Docker Hub username for login"
         required: true
-      DOCKER_PASSWORD:
+      ORAS_DOCKER_PASSWORD:
         description: "Docker Hub Personal Access Token (Read/Write/Delete scope)"
         required: true
     outputs:
@@ -104,12 +104,12 @@ jobs:
       - name: Login to Docker Hub
         shell: bash
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          ORAS_DOCKER_PASSWORD: ${{ secrets.ORAS_DOCKER_PASSWORD }}
+          ORAS_DOCKER_USERNAME: ${{ secrets.ORAS_DOCKER_USERNAME }}
         run: |
           set -euo pipefail
-          echo "${DOCKER_PASSWORD}" | oras login docker.io \
-            --username "${DOCKERHUB_USERNAME}" \
+          echo "${ORAS_DOCKER_PASSWORD}" | oras login docker.io \
+            --username "${ORAS_DOCKER_USERNAME}" \
             --password-stdin
 
       - name: Push artifact to Docker Hub

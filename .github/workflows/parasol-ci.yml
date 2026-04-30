@@ -84,5 +84,5 @@ jobs:
       artifact-media-type: application/zip
       source-repository: neonlabsorg/agave
     secrets:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      ORAS_DOCKER_USERNAME: ${{ secrets.ORAS_DOCKER_USERNAME }}
+      ORAS_DOCKER_PASSWORD: ${{ secrets.ORAS_DOCKER_PASSWORD }}
