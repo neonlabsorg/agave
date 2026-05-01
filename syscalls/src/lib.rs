@@ -5950,13 +5950,8 @@ mod tests {
         // program would deserialize successfully.
         payload[..8].copy_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
         let owner = Pubkey::new_from_array([42u8; 32]);
-        let preloaded = AccountSharedData::create(
-            SUBACCOUNT_LAMPORTS,
-            payload.clone(),
-            owner,
-            false,
-            0,
-        );
+        let preloaded =
+            AccountSharedData::create(SUBACCOUNT_LAMPORTS, payload.clone(), owner, false, 0);
 
         struct LoadingMockCallback {
             address: Pubkey,
@@ -6040,5 +6035,226 @@ mod tests {
             .try_borrow_subaccount(unknown_index)
             .unwrap();
         assert!(unknown.data().is_empty(), "unknown subaccount stays empty");
+    }
+
+    // ========================================================================
+    // F10 — Subaccount logic unit tests
+    //
+    // Pin the invariants of the subaccount lane on the agave side so any
+    // regression in derivation, registration, or index reuse trips a
+    // deterministic unit test instead of surfacing as a hard-to-trace failure
+    // in the parasol-dex multi-self-invoke flow.
+    // ========================================================================
+
+    /// `subaccount_address` must be a pure function — same pubkey → same
+    /// derived storage address every time.
+    #[test]
+    fn test_subaccount_address_is_deterministic() {
+        let pubkey = Pubkey::new_from_array([7u8; 32]);
+        let first = subaccount_address(&pubkey);
+        let second = subaccount_address(&pubkey);
+        assert_eq!(
+            first, second,
+            "subaccount_address must be deterministic for a fixed pubkey"
+        );
+    }
+
+    /// Different pubkeys must derive to different storage addresses, otherwise
+    /// two subaccounts could collide in the on-chain account store.
+    #[test]
+    fn test_subaccount_address_distinct_pubkeys_yield_distinct_storage() {
+        let a = subaccount_address(&Pubkey::new_from_array([7u8; 32]));
+        let b = subaccount_address(&Pubkey::new_from_array([8u8; 32]));
+        let c = subaccount_address(&Pubkey::new_from_array([0u8; 32]));
+        assert_ne!(a, b, "[7;32] and [8;32] must derive to distinct storage");
+        assert_ne!(a, c, "[7;32] and [0;32] must derive to distinct storage");
+        assert_ne!(b, c, "[8;32] and [0;32] must derive to distinct storage");
+    }
+
+    /// Pin the exact derivation formula so a refactor that swaps the domain
+    /// byte (`[1u8]` prefix) or the hash function fails this test instead of
+    /// silently shifting all on-chain storage to a new key space.
+    #[test]
+    fn test_subaccount_address_matches_known_vector() {
+        let pubkey = Pubkey::new_from_array([7u8; 32]);
+        let expected = Pubkey::new_from_array(hashv(&[&[1u8], pubkey.as_ref()]).to_bytes());
+        assert_eq!(
+            subaccount_address(&pubkey),
+            expected,
+            "subaccount_address must equal hashv(&[&[1u8], pubkey])"
+        );
+    }
+
+    /// Empty seed list → empty result, no transaction-context mutation.
+    #[test]
+    fn test_build_next_instruction_subaccounts_empty_seeds_returns_empty() {
+        with_mock_invoke_context!(invoke_context, transaction_context, vec![]);
+        let result = build_next_instruction_subaccounts(&mut invoke_context, &[])
+            .expect("empty seeds must succeed");
+        assert!(
+            result.is_empty(),
+            "empty seeds must produce empty next_instruction_subaccounts"
+        );
+    }
+
+    /// Two different subaccounts in the same call must each register and
+    /// surface in `result` in input order, with their `is_writable` flag
+    /// preserved one-for-one. Catches order-swap bugs in the materialization
+    /// loop and writable-bit-flip bugs.
+    #[test]
+    fn test_build_next_instruction_subaccounts_preserves_order_and_writable_flag() {
+        let pubkey_writable = Pubkey::new_from_array([11u8; 32]);
+        let pubkey_readonly = Pubkey::new_from_array([22u8; 32]);
+
+        with_mock_invoke_context!(invoke_context, transaction_context, vec![]);
+
+        let seeds = [(pubkey_writable, true), (pubkey_readonly, false)];
+        let result = build_next_instruction_subaccounts(&mut invoke_context, &seeds)
+            .expect("two-seed materialization must succeed");
+
+        assert_eq!(result.len(), 2);
+
+        let idx_writable = invoke_context
+            .transaction_context
+            .find_index_of_subaccount(&pubkey_writable)
+            .expect("writable subaccount must be registered");
+        let idx_readonly = invoke_context
+            .transaction_context
+            .find_index_of_subaccount(&pubkey_readonly)
+            .expect("readonly subaccount must be registered");
+        assert_ne!(idx_writable, idx_readonly, "indices must be distinct");
+
+        // Writable flag must round-trip into the InstructionAccount entries.
+        assert!(
+            result[0].is_writable(),
+            "first seed declared writable=true must produce writable InstructionAccount"
+        );
+        assert!(
+            !result[1].is_writable(),
+            "second seed declared writable=false must produce readonly InstructionAccount"
+        );
+    }
+
+    /// Calling `build_next_instruction_subaccounts` twice with the same pubkey
+    /// must REUSE the existing subaccount index — not double-add. A regression
+    /// here would corrupt the subaccount table between sequential self-invokes
+    /// to the same PDA (the load-bearing pattern in parasol-dex's
+    /// `inner_fill_vs_order` cascade).
+    #[test]
+    fn test_build_next_instruction_subaccounts_reuses_existing_index() {
+        let pubkey = Pubkey::new_from_array([33u8; 32]);
+
+        with_mock_invoke_context!(invoke_context, transaction_context, vec![]);
+
+        // First call: registers the subaccount.
+        let result1 = build_next_instruction_subaccounts(&mut invoke_context, &[(pubkey, true)])
+            .expect("first registration must succeed");
+        let idx_after_first = invoke_context
+            .transaction_context
+            .find_index_of_subaccount(&pubkey)
+            .expect("subaccount must be registered after first call");
+
+        // Second call with the same pubkey: must reuse the same slot.
+        let result2 = build_next_instruction_subaccounts(&mut invoke_context, &[(pubkey, true)])
+            .expect("second call with same pubkey must succeed");
+        let idx_after_second = invoke_context
+            .transaction_context
+            .find_index_of_subaccount(&pubkey)
+            .expect("subaccount must remain registered");
+
+        assert_eq!(
+            idx_after_first, idx_after_second,
+            "second call must NOT allocate a new subaccount slot for the same pubkey"
+        );
+        assert_eq!(result1.len(), 1);
+        assert_eq!(result2.len(), 1);
+    }
+
+    /// A single call carrying the same pubkey twice must also resolve to one
+    /// shared slot. This shape can occur in self-invoke chains where a
+    /// program declares the same `#[subaccount]` twice in a single Accounts
+    /// struct; the runtime must not corrupt state by allocating two slots.
+    #[test]
+    fn test_build_next_instruction_subaccounts_dedupes_within_single_call() {
+        let pubkey = Pubkey::new_from_array([44u8; 32]);
+
+        with_mock_invoke_context!(invoke_context, transaction_context, vec![]);
+
+        let seeds = [(pubkey, true), (pubkey, true)];
+        let result = build_next_instruction_subaccounts(&mut invoke_context, &seeds)
+            .expect("duplicate pubkey within one call must succeed");
+
+        assert_eq!(
+            result.len(),
+            2,
+            "result mirrors the input length even when pubkeys repeat"
+        );
+        let idx = invoke_context
+            .transaction_context
+            .find_index_of_subaccount(&pubkey)
+            .expect("subaccount must be registered exactly once");
+        assert_eq!(
+            result[0].index_in_transaction, result[1].index_in_transaction,
+            "both InstructionAccount entries must point to the same subaccount slot"
+        );
+        assert_eq!(
+            result[0].index_in_transaction,
+            idx | SUBACCOUNT_MARKER,
+            "the shared slot must equal the registered subaccount index with the marker bit set"
+        );
+    }
+
+    /// Repeating the same `(pubkey, true)` seed in a SECOND call to
+    /// `build_next_instruction_subaccounts` must not change the bare
+    /// transaction-side index for that pubkey — i.e. no double-registration.
+    /// Combined with the existing `loads_onchain_state` test this nails down
+    /// data preservation: registration is idempotent, so the slot's payload
+    /// (loaded once on first call) cannot be overwritten by a subsequent
+    /// fall-through that would otherwise re-fetch the storage account.
+    #[test]
+    fn test_build_next_instruction_subaccounts_does_not_double_register() {
+        let pubkey = Pubkey::new_from_array([55u8; 32]);
+
+        with_mock_invoke_context!(invoke_context, transaction_context, vec![]);
+
+        build_next_instruction_subaccounts(&mut invoke_context, &[(pubkey, true)])
+            .expect("first registration must succeed");
+        let count_before = invoke_context
+            .transaction_context
+            .accounts()
+            .number_of_subaccounts();
+
+        build_next_instruction_subaccounts(&mut invoke_context, &[(pubkey, true)])
+            .expect("second registration must succeed");
+        let count_after = invoke_context
+            .transaction_context
+            .accounts()
+            .number_of_subaccounts();
+
+        assert_eq!(
+            count_before, count_after,
+            "second build_next_instruction_subaccounts call for the SAME pubkey must reuse the existing slot, not allocate a new one"
+        );
+    }
+
+    /// `build_next_instruction_subaccounts` produces InstructionAccount entries
+    /// flagged via `SUBACCOUNT_MARKER` so the downstream CPI machinery routes
+    /// them through the subaccount lane rather than treating them as ordinary
+    /// instruction accounts. A regression that drops the marker would cause
+    /// silent corruption of the main account list.
+    #[test]
+    fn test_build_next_instruction_subaccounts_entries_carry_subaccount_marker() {
+        let pubkey = Pubkey::new_from_array([66u8; 32]);
+
+        with_mock_invoke_context!(invoke_context, transaction_context, vec![]);
+
+        let result = build_next_instruction_subaccounts(&mut invoke_context, &[(pubkey, true)])
+            .expect("must succeed");
+
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].index_in_transaction & SUBACCOUNT_MARKER != 0,
+            "InstructionAccount index must have the SUBACCOUNT_MARKER bit set"
+        );
     }
 }
