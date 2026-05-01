@@ -20,6 +20,7 @@ pub use self::{
     },
 };
 use solana_program_runtime::memory::translate_vm_slice;
+use solana_svm_measure::measure::Measure;
 #[allow(deprecated)]
 use {
     crate::mem_ops::is_nonoverlapping,
@@ -2768,6 +2769,7 @@ fn build_next_instruction_subaccounts(
     invoke_context: &mut InvokeContext,
     subaccounts_seeds: &[(Pubkey, bool)],
 ) -> Result<Vec<InstructionAccount>, Error> {
+    let mut load_subaccounts_time = Measure::start("load_subaccounts");
     let mut next_instruction_subaccounts = Vec::with_capacity(subaccounts_seeds.len());
     for (subaccount_pubkey, is_writable) in subaccounts_seeds {
         let subaccount_index = if let Some(subaccount_index) = invoke_context
@@ -2794,6 +2796,8 @@ fn build_next_instruction_subaccounts(
             *is_writable,
         ));
     }
+    load_subaccounts_time.stop();
+    invoke_context.timings.load_subaccounts_us += load_subaccounts_time.as_us();
     Ok(next_instruction_subaccounts)
 }
 

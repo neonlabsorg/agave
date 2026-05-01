@@ -34,11 +34,7 @@ impl LeaderExecuteAndCommitTimings {
             ("freeze_lock_us", self.freeze_lock_us as i64, i64),
             ("record_us", self.record_us as i64, i64),
             ("commit_us", self.commit_us as i64, i64),
-            (
-                "find_and_send_votes_us",
-                self.find_and_send_votes_us as i64,
-                i64
-            ),
+            ("find_and_send_votes_us", self.find_and_send_votes_us as i64, i64),
         );
 
         datapoint_info!(
