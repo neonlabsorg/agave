@@ -79,7 +79,6 @@ mod test {
         solana_rent::Rent,
         solana_signer::Signer,
         solana_transaction_context::TransactionContext,
-        solana_transaction_error::TransactionError,
         std::collections::HashSet,
     };
 
@@ -225,9 +224,10 @@ mod test {
             &post_rent_state,
             &context,
         );
-        assert_eq!(
-            result.err(),
-            Some(TransactionError::InsufficientFundsForRent { account_index: 0 })
-        );
+        // Parasol fork (F2/F3): `check_rent_state` is neutralized — every
+        // pre→post transition is accepted, including Uninitialized → RentPaying.
+        // The upstream `InsufficientFundsForRent` assertion is replaced with
+        // an Ok-pin so any restoration of rent enforcement is caught.
+        assert!(result.is_ok());
     }
 }
