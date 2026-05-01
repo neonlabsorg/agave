@@ -3758,9 +3758,17 @@ pub mod rpc_full {
             } else {
                 bank.confirmed_last_blockhash()
             };
+            if let Some(blockhash_age_slots) = bank.get_hash_age(&blockhash) {
+                solana_metrics::custom_metrics::observe_blockhash_age_at_submit_slots(
+                    blockhash_age_slots,
+                );
+            }
             let last_valid_block_height = bank
                 .get_blockhash_last_valid_block_height(&blockhash)
                 .unwrap_or(0);
+            solana_metrics::custom_metrics::observe_blockhash_remaining_validity_slots(
+                last_valid_block_height.saturating_sub(bank.block_height()),
+            );
 
             let transaction =
                 request_airdrop_transaction(&faucet_addr, &pubkey, lamports, blockhash).map_err(
@@ -3838,6 +3846,11 @@ pub mod rpc_full {
             let blockhash = *transaction.message().recent_blockhash();
             let message_hash = *transaction.message_hash();
             let signature = *transaction.signature();
+            if let Some(blockhash_age_slots) = preflight_bank.get_hash_age(&blockhash) {
+                solana_metrics::custom_metrics::observe_blockhash_age_at_submit_slots(
+                    blockhash_age_slots,
+                );
+            }
 
             let mut last_valid_block_height = preflight_bank
                 .get_blockhash_last_valid_block_height(&blockhash)
@@ -3853,6 +3866,9 @@ pub mod rpc_full {
                 // retried until the nonce is advanced.
                 last_valid_block_height = preflight_bank.block_height() + MAX_PROCESSING_AGE as u64;
             }
+            solana_metrics::custom_metrics::observe_blockhash_remaining_validity_slots(
+                last_valid_block_height.saturating_sub(preflight_bank.block_height()),
+            );
 
             if !skip_preflight {
                 let verification_error = transaction.verify().err();

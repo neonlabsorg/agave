@@ -26,6 +26,7 @@ use {
     solana_cost_model::cost_model::CostModel,
     solana_fee_structure::FeeBudgetLimits,
     solana_message::v0::LoadedAddresses,
+    solana_metrics::custom_metrics,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_runtime_transaction::{
         runtime_transaction::RuntimeTransaction, transaction_meta::StaticMeta,
@@ -310,6 +311,9 @@ impl TransactionViewReceiveAndBuffer {
                         continue;
                     }
 
+                    custom_metrics::observe_avg_locked_accounts_per_tx(
+                        transaction.account_keys().len() as u64,
+                    );
                     num_buffered += 1;
                 }
                 // Push non-errored transaction into queue.
