@@ -346,6 +346,9 @@ impl SendTransactionService {
                             // drop transactions with 0 max retries: they are accepted and
                             // already forwarded, but not retained for retry.
                             if max_retries == Some(0) {
+                                solana_metrics::custom_metrics::clear_tx_acceptance_time(
+                                    &transaction_info.signature,
+                                );
                                 continue;
                             }
                             transactions_to_retry += 1;
@@ -358,6 +361,9 @@ impl SendTransactionService {
                                     solana_metrics::custom_metrics::inc_tx_dropped_with_reason(
                                         1,
                                         "retry_pool_full",
+                                    );
+                                    solana_metrics::custom_metrics::clear_tx_acceptance_time(
+                                        &transaction_info.signature,
                                     );
                                     break;
                                 } else {
