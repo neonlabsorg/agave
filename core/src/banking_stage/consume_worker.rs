@@ -1216,11 +1216,6 @@ impl ConsumeWorkerMetrics {
             Ordering::Relaxed,
         );
 
-        self.timing_metrics.load_program_cache_us.fetch_add(
-            execute_timings.metrics.index(ExecuteTimingType::ProgramCacheUs).0,
-            Ordering::Relaxed,
-        );
-
         self.timing_metrics.load_validate_fees_us.fetch_add(
             execute_timings.metrics.index(ExecuteTimingType::ValidateFeesUs).0,
             Ordering::Relaxed,
