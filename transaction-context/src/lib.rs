@@ -869,6 +869,37 @@ impl<'a> InstructionContext<'a, '_> {
         })
     }
 
+    /// F10: borrow a subaccount via its transaction-level index, with a
+    /// synthetic [`InstructionAccount`] whose `is_signer` is always false
+    /// and whose `is_writable` is supplied by the caller.
+    ///
+    /// Used by `sol_load_subaccount` slots — those subaccounts are not part
+    /// of the current instruction's `instruction_subaccounts` list, so the
+    /// CPI sync path can't go through [`try_borrow_subaccount`]. The
+    /// returned `BorrowedInstructionAccount` exposes the same `WritableAccount`
+    /// surface as a regular instruction subaccount, and the synthetic
+    /// `InstructionAccount` carries the `SUBACCOUNT_MARKER` bit so any
+    /// downstream lane checks still classify it as a subaccount.
+    #[cfg(not(target_os = "solana"))]
+    pub fn try_borrow_subaccount_by_tx_index(
+        &self,
+        index_in_transaction: IndexOfAccount,
+        is_writable: bool,
+    ) -> Result<BorrowedInstructionAccount<'_, '_>, InstructionError> {
+        let instruction_account =
+            InstructionAccount::new_subaccount(index_in_transaction, false, is_writable);
+        let account = self
+            .transaction_context
+            .accounts
+            .try_borrow_mut_subaccount(index_in_transaction)?;
+        Ok(BorrowedInstructionAccount {
+            transaction_context: self.transaction_context,
+            instruction_account,
+            account,
+            index_in_transaction_of_instruction_program: self.program_account_index_in_tx,
+        })
+    }
+
     /// F10: Returns `Some(instruction_subaccount_index)` if this is a duplicate
     /// and `None` if it is the first subaccount with this key.
     pub fn is_instruction_subaccount_duplicate(

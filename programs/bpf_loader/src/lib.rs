@@ -23,7 +23,8 @@ use {
     solana_program_runtime::{
         execution_budget::MAX_INSTRUCTION_STACK_DEPTH,
         invoke_context::{
-            BpfAllocator, InvokeContext, SerializedAccountMetadata, SyscallContext, UntypedVmSlice,
+            BpfAllocator, InvokeContext, SerializedAccountMetadata, SubaccountSlot, SyscallContext,
+            UntypedVmSlice,
         },
         loaded_programs::{
             LoadProgramMetrics, ProgramCacheEntry, ProgramCacheEntryOwner, ProgramCacheEntryType,
@@ -264,6 +265,7 @@ fn create_vm<'a, 'b>(
     regions: Vec<MemoryRegion>,
     accounts_metadata: Vec<SerializedAccountMetadata>,
     subaccounts_metadata: Vec<SerializedAccountMetadata>,
+    subaccount_slots: Vec<SubaccountSlot>,
     invoke_context: &'a mut InvokeContext<'b, 'b>,
     stack: &mut [u8],
     heap: &mut [u8],
@@ -289,6 +291,7 @@ fn create_vm<'a, 'b>(
         // and regular CPIs the Vec is empty.
         subaccounts_metadata,
         subaccounts_infos: UntypedVmSlice::default(),
+        subaccount_slots,
         trace_log: Vec::new(),
         dynamic_cpi_accounts: Vec::new(),
     })?;
@@ -304,7 +307,7 @@ fn create_vm<'a, 'b>(
 /// Create the SBF virtual machine
 #[macro_export]
 macro_rules! create_vm {
-    ($vm:ident, $program:expr, $regions:expr, $accounts_metadata:expr, $subaccounts_metadata:expr, $invoke_context:expr $(,)?) => {
+    ($vm:ident, $program:expr, $regions:expr, $accounts_metadata:expr, $subaccounts_metadata:expr, $subaccount_slots:expr, $invoke_context:expr $(,)?) => {
         let invoke_context = &*$invoke_context;
         let stack_size = $program.get_config().stack_size();
         let heap_size = invoke_context.get_compute_budget().heap_size;
@@ -320,6 +323,7 @@ macro_rules! create_vm {
                 $regions,
                 $accounts_metadata,
                 $subaccounts_metadata,
+                $subaccount_slots,
                 $invoke_context,
                 stack
                     .as_slice_mut()
@@ -1490,12 +1494,22 @@ fn execute<'a, 'b: 'a>(
         .get_feature_set()
         .provide_instruction_data_offset_in_vm_r2;
 
+    ic_msg!(invoke_context, "Executing program {}: stricter_abi {}, account_data_direct_mapping {}, mask_out_rent_epoch {}, provide_instruction_data_offset_in_vm_r2 {}, use_jit {}",
+        program_id,
+        stricter_abi_and_runtime_constraints,
+        account_data_direct_mapping,
+        mask_out_rent_epoch_in_vm_serialization,
+        provide_instruction_data_offset_in_vm_r2,
+        use_jit,
+    );
+
     let mut serialize_time = Measure::start("serialize");
     let (
         parameter_bytes,
         regions,
         accounts_metadata,
         subaccounts_metadata,
+        subaccount_slots,
         instruction_data_offset,
     ) = serialization::serialize_parameters(
         &instruction_context,
@@ -1539,6 +1553,7 @@ fn execute<'a, 'b: 'a>(
             regions,
             accounts_metadata,
             subaccounts_metadata,
+            subaccount_slots,
             invoke_context
         );
         let (mut vm, stack, heap) = match vm {
@@ -1708,6 +1723,20 @@ fn execute<'a, 'b: 'a>(
         stricter_abi_and_runtime_constraints: bool,
         account_data_direct_mapping: bool,
     ) -> Result<(), InstructionError> {
+        // F10: flush any subaccount slots the program left occupied (i.e. that
+        // it didn't `sol_unload_subaccount`) so VM-side mutations persist at
+        // tx commit. Take ownership of the slots vec to avoid borrow conflicts
+        // between `invoke_context.transaction_context` and the syscall context.
+        let slots = std::mem::take(
+            &mut invoke_context
+                .get_syscall_context_mut()?
+                .subaccount_slots,
+        );
+        serialization::flush_subaccount_slots(
+            invoke_context.transaction_context,
+            parameter_bytes,
+            &slots,
+        )?;
         serialization::deserialize_parameters(
             &invoke_context
                 .transaction_context
