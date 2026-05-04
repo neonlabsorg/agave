@@ -196,65 +196,92 @@ impl SignatureMetricsTracker {
 static TRACKER: LazyLock<Mutex<SignatureMetricsTracker>> =
     LazyLock::new(|| Mutex::new(SignatureMetricsTracker::default()));
 
+// Fast-path gate: `register_signature` flips this to `true` on first use. Until
+// then every read-side method (`mark_*`, `is_tracked`) returns without taking
+// the global Mutex, so a not-yet-wired-up tracker does not produce contention
+// on the banking_stage / RPC notification hot paths.
+static TRACKER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn tracker_active() -> bool {
+    TRACKER_ACTIVE.load(Ordering::Relaxed)
+}
+
 pub fn register_signature(signature: Signature, t1: Instant, t3_proxy: Instant) {
     if let Ok(mut tracker) = TRACKER.lock() {
+        TRACKER_ACTIVE.store(true, Ordering::Relaxed);
         tracker.maybe_sweep_timeouts(Instant::now());
         tracker.register(signature, t1, t3_proxy);
     }
 }
 
 pub fn mark_processed(signature: &Signature) {
+    if !tracker_active() {
+        return;
+    }
     if let Ok(mut tracker) = TRACKER.lock() {
-        tracker.maybe_sweep_timeouts(Instant::now());
         tracker.mark_processed(signature, Instant::now());
     }
 }
 
 pub fn mark_processed_with_slot(signature: &Signature, slot: Slot) {
+    if !tracker_active() {
+        return;
+    }
     if let Ok(mut tracker) = TRACKER.lock() {
-        tracker.maybe_sweep_timeouts(Instant::now());
         tracker.mark_processed_with_slot(signature, slot, Instant::now());
     }
 }
 
 pub fn mark_confirmed(signature: &Signature) {
+    if !tracker_active() {
+        return;
+    }
     if let Ok(mut tracker) = TRACKER.lock() {
-        tracker.maybe_sweep_timeouts(Instant::now());
         tracker.mark_confirmed(signature, Instant::now());
     }
 }
 
 pub fn mark_confirmed_up_to_slot(slot: Slot) {
+    if !tracker_active() {
+        return;
+    }
     if let Ok(mut tracker) = TRACKER.lock() {
-        tracker.maybe_sweep_timeouts(Instant::now());
         tracker.mark_confirmed_up_to_slot(slot, Instant::now());
     }
 }
 
 pub fn mark_finalized(signature: &Signature) {
+    if !tracker_active() {
+        return;
+    }
     if let Ok(mut tracker) = TRACKER.lock() {
-        tracker.maybe_sweep_timeouts(Instant::now());
         tracker.mark_finalized(signature, Instant::now());
     }
 }
 
 pub fn mark_finalized_up_to_slot(slot: Slot) {
+    if !tracker_active() {
+        return;
+    }
     if let Ok(mut tracker) = TRACKER.lock() {
-        tracker.maybe_sweep_timeouts(Instant::now());
         tracker.mark_finalized_up_to_slot(slot, Instant::now());
     }
 }
 
 pub fn mark_block_produced(slot: Slot) {
+    if !tracker_active() {
+        return;
+    }
     if let Ok(mut tracker) = TRACKER.lock() {
-        tracker.maybe_sweep_timeouts(Instant::now());
         tracker.mark_block_produced(slot, Instant::now());
     }
 }
 
 pub fn is_tracked(signature: &Signature) -> bool {
-    if let Ok(mut tracker) = TRACKER.lock() {
-        tracker.maybe_sweep_timeouts(Instant::now());
+    if !tracker_active() {
+        return false;
+    }
+    if let Ok(tracker) = TRACKER.lock() {
         tracker.by_signature.contains_key(signature)
     } else {
         false
@@ -266,8 +293,10 @@ pub fn start_timeout_sweeper(exit: Arc<AtomicBool>) -> JoinHandle<()> {
         .name("solSigMetricsSweep".to_string())
         .spawn(move || {
             while !exit.load(Ordering::Relaxed) {
-                if let Ok(mut tracker) = TRACKER.lock() {
-                    tracker.maybe_sweep_timeouts(Instant::now());
+                if tracker_active() {
+                    if let Ok(mut tracker) = TRACKER.lock() {
+                        tracker.maybe_sweep_timeouts(Instant::now());
+                    }
                 }
                 thread::sleep(SWEEP_INTERVAL);
             }
