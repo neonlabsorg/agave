@@ -511,7 +511,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                     }
 
                     let executed_tx = self.execute_loaded_transaction(
-                        callbacks,
+                        &account_loader,
                         tx,
                         loaded_transaction,
                         &mut execute_timings,
