@@ -1562,17 +1562,16 @@ mod tests {
             ..Rent::default()
         };
 
-        // Parasol fork (F2/F3): zero-rent + zero-fee economics — `Rent::minimum_balance`
-        // returns 0, so a nonce payer never needs an extra rent reserve. With balance ==
-        // fee == u64::MAX the validator subtracts cleanly to a 0 post-balance instead of
-        // tripping the upstream "min_balance + fee" checked-arithmetic overflow path.
+        // nonce payer account has balance of u64::MAX, so does fee; due to nonce account
+        // requires additional min_balance, expect InsufficientFundsForFee error if feature gate is
+        // enabled
         validate_fee_payer_account(
             ValidateFeePayerTestParameter {
                 is_nonce: true,
                 payer_init_balance: u64::MAX,
                 fee: u64::MAX,
-                expected_result: Ok(()),
-                payer_post_balance: 0,
+                expected_result: Err(TransactionError::InsufficientFundsForFee),
+                payer_post_balance: u64::MAX,
             },
             &rent,
         );
@@ -2515,9 +2514,6 @@ mod tests {
 
     #[test]
     fn test_update_rent_exempt_status_for_rent_paying_account() {
-        // Parasol fork (F2/F3): all accounts are rent-exempt regardless of
-        // balance because `Rent::minimum_balance` returns 0. A 1-lamport
-        // account therefore receives `RENT_EXEMPT_RENT_EPOCH`, not 0.
         let rent = Rent::default();
 
         let mut account = AccountSharedData::from(Account {
@@ -2526,7 +2522,7 @@ mod tests {
         });
 
         update_rent_exempt_status_for_account(&rent, &mut account);
-        assert_eq!(account.rent_epoch(), RENT_EXEMPT_RENT_EPOCH);
+        assert_eq!(account.rent_epoch(), 0);
         assert_eq!(account.lamports(), 1);
     }
 

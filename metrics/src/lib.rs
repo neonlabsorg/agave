@@ -9,7 +9,6 @@
 )]
 #![allow(clippy::arithmetic_side_effects)]
 pub mod counter;
-pub mod custom_metrics;
 pub mod datapoint;
 pub mod metrics;
 pub use crate::metrics::{flush, query, set_host_id, set_panic_hook, submit};
