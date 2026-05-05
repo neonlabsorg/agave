@@ -39,16 +39,9 @@ use {
 // Default amount received by the validator
 const VALIDATOR_LAMPORTS: u64 = 42;
 
-// Upstream Rent::default().minimum_balance(StakeStateV2::size_of()) on the v3.1 base.
-// Pinned as a constant on the parasol fork because F2/F3 zero-rent makes
-// `Rent::default().minimum_balance` return 0 for any data length, which would
-// give the bootstrap validator a stake of 0 and break leader-schedule
-// generation (vote-keyed schedule filters stake > 0 and panics on empty input).
-const BOOTSTRAP_VALIDATOR_STAKE_LAMPORTS_UPSTREAM: u64 = 2_282_880;
-
 // fun fact: rustc is very close to make this const fn.
 pub fn bootstrap_validator_stake_lamports() -> u64 {
-    BOOTSTRAP_VALIDATOR_STAKE_LAMPORTS_UPSTREAM
+    Rent::default().minimum_balance(StakeStateV2::size_of())
 }
 
 // Number of lamports automatically used for genesis accounts

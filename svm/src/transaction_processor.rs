@@ -2063,11 +2063,6 @@ mod tests {
     fn test_validate_transaction_fee_payer_rent_paying(
         formalize_loaded_transaction_data_size: bool,
     ) {
-        // Parasol fork (F2/F3): the upstream "rent-paying fee payer is rejected"
-        // path is gone — `Rent::minimum_balance` returns 0, so a 1-lamport
-        // surplus over the transaction fee is enough. The test pins this new
-        // invariant: a near-bankrupt account paying exactly `fee + 1` lamports
-        // succeeds and is left with 1 lamport post-validation.
         let lamports_per_signature = 5000;
         let message = new_unchecked_sanitized_message(Message::new_with_blockhash(
             &[],
@@ -2079,8 +2074,9 @@ mod tests {
             lamports_per_byte_year: 1_000_000,
             ..Default::default()
         };
+        let min_balance = rent.minimum_balance(0);
         let transaction_fee = lamports_per_signature;
-        let starting_balance = transaction_fee + 1;
+        let starting_balance = min_balance - 1;
         let fee_payer_account = AccountSharedData::new(starting_balance, 0, &Pubkey::default());
 
         let mut mock_accounts = HashMap::new();
@@ -2108,21 +2104,9 @@ mod tests {
                 &mut error_counters,
             );
 
-        // Two views of the post-validation account:
-        //   * `rollback_account` — the snapshot the runtime will restore on
-        //     transaction failure: still tagged with rent_epoch == 0 because
-        //     `RollbackAccounts::new` is called with `0` for fee_payer_rent_epoch.
-        //   * `loaded_account` — the live account after `update_rent_exempt_status_for_account`,
-        //     which under F2/F3 stamps `RENT_EXEMPT_RENT_EPOCH` (every account
-        //     is rent-exempt because `Rent::minimum_balance == 0`).
-        let rollback_fee_payer_account = {
+        let post_validation_fee_payer_account = {
             let mut account = fee_payer_account.clone();
             account.set_lamports(starting_balance - transaction_fee);
-            account
-        };
-        let loaded_fee_payer_account = {
-            let mut account = rollback_fee_payer_account.clone();
-            account.set_rent_epoch(RENT_EXEMPT_RENT_EPOCH);
             account
         };
 
@@ -2138,7 +2122,7 @@ mod tests {
                 rollback_accounts: RollbackAccounts::new(
                     None, // nonce
                     *fee_payer_address,
-                    rollback_fee_payer_account,
+                    post_validation_fee_payer_account.clone(),
                     0, // rent epoch
                 ),
                 compute_budget: compute_budget_and_limits.budget,
@@ -2147,7 +2131,7 @@ mod tests {
                 fee_details: FeeDetails::new(transaction_fee, 0),
                 loaded_fee_payer_account: LoadedTransactionAccount {
                     loaded_size: base_account_size + fee_payer_account.data().len(),
-                    account: loaded_fee_payer_account,
+                    account: post_validation_fee_payer_account,
                 }
             })
         );
@@ -2155,11 +2139,6 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_fee_payer_not_found() {
-        // Parasol fork (F2): with fee == 0 the gasless path synthesizes a
-        // fee-payer account on-the-fly and returns Ok, so the upstream
-        // `AccountNotFound` assertion only triggers when the fee is strictly
-        // positive. Pin the non-zero-fee path so the regression catches any
-        // accidental skip of fee-payer existence checks under gasless mode.
         let lamports_per_signature = 5000;
         let message =
             new_unchecked_sanitized_message(Message::new(&[], Some(&Pubkey::new_unique())));
@@ -2173,13 +2152,7 @@ mod tests {
                 &message,
                 CheckedTransactionDetails::new(
                     None,
-                    SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
-                        MockBankCallback::calculate_fee_details(
-                            &message,
-                            lamports_per_signature,
-                            0,
-                        ),
-                    ),
+                    SVMTransactionExecutionAndFeeBudgetLimits::default(),
                 ),
                 &Hash::default(),
                 lamports_per_signature,
@@ -2233,19 +2206,14 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_fee_payer_insufficient_rent() {
-        // Parasol fork (F2/F3): rent enforcement is gone — `minimum_balance`
-        // returns 0, so the upstream "starting_balance = min_balance + fee - 1"
-        // setup always reduces to `fee - 1`, and the validator returns
-        // `InsufficientFundsForFee` rather than `InsufficientFundsForRent`.
-        // Pin the new error variant so any restoration of rent enforcement
-        // is caught.
         let lamports_per_signature = 5000;
         let message =
             new_unchecked_sanitized_message(Message::new(&[], Some(&Pubkey::new_unique())));
         let fee_payer_address = message.fee_payer();
         let transaction_fee = lamports_per_signature;
         let rent = Rent::default();
-        let starting_balance = transaction_fee - 1;
+        let min_balance = rent.minimum_balance(0);
+        let starting_balance = min_balance + transaction_fee - 1;
         let fee_payer_account = AccountSharedData::new(starting_balance, 0, &Pubkey::default());
         let mut mock_accounts = HashMap::new();
         mock_accounts.insert(*fee_payer_address, fee_payer_account.clone());
@@ -2276,8 +2244,10 @@ mod tests {
                 &mut error_counters,
             );
 
-        assert_eq!(error_counters.insufficient_funds.0, 1);
-        assert_eq!(result, Err(TransactionError::InsufficientFundsForFee));
+        assert_eq!(
+            result,
+            Err(TransactionError::InsufficientFundsForRent { account_index: 0 })
+        );
     }
 
     #[test]
@@ -2540,14 +2510,9 @@ mod tests {
         }
 
         // Insufficient Fees
-        //
-        // Parasol fork (F2/F3): nonce accounts no longer require a separate
-        // `min_balance` reserve (rent is removed). Drop the balance one
-        // lamport below the actual fee+priority sum so the legitimate
-        // `InsufficientFundsForFee` path still triggers.
         {
             let fee_payer_account = AccountSharedData::new_data(
-                transaction_fee + priority_fee - 1,
+                transaction_fee + priority_fee, // no min_balance this time
                 &nonce_versions,
                 &system_program::id(),
             )

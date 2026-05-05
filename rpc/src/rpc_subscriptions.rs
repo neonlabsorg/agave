@@ -839,12 +839,6 @@ impl RpcSubscriptions {
                             }
                         }
                         NotificationEntry::Bank(commitment_slots) => {
-                            crate::signature_metrics_tracker::mark_confirmed_up_to_slot(
-                                commitment_slots.highest_confirmed_slot,
-                            );
-                            crate::signature_metrics_tracker::mark_finalized_up_to_slot(
-                                commitment_slots.highest_super_majority_root,
-                            );
                             const SOURCE: &str = "bank";
                             RpcSubscriptions::notify_watchers(
                                 max_complete_transaction_status_slot.clone(),
@@ -857,7 +851,6 @@ impl RpcSubscriptions {
                             );
                         }
                         NotificationEntry::Gossip(slot) => {
-                            crate::signature_metrics_tracker::mark_confirmed_up_to_slot(slot);
                             let commitment_slots = CommitmentSlots {
                                 highest_confirmed_slot: slot,
                                 ..CommitmentSlots::default()
@@ -903,9 +896,6 @@ impl RpcSubscriptions {
                     }
                     stats.notification_entry_processing_time_us +=
                         queued_at.elapsed().as_micros() as u64;
-                    solana_metrics::custom_metrics::observe_state_update_notification_latency_us(
-                        queued_at.elapsed().as_micros() as u64,
-                    );
                     stats.notification_entry_processing_count += 1;
                 }
                 Err(RecvTimeoutError::Timeout) => {
@@ -1123,19 +1113,6 @@ impl RpcSubscriptions {
 
                         if notified {
                             num_signatures_notified.fetch_add(1, Ordering::Relaxed);
-                            if params.commitment.is_finalized() {
-                                crate::signature_metrics_tracker::mark_finalized(
-                                    &params.signature,
-                                );
-                            } else if params.commitment.is_confirmed() {
-                                crate::signature_metrics_tracker::mark_confirmed(
-                                    &params.signature,
-                                );
-                            } else if params.commitment.is_processed() {
-                                crate::signature_metrics_tracker::mark_processed(
-                                    &params.signature,
-                                );
-                            }
                         }
                     }
                 }
