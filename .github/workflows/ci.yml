@@ -22,13 +22,13 @@ jobs:
     runs-on: gha-runner-scale-set-large
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to DockerHub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
@@ -47,7 +47,7 @@ jobs:
           echo "image_tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ci/Dockerfile
@@ -56,7 +56,7 @@ jobs:
           push: true
 
       - name: Build and push Docker image (with Yellowstone gRPC)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ci/Dockerfile
@@ -70,7 +70,6 @@ jobs:
     needs: build
     runs-on: gha-runner-scale-set
     timeout-minutes: 25
-    if: always()
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_DEFAULT_REGION: eu-central-1
@@ -140,6 +139,9 @@ jobs:
             docker_password: ${{ secrets.DOCKER_PASSWORD }}
     outputs:
       parasol_node_ip: ${{ steps.create-instance.outputs.public-ip-v4 }}
+      docker_ca_cert: ${{ steps.prepare-docker-instance.outputs.docker_ca_cert }}
+      docker_cert: ${{ steps.prepare-docker-instance.outputs.docker_cert }}
+      docker_key: ${{ steps.prepare-docker-instance.outputs.docker_key }}
 
   run-tests:
     needs: prepare-infrastructure
@@ -153,9 +155,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       - name: Docker login
-        uses: docker/login-action@v2
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
@@ -218,7 +220,7 @@ jobs:
     - name: Fetch docker logs
       uses: ./dynamic-ci-cd/actions/fetch-docker-container-logs
       with:
-          docker_host: ${{ needs.prepare-infrastructure.outputs.proxy_ip }}
+          docker_host: ${{ needs.prepare-infrastructure.outputs.parasol_node_ip }}
           docker_ca_cert: ${{ needs.prepare-infrastructure.outputs.docker_ca_cert }}
           docker_cert: ${{ needs.prepare-infrastructure.outputs.docker_cert }}
           docker_key: ${{ needs.prepare-infrastructure.outputs.docker_key }}
@@ -231,6 +233,5 @@ jobs:
       id: delete-instance
       with:
         project-repository: ${{ github.event.repository.name }}
-        job-id: ${{ github.job }}
         run-id: ${{github.run_id}}
         hcloud-token: ${{ secrets.HCLOUD_TOKEN }}

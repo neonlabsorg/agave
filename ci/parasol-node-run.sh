@@ -2,7 +2,6 @@
 solana-test-validator \
   --ticks-per-slot 16 \
   --ledger /opt/parasol/data \
-  --rpc-tx-type-map-config /usr/local/bin/tx_type_rules.yml \
   --rpc-port 8899 \
   --faucet-port 19900 \
   --gossip-port 18000 \

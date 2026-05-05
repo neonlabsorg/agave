@@ -82,7 +82,6 @@ RUN apt-get update && \
 
 COPY --from=builder /opt/agave/target/release/solana-* /usr/local/bin/
 COPY ./ci/parasol-node-run.sh /usr/local/bin/parasol-node-run.sh
-COPY ./ci/tx_type_rules.yml /usr/local/bin/tx_type_rules.yml
 RUN mkdir -p /opt/parasol/data
 RUN chmod +x /usr/local/bin/parasol-node-run.sh
 CMD ["solana-test-validator", "--version"]
