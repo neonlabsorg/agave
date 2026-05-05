@@ -113,6 +113,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for PrioGraphScheduler<Tx> {
         budget: u64,
         pre_graph_filter: impl Fn(&[&Tx], &mut [bool]),
         pre_lock_filter: impl Fn(&TransactionState<Tx>) -> PreLockFilterAction,
+        _relax_intrabatch_account_locks: bool,
     ) -> Result<SchedulingSummary, SchedulerError> {
         // Subtract any in-flight compute units from the budget.
         let mut budget = budget.saturating_sub(
@@ -585,7 +586,8 @@ mod tests {
                 &mut container,
                 u64::MAX, // no budget
                 test_pre_graph_filter,
-                test_pre_lock_filter
+                test_pre_lock_filter,
+                false, // relax_intrabatch_account_locks
             ),
             Err(SchedulerError::DisconnectedSendChannel(_))
         );
@@ -605,6 +607,7 @@ mod tests {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
+                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 2);
@@ -626,6 +629,7 @@ mod tests {
                 0, // zero budget. nothing should be scheduled
                 test_pre_graph_filter,
                 test_pre_lock_filter,
+                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 0);
@@ -647,6 +651,7 @@ mod tests {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
+                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 2);
@@ -669,6 +674,7 @@ mod tests {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
+                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(
@@ -696,6 +702,7 @@ mod tests {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
+                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 4);
@@ -742,6 +749,7 @@ mod tests {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
+                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 4);
@@ -757,6 +765,7 @@ mod tests {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
+                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 0);
@@ -776,6 +785,7 @@ mod tests {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
+                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 2);
@@ -804,6 +814,7 @@ mod tests {
                 u64::MAX, // no budget
                 test_pre_graph_filter,
                 test_pre_lock_filter,
+                false, // relax_intrabatch_account_locks
             )
             .unwrap();
         // for each pass, it'd schedule no more than configured max_scanned_transactions_per_scheduling_pass
