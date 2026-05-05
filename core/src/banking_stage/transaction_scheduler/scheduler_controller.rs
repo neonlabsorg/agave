@@ -198,12 +198,14 @@ where
                 .for_each(|metrics| metrics.maybe_report_and_reset());
             self.scheduling_details.maybe_report();
 
-            solana_metrics::custom_metrics::set_scheduler_buffer_size(
-                self.container.buffer_size() as u64,
-            );
-            solana_metrics::custom_metrics::set_scheduler_buffer_queue_size(
-                self.container.queue_size() as u64,
-            );
+            if should_report {
+                solana_metrics::custom_metrics::set_scheduler_buffer_size(
+                    self.container.buffer_size() as u64,
+                );
+                solana_metrics::custom_metrics::set_scheduler_buffer_queue_size(
+                    self.container.queue_size() as u64,
+                );
+            }
         }
 
         Ok(())
