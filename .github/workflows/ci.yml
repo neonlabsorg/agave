@@ -6,7 +6,7 @@ on:
     types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review]
   push:
     branches:
-      - parasol-dev
+      - parasol-fork-dev
       - '[vt][0-9].[0-9]+.[0-9x]+*'
   workflow_dispatch:
 
