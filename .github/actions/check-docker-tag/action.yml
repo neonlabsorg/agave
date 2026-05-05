@@ -1,0 +1,32 @@
+name: Check Docker Tag
+description: Verify whether a Docker Hub repository already has a specific tag.
+inputs:
+  repository:
+    description: "Docker Hub repository in the format 'namespace/name'."
+    required: true
+  tag:
+    description: Tag to check for.
+    required: true
+outputs:
+  exists:
+    description: 'true if the tag exists in Docker Hub, false otherwise.'
+    value: ${{ steps.check.outputs.exists }}
+runs:
+  using: composite
+  steps:
+    - name: Check Docker Hub tag
+      id: check
+      shell: bash
+      env:
+        DOCKER_REPO: ${{ inputs.repository }}
+        DOCKER_TAG: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        full_image="${DOCKER_REPO}:${DOCKER_TAG}"
+        if docker manifest inspect "$full_image" >/dev/null 2>&1; then
+          echo "Tag exists for $full_image"
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "Tag not found for $full_image"
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+        fi
