@@ -2634,7 +2634,7 @@ declare_builtin_function!(
     /// the subaccount whose on-chain storage at `subaccount_address(pda)`
     /// is fetched and exposed inside the VM.
     ///
-    /// `proposed_view_addr` is a VM pointer to a caller-owned account-view
+    /// `account_view_addr` is a VM pointer to a caller-owned account-view
     /// buffer (typically a `SolAccountInfo`-shaped struct on the program's
     /// stack or heap). The syscall does **not** write into this buffer —
     /// the program populates it itself from the slot's regions. The pointer
@@ -2642,29 +2642,22 @@ declare_builtin_function!(
     /// at CPI sync time using the captured field addresses (the slot's
     /// [`SerializedAccountMetadata`]).
     ///
-    /// **Idempotent reload**: if a slot for this subaccount already exists
-    /// (e.g. the program previously called `sol_load_subaccount` with the
-    /// same seeds), the syscall does NOT fail. The pre-existing slot is
-    /// returned unchanged — its stored view-addr / metadata stay anchored
-    /// to whatever pointers the program set on the FIRST load (CPI-sync
-    /// `check_account_info_pointer` would otherwise reject a freshly-
-    /// proposed view with different field pointers).
+    /// Loading the same subaccount twice in a single invocation is rejected
+    /// with [`InstructionError::AccountAlreadyInitialized`] — the program
+    /// must `sol_unload_subaccount` first if it wants to rebind the slot
+    /// to a fresh account-view buffer.
     ///
     /// On success writes the slot's stable `vm_header_addr` into
-    /// `*out_header_addr` and the canonical view-addr into
-    /// `*out_view_addr`. Programs detect reload via
-    /// `*out_view_addr != proposed_view_addr` — when that holds, the
-    /// program should reuse its already-filled AccountInfo at
-    /// `*out_view_addr` instead of populating the proposed buffer.
+    /// `*out_header_addr` and returns [`SUCCESS`].
     /// `sol_unload_subaccount` takes the `vm_header_addr` to release.
     SyscallLoadSubaccount,
     fn rust(
         invoke_context: &mut InvokeContext,
         seeds_addr: u64,
         seeds_len: u64,
-        proposed_view_addr: u64,
+        account_view_addr: u64,
         out_header_addr: u64,
-        out_view_addr: u64,
+        _arg5: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
         let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
@@ -2687,30 +2680,6 @@ declare_builtin_function!(
                 &instruction_context,
             )?
         };
-
-        // Idempotent reload: if a slot already exists for this subaccount
-        // pubkey, return its stable header / view addresses unchanged. The
-        // program detects this via `*out_view_addr != proposed_view_addr`.
-        let already_loaded = invoke_context
-            .transaction_context
-            .find_index_of_subaccount(&subaccount_pubkey)
-            .and_then(|idx| {
-                invoke_context.get_syscall_context().ok().and_then(|sc| {
-                    sc.subaccount_slots
-                        .iter()
-                        .find(|s| s.occupied_subaccount_index == Some(idx))
-                        .map(|s| (s.vm_header_addr, s.caller_account_view_addr))
-                })
-            });
-        if let Some((existing_header_addr, existing_view_addr)) = already_loaded {
-            let header_out =
-                translate_type_mut::<u64>(memory_mapping, out_header_addr, check_aligned)?;
-            *header_out = existing_header_addr;
-            let view_out =
-                translate_type_mut::<u64>(memory_mapping, out_view_addr, check_aligned)?;
-            *view_out = existing_view_addr;
-            return Ok(SUCCESS);
-        }
 
         // Find or load the on-chain subaccount state and snapshot the fields
         // we'll write into the slot header. Rent epoch is not captured —
@@ -2749,10 +2718,24 @@ declare_builtin_function!(
             (subaccount_index, data_len, lamports, owner_bytes)
         };
 
-        // Pick a free slot. `already_loaded` was checked above so we don't
-        // need the alias guard here.
+        // Reject loading the same subaccount twice — that would alias two
+        // writable views onto the same `AccountSharedData` storage and
+        // CPI sync would have ambiguous metadata to verify against. Then
+        // pick a free slot.
         let (slot_index, vm_header_addr, vm_data_addr) = {
             let syscall_context = invoke_context.get_syscall_context_mut()?;
+            if syscall_context
+                .subaccount_slots
+                .iter()
+                .any(|s| s.occupied_subaccount_index == Some(subaccount_index))
+            {
+                ic_msg!(
+                    invoke_context,
+                    "sol_load_subaccount: subaccount {} is already loaded",
+                    subaccount_pubkey,
+                );
+                return Err(InstructionError::AccountAlreadyInitialized.into());
+            }
             let Some((slot_index, slot)) = syscall_context
                 .subaccount_slots
                 .iter_mut()
@@ -2805,18 +2788,13 @@ declare_builtin_function!(
         let syscall_context = invoke_context.get_syscall_context_mut()?;
         if let Some(slot) = syscall_context.subaccount_slots.get_mut(slot_index) {
             slot.occupied_subaccount_index = Some(subaccount_index);
-            slot.caller_account_view_addr = proposed_view_addr;
+            slot.caller_account_view_addr = account_view_addr;
             slot.caller_account_metadata = Some(metadata);
             slot.is_writable = is_writable;
         }
 
         let header_out = translate_type_mut::<u64>(memory_mapping, out_header_addr, check_aligned)?;
         *header_out = vm_header_addr;
-        // On a fresh load the canonical view addr equals the proposed one;
-        // mirror it back so the program can use a single
-        // `*out_view_addr != proposed_view_addr` check to detect reload.
-        let view_out = translate_type_mut::<u64>(memory_mapping, out_view_addr, check_aligned)?;
-        *view_out = proposed_view_addr;
 
         Ok(SUCCESS)
     }
