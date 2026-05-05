@@ -7,4 +7,3 @@ solana-test-validator \
   --gossip-port 18000 \
   --limit-ledger-size 1000000 \
   --log
-  
