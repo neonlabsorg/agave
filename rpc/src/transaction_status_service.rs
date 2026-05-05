@@ -4,10 +4,7 @@
 //! frozen banks it receives.
 
 use {
-    crate::{
-        signature_metrics_tracker, transaction_notifier_interface::TransactionNotifierArc,
-        tx_type_rules,
-    },
+    crate::transaction_notifier_interface::TransactionNotifierArc,
     crossbeam_channel::{Receiver, RecvTimeoutError},
     itertools::izip,
     solana_clock::Slot,
@@ -15,7 +12,6 @@ use {
         blockstore::{Blockstore, BlockstoreError},
         blockstore_processor::{TransactionStatusBatch, TransactionStatusMessage},
     },
-    solana_metrics::custom_metrics,
     solana_runtime::{
         bank::{Bank, KeyedRewardsAndNumPartitions},
         dependency_tracker::DependencyTracker,
@@ -184,26 +180,6 @@ impl TransactionStatusService {
                         ..
                     } = committed_tx;
 
-                    let is_tracked = signature_metrics_tracker::is_tracked(transaction.signature());
-                    if is_tracked {
-                        let tx_types = tx_type_rules::infer_types_from_transaction(&transaction);
-                        if status.is_ok() {
-                            custom_metrics::inc_tx_executed_total(1);
-                            for tx_type in &tx_types {
-                                custom_metrics::inc_tx_executed_total_with_type(1, tx_type);
-                            }
-                        } else {
-                            custom_metrics::inc_tx_failed_total(1);
-                            for tx_type in &tx_types {
-                                custom_metrics::inc_tx_failed_total_with_type(1, tx_type);
-                            }
-                        }
-                    }
-                    signature_metrics_tracker::mark_processed_with_slot(
-                        transaction.signature(),
-                        slot,
-                    );
-
                     let fee = fee_details.total_fee();
                     let inner_instructions = inner_instructions.map(|inner_instructions| {
                         map_inner_instructions(inner_instructions).collect()
@@ -293,7 +269,6 @@ impl TransactionStatusService {
                 if !bank.is_frozen() {
                     return Err(Error::NonFrozenBank(bank.slot()));
                 }
-                signature_metrics_tracker::mark_block_produced(bank.slot());
                 Self::write_block_meta(&bank, blockstore)?;
                 max_complete_transaction_status_slot.fetch_max(bank.slot(), Ordering::SeqCst);
             }

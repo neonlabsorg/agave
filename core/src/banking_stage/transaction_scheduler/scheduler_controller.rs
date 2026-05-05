@@ -97,9 +97,6 @@ where
         scheduler: S,
         worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
     ) -> Self {
-        solana_metrics::custom_metrics::set_scheduler_buffer_capacity(
-            TOTAL_BUFFERED_PACKETS as u64,
-        );
         Self {
             exit,
             config,
@@ -197,13 +194,6 @@ where
                 .iter()
                 .for_each(|metrics| metrics.maybe_report_and_reset());
             self.scheduling_details.maybe_report();
-
-            solana_metrics::custom_metrics::set_scheduler_buffer_size(
-                self.container.buffer_size() as u64,
-            );
-            solana_metrics::custom_metrics::set_scheduler_buffer_queue_size(
-                self.container.queue_size() as u64,
-            );
         }
 
         Ok(())
@@ -221,13 +211,17 @@ where
                 let scheduling_budget = cost_pacer
                     .expect("cost pacer must be set for Consume")
                     .scheduling_budget(now);
+                let relax_intrabatch_account_locks = bank
+                    .feature_set
+                    .is_active(&agave_feature_set::relax_intrabatch_account_locks::id());
                 let (scheduling_summary, schedule_time_us) = measure_us!(self.scheduler.schedule(
                     &mut self.container,
                     scheduling_budget,
                     |txs, results| {
                         Self::pre_graph_filter(txs, results, bank, MAX_PROCESSING_AGE)
                     },
-                    |_| PreLockFilterAction::AttemptToSchedule // no pre-lock filter for now
+                    |_| PreLockFilterAction::AttemptToSchedule, // no pre-lock filter for now
+                    relax_intrabatch_account_locks,
                 )?);
 
                 self.count_metrics.update(|count_metrics| {
@@ -405,57 +399,6 @@ where
                 receive_time_us: _,
                 buffer_time_us: _,
             } = &receiving_stats;
-            let total_dropped = *num_dropped_without_buffering
-                + *num_dropped_on_parsing_and_sanitization
-                + *num_dropped_on_lock_validation
-                + *num_dropped_on_compute_budget
-                + *num_dropped_on_age
-                + *num_dropped_on_already_processed
-                + *num_dropped_on_fee_payer
-                + *num_dropped_on_capacity;
-            if total_dropped > 0 {
-                solana_metrics::custom_metrics::inc_tx_dropped_total(total_dropped as u64);
-            }
-            use solana_metrics::custom_metrics::inc_tx_dropped_with_reason;
-            if *num_dropped_without_buffering > 0 {
-                inc_tx_dropped_with_reason(
-                    *num_dropped_without_buffering as u64,
-                    "without_parsing",
-                );
-            }
-            if *num_dropped_on_parsing_and_sanitization > 0 {
-                inc_tx_dropped_with_reason(
-                    *num_dropped_on_parsing_and_sanitization as u64,
-                    "parsing_and_sanitization",
-                );
-            }
-            if *num_dropped_on_lock_validation > 0 {
-                inc_tx_dropped_with_reason(
-                    *num_dropped_on_lock_validation as u64,
-                    "lock_validation",
-                );
-            }
-            if *num_dropped_on_compute_budget > 0 {
-                inc_tx_dropped_with_reason(
-                    *num_dropped_on_compute_budget as u64,
-                    "compute_budget",
-                );
-            }
-            if *num_dropped_on_age > 0 {
-                inc_tx_dropped_with_reason(*num_dropped_on_age as u64, "age");
-            }
-            if *num_dropped_on_already_processed > 0 {
-                inc_tx_dropped_with_reason(
-                    *num_dropped_on_already_processed as u64,
-                    "already_processed",
-                );
-            }
-            if *num_dropped_on_fee_payer > 0 {
-                inc_tx_dropped_with_reason(*num_dropped_on_fee_payer as u64, "fee_payer");
-            }
-            if *num_dropped_on_capacity > 0 {
-                inc_tx_dropped_with_reason(*num_dropped_on_capacity as u64, "capacity");
-            }
 
             count_metrics.num_received += *num_received;
             count_metrics.num_dropped_on_receive += *num_dropped_without_buffering;
