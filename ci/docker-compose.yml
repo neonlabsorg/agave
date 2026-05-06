@@ -3,6 +3,9 @@ services:
   parasol-node:
     container_name: parasol-node
     image: ${PARASOL_NODE_IMAGE}
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
     environment:
       - SOLANA_URL=http://127.0.0.1:8899
     hostname: parasol-node

@@ -8,7 +8,8 @@ use {crate::io_uring::dir_remover::RingDirRemover, agave_io_uring::io_uring_supp
 /// Removes a directory and all its contents.
 pub fn remove_dir_all(path: impl Into<PathBuf> + AsRef<Path>) -> io::Result<()> {
     #[cfg(target_os = "linux")]
-    if io_uring_supported() {
+    {
+        assert!(io_uring_supported());
         if let Ok(mut remover) = RingDirRemover::new() {
             return remover.remove_dir_all(path);
         }
@@ -22,7 +23,8 @@ pub fn remove_dir_contents(path: impl AsRef<Path>) {
     let path = path.as_ref();
 
     #[cfg(target_os = "linux")]
-    if io_uring_supported() {
+    {
+        assert!(io_uring_supported());
         if let Ok(mut remover) = RingDirRemover::new() {
             if let Err(e) = remover.remove_dir_contents(path) {
                 log::warn!("Failed to delete contents of '{}': {e}", path.display());
