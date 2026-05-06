@@ -1494,15 +1494,6 @@ fn execute<'a, 'b: 'a>(
         .get_feature_set()
         .provide_instruction_data_offset_in_vm_r2;
 
-    ic_msg!(invoke_context, "Executing program {}: stricter_abi {}, account_data_direct_mapping {}, mask_out_rent_epoch {}, provide_instruction_data_offset_in_vm_r2 {}, use_jit {}",
-        program_id,
-        stricter_abi_and_runtime_constraints,
-        account_data_direct_mapping,
-        mask_out_rent_epoch_in_vm_serialization,
-        provide_instruction_data_offset_in_vm_r2,
-        use_jit,
-    );
-
     let mut serialize_time = Measure::start("serialize");
     let (
         parameter_bytes,
