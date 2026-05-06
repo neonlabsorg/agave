@@ -2132,6 +2132,9 @@ impl SyscallSelfInvokeRust {
             })
             .map_err(|_| InstructionError::InvalidArgument)?;
 
+        // let subaccount_pubkey = subaccount_address::create_subaccount_address(&seeds, program_id)
+        //     .map_err(|_| InstructionError::InvalidSeeds)?;
+
         Ok((subaccount_pubkey, is_writable))
     }
 }
@@ -2152,12 +2155,13 @@ declare_builtin_function!(
         consume_compute_meter(invoke_context, syscall_base_cost)?;
         let check_aligned = invoke_context.get_check_aligned();
 
+        let mut compute_subaccounts_time = Measure::start("compute_subaccounts");
         let (program_id, subaccount_pubkey) = {
             let instruction_context = invoke_context
                 .transaction_context
                 .get_current_instruction_context()?;
             let program_id = *instruction_context.get_program_key()?;
-            let (subaccount_pubkey, is_writable) = SyscallSelfInvokeRust::translate_subaccount_seeds(
+            let (subaccount_pubkey, is_writable) = SyscallSelfInvokeC::translate_subaccount_seeds(
                 &program_id,
                 seeds_addr,
                 seeds_len,
@@ -2173,6 +2177,8 @@ declare_builtin_function!(
 
             (program_id, subaccount_pubkey)
         };
+        compute_subaccounts_time.stop();
+        invoke_context.timings.compute_subaccounts_us += compute_subaccounts_time.as_us();
 
         // F10 W9: load any pre-existing on-chain state for the subaccount
         // address through the SVM `TransactionProcessingCallback`. Mirrors
@@ -2660,10 +2666,12 @@ declare_builtin_function!(
         _arg5: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
+        let mut load_subaccount_time = Measure::start("load_subaccount");
         let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
         consume_compute_meter(invoke_context, syscall_base_cost)?;
         let check_aligned = invoke_context.get_check_aligned();
 
+        let mut compute_subaccounts_time = Measure::start("compute_subaccounts");
         // Translate seeds → derive PDA → inherit base account writable bit.
         let (subaccount_pubkey, is_writable) = {
             let instruction_context = invoke_context
@@ -2680,6 +2688,8 @@ declare_builtin_function!(
                 &instruction_context,
             )?
         };
+        compute_subaccounts_time.stop();
+        invoke_context.timings.compute_subaccounts_us += compute_subaccounts_time.as_us();
 
         // Find or load the on-chain subaccount state and snapshot the fields
         // we'll write into the slot header. Rent epoch is not captured —
@@ -2795,6 +2805,9 @@ declare_builtin_function!(
 
         let header_out = translate_type_mut::<u64>(memory_mapping, out_header_addr, check_aligned)?;
         *header_out = vm_header_addr;
+
+        load_subaccount_time.stop();
+        invoke_context.timings.load_subaccounts_us += load_subaccount_time.as_us();
 
         Ok(SUCCESS)
     }
@@ -3109,6 +3122,7 @@ declare_builtin_function!(
     ) -> Result<u64, Error> {
         let check_aligned = invoke_context.get_check_aligned();
 
+        let mut compute_subaccounts_time = Measure::start("compute_subaccounts");
         let caller_program_id = *invoke_context
             .transaction_context
             .get_current_instruction_context()?
@@ -3121,6 +3135,8 @@ declare_builtin_function!(
             check_aligned,
             invoke_context,
         )?;
+        compute_subaccounts_time.stop();
+        invoke_context.timings.compute_subaccounts_us += compute_subaccounts_time.as_us();
 
         let next_instruction_subaccounts =
             build_next_instruction_subaccounts(invoke_context, &subaccounts_seeds)?;
@@ -3139,6 +3155,38 @@ declare_builtin_function!(
         Ok(SUCCESS)
     }
 );
+
+// mod subaccount_address {
+//     use solana_address::{Address, error::AddressError};
+//     pub fn create_subaccount_address(
+//         seeds: &[&[u8]],
+//         program_id: &Address,
+//     ) -> Result<Address, AddressError> {
+//         use crate::{MAX_SEEDS, MAX_SEED_LEN};
+
+//         if seeds.len() > MAX_SEEDS {
+//             return Err(AddressError::MaxSeedLengthExceeded);
+//         }
+//         if seeds.iter().any(|seed| seed.len() > MAX_SEED_LEN) {
+//             return Err(AddressError::MaxSeedLengthExceeded);
+//         }
+
+//         // Perform the calculation inline, calling this from within a program is
+//         // not supported
+//         {
+//             const SUBACCOUNT_MARKER: &[u8; 10] = b"SubAccount";
+
+//             let mut hasher = solana_sha256_hasher::Hasher::default();
+//             for seed in seeds.iter() {
+//                 hasher.hash(seed);
+//             }
+//             hasher.hashv(&[program_id.as_ref(), SUBACCOUNT_MARKER]);
+//             let hash = hasher.result();
+
+//             Ok(Address::from(hash.to_bytes()))
+//         }
+//     }
+// }
 
 impl SyscallSelfInvokeC {
     /// F10 C-ABI variant of `translate_subaccount_seeds`. Uses `SolSignerSeedsC`
@@ -3192,6 +3240,9 @@ impl SyscallSelfInvokeC {
                 InstructionError::InvalidSeeds
             })
             .map_err(|_| InstructionError::InvalidArgument)?;
+
+        // let subaccount_pubkey = subaccount_address::create_subaccount_address(&seeds_bytes, program_id)
+        //     .map_err(|_| InstructionError::InvalidSeeds)?;
 
         Ok((subaccount_pubkey, is_writable))
     }
