@@ -565,7 +565,7 @@ impl<'ix_data> TransactionContext<'ix_data> {
                     let old_len = account.data().len();
                     let new_len = (address_space_reserved_for_account as usize)
                         .min(MAX_ACCOUNT_DATA_LEN as usize)
-                        .min(old_len.saturating_add(remaining_allowed_growth));
+                        .min(old_len.saturating_add(remaining_allowed_growth.min(MAX_ACCOUNT_DATA_GROWTH_PER_INSTRUCTION)));
                     // The last two min operations ensure the following:
                     debug_assert!(accounts.can_data_be_resized(old_len, new_len).is_ok());
                     if accounts
