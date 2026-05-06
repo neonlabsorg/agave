@@ -1,0 +1,26 @@
+
+services:
+  parasol-node:
+    container_name: parasol-node
+    image: ${PARASOL_NODE_IMAGE}
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    environment:
+      - SOLANA_URL=http://127.0.0.1:8899
+    hostname: parasol-node
+    ports:
+      - "8899:8899"
+      - "8900:8900"
+    expose:
+      - "8899"
+      - "8900"
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    networks:
+      - net
+    command: /usr/local/bin/parasol-node-run.sh
+networks:
+  net:
