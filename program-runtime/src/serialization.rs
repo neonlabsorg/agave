@@ -1,7 +1,8 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use {
-    crate::invoke_context::SerializedAccountMetadata,
+    crate::invoke_context::{SerializedAccountMetadata, SubaccountSlot},
+    solana_account::{ReadableAccount, WritableAccount},
     solana_instruction::error::InstructionError,
     solana_program_entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER},
     solana_pubkey::Pubkey,
@@ -14,21 +15,56 @@ use {
     solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
     solana_transaction_context::{
         BorrowedInstructionAccount, IndexOfAccount, InstructionContext,
-        MAX_ACCOUNTS_PER_INSTRUCTION,
+        TransactionContext, MAX_ACCOUNTS_PER_INSTRUCTION,
     },
     std::mem::{self, size_of},
 };
+
+/// F10: number of pre-reserved subaccount slots in every aligned-loader VM.
+/// `sol_load_subaccount` consumes one slot per loaded subaccount and
+/// `sol_unload_subaccount` releases it. Slots beyond the reserved count cause
+/// `MaxAccountsExceeded`.
+pub const MAX_SUBACCOUNT_SLOTS: usize = 16;
+
+/// F10: byte size of a slot's header region. Layout matches the leading 88
+/// bytes of an aligned-serialized non-duplicate subaccount record:
+///   NON_DUP_MARKER (1) + is_signer (1) + is_writable (1) + executable (1) +
+///   padding (4) + key (32) + owner (32) + lamports (8) + data_len (8).
+pub const SUBACCOUNT_SLOT_HEADER_SIZE: usize = 88;
+
+/// F10: VM address space reserved per slot's data region. The slot's data
+/// region starts as an empty readonly placeholder; `sol_load_subaccount`
+/// swaps it for a region pointing at the on-chain `AccountSharedData`. The
+/// reservation must be at least `MAX_PERMITTED_DATA_LENGTH +
+/// MAX_PERMITTED_DATA_INCREASE` so the swapped-in region cannot overlap the
+/// next slot in unaligned-mapping mode.
+pub const SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES: u64 =
+    (MAX_PERMITTED_DATA_LENGTH as u64).saturating_add(MAX_PERMITTED_DATA_INCREASE as u64);
+
+/// Field offsets within a slot's header region. Mirror the aligned-loader
+/// account record layout so the program can decode the slot via the standard
+/// `AccountInfo` ABI (raw or via the SDK helpers).
+pub const SLOT_HEADER_OFFSET_NON_DUP_MARKER: u64 = 0;
+pub const SLOT_HEADER_OFFSET_IS_SIGNER: u64 = 1;
+pub const SLOT_HEADER_OFFSET_IS_WRITABLE: u64 = 2;
+pub const SLOT_HEADER_OFFSET_IS_EXECUTABLE: u64 = 3;
+pub const SLOT_HEADER_OFFSET_KEY: u64 = 8;
+pub const SLOT_HEADER_OFFSET_OWNER: u64 = 40;
+pub const SLOT_HEADER_OFFSET_LAMPORTS: u64 = 72;
+pub const SLOT_HEADER_OFFSET_DATA_LEN: u64 = 80;
 
 /// Return shape of `serialize_parameters` and its aligned/unaligned helpers.
 ///
 /// Fields, in order: the VM input buffer, its memory regions, per-account
 /// metadata, F10 per-subaccount metadata (empty until subaccount syscalls
-/// wire in), and the instruction-data offset in the buffer.
+/// wire in), F10 reserved subaccount slots that `sol_load_subaccount` can
+/// populate at runtime, and the instruction-data offset in the buffer.
 type SerializedParameters = (
     AlignedMemory<HOST_ALIGN>,
     Vec<MemoryRegion>,
     Vec<SerializedAccountMetadata>,
     Vec<SerializedAccountMetadata>,
+    Vec<SubaccountSlot>,
     usize,
 );
 
@@ -101,6 +137,17 @@ impl Serializer {
 
     fn fill_write(&mut self, num: usize, value: u8) -> std::io::Result<()> {
         self.buffer.fill_write(num, value)
+    }
+
+    /// Returns the VM address of the next byte that will be written.
+    fn current_vaddr(&self) -> u64 {
+        self.vaddr
+            .saturating_add(self.buffer.len() as u64)
+            .saturating_sub(self.region_start as u64)
+    }
+
+    fn current_len(&self) -> usize {
+        self.buffer.len()
     }
 
     fn write<T: Pod>(&mut self, value: T) -> u64 {
@@ -212,6 +259,21 @@ impl Serializer {
         self.vaddr += range.len() as u64;
     }
 
+    /// F10: pushes an empty readonly memory region at the current vaddr and
+    /// advances vaddr by `vm_size`, reserving that range for a region whose
+    /// host backing is set later via `MemoryMapping::replace_region`.
+    /// Called between slot header and the next slot header in
+    /// `serialize_parameters_aligned` to leave a stable VM-address window
+    /// for the slot's data region (initially empty, replaced on
+    /// `sol_load_subaccount` by a region pointing at the loaded
+    /// `AccountSharedData`'s storage).
+    fn push_data_placeholder(&mut self, vm_size: u64) {
+        debug_assert_eq!(self.region_start, self.buffer.len());
+        self.regions
+            .push(MemoryRegion::new_readonly(&[], self.vaddr));
+        self.vaddr = self.vaddr.saturating_add(vm_size);
+    }
+
     fn finish(mut self) -> (AlignedMemory<HOST_ALIGN>, Vec<MemoryRegion>) {
         self.push_region();
         debug_assert_eq!(self.region_start, self.buffer.len());
@@ -308,6 +370,67 @@ pub fn serialize_parameters(
             mask_out_rent_epoch_in_vm_serialization,
         )
     }
+}
+
+/// F10: flush still-occupied subaccount slots back to host
+/// `AccountSharedData`. Called from the bpf_loader deserialize step so that
+/// programs that exit without explicitly calling `sol_unload_subaccount`
+/// still persist any header-side mutations (lamports, owner, data_len) at
+/// end-of-instruction. The data region itself is direct-mapped, so writes
+/// to data inside the VM are already reflected in the host storage; this
+/// helper only reconciles the header bytes plus any data-length resize.
+///
+/// `buffer` is the VM input buffer post-execute; the slot's header region
+/// is laid out at `slot.buffer_position` relative to the start of the buffer.
+pub fn flush_subaccount_slots(
+    transaction_context: &TransactionContext,
+    buffer: &[u8],
+    slots: &[SubaccountSlot],
+) -> Result<(), InstructionError> {
+    for slot in slots {
+        let Some(subaccount_index) = slot.occupied_subaccount_index else {
+            continue;
+        };
+        let header_offset = slot.buffer_position;
+        let header = buffer
+            .get(header_offset..header_offset.saturating_add(SUBACCOUNT_SLOT_HEADER_SIZE))
+            .ok_or(InstructionError::InvalidArgument)?;
+        let owner_bytes: [u8; 32] = header
+            [SLOT_HEADER_OFFSET_OWNER as usize..SLOT_HEADER_OFFSET_LAMPORTS as usize]
+            .try_into()
+            .map_err(|_| InstructionError::InvalidArgument)?;
+        let lamports = u64::from_le_bytes(
+            header[SLOT_HEADER_OFFSET_LAMPORTS as usize..SLOT_HEADER_OFFSET_DATA_LEN as usize]
+                .try_into()
+                .map_err(|_| InstructionError::InvalidArgument)?,
+        );
+        let data_len = u64::from_le_bytes(
+            header[SLOT_HEADER_OFFSET_DATA_LEN as usize
+                ..SLOT_HEADER_OFFSET_DATA_LEN as usize + 8]
+                .try_into()
+                .map_err(|_| InstructionError::InvalidArgument)?,
+        ) as usize;
+        if data_len > MAX_PERMITTED_DATA_LENGTH as usize {
+            return Err(InstructionError::InvalidRealloc);
+        }
+        let mut borrowed = transaction_context
+            .accounts()
+            .try_borrow_mut_subaccount(subaccount_index)?;
+        if borrowed.lamports() != lamports {
+            borrowed.set_lamports(lamports);
+        }
+        // Data was direct-mapped, so any in-place mutation already lives in
+        // `AccountSharedData`; only resize is required if the program changed
+        // data_len through the header.
+        if borrowed.data().len() != data_len {
+            borrowed.resize(data_len, 0);
+        }
+        let owner_pubkey = Pubkey::new_from_array(owner_bytes);
+        if *borrowed.owner() != owner_pubkey {
+            borrowed.set_owner(owner_pubkey);
+        }
+    }
+    Ok(())
 }
 
 pub fn deserialize_parameters(
@@ -433,6 +556,9 @@ fn serialize_parameters_unaligned(
         regions,
         accounts_metadata,
         Vec::new(), // F10: subaccounts_metadata, wired in Wave 7+
+        // F10: subaccount slots are not reserved on the deprecated unaligned
+        // loader path — `sol_load_subaccount` is gated to aligned loaders.
+        Vec::new(),
         instruction_data_offset as usize,
     ))
 }
@@ -575,6 +701,13 @@ fn serialize_parameters_aligned(
             }
         }
     }
+    // F10: per slot, reserve `SUBACCOUNT_SLOT_HEADER_SIZE` bytes inside the
+    // input buffer for the slot's header region. The data region is set up
+    // outside the input buffer as an empty readonly placeholder whose VM
+    // address `sol_load_subaccount` later replaces with one backed by the
+    // loaded subaccount's `AccountSharedData` storage (direct mapping — no
+    // input-buffer space is reserved for the data, only VM address space).
+    size += MAX_SUBACCOUNT_SLOTS.saturating_mul(SUBACCOUNT_SLOT_HEADER_SIZE);
 
     let mut s = Serializer::new(
         size,
@@ -667,12 +800,64 @@ fn serialize_parameters_aligned(
         };
     }
 
+    // F10: reserve `MAX_SUBACCOUNT_SLOTS` slots after the existing-subaccount
+    // region. Each slot consists of two memory regions:
+    //   1. an 88-byte writable header region inside the input buffer
+    //      (NON_DUP_MARKER + flags + key + owner + lamports + data_len),
+    //   2. an empty readonly placeholder data region whose VM address is
+    //      reserved with `SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES` so a later
+    //      `MemoryMapping::replace_region` can install a region pointing at
+    //      the loaded subaccount's `AccountSharedData` storage without
+    //      colliding with the next slot's reserved range.
+    // Slots beyond the real-subaccount count are invisible to the deserialize
+    // loop (which iterates only `instruction_subaccounts`).
+    //
+    // After the previous loop, `s` may have unflushed bytes from real
+    // subaccount records — close that region first so each slot header lives
+    // in its own region.
+    s.push_region();
+    let mut subaccount_slots: Vec<SubaccountSlot> = Vec::with_capacity(MAX_SUBACCOUNT_SLOTS);
+    for _ in 0..MAX_SUBACCOUNT_SLOTS {
+        let vm_header_addr = s.current_vaddr();
+        let buffer_position = s.current_len();
+        s.write::<u8>(NON_DUP_MARKER);
+        s.write::<u8>(0u8); // is_signer
+        s.write::<u8>(0u8); // is_writable
+        s.write::<u8>(0u8); // is_executable
+        s.write_all(&[0u8, 0, 0, 0]); // padding
+        s.write_all(&[0u8; size_of::<Pubkey>()]); // key
+        s.write_all(&[0u8; size_of::<Pubkey>()]); // owner
+        s.write::<u64>(0u64); // lamports
+        s.write::<u64>(0u64); // data_len
+        debug_assert_eq!(
+            s.current_vaddr().saturating_sub(vm_header_addr),
+            SUBACCOUNT_SLOT_HEADER_SIZE as u64,
+        );
+        // Close the header region so it lives at vm_header_addr..+88 only.
+        s.push_region();
+        // Reserve the slot's data VM address space behind an empty readonly
+        // region; `sol_load_subaccount` swaps this for a writable region
+        // backed by the loaded subaccount's data storage.
+        let vm_data_addr = s.current_vaddr();
+        s.push_data_placeholder(SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES);
+        subaccount_slots.push(SubaccountSlot {
+            buffer_position,
+            vm_header_addr,
+            vm_data_addr,
+            caller_account_view_addr: 0,
+            caller_account_metadata: None,
+            occupied_subaccount_index: None,
+            is_writable: false,
+        });
+    }
+
     let (mem, regions) = s.finish();
     Ok((
         mem,
         regions,
         accounts_metadata,
         subaccounts_metadata,
+        subaccount_slots,
         instruction_data_offset as usize,
     ))
 }
@@ -1000,6 +1185,7 @@ mod tests {
                     regions,
                     _account_lengths,
                     _subaccounts_metadata,
+                    _subaccount_slots,
                     _instruction_data_offset,
                 ) = serialization_result.unwrap();
                 let mut serialized_regions = concat_regions(&regions);
@@ -1151,6 +1337,7 @@ mod tests {
                 regions,
                 accounts_metadata,
                 _subaccounts_metadata,
+                _subaccount_slots,
                 _instruction_data_offset,
             ) = serialize_parameters(
                 &instruction_context,
@@ -1160,21 +1347,29 @@ mod tests {
             )
             .unwrap();
 
-            let mut serialized_regions = concat_regions(&regions);
+            // F10: subaccount-slot regions are at far-apart vm-addrs (gaps of
+            // `SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES` per slot) so a full
+            // `concat_regions(regions)` would allocate hundreds of MB and
+            // wouldn't byte-match the contiguous input buffer anyway. The
+            // deserialize roundtrip below is the real correctness check;
+            // the byte-equality assert is preserved over `regions[..1]` only.
+            let serialized_regions = concat_regions(&regions[..1]);
             if !stricter_abi_and_runtime_constraints {
-                assert_eq!(serialized.as_slice(), serialized_regions.as_slice());
+                assert_eq!(
+                    &serialized.as_slice()[..serialized_regions.len()],
+                    serialized_regions.as_slice(),
+                );
             }
+            // Deserialize from the contiguous `serialized` buffer in both
+            // modes — with `account_data_direct_mapping = false`, all account
+            // bytes live in the input AlignedMemory regardless of the
+            // VM-side region split.
             let (de_program_id, de_accounts, de_instruction_data) = unsafe {
                 deserialize(
-                    if !stricter_abi_and_runtime_constraints {
-                        serialized.as_slice_mut()
-                    } else {
-                        serialized_regions.as_slice_mut()
-                    }
-                    .first_mut()
-                    .unwrap() as *mut u8,
+                    serialized.as_slice_mut().first_mut().unwrap() as *mut u8,
                 )
             };
+            let _ = serialized_regions;
 
             assert_eq!(&program_id, de_program_id);
             assert_eq!(instruction_data, de_instruction_data);
@@ -1256,6 +1451,7 @@ mod tests {
                 regions,
                 account_lengths,
                 _subaccounts_metadata,
+                _subaccount_slots,
                 _instruction_data_offset,
             ) = serialize_parameters(
                 &instruction_context,
@@ -1425,6 +1621,7 @@ mod tests {
                 regions,
                 _accounts_metadata,
                 _subaccounts_metadata,
+                _subaccount_slots,
                 _instruction_data_offset,
             ) = serialize_parameters(
                 &instruction_context,
@@ -1463,6 +1660,7 @@ mod tests {
                 regions,
                 _account_lengths,
                 _subaccounts_metadata,
+                _subaccount_slots,
                 _instruction_data_offset,
             ) = serialize_parameters(
                 &instruction_context,

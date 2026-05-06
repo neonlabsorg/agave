@@ -5,8 +5,8 @@ use {
     solana_program_runtime::cpi::{
         cpi_common, translate_account_infos, translate_accounts_c, translate_accounts_rust,
         translate_instruction_c, translate_instruction_rust, translate_signers_c,
-        translate_signers_rust, translate_subaccounts_common, CallerAccount, SolAccountInfo,
-        SyscallInvokeSigned, TranslatedAccount,
+        translate_signers_rust, translate_subaccount_slots, translate_subaccounts_common,
+        CallerAccount, SolAccountInfo, SyscallInvokeSigned, TranslatedAccount,
     },
 };
 
@@ -76,14 +76,26 @@ impl SyscallInvokeSigned for SyscallInvokeSignedRust {
             invoke_context,
             check_aligned,
         )?;
-        translate_subaccounts_common(
+        let mut subaccounts = translate_subaccounts_common(
             subaccount_infos,
             subaccount_infos_addr,
             invoke_context,
             memory_mapping,
             check_aligned,
             CallerAccount::from_account_info,
-        )
+        )?;
+        // F10: append `sol_load_subaccount` slot entries so the CPI machinery
+        // syncs them across the call boundary. Pre-CPI sync (program view →
+        // AccountSharedData) runs inside `translate_subaccount_slots`; post-CPI
+        // sync runs through `cpi_common` via `subaccount_slot` dispatch.
+        let mut slot_entries = translate_subaccount_slots::<AccountInfo, _>(
+            invoke_context,
+            memory_mapping,
+            check_aligned,
+            CallerAccount::from_account_info,
+        )?;
+        subaccounts.append(&mut slot_entries);
+        Ok(subaccounts)
     }
 
     fn translate_signers(
@@ -169,14 +181,24 @@ impl SyscallInvokeSigned for SyscallInvokeSignedC {
             invoke_context,
             check_aligned,
         )?;
-        translate_subaccounts_common(
+        let mut subaccounts = translate_subaccounts_common(
             subaccount_infos,
             subaccount_infos_addr,
             invoke_context,
             memory_mapping,
             check_aligned,
             CallerAccount::from_sol_account_info,
-        )
+        )?;
+        // F10: append `sol_load_subaccount` slot entries — see Rust impl
+        // above for the details.
+        let mut slot_entries = translate_subaccount_slots::<SolAccountInfo, _>(
+            invoke_context,
+            memory_mapping,
+            check_aligned,
+            CallerAccount::from_sol_account_info,
+        )?;
+        subaccounts.append(&mut slot_entries);
+        Ok(subaccounts)
     }
 
     fn translate_signers(

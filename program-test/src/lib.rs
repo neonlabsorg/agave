@@ -150,6 +150,7 @@ pub fn invoke_builtin_function(
         _regions,
         _account_lengths,
         _subaccounts_metadata,
+        _subaccount_slots,
         _instruction_data_offset,
     ) = serialize_parameters(
         &instruction_context,

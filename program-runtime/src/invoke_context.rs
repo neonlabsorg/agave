@@ -180,12 +180,57 @@ pub struct SyscallContext {
     /// F10: pointer+length into VM memory describing the subaccount-info array
     /// that CPI translation helpers populate at runtime.
     pub subaccounts_infos: UntypedVmSlice,
+    /// F10: pre-reserved subaccount slots populated by `sol_load_subaccount` /
+    /// freed by `sol_unload_subaccount`. Each slot owns a fixed-size region in
+    /// the VM input buffer that the syscall fills with a serialized subaccount
+    /// record (matching the aligned `serialize_parameters` layout).
+    pub subaccount_slots: Vec<SubaccountSlot>,
     /// PRS-103 stub: execution trace log (minimal placeholder so SyscallContext
     /// shape matches parasol-dev).
     pub trace_log: Vec<[u64; 12]>,
     /// PRS-103 stub: dynamically-loaded CPI accounts (minimal placeholder; not
     /// populated in this port — sol_cpi_load_account syscalls are not ported).
     pub dynamic_cpi_accounts: Vec<DynamicCpiAccount>,
+}
+
+/// Per-slot bookkeeping for a `sol_load_subaccount` reservation.
+///
+/// At VM creation `serialize_parameters_aligned` reserves
+/// [`MAX_SUBACCOUNT_SLOTS`] slots, each backed by **two** memory regions:
+/// a fixed-size header region (88 bytes, holding NON_DUP_MARKER + flags +
+/// key/owner/lamports/data_len) and a placeholder data region whose VM
+/// address is stable across the VM's lifetime but whose host-side backing
+/// is empty until `sol_load_subaccount` swaps it for one pointing at the
+/// loaded subaccount's `AccountSharedData` storage (direct mapping).
+///
+/// The syscall also accepts a caller-supplied `SolAccountInfo` pointer
+/// (`caller_account_view_addr`), fills it to point at the slot's regions,
+/// and stamps `caller_account_metadata` with the VM addresses of the
+/// individual fields — the same metadata layout the CPI sync path uses to
+/// flow state changes back to the program's view after a CPI returns.
+#[derive(Debug, Clone)]
+pub struct SubaccountSlot {
+    pub buffer_position: usize,
+    /// Stable VM address of the slot's 88-byte header region.
+    pub vm_header_addr: u64,
+    /// Stable VM address of the slot's data region. Points at an empty
+    /// readonly placeholder until `sol_load_subaccount` replaces it with a
+    /// region backed by the on-chain `AccountSharedData`.
+    pub vm_data_addr: u64,
+    /// Caller-supplied `SolAccountInfo` pointer captured by `load_subaccount`.
+    /// Zero when the slot is empty.
+    pub caller_account_view_addr: u64,
+    /// Field-pointer metadata for the caller's account view. Populated
+    /// alongside `caller_account_view_addr` so CPI sync (and end-of-
+    /// instruction flush) can locate lamports/owner/data fields in VM memory.
+    pub caller_account_metadata: Option<SerializedAccountMetadata>,
+    /// `Some(index)` once the slot is occupied, naming the subaccount index
+    /// inside `TransactionAccounts` whose state the slot mirrors.
+    pub occupied_subaccount_index: Option<IndexOfAccount>,
+    /// Writability bit recorded at `sol_load_subaccount` time. Re-install of
+    /// the data region (after `sol_create_subaccount` resizes the underlying
+    /// `AccountSharedData`) preserves this bit.
+    pub is_writable: bool,
 }
 
 /// F10: untyped (pointer, length) description of an array in VM memory.
