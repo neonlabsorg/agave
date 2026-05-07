@@ -2122,18 +2122,8 @@ impl SyscallSelfInvokeRust {
             .is_instruction_account_writable(base_index_in_instruction)
             .map_err(|_| InstructionError::InvalidArgument)?;
 
-        let (subaccount_pubkey, _) = Pubkey::try_find_program_address(&seeds, program_id)
-            .ok_or_else(|| {
-                ic_msg!(
-                    invoke_context,
-                    "Unable to find a viable program address bump seed"
-                );
-                InstructionError::InvalidSeeds
-            })
-            .map_err(|_| InstructionError::InvalidArgument)?;
-
-        // let subaccount_pubkey = subaccount_address::create_subaccount_address(&seeds, program_id)
-        //     .map_err(|_| InstructionError::InvalidSeeds)?;
+        let subaccount_pubkey = subaccount_address::create_subaccount_address(&seeds, program_id)
+            .map_err(|_| InstructionError::InvalidSeeds)?;
 
         Ok((subaccount_pubkey, is_writable))
     }
@@ -3156,37 +3146,37 @@ declare_builtin_function!(
     }
 );
 
-// mod subaccount_address {
-//     use solana_address::{Address, error::AddressError};
-//     pub fn create_subaccount_address(
-//         seeds: &[&[u8]],
-//         program_id: &Address,
-//     ) -> Result<Address, AddressError> {
-//         use crate::{MAX_SEEDS, MAX_SEED_LEN};
+mod subaccount_address {
+    use solana_address::{Address, error::AddressError};
+    pub fn create_subaccount_address(
+        seeds: &[&[u8]],
+        program_id: &Address,
+    ) -> Result<Address, AddressError> {
+        use crate::{MAX_SEEDS, MAX_SEED_LEN};
 
-//         if seeds.len() > MAX_SEEDS {
-//             return Err(AddressError::MaxSeedLengthExceeded);
-//         }
-//         if seeds.iter().any(|seed| seed.len() > MAX_SEED_LEN) {
-//             return Err(AddressError::MaxSeedLengthExceeded);
-//         }
+        if seeds.len() > MAX_SEEDS {
+            return Err(AddressError::MaxSeedLengthExceeded);
+        }
+        if seeds.iter().any(|seed| seed.len() > MAX_SEED_LEN) {
+            return Err(AddressError::MaxSeedLengthExceeded);
+        }
 
-//         // Perform the calculation inline, calling this from within a program is
-//         // not supported
-//         {
-//             const SUBACCOUNT_MARKER: &[u8; 10] = b"SubAccount";
+        // Perform the calculation inline, calling this from within a program is
+        // not supported
+        {
+            const SUBACCOUNT_MARKER: &[u8; 10] = b"SubAccount";
 
-//             let mut hasher = solana_sha256_hasher::Hasher::default();
-//             for seed in seeds.iter() {
-//                 hasher.hash(seed);
-//             }
-//             hasher.hashv(&[program_id.as_ref(), SUBACCOUNT_MARKER]);
-//             let hash = hasher.result();
+            let mut hasher = solana_sha256_hasher::Hasher::default();
+            for seed in seeds.iter() {
+                hasher.hash(seed);
+            }
+            hasher.hashv(&[program_id.as_ref(), SUBACCOUNT_MARKER]);
+            let hash = hasher.result();
 
-//             Ok(Address::from(hash.to_bytes()))
-//         }
-//     }
-// }
+            Ok(Address::from(hash.to_bytes()))
+        }
+    }
+}
 
 impl SyscallSelfInvokeC {
     /// F10 C-ABI variant of `translate_subaccount_seeds`. Uses `SolSignerSeedsC`
@@ -3231,18 +3221,8 @@ impl SyscallSelfInvokeC {
             .is_instruction_account_writable(base_index_in_instruction)
             .map_err(|_| InstructionError::InvalidArgument)?;
 
-        let (subaccount_pubkey, _) = Pubkey::try_find_program_address(&seeds_bytes, program_id)
-            .ok_or_else(|| {
-                ic_msg!(
-                    invoke_context,
-                    "Unable to find a viable program address bump seed"
-                );
-                InstructionError::InvalidSeeds
-            })
-            .map_err(|_| InstructionError::InvalidArgument)?;
-
-        // let subaccount_pubkey = subaccount_address::create_subaccount_address(&seeds_bytes, program_id)
-        //     .map_err(|_| InstructionError::InvalidSeeds)?;
+        let subaccount_pubkey = subaccount_address::create_subaccount_address(&seeds_bytes, program_id)
+            .map_err(|_| InstructionError::InvalidSeeds)?;
 
         Ok((subaccount_pubkey, is_writable))
     }
