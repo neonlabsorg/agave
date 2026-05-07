@@ -32,7 +32,7 @@ use {
 };
 
 /// Consumer will create chunks of transactions from buffer with up to this size.
-pub const TARGET_NUM_TRANSACTIONS_PER_BATCH: usize = 64;
+pub const TARGET_NUM_TRANSACTIONS_PER_BATCH: usize = 16;
 
 const SERIALIZED_ENTRIES_OVERHEAD: u64 = {
     48  // Entry Header

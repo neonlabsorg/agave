@@ -25,14 +25,14 @@ pub const INSTRUCTION_DATA_BYTES_COST: u64 = 140 /*bytes per us*/ / COMPUTE_UNIT
 /// accumulated by Transactions added to it; A transaction's compute units are
 /// calculated by cost_model, based on transaction's signatures, write locks,
 /// data size and built-in and SBF instructions.
-pub const MAX_BLOCK_UNITS: u64 = MAX_BLOCK_UNITS_SIMD_0256;
+pub const MAX_BLOCK_UNITS: u64 = MAX_BLOCK_UNITS_SIMD_0286;
 pub const MAX_BLOCK_UNITS_SIMD_0256: u64 = 60_000_000;
 pub const MAX_BLOCK_UNITS_SIMD_0286: u64 = 100_000_000;
 
 /// Number of compute units that a writable account in a block is allowed. The
 /// limit is to prevent too many transactions write to same account, therefore
 /// reduce block's parallelism.
-pub const MAX_WRITABLE_ACCOUNT_UNITS: u64 = 12_000_000;
+pub const MAX_WRITABLE_ACCOUNT_UNITS: u64 = MAX_BLOCK_UNITS;
 
 /// Number of compute units that a block can have for vote transactions,
 /// set to less than MAX_BLOCK_UNITS to leave room for non-vote transactions
