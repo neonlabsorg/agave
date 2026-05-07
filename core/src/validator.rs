@@ -219,8 +219,9 @@ impl BlockVerificationMethod {
 #[serde(rename_all = "kebab-case")]
 pub enum BlockProductionMethod {
     CentralScheduler,
-    #[default]
     CentralSchedulerGreedy,
+    #[default]
+    CentralSchedulerFifo,
 }
 
 impl BlockProductionMethod {

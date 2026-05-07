@@ -1,6 +1,11 @@
 mod batch_id_generator;
 
 #[cfg(feature = "dev-context-only-utils")]
+pub mod fifo_scheduler;
+#[cfg(not(feature = "dev-context-only-utils"))]
+pub(crate) mod fifo_scheduler;
+
+#[cfg(feature = "dev-context-only-utils")]
 pub mod greedy_scheduler;
 #[cfg(not(feature = "dev-context-only-utils"))]
 pub(crate) mod greedy_scheduler;

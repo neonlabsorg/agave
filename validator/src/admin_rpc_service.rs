@@ -12,7 +12,8 @@ use {
     solana_core::{
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
         banking_stage::{
-            transaction_scheduler::scheduler_controller::SchedulerConfig, BankingStage,
+            transaction_scheduler::scheduler_controller::{HotAccount, SchedulerConfig},
+            BankingStage,
         },
         consensus::{tower_storage::TowerStorage, Tower},
         repair::repair_service,
@@ -57,6 +58,10 @@ pub struct AdminRpcRequestMetadata {
     pub staked_nodes_overrides: Arc<RwLock<HashMap<Pubkey, u64>>>,
     pub post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
     pub rpc_to_plugin_manager_sender: Option<Sender<GeyserPluginManagerRequest>>,
+    /// Hot writable accounts statically pinned across worker threads by
+    /// the FIFO block-production scheduler. Used as the default when
+    /// `manage_block_production` respawns scheduler threads at runtime.
+    pub hot_accounts: Arc<RwLock<Vec<HotAccount>>>,
 }
 
 impl Metadata for AdminRpcRequestMetadata {}
@@ -778,6 +783,7 @@ impl AdminRpc for AdminRpcImpl {
             warn!("TransactionStructure::Sdk has no effect on block production");
         }
 
+        let hot_accounts = meta.hot_accounts.read().unwrap().clone();
         meta.with_post_init(|post_init| {
             let mut banking_stage = post_init.banking_stage.write().unwrap();
             let Some(banking_stage) = banking_stage.as_mut() else {
@@ -789,7 +795,10 @@ impl AdminRpc for AdminRpcImpl {
                 .spawn_internal_threads(
                     block_production_method,
                     num_workers,
-                    SchedulerConfig { scheduler_pacing },
+                    SchedulerConfig {
+                        scheduler_pacing,
+                        hot_accounts: hot_accounts.clone(),
+                    },
                 )
                 .map_err(|err| {
                     error!("Failed to spawn new non-vote threads: {err:?}");
@@ -1089,6 +1098,7 @@ mod tests {
                 }))),
                 staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
                 rpc_to_plugin_manager_sender: None,
+                hot_accounts: Arc::new(RwLock::new(Vec::new())),
             };
             let mut io = MetaIoHandler::default();
             io.extend_with(AdminRpcImpl.to_delegate());
@@ -1509,6 +1519,7 @@ mod tests {
                 post_init: post_init.clone(),
                 staked_nodes_overrides: Arc::new(RwLock::new(HashMap::new())),
                 rpc_to_plugin_manager_sender: None,
+                hot_accounts: Arc::new(RwLock::new(Vec::new())),
             };
 
             let _validator = Validator::new(

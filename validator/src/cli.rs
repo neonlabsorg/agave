@@ -924,6 +924,20 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                      silently ignored",
                 ),
         )
+        .arg(
+            Arg::with_name("hot_accounts")
+                .long("hot-accounts")
+                .value_name("PATH")
+                .takes_value(true)
+                .help(
+                    "Path to a JSON file declaring writable accounts that should be statically \
+                     pinned across worker threads by the FIFO block-production scheduler. The \
+                     file must contain an array of objects, each with a `pubkey` (string) and an \
+                     optional `weight` (positive integer, default 1) used as a load hint when \
+                     bin-packing accounts onto threads. Honored only by the \
+                     `central-scheduler-fifo` block-production method.",
+                ),
+        )
         .args(&pub_sub_config::args(/*test_validator:*/ true))
 }
 
