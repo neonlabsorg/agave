@@ -2,7 +2,7 @@ use {
     agave_logger::redirect_stderr_to_file,
     agave_validator::{
         admin_rpc_service, cli, commands::FromClapArgMatches, dashboard::Dashboard,
-        ledger_lockfile, lock_ledger, println_name_value,
+        hot_accounts::parse_hot_accounts_file, ledger_lockfile, lock_ledger, println_name_value,
     },
     clap::{crate_name, value_t, value_t_or_exit, values_t_or_exit},
     crossbeam_channel::unbounded,
@@ -188,6 +188,14 @@ fn main() {
     };
 
     let compute_unit_limit = value_t!(matches, "compute_unit_limit", u64).ok();
+
+    let hot_accounts = match matches.value_of("hot_accounts") {
+        Some(path) => parse_hot_accounts_file(Path::new(path)).unwrap_or_else(|err| {
+            println!("Error: --hot-accounts {path}: {err}");
+            exit(1);
+        }),
+        None => Vec::new(),
+    };
 
     let faucet_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), faucet_port);
 
@@ -431,6 +439,7 @@ fn main() {
             post_init: admin_service_post_init,
             tower_storage: tower_storage.clone(),
             rpc_to_plugin_manager_sender,
+            hot_accounts: Arc::new(RwLock::new(hot_accounts.clone())),
         },
     );
     let dashboard = if output == Output::Dashboard {
@@ -598,6 +607,10 @@ fn main() {
 
     if let Some(compute_unit_limit) = compute_unit_limit {
         genesis.compute_unit_limit(compute_unit_limit);
+    }
+
+    if !hot_accounts.is_empty() {
+        genesis.hot_accounts(hot_accounts);
     }
 
     match genesis.start_with_mint_address_and_geyser_plugin_rpc(
