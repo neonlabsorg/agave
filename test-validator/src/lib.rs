@@ -143,7 +143,7 @@ pub struct TestValidatorGenesis {
     pub tpu_enable_udp: bool,
     pub geyser_plugin_manager: Arc<RwLock<GeyserPluginManager>>,
     /// Hot writable accounts statically pinned across worker threads by
-    /// the FIFO block-production scheduler. Populated from
+    /// the hot-pinned block-production scheduler. Populated from
     /// `--hot-accounts <PATH>` on the test-validator binary.
     pub hot_accounts: Vec<HotAccount>,
     admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
@@ -233,8 +233,8 @@ impl TestValidatorGenesis {
         self
     }
 
-    /// Configure the FIFO block-production scheduler's static hot-account
-    /// thread map. See `HotAccount` for semantics.
+    /// Configure the hot-pinned block-production scheduler's static
+    /// hot-account thread map. See `HotAccount` for semantics.
     pub fn hot_accounts(&mut self, hot_accounts: Vec<HotAccount>) -> &mut Self {
         self.hot_accounts = hot_accounts;
         self

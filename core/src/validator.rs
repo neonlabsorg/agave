@@ -221,7 +221,7 @@ pub enum BlockProductionMethod {
     CentralScheduler,
     CentralSchedulerGreedy,
     #[default]
-    CentralSchedulerFifo,
+    CentralSchedulerHotPinned,
 }
 
 impl BlockProductionMethod {

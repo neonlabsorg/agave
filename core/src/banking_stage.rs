@@ -50,7 +50,7 @@ use {
         time::Duration,
     },
     transaction_scheduler::{
-        fifo_scheduler::{FifoScheduler, FifoSchedulerConfig},
+        hot_pinned_scheduler::{HotPinnedScheduler, HotPinnedSchedulerConfig},
         greedy_scheduler::{GreedyScheduler, GreedySchedulerConfig},
         prio_graph_scheduler::PrioGraphSchedulerConfig,
         receive_and_buffer::{ReceiveAndBuffer, TransactionViewReceiveAndBuffer},
@@ -569,13 +569,13 @@ impl BankingStage {
                 );
                 spawn_scheduler!(scheduler);
             }
-            BlockProductionMethod::CentralSchedulerFifo => {
-                let scheduler = FifoScheduler::new(
+            BlockProductionMethod::CentralSchedulerHotPinned => {
+                let scheduler = HotPinnedScheduler::new(
                     work_senders,
                     finished_work_receiver,
-                    FifoSchedulerConfig {
+                    HotPinnedSchedulerConfig {
                         hot_accounts: scheduler_config.hot_accounts.clone(),
-                        ..FifoSchedulerConfig::default()
+                        ..HotPinnedSchedulerConfig::default()
                     },
                 );
                 spawn_scheduler!(scheduler);

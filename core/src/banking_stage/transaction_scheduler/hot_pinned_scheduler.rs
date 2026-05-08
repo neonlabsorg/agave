@@ -1,17 +1,18 @@
-//! FIFO scheduler.
+//! Hot-pinned scheduler.
 //!
 //! Shaped like `PrioGraphScheduler` (look-ahead window, multi-cycle inner
 //! loop, per-thread `MAX_BLOCK_UNITS / num_threads` CU cap, send-one-thread
-//! on batch full) but with the priority graph replaced by a plain FIFO
-//! `VecDeque`. Honors `relax_intrabatch_account_locks`: when set, conflicting
-//! txs may share a batch on the thread that already holds the writable lock;
-//! when cleared, the working-account-set is consulted and the batch is
-//! flushed before scheduling a conflicting tx (same trick the greedy
-//! scheduler uses).
-//!
-//! This makes sense when transactions are ordered solely by the container
-//! (priority + tx id) and dependency-graph reasoning would just walk that
-//! same FIFO order.
+//! on batch full) but with the priority graph replaced by a plain
+//! `VecDeque` walked in container (priority + tx id) order. Statically
+//! declared "hot" writable accounts are LPT bin-packed onto worker threads
+//! at construction; every future tx writing one of those accounts is
+//! forced onto its assigned thread. Honors `relax_intrabatch_account_locks`:
+//! when set, conflicting txs may share a batch on the thread that already
+//! holds the writable lock; when cleared, the working-account-set is
+//! consulted and the batch is flushed before scheduling a conflicting tx
+//! (same trick the greedy scheduler uses). A tx whose accounts can't
+//! currently be locked is set aside and re-queued at end of pass; later
+//! txs are free to leapfrog it.
 
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
@@ -46,7 +47,7 @@ use {
 pub use super::scheduler_controller::HotAccount;
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-pub(crate) struct FifoSchedulerConfig {
+pub(crate) struct HotPinnedSchedulerConfig {
     /// High-water cap (`B`) on cumulative scheduled CU per `schedule()`
     /// invocation, distributed evenly across worker threads. Once a
     /// thread's `in_flight + batched` reaches `B / num_threads` it is
@@ -74,11 +75,11 @@ pub(crate) struct FifoSchedulerConfig {
     /// onto exactly one worker thread at scheduler construction; every
     /// future tx writing one of these accounts is forced onto that
     /// thread. Empty by default — the scheduler then behaves as a plain
-    /// least-loaded FIFO scheduler.
+    /// least-loaded priority-ordered scheduler.
     pub hot_accounts: Vec<HotAccount>,
 }
 
-impl Default for FifoSchedulerConfig {
+impl Default for HotPinnedSchedulerConfig {
     fn default() -> Self {
         Self {
             max_scheduled_cus: MAX_BLOCK_UNITS,
@@ -94,14 +95,10 @@ impl Default for FifoSchedulerConfig {
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-pub(crate) struct FifoScheduler<Tx> {
+pub(crate) struct HotPinnedScheduler<Tx> {
     common: SchedulingCommon<Tx>,
     /// Pre-filtered look-ahead window, drained in container order.
     window: VecDeque<TransactionPriorityId>,
-    /// Sticky locks of txs that proved unschedulable in the current pass.
-    /// Used to fail-fast any later tx that conflicts with an older
-    /// unschedulable one, preserving FIFO fairness.
-    blocking_locks: ReadWriteAccountSet,
     /// Locks of txs already in an in-progress batch this pass. Only
     /// consulted when `relax_intrabatch_account_locks` is `false`.
     working_account_set: ReadWriteAccountSet,
@@ -109,15 +106,15 @@ pub(crate) struct FifoScheduler<Tx> {
     /// LPT bin-packing `config.hot_accounts` over `num_threads`. Empty
     /// when no hot accounts are configured.
     hot_account_threads: AHashMap<Pubkey, ThreadId>,
-    config: FifoSchedulerConfig,
+    config: HotPinnedSchedulerConfig,
 }
 
-impl<Tx: TransactionWithMeta> FifoScheduler<Tx> {
+impl<Tx: TransactionWithMeta> HotPinnedScheduler<Tx> {
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     pub(crate) fn new(
         consume_work_senders: Vec<Sender<ConsumeWork<Tx>>>,
         finished_consume_work_receiver: Receiver<FinishedConsumeWork<Tx>>,
-        config: FifoSchedulerConfig,
+        config: HotPinnedSchedulerConfig,
     ) -> Self {
         let window = VecDeque::with_capacity(config.look_ahead_window_size);
         let num_threads = consume_work_senders.len();
@@ -129,7 +126,6 @@ impl<Tx: TransactionWithMeta> FifoScheduler<Tx> {
                 config.target_transactions_per_batch,
             ),
             window,
-            blocking_locks: ReadWriteAccountSet::default(),
             working_account_set: ReadWriteAccountSet::default(),
             hot_account_threads,
             config,
@@ -162,7 +158,7 @@ fn bin_pack_hot_accounts(
     map
 }
 
-impl<Tx: TransactionWithMeta> Scheduler<Tx> for FifoScheduler<Tx> {
+impl<Tx: TransactionWithMeta> Scheduler<Tx> for HotPinnedScheduler<Tx> {
     fn schedule<S: StateContainer<Tx>>(
         &mut self,
         container: &mut S,
@@ -267,7 +263,6 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for FifoScheduler<Tx> {
                 let maybe_schedule_info = try_schedule_transaction(
                     transaction_state,
                     &pre_lock_filter,
-                    &mut self.blocking_locks,
                     &mut self.common.account_locks,
                     schedulable_threads,
                     &self.hot_account_threads,
@@ -385,9 +380,6 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for FifoScheduler<Tx> {
         let new_sent = self.common.send_batches()?;
         num_sent = Saturating(sent + new_sent);
 
-        // Reset pass-scoped state.
-        self.blocking_locks.clear();
-
         // Re-queue txs that proved unschedulable this pass.
         container.push_ids_into_queue(unschedulable_ids.into_iter());
 
@@ -420,7 +412,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for FifoScheduler<Tx> {
     }
 }
 
-impl<Tx: TransactionWithMeta> FifoScheduler<Tx> {
+impl<Tx: TransactionWithMeta> HotPinnedScheduler<Tx> {
     fn refill_window<S: StateContainer<Tx>>(
         container: &mut S,
         window: &mut VecDeque<TransactionPriorityId>,
@@ -473,7 +465,6 @@ impl<Tx: TransactionWithMeta> FifoScheduler<Tx> {
 fn try_schedule_transaction<Tx: TransactionWithMeta>(
     transaction_state: &mut TransactionState<Tx>,
     pre_lock_filter: impl Fn(&TransactionState<Tx>) -> PreLockFilterAction,
-    blocking_locks: &mut ReadWriteAccountSet,
     account_locks: &mut ThreadAwareAccountLocks,
     allowed_threads: ThreadSet,
     hot_account_threads: &AHashMap<Pubkey, ThreadId>,
@@ -484,13 +475,6 @@ fn try_schedule_transaction<Tx: TransactionWithMeta>(
     }
 
     let transaction = transaction_state.transaction();
-
-    // Bail if a previously-unschedulable tx in this pass already claims
-    // these accounts — we don't want to leapfrog older work.
-    if !blocking_locks.check_locks(transaction) {
-        blocking_locks.take_locks(transaction);
-        return Err(TransactionSchedulingError::UnschedulableConflicts);
-    }
 
     let account_keys = transaction.account_keys();
     let write_account_locks = account_keys
@@ -538,11 +522,9 @@ fn try_schedule_transaction<Tx: TransactionWithMeta>(
     ) {
         Ok(thread_id) => thread_id,
         Err(TryLockError::MultipleConflicts) => {
-            blocking_locks.take_locks(transaction);
             return Err(TransactionSchedulingError::UnschedulableConflicts);
         }
         Err(TryLockError::ThreadNotAllowed) => {
-            blocking_locks.take_locks(transaction);
             return Err(TransactionSchedulingError::UnschedulableThread);
         }
     };

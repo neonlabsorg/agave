@@ -37,11 +37,11 @@ use {
 };
 
 /// A pre-declared "hot" writable account, statically pinned to a worker
-/// thread by the FIFO scheduler. Operators supply a list of these
+/// thread by the hot-pinned scheduler. Operators supply a list of these
 /// (typically a handful of accounts that dominate write contention);
 /// the scheduler builds a `Pubkey -> ThreadId` map at construction time
 /// via LPT bin-packing and forces every tx writing one of these accounts
-/// onto its assigned thread. Honored only by `CentralSchedulerFifo`.
+/// onto its assigned thread. Honored only by `CentralSchedulerHotPinned`.
 #[derive(Clone, Debug)]
 pub struct HotAccount {
     pub pubkey: Pubkey,
@@ -54,7 +54,7 @@ pub struct HotAccount {
 pub struct SchedulerConfig {
     pub scheduler_pacing: SchedulerPacing,
     /// Hot writable accounts statically pinned to worker threads. Only
-    /// honored by the `CentralSchedulerFifo` block production method;
+    /// honored by the `CentralSchedulerHotPinned` block production method;
     /// other schedulers ignore this list.
     pub hot_accounts: Vec<HotAccount>,
 }

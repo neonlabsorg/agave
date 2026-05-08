@@ -59,7 +59,7 @@ pub struct AdminRpcRequestMetadata {
     pub post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
     pub rpc_to_plugin_manager_sender: Option<Sender<GeyserPluginManagerRequest>>,
     /// Hot writable accounts statically pinned across worker threads by
-    /// the FIFO block-production scheduler. Used as the default when
+    /// the hot-pinned block-production scheduler. Used as the default when
     /// `manage_block_production` respawns scheduler threads at runtime.
     pub hot_accounts: Arc<RwLock<Vec<HotAccount>>>,
 }
