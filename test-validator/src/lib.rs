@@ -21,6 +21,7 @@ use {
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_core::{
         admin_rpc_post_init::AdminRpcRequestMetadataPostInit,
+        banking_stage::transaction_scheduler::scheduler_controller::HotAccount,
         consensus::tower_storage::TowerStorage,
         validator::{Validator, ValidatorConfig, ValidatorStartProgress, ValidatorTpuConfig},
     },
@@ -141,6 +142,10 @@ pub struct TestValidatorGenesis {
     pub transaction_account_lock_limit: Option<usize>,
     pub tpu_enable_udp: bool,
     pub geyser_plugin_manager: Arc<RwLock<GeyserPluginManager>>,
+    /// Hot writable accounts statically pinned across worker threads by
+    /// the hot-pinned block-production scheduler. Populated from
+    /// `--hot-accounts <PATH>` on the test-validator binary.
+    pub hot_accounts: Vec<HotAccount>,
     admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
 }
 
@@ -176,6 +181,7 @@ impl Default for TestValidatorGenesis {
             transaction_account_lock_limit: Option::<usize>::default(),
             tpu_enable_udp: DEFAULT_TPU_ENABLE_UDP,
             geyser_plugin_manager: Arc::new(RwLock::new(GeyserPluginManager::default())),
+            hot_accounts: Vec::new(),
             admin_rpc_service_post_init:
                 Arc::<RwLock<Option<AdminRpcRequestMetadataPostInit>>>::default(),
         }
@@ -224,6 +230,13 @@ impl TestValidatorGenesis {
     /// it will be silently ignored
     pub fn deactivate_features(&mut self, deactivate_list: &[Pubkey]) -> &mut Self {
         self.deactivate_feature_set.extend(deactivate_list);
+        self
+    }
+
+    /// Configure the hot-pinned block-production scheduler's static
+    /// hot-account thread map. See `HotAccount` for semantics.
+    pub fn hot_accounts(&mut self, hot_accounts: Vec<HotAccount>) -> &mut Self {
+        self.hot_accounts = hot_accounts;
         self
     }
     pub fn ledger_path<P: Into<PathBuf>>(&mut self, ledger_path: P) -> &mut Self {
@@ -1137,6 +1150,9 @@ impl TestValidator {
         if let Some(ref tower_storage) = config.tower_storage {
             validator_config.tower_storage = tower_storage.clone();
         }
+        validator_config
+            .block_production_scheduler_config
+            .hot_accounts = config.hot_accounts.clone();
 
         let validator = Some(Validator::new(
             node,
