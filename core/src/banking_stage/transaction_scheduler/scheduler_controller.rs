@@ -136,8 +136,17 @@ where
     }
 
     pub fn run(mut self) -> Result<(), SchedulerError> {
+        // Rate limit for the scheduler buffer/queue gauge emits. The outer loop
+        // busy-spins at >10k iterations/sec on a leader-mode test-validator
+        // (`try_recv` on the packet channel returns immediately, no `recv_timeout`
+        // sleep on the `Forward` path), so emitting these gauges on every
+        // `should_report` iteration produces ~20k datapoints/sec — pure noise for
+        // a value that only meaningfully changes per leader interval.
+        const GAUGE_EMIT_INTERVAL: Duration = Duration::from_secs(1);
+
         let mut most_recent_leader_slot = None;
         let mut cost_pacer = None;
+        let mut last_gauge_emit: Option<Instant> = None;
 
         while !self.exit.load(Ordering::Relaxed) {
             let now = Instant::now();
@@ -218,7 +227,12 @@ where
                 .for_each(|metrics| metrics.maybe_report_and_reset());
             self.scheduling_details.maybe_report();
 
-            if should_report {
+            if should_report
+                && last_gauge_emit.map_or(true, |last| {
+                    now.saturating_duration_since(last) >= GAUGE_EMIT_INTERVAL
+                })
+            {
+                last_gauge_emit = Some(now);
                 solana_metrics::custom_metrics::set_scheduler_buffer_size(
                     self.container.buffer_size() as u64,
                 );
