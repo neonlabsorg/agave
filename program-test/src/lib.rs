@@ -149,7 +149,6 @@ pub fn invoke_builtin_function(
         mut parameter_bytes,
         _regions,
         _account_lengths,
-        _subaccounts_metadata,
         _subaccount_slots,
         _instruction_data_offset,
     ) = serialize_parameters(
@@ -290,7 +289,7 @@ impl solana_sysvar::program_stubs::SyscallStubs for SyscallStubs {
             .collect::<Vec<_>>();
 
         invoke_context
-            .prepare_next_instruction(instruction.clone(), &signers, Vec::new())
+            .prepare_next_instruction(instruction.clone(), &signers)
             .unwrap();
 
         // Copy caller's account_info modifications into invoke_context accounts
