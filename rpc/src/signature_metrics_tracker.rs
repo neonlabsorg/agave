@@ -15,6 +15,7 @@ use {
 
 const CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(60);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+const LOG_SIZES_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 struct SignatureLifecycle {
@@ -32,6 +33,7 @@ struct SignatureMetricsTracker {
     by_signature: HashMap<Signature, SignatureLifecycle>,
     by_slot: HashMap<Slot, Vec<Signature>>,
     last_sweep: Option<Instant>,
+    last_size_log: Option<Instant>,
 }
 
 impl SignatureMetricsTracker {
@@ -161,6 +163,26 @@ impl SignatureMetricsTracker {
         }
     }
 
+    fn maybe_log_sizes(&mut self, now: Instant) {
+        if self
+            .last_size_log
+            .is_some_and(|last| now.saturating_duration_since(last) < LOG_SIZES_INTERVAL)
+        {
+            return;
+        }
+        self.last_size_log = Some(now);
+        let by_signature = self.by_signature.len();
+        let by_slot = self.by_slot.len();
+        log::info!(
+            "signature_metrics_tracker sizes: by_signature={by_signature} by_slot={by_slot}"
+        );
+        datapoint_info!(
+            "signature_metrics_tracker_sizes",
+            ("by_signature", by_signature as i64, i64),
+            ("by_slot", by_slot as i64, i64),
+        );
+    }
+
     fn maybe_sweep_timeouts(&mut self, now: Instant) {
         if self
             .last_sweep
@@ -209,8 +231,10 @@ fn tracker_active() -> bool {
 pub fn register_signature(signature: Signature, t1: Instant, t3_proxy: Instant) {
     if let Ok(mut tracker) = TRACKER.lock() {
         TRACKER_ACTIVE.store(true, Ordering::Relaxed);
-        tracker.maybe_sweep_timeouts(Instant::now());
+        let now = Instant::now();
+        tracker.maybe_sweep_timeouts(now);
         tracker.register(signature, t1, t3_proxy);
+        tracker.maybe_log_sizes(now);
     }
 }
 
@@ -264,7 +288,9 @@ pub fn mark_finalized_up_to_slot(slot: Slot) {
         return;
     }
     if let Ok(mut tracker) = TRACKER.lock() {
-        tracker.mark_finalized_up_to_slot(slot, Instant::now());
+        let now = Instant::now();
+        tracker.mark_finalized_up_to_slot(slot, now);
+        tracker.maybe_log_sizes(now);
     }
 }
 
