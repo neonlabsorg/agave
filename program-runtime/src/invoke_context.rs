@@ -141,7 +141,7 @@ pub struct EnvironmentConfig<'a> {
     pub blockhash_lamports_per_signature: u64,
     // F10 W9: widened from `&dyn InvokeContextCallback` to the SVM-side
     // `&dyn TransactionProcessingCallback` so subaccount syscalls
-    // (`SyscallCreateSubaccount`, `build_next_instruction_subaccounts`) can
+    // (`SyscallCreateSubaccount`, `SyscallLoadSubaccount`) can
     // load existing on-chain state via `get_account_shared_data`. Narrow
     // accesses (epoch stake, precompile) keep working through the supertrait.
     transaction_processing_callback: &'a dyn TransactionProcessingCallback,
@@ -175,11 +175,6 @@ impl<'a> EnvironmentConfig<'a> {
 pub struct SyscallContext {
     pub allocator: BpfAllocator,
     pub accounts_metadata: Vec<SerializedAccountMetadata>,
-    /// F10: per-instruction subaccount metadata parallel to `accounts_metadata`.
-    pub subaccounts_metadata: Vec<SerializedAccountMetadata>,
-    /// F10: pointer+length into VM memory describing the subaccount-info array
-    /// that CPI translation helpers populate at runtime.
-    pub subaccounts_infos: UntypedVmSlice,
     /// F10: pre-reserved subaccount slots populated by `sol_load_subaccount` /
     /// freed by `sol_unload_subaccount`. Each slot owns a fixed-size region in
     /// the VM input buffer that the syscall fills with a serialized subaccount
@@ -188,9 +183,6 @@ pub struct SyscallContext {
     /// PRS-103 stub: execution trace log (minimal placeholder so SyscallContext
     /// shape matches parasol-dev).
     pub trace_log: Vec<[u64; 12]>,
-    /// PRS-103 stub: dynamically-loaded CPI accounts (minimal placeholder; not
-    /// populated in this port — sol_cpi_load_account syscalls are not ported).
-    pub dynamic_cpi_accounts: Vec<DynamicCpiAccount>,
 }
 
 /// Per-slot bookkeeping for a `sol_load_subaccount` reservation.
@@ -230,24 +222,6 @@ pub struct SubaccountSlot {
     /// Writability bit recorded at `sol_load_subaccount` time. Re-install of
     /// the data region (after `sol_create_subaccount` resizes the underlying
     /// `AccountSharedData`) preserves this bit.
-    pub is_writable: bool,
-}
-
-/// F10: untyped (pointer, length) description of an array in VM memory.
-/// Parallel to `agave_syscalls::VmVmSlice<T>` but without the type parameter.
-#[derive(Default)]
-pub struct UntypedVmSlice {
-    pub vm_data_addr: u64,
-    pub vm_data_len: u64,
-}
-
-/// PRS-103 stub struct: describes a dynamically-added CPI account.
-/// Retained in shape so that PRS-103 code paths can be ported later without
-/// a second infrastructure refactor. Not populated by this F10 port.
-#[derive(Debug, Clone, Copy)]
-pub struct DynamicCpiAccount {
-    pub index_in_transaction: IndexOfAccount,
-    pub is_signer: bool,
     pub is_writable: bool,
 }
 
@@ -362,22 +336,18 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         instruction: Instruction,
         signers: &[Pubkey],
     ) -> Result<(), InstructionError> {
-        self.prepare_next_instruction(instruction, signers, Vec::new())?;
+        self.prepare_next_instruction(instruction, signers)?;
         let mut compute_units_consumed = 0;
         self.process_instruction(&mut compute_units_consumed, &mut ExecuteTimings::default())?;
         Ok(())
     }
 
     /// Helper to prepare for process_instruction() when the instruction is not a top level one,
-    /// and depends on `AccountMeta`s.
-    ///
-    /// `subaccounts` is the F10 subaccount account list for this CPI. Top-level
-    /// and non-subaccount-bearing invokes pass `Vec::new()`.
+    /// and depends on `AccountMeta`s
     pub fn prepare_next_instruction(
         &mut self,
         instruction: Instruction,
         signers: &[Pubkey],
-        subaccounts: Vec<InstructionAccount>,
     ) -> Result<(), InstructionError> {
         // We reference accounts by an u8 index, so we have a total of 256 accounts.
         let mut transaction_callee_map: Vec<u16> = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
@@ -511,7 +481,6 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             instruction_accounts,
             transaction_callee_map,
             Cow::Owned(instruction.data),
-            subaccounts,
         )?;
         Ok(())
     }
@@ -554,7 +523,6 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             instruction_accounts,
             transaction_callee_map,
             Cow::Borrowed(data),
-            Vec::new(),
         )?;
         Ok(())
     }
@@ -1409,7 +1377,7 @@ mod tests {
             metas.clone(),
         );
         invoke_context
-            .prepare_next_instruction(inner_instruction, &[], Vec::new())
+            .prepare_next_instruction(inner_instruction, &[])
             .unwrap();
 
         let mut compute_units_consumed = 0;
@@ -1637,13 +1605,13 @@ mod tests {
 
         invoke_context.transaction_context.push().unwrap();
         invoke_context
-            .prepare_next_instruction(instruction_1, &[fee_payer.pubkey()], Vec::new())
+            .prepare_next_instruction(instruction_1, &[fee_payer.pubkey()])
             .unwrap();
         test_case_1(&invoke_context);
 
         invoke_context.transaction_context.push().unwrap();
         invoke_context
-            .prepare_next_instruction(instruction_2, &[fee_payer.pubkey()], Vec::new())
+            .prepare_next_instruction(instruction_2, &[fee_payer.pubkey()])
             .unwrap();
         test_case_2(&invoke_context);
     }
@@ -1728,7 +1696,7 @@ mod tests {
         );
 
         invoke_context
-            .prepare_next_instruction(instruction, &[fee_payer.pubkey()], Vec::new())
+            .prepare_next_instruction(instruction, &[fee_payer.pubkey()])
             .unwrap();
         let instruction_context = invoke_context
             .transaction_context

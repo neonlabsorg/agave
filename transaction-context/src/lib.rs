@@ -12,9 +12,7 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 use {
-    crate::transaction_accounts::{
-        AccountRef, AccountRefMut, KeyedAccountSharedData, TransactionAccounts,
-    },
+    crate::transaction_accounts::{AccountRefMut, KeyedAccountSharedData, TransactionAccounts},
     solana_account::{AccountSharedData, ReadableAccount},
     solana_instruction::error::InstructionError,
     solana_instructions_sysvar as instructions,
@@ -224,12 +222,6 @@ impl<'ix_data> TransactionContext<'ix_data> {
         self.accounts.find_index_of_subaccount(pubkey)
     }
 
-    /// F10: number of subaccounts registered in this transaction so far.
-    #[cfg(not(target_os = "solana"))]
-    pub fn number_of_subaccounts(&self) -> IndexOfAccount {
-        self.accounts.number_of_subaccounts()
-    }
-
     /// F10: register a new subaccount under the given key.
     /// Returns the subaccount index (without the `SUBACCOUNT_MARKER` high-bit).
     #[cfg(not(target_os = "solana"))]
@@ -245,30 +237,6 @@ impl<'ix_data> TransactionContext<'ix_data> {
             return Err(InstructionError::MaxAccountsExceeded);
         }
         Ok(self.accounts.add_subaccount(pubkey, account))
-    }
-
-    /// F10: borrow a subaccount by its (unmarked) index — read-only view.
-    ///
-    /// Returns `AccountRef<'_>` — the same uniform borrow type main-lane
-    /// accounts use. The subaccount lane is backed by the split
-    /// `AccountSharedFields`/`AccountPrivateFields` storage format, so
-    /// `BorrowedInstructionAccount` can wrap these borrows without an enum
-    /// split (see `InstructionContext::try_borrow_subaccount`).
-    #[cfg(not(target_os = "solana"))]
-    pub fn try_borrow_subaccount(
-        &self,
-        index: IndexOfAccount,
-    ) -> Result<AccountRef<'_>, InstructionError> {
-        self.accounts.try_borrow_subaccount(index)
-    }
-
-    /// F10: borrow a subaccount mutably by its (unmarked) index.
-    #[cfg(not(target_os = "solana"))]
-    pub fn try_borrow_mut_subaccount(
-        &self,
-        index: IndexOfAccount,
-    ) -> Result<AccountRefMut<'_>, InstructionError> {
-        self.accounts.try_borrow_mut_subaccount(index)
     }
 
     /// Gets the max length of the instruction trace
@@ -301,8 +269,6 @@ impl<'ix_data> TransactionContext<'ix_data> {
             instruction_accounts: &instruction.instruction_accounts,
             dedup_map: &instruction.dedup_map,
             instruction_data: &instruction.instruction_data,
-            subaccounts: &instruction.subaccounts,
-            dedup_subaccounts: &instruction.dedup_subaccounts,
         })
     }
 
@@ -359,36 +325,14 @@ impl<'ix_data> TransactionContext<'ix_data> {
     /// Configures the next instruction.
     ///
     /// The last InstructionContext is always empty and pre-reserved for the next instruction.
-    ///
-    /// F10: `subaccounts` is the CPI subaccount list for this instruction. Top-level
-    /// invokes and regular (non-subaccount-bearing) CPIs pass `Vec::new()`. The
-    /// dedup map over the subaccount lane is built here.
     pub fn configure_next_instruction(
         &mut self,
         program_index: IndexOfAccount,
         instruction_accounts: Vec<InstructionAccount>,
         deduplication_map: Vec<u16>,
         instruction_data: Cow<'ix_data, [u8]>,
-        subaccounts: Vec<InstructionAccount>,
     ) -> Result<(), InstructionError> {
         debug_assert_eq!(deduplication_map.len(), MAX_ACCOUNTS_PER_TRANSACTION);
-        if subaccounts.len() > MAX_ACCOUNTS_PER_INSTRUCTION {
-            return Err(InstructionError::MissingAccount);
-        }
-        let mut dedup_subaccounts = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
-        let number_of_subaccounts = self.accounts.number_of_subaccounts() as usize;
-        for (position, subaccount) in subaccounts.iter().enumerate() {
-            let index_in_transaction = subaccount.index_in_transaction & !SUBACCOUNT_MARKER;
-            if (index_in_transaction as usize) >= number_of_subaccounts {
-                return Err(InstructionError::MissingAccount);
-            }
-            let slot = dedup_subaccounts
-                .get_mut(index_in_transaction as usize)
-                .ok_or(InstructionError::MissingAccount)?;
-            if *slot == u16::MAX {
-                *slot = position as u16;
-            }
-        }
         let instruction = self
             .instruction_trace
             .last_mut()
@@ -397,8 +341,6 @@ impl<'ix_data> TransactionContext<'ix_data> {
         instruction.instruction_accounts = instruction_accounts;
         instruction.instruction_data = instruction_data;
         instruction.dedup_map = deduplication_map;
-        instruction.subaccounts = subaccounts;
-        instruction.dedup_subaccounts = dedup_subaccounts;
         Ok(())
     }
 
@@ -424,7 +366,6 @@ impl<'ix_data> TransactionContext<'ix_data> {
             instruction_accounts,
             dedup_map,
             Cow::Owned(instruction_data),
-            Vec::new(),
         )
     }
 
@@ -615,13 +556,6 @@ pub struct InstructionFrame<'ix_data> {
     /// This is a vector of u8s to save memory, since many entries may be unused.
     dedup_map: Vec<u16>,
     pub instruction_data: Cow<'ix_data, [u8]>,
-    /// F10 subaccount lane — populated by `SyscallCreateSubaccount`. Each entry
-    /// is an `InstructionAccount` whose `index_in_transaction` carries the
-    /// `SUBACCOUNT_MARKER` high bit.
-    pub subaccounts: Vec<InstructionAccount>,
-    /// Dedup map parallel to `dedup_map`: indexed by (subaccount_index & !SUBACCOUNT_MARKER),
-    /// values are positions within `subaccounts` (u16::MAX when unused).
-    dedup_subaccounts: Vec<u16>,
 }
 
 /// View interface to read instructions.
@@ -635,10 +569,6 @@ pub struct InstructionContext<'a, 'ix_data> {
     instruction_accounts: &'a [InstructionAccount],
     dedup_map: &'a [u16],
     instruction_data: &'ix_data [u8],
-    /// F10 subaccount instruction accounts (see `InstructionFrame::subaccounts`).
-    subaccounts: &'a [InstructionAccount],
-    /// Dedup map over subaccount lane.
-    dedup_subaccounts: &'a [u16],
 }
 
 impl<'a> InstructionContext<'a, '_> {
@@ -821,54 +751,7 @@ impl<'a> InstructionContext<'a, '_> {
     pub fn instruction_accounts(&self) -> &[InstructionAccount] {
         self.instruction_accounts
     }
-
-    /// F10: Number of subaccounts supplied to this Instruction (read-only view).
-    pub fn get_number_of_subaccounts(&self) -> IndexOfAccount {
-        self.subaccounts.len() as IndexOfAccount
-    }
-
-    /// F10: Subaccount list for this Instruction.
-    pub fn instruction_subaccounts(&self) -> &[InstructionAccount] {
-        self.subaccounts
-    }
-
-    /// F10: borrow a subaccount referenced by this instruction (instruction-scope).
-    ///
-    /// Returns a `BorrowedInstructionAccount<'_, '_>` — the same uniform
-    /// wrapper type that `try_borrow_instruction_account` returns for main
-    /// accounts. The subaccount lane uses the same
-    /// `AccountSharedFields`/`AccountPrivateFields` split-storage format as
-    /// main accounts (W8b-agave), so no enum dispatch or parallel borrow type
-    /// is required.
-    ///
-    /// `index_in_instruction` refers to the position within this instruction's
-    /// subaccount list (as returned by `instruction_subaccounts`), not the
-    /// transaction-level subaccount index. The high-bit `SUBACCOUNT_MARKER`
-    /// on the stored `index_in_transaction` is stripped before dispatching to
-    /// the subaccount lane.
-    #[cfg(not(target_os = "solana"))]
-    pub fn try_borrow_subaccount(
-        &self,
-        index_in_instruction: IndexOfAccount,
-    ) -> Result<BorrowedInstructionAccount<'_, '_>, InstructionError> {
-        let instruction_account = *self
-            .subaccounts
-            .get(index_in_instruction as usize)
-            .ok_or(InstructionError::NotEnoughAccountKeys)?;
-        let index_in_transaction_unmarked =
-            instruction_account.index_in_transaction & !SUBACCOUNT_MARKER;
-        let account = self
-            .transaction_context
-            .accounts
-            .try_borrow_mut_subaccount(index_in_transaction_unmarked)?;
-        Ok(BorrowedInstructionAccount {
-            transaction_context: self.transaction_context,
-            instruction_account,
-            account,
-            index_in_transaction_of_instruction_program: self.program_account_index_in_tx,
-        })
-    }
-
+    
     /// F10: borrow a subaccount via its transaction-level index, with a
     /// synthetic [`InstructionAccount`] whose `is_signer` is always false
     /// and whose `is_writable` is supplied by the caller.
@@ -898,39 +781,6 @@ impl<'a> InstructionContext<'a, '_> {
             account,
             index_in_transaction_of_instruction_program: self.program_account_index_in_tx,
         })
-    }
-
-    /// F10: Returns `Some(instruction_subaccount_index)` if this is a duplicate
-    /// and `None` if it is the first subaccount with this key.
-    pub fn is_instruction_subaccount_duplicate(
-        &self,
-        instruction_subaccount_index: IndexOfAccount,
-    ) -> Result<Option<IndexOfAccount>, InstructionError> {
-        let index_in_transaction = self
-            .subaccounts
-            .get(instruction_subaccount_index as usize)
-            .ok_or(InstructionError::NotEnoughAccountKeys)?
-            .index_in_transaction;
-        let stripped = index_in_transaction & !SUBACCOUNT_MARKER;
-        let first_instruction_subaccount_index = self
-            .dedup_subaccounts
-            .get(stripped as usize)
-            .and_then(|idx| {
-                if (*idx as usize) >= self.subaccounts.len() {
-                    None
-                } else {
-                    Some(*idx as IndexOfAccount)
-                }
-            })
-            .ok_or(InstructionError::MissingAccount)?;
-
-        Ok(
-            if first_instruction_subaccount_index == instruction_subaccount_index {
-                None
-            } else {
-                Some(first_instruction_subaccount_index)
-            },
-        )
     }
 
     pub fn get_key_of_instruction_account(
