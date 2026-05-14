@@ -126,7 +126,6 @@ fn bench_program_alu(bencher: &mut Bencher) {
         vec![MemoryRegion::new_writable(&mut inner_iter, MM_INPUT_START)],
         vec![],
         vec![],
-        vec![],
         &mut invoke_context,
     );
     let (mut vm, _, _) = vm.unwrap();
@@ -255,7 +254,6 @@ fn bench_create_vm(bencher: &mut Bencher) {
         _serialized,
         regions,
         account_lengths,
-        _subaccounts_metadata,
         _subaccount_slots,
         _instruction_data_offset,
     ) = serialize_parameters(
@@ -275,7 +273,6 @@ fn bench_create_vm(bencher: &mut Bencher) {
             &executable,
             clone_regions(&regions),
             account_lengths.clone(),
-            vec![],
             vec![],
             &mut invoke_context,
         );
@@ -300,7 +297,6 @@ fn bench_instruction_count_tuner(_bencher: &mut Bencher) {
         _serialized,
         regions,
         account_lengths,
-        _subaccounts_metadata,
         _subaccount_slots,
         _instruction_data_offset,
     ) = serialize_parameters(
@@ -332,7 +328,6 @@ fn bench_instruction_count_tuner(_bencher: &mut Bencher) {
         &executable,
         regions,
         account_lengths,
-        vec![],
         vec![],
         &mut invoke_context,
     );

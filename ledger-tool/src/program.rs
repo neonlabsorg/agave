@@ -509,7 +509,7 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
         )
         .unwrap();
     invoke_context.push().unwrap();
-    let (_parameter_bytes, regions, account_lengths, subaccounts_metadata, instruction_data_offset) =
+    let (_parameter_bytes, regions, account_lengths, instruction_data_offset) =
         serialize_parameters(
             &invoke_context
                 .transaction_context
@@ -528,7 +528,6 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
         &verified_executable,
         regions,
         account_lengths,
-        subaccounts_metadata,
         &mut invoke_context,
     );
     let (mut vm, _, _) = vm.unwrap();
