@@ -50,6 +50,7 @@ use {
         time::Duration,
     },
     transaction_scheduler::{
+        hot_pinned_scheduler::{HotPinnedScheduler, HotPinnedSchedulerConfig},
         greedy_scheduler::{GreedyScheduler, GreedySchedulerConfig},
         prio_graph_scheduler::PrioGraphSchedulerConfig,
         receive_and_buffer::{ReceiveAndBuffer, TransactionViewReceiveAndBuffer},
@@ -418,10 +419,7 @@ impl BankingStage {
         Self::spawn_scheduler_and_workers(
             &mut thread_hdls,
             receive_and_buffer,
-            matches!(
-                block_production_method,
-                BlockProductionMethod::CentralSchedulerGreedy
-            ),
+            block_production_method,
             num_workers,
             scheduler_config,
             &context,
@@ -461,10 +459,7 @@ impl BankingStage {
             Self::spawn_scheduler_and_workers(
                 &mut self.thread_hdls,
                 receive_and_buffer,
-                matches!(
-                    block_production_method,
-                    BlockProductionMethod::CentralSchedulerGreedy
-                ),
+                block_production_method,
                 num_workers,
                 scheduler_config,
                 context,
@@ -477,7 +472,7 @@ impl BankingStage {
     fn spawn_scheduler_and_workers<R: ReceiveAndBuffer + Send + Sync + 'static>(
         non_vote_thread_hdls: &mut Vec<JoinHandle<()>>,
         receive_and_buffer: R,
-        use_greedy_scheduler: bool,
+        block_production_method: BlockProductionMethod,
         num_workers: NonZeroUsize,
         scheduler_config: SchedulerConfig,
         context: &BankingStageContext,
@@ -557,20 +552,34 @@ impl BankingStage {
         }
 
         // Spawn the central scheduler thread
-        if use_greedy_scheduler {
-            let scheduler = GreedyScheduler::new(
-                work_senders,
-                finished_work_receiver,
-                GreedySchedulerConfig::default(),
-            );
-            spawn_scheduler!(scheduler);
-        } else {
-            let scheduler = PrioGraphScheduler::new(
-                work_senders,
-                finished_work_receiver,
-                PrioGraphSchedulerConfig::default(),
-            );
-            spawn_scheduler!(scheduler);
+        match block_production_method {
+            BlockProductionMethod::CentralSchedulerGreedy => {
+                let scheduler = GreedyScheduler::new(
+                    work_senders,
+                    finished_work_receiver,
+                    GreedySchedulerConfig::default(),
+                );
+                spawn_scheduler!(scheduler);
+            }
+            BlockProductionMethod::CentralScheduler => {
+                let scheduler = PrioGraphScheduler::new(
+                    work_senders,
+                    finished_work_receiver,
+                    PrioGraphSchedulerConfig::default(),
+                );
+                spawn_scheduler!(scheduler);
+            }
+            BlockProductionMethod::CentralSchedulerHotPinned => {
+                let scheduler = HotPinnedScheduler::new(
+                    work_senders,
+                    finished_work_receiver,
+                    HotPinnedSchedulerConfig {
+                        hot_accounts: scheduler_config.hot_accounts.clone(),
+                        ..HotPinnedSchedulerConfig::default()
+                    },
+                );
+                spawn_scheduler!(scheduler);
+            }
         }
     }
 
@@ -855,6 +864,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                hot_accounts: Vec::new(),
             },
             None,
             replay_vote_sender,
@@ -918,6 +928,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                hot_accounts: Vec::new(),
             },
             None,
             replay_vote_sender,
@@ -989,6 +1000,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                hot_accounts: Vec::new(),
             },
             None,
             replay_vote_sender,
@@ -1138,6 +1150,7 @@ mod tests {
                 DEFAULT_NUM_WORKERS,
                 SchedulerConfig {
                     scheduler_pacing: SchedulerPacing::Disabled,
+                    hot_accounts: Vec::new(),
                 },
                 None,
                 replay_vote_sender,
@@ -1289,6 +1302,7 @@ mod tests {
             DEFAULT_NUM_WORKERS,
             SchedulerConfig {
                 scheduler_pacing: SchedulerPacing::Disabled,
+                hot_accounts: Vec::new(),
             },
             None,
             replay_vote_sender,

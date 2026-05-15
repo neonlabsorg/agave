@@ -23,6 +23,7 @@ use {
     solana_clock::MAX_PROCESSING_AGE,
     solana_cost_model::cost_tracker::SharedBlockCost,
     solana_measure::measure_us,
+    solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     std::{
@@ -35,9 +36,27 @@ use {
     },
 };
 
+/// A pre-declared "hot" writable account, statically pinned to a worker
+/// thread by the hot-pinned scheduler. Operators supply a list of these
+/// (typically a handful of accounts that dominate write contention);
+/// the scheduler builds a `Pubkey -> ThreadId` map at construction time
+/// via LPT bin-packing and forces every tx writing one of these accounts
+/// onto its assigned thread. Honored only by `CentralSchedulerHotPinned`.
+#[derive(Clone, Debug)]
+pub struct HotAccount {
+    pub pubkey: Pubkey,
+    /// Relative load hint used only at construction time to bin-pack
+    /// accounts across threads. Defaults to 1 when unknown.
+    pub weight: u64,
+}
+
 #[derive(Clone)]
 pub struct SchedulerConfig {
     pub scheduler_pacing: SchedulerPacing,
+    /// Hot writable accounts statically pinned to worker threads. Only
+    /// honored by the `CentralSchedulerHotPinned` block production method;
+    /// other schedulers ignore this list.
+    pub hot_accounts: Vec<HotAccount>,
 }
 
 impl Default for SchedulerConfig {
@@ -46,6 +65,7 @@ impl Default for SchedulerConfig {
             scheduler_pacing: SchedulerPacing::FillTimeMillis(
                 DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS,
             ),
+            hot_accounts: Vec::new(),
         }
     }
 }

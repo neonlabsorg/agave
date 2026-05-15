@@ -4,6 +4,7 @@ use {
         bootstrap,
         cli::{self},
         commands::{run::args::RunArgs, FromClapArgMatches},
+        hot_accounts::parse_hot_accounts_file,
         ledger_lockfile, lock_ledger,
     },
     agave_logger::redirect_stderr_to_file,
@@ -155,6 +156,18 @@ pub fn execute(
         }
         .staked_map_id,
     ));
+
+    let hot_accounts = match matches.value_of("hot_accounts") {
+        Some(path) => parse_hot_accounts_file(Path::new(path)).unwrap_or_else(|err| {
+            error!("Failed to load --hot-accounts from {path}: {err}");
+            clap::Error::with_description(
+                "Failed to load configuration of hot-accounts argument",
+                clap::ErrorKind::InvalidValue,
+            )
+            .exit()
+        }),
+        None => Vec::new(),
+    };
 
     let init_complete_file = matches.value_of("init_complete_file");
 
@@ -631,6 +644,7 @@ pub fn execute(
                 "block_production_pacing_fill_time_millis",
                 SchedulerPacing
             ),
+            hot_accounts: hot_accounts.clone(),
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
         banking_trace_dir_byte_limit: parse_banking_trace_dir_byte_limit(matches),
@@ -733,6 +747,7 @@ pub fn execute(
             tower_storage: validator_config.tower_storage.clone(),
             staked_nodes_overrides,
             rpc_to_plugin_manager_sender,
+            hot_accounts: Arc::new(RwLock::new(hot_accounts)),
         },
     );
 
