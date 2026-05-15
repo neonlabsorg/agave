@@ -185,6 +185,18 @@ pub struct SyscallContext {
     pub trace_log: Vec<[u64; 12]>,
 }
 
+/// Source-language ABI of the account-view bytes a program writes into a
+/// subaccount slot's reserved view buffer. Captured by the `sol_load_subaccount_*`
+/// syscalls so the runtime can dispatch the CPI sync path to the matching
+/// `CallerAccount::from_*` decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountViewKind {
+    /// Rust SDK `solana_account_info::AccountInfo<'_>` layout.
+    Rust,
+    /// C ABI `SolAccountInfo` layout (mirrors `solana_program_runtime::cpi::SolAccountInfo`).
+    C,
+}
+
 /// Per-slot bookkeeping for a `sol_load_subaccount` reservation.
 ///
 /// At VM creation `serialize_parameters_aligned` reserves
@@ -218,10 +230,18 @@ pub struct SubaccountSlot {
     /// readonly placeholder until `sol_load_subaccount` replaces it with a
     /// region backed by the on-chain `AccountSharedData`.
     pub vm_data_addr: u64,
-    /// Field-pointer metadata for the caller's account view. Populated
-    /// alongside `caller_account_view_addr` so CPI sync (and end-of-
-    /// instruction flush) can locate lamports/owner/data fields in VM memory.
+    /// Field-pointer metadata for the slot's account view. Populated when
+    /// the slot is loaded so CPI sync (and end-of-instruction flush) can
+    /// locate lamports/owner/data fields in VM memory.
     pub caller_account_metadata: Option<SerializedAccountMetadata>,
+    /// Source-language ABI of the bytes the program wrote into the view
+    /// buffer at `vm_account_view_addr`. `Some(Rust)` when
+    /// `sol_load_subaccount_rust` loaded the slot, `Some(C)` when
+    /// `sol_load_subaccount_c` loaded it, and `None` when the slot is empty.
+    /// CPI sync uses this to dispatch between
+    /// [`crate::cpi::CallerAccount::from_account_info`] and
+    /// [`crate::cpi::CallerAccount::from_sol_account_info`].
+    pub account_view_kind: Option<AccountViewKind>,
     /// `Some(index)` once the slot is occupied, naming the subaccount index
     /// inside `TransactionAccounts` whose state the slot mirrors.
     pub occupied_subaccount_index: Option<IndexOfAccount>,

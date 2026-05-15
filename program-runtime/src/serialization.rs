@@ -771,6 +771,7 @@ fn serialize_parameters_aligned(
             vm_header_addr,
             vm_data_addr,
             caller_account_metadata: None,
+            account_view_kind: None,
             occupied_subaccount_index: None,
             is_writable: false,
         });
