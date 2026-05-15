@@ -20,8 +20,8 @@ use {
     solana_sha256_hasher::hashv,
     solana_svm_log_collector::ic_msg,
     solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
-    solana_transaction_context::{vm_slice::VmSlice, 
-        MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER
+    solana_transaction_context::{
+        vm_slice::VmSlice, InstructionAccount, MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
     },
 };
 
@@ -73,7 +73,7 @@ declare_builtin_function!(
     SyscallCreateSubaccount,
     fn rust(
         invoke_context: &mut InvokeContext,
-        _payer_pubkey_addr: u64,
+        payer_pubkey_addr: u64,
         seeds_addr: u64,
         seeds_len: u64,
         space: u64,
@@ -185,9 +185,84 @@ declare_builtin_function!(
         invoke_context.transaction_context.pop()?;
 
         if lamports > 0 {
-            // W8e: fund the subaccount from the payer account. Requires the
-            // self-invoke path so the system-program `Transfer` instruction
-            // can execute inside the current transaction frame.
+            // Fund the subaccount by inlining a `system_program::Transfer`.
+            // The subaccount lives in the subaccount lane and isn't reachable
+            // through the regular instruction-accounts list, so a true CPI
+            // can't dispatch to `system_processor::transfer` directly. We
+            // mirror its semantics: enforce the payer-signed-by-caller
+            // invariant, push a system_program frame with the payer as the
+            // lone signed-writable instruction account, then debit the payer
+            // / credit the subaccount under system_program's authority (so
+            // `set_lamports` allows the decrease of a system-owned payer).
+            let payer_pubkey = *translate_type::<Pubkey>(
+                memory_mapping,
+                payer_pubkey_addr,
+                check_aligned,
+            )?;
+            let payer_index_in_transaction = invoke_context
+                .transaction_context
+                .find_index_of_account(&payer_pubkey)
+                .ok_or_else(|| {
+                    ic_msg!(
+                        invoke_context,
+                        "Transfer: payer {} not in transaction",
+                        payer_pubkey,
+                    );
+                    InstructionError::MissingAccount
+                })?;
+            {
+                let outer_ix_ctx = invoke_context
+                    .transaction_context
+                    .get_current_instruction_context()?;
+                let payer_index_in_outer = outer_ix_ctx
+                    .get_index_of_account_in_instruction(payer_index_in_transaction)
+                    .map_err(|_| {
+                        ic_msg!(
+                            invoke_context,
+                            "Transfer: payer {} not in instruction",
+                            payer_pubkey,
+                        );
+                        InstructionError::MissingAccount
+                    })?;
+                if !outer_ix_ctx.is_instruction_account_signer(payer_index_in_outer)? {
+                    ic_msg!(
+                        invoke_context,
+                        "Transfer: payer {} must sign",
+                        payer_pubkey,
+                    );
+                    return Err(InstructionError::MissingRequiredSignature.into());
+                }
+            }
+
+            let mut dedup_map = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
+            *dedup_map
+                .get_mut(payer_index_in_transaction as usize)
+                .ok_or(InstructionError::MissingAccount)? = 0;
+            invoke_context
+                .transaction_context
+                .configure_next_instruction(
+                    system_program_index,
+                    vec![InstructionAccount::new(
+                        payer_index_in_transaction,
+                        true, // is_signer
+                        true, // is_writable
+                    )],
+                    dedup_map,
+                    std::borrow::Cow::Borrowed(&[]),
+                )?;
+            invoke_context.transaction_context.push()?;
+            {
+                let ix_ctx = invoke_context
+                    .transaction_context
+                    .get_current_instruction_context()?;
+                let mut payer = ix_ctx.try_borrow_instruction_account(0)?;
+                payer.checked_sub_lamports(lamports)?;
+                drop(payer);
+                let mut subaccount =
+                    ix_ctx.try_borrow_subaccount_by_tx_index(subaccount_index, true)?;
+                subaccount.checked_add_lamports(lamports)?;
+            }
+            invoke_context.transaction_context.pop()?;
         }
 
         // Mark the account as a subaccount via the SDK-side `rent_epoch`
