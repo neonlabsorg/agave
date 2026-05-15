@@ -1214,7 +1214,7 @@ where
                     s.caller_account_metadata.as_ref(),
                 ) {
                     (Some(idx), Some(meta)) => Some((
-                        s.caller_account_view_addr,
+                        s.vm_account_view_addr,
                         meta.clone(),
                         idx,
                         s.is_writable,

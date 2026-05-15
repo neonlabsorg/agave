@@ -379,7 +379,7 @@ fn sync_subaccount_slot_after_mutation(
             .and_then(|s| {
                 s.caller_account_metadata
                     .as_ref()
-                    .map(|m| (s.caller_account_view_addr, m.clone(), s.vm_data_addr, s.is_writable))
+                    .map(|m| (s.vm_account_view_addr, m.clone(), s.vm_data_addr, s.is_writable))
             })
     }) else {
         return Ok(());
@@ -491,13 +491,16 @@ declare_builtin_function!(
     /// the subaccount whose on-chain storage at `subaccount_address(pda)`
     /// is fetched and exposed inside the VM.
     ///
-    /// `account_view_addr` is a VM pointer to a caller-owned account-view
-    /// buffer (typically a `SolAccountInfo`-shaped struct on the program's
-    /// stack or heap). The syscall does **not** write into this buffer —
-    /// the program populates it itself from the slot's regions. The pointer
-    /// is stored opaquely on the slot so the runtime can reconcile state
-    /// at CPI sync time using the captured field addresses (the slot's
-    /// [`SerializedAccountMetadata`]).
+    /// `out_account_view_addr` is a VM out-pointer that receives the stable
+    /// address of the slot's runtime-owned account-view buffer. The buffer
+    /// lives in MM_INPUT immediately before the slot header and is sized
+    /// (`SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE`) to fit either the Rust SDK
+    /// `AccountInfo<'_>` or the C-ABI `SolAccountInfo`. The syscall does
+    /// **not** write into the view buffer — the program populates it itself
+    /// from the slot's field addresses. The runtime captures the buffer
+    /// pointer alongside the slot's [`SerializedAccountMetadata`] so CPI
+    /// sync can later locate the lamports / owner / data fields the program
+    /// dereferences.
     ///
     /// Loading the same subaccount twice in a single invocation is rejected
     /// with [`InstructionError::AccountAlreadyInitialized`] — the program
@@ -505,14 +508,15 @@ declare_builtin_function!(
     /// to a fresh account-view buffer.
     ///
     /// On success writes the slot's stable `vm_header_addr` into
-    /// `*out_header_addr` and returns [`SUCCESS`].
+    /// `*out_header_addr`, the slot's stable view-buffer address into
+    /// `*out_account_view_addr`, and returns [`SUCCESS`].
     /// `sol_unload_subaccount` takes the `vm_header_addr` to release.
     SyscallLoadSubaccount,
     fn rust(
         invoke_context: &mut InvokeContext,
         seeds_addr: u64,
         seeds_len: u64,
-        account_view_addr: u64,
+        out_account_view_addr: u64,
         out_header_addr: u64,
         _arg5: u64,
         memory_mapping: &mut MemoryMapping,
@@ -583,7 +587,7 @@ declare_builtin_function!(
         // writable views onto the same `AccountSharedData` storage and
         // CPI sync would have ambiguous metadata to verify against. Then
         // pick a free slot.
-        let (slot_index, vm_header_addr, vm_data_addr) = {
+        let (slot_index, vm_header_addr, vm_data_addr, vm_account_view_addr) = {
             let syscall_context = invoke_context.get_syscall_context_mut()?;
             if syscall_context
                 .subaccount_slots
@@ -606,7 +610,12 @@ declare_builtin_function!(
                 ic_msg!(invoke_context, "sol_load_subaccount: all slots in use");
                 return Err(InstructionError::MaxAccountsExceeded.into());
             };
-            (slot_index, slot.vm_header_addr, slot.vm_data_addr)
+            (
+                slot_index,
+                slot.vm_header_addr,
+                slot.vm_data_addr,
+                slot.vm_account_view_addr,
+            )
         };
 
         // Stamp the slot header with the loaded subaccount's metadata.
@@ -645,17 +654,22 @@ declare_builtin_function!(
             vm_data_addr,
         };
 
-        // Stash the metadata + opaque view pointer in the slot for later sync.
+        // Stash the metadata + runtime-owned view pointer in the slot for
+        // later sync. `caller_account_view_addr` is set to the slot's
+        // reserved view buffer — the program writes its `AccountInfo` /
+        // `SolAccountInfo` there after this syscall returns.
         let syscall_context = invoke_context.get_syscall_context_mut()?;
         if let Some(slot) = syscall_context.subaccount_slots.get_mut(slot_index) {
             slot.occupied_subaccount_index = Some(subaccount_index);
-            slot.caller_account_view_addr = account_view_addr;
             slot.caller_account_metadata = Some(metadata);
             slot.is_writable = is_writable;
         }
 
         let header_out = translate_type_mut::<u64>(memory_mapping, out_header_addr, check_aligned)?;
         *header_out = vm_header_addr;
+        let view_out =
+            translate_type_mut::<u64>(memory_mapping, out_account_view_addr, check_aligned)?;
+        *view_out = vm_account_view_addr;
 
         load_subaccount_time.stop();
         invoke_context.timings.load_subaccounts_us += load_subaccount_time.as_us();
@@ -779,7 +793,6 @@ declare_builtin_function!(
             .get_mut(slot_index)
         {
             slot.occupied_subaccount_index = None;
-            slot.caller_account_view_addr = 0;
             slot.caller_account_metadata = None;
             slot.is_writable = false;
         }
