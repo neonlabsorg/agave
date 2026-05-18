@@ -555,6 +555,38 @@ impl JsonRpcRequestProcessor {
         Ok(new_response(&bank, response))
     }
 
+    /// F10: resolve a subaccount's owner-facing pubkey to its on-chain storage
+    /// entry. The runtime persists subaccount state in accounts-db under
+    /// `subaccount_storage_address(pubkey)` (sha256 of `[0x01, pubkey]`); this
+    /// RPC just runs the same translation and delegates to
+    /// [`Self::get_account_info`], so callers see the standard
+    /// `Option<UiAccount>` shape (missing storage → `None`).
+    pub async fn get_subaccount(
+        &self,
+        pubkey: Pubkey,
+        config: Option<RpcAccountInfoConfig>,
+    ) -> Result<RpcResponse<Option<UiAccount>>> {
+        let storage_address = solana_transaction_context::subaccount_storage_address(&pubkey);
+        self.get_account_info(storage_address, config).await
+    }
+
+    /// F10: batch variant of [`Self::get_subaccount`]. Translates each
+    /// owner-facing subaccount pubkey to its `subaccount_storage_address`
+    /// and delegates to [`Self::get_multiple_accounts`], preserving the
+    /// `Vec<Option<UiAccount>>` shape (one slot per input pubkey, `None`
+    /// for unprovisioned storage).
+    pub async fn get_multiple_subaccounts(
+        &self,
+        pubkeys: Vec<Pubkey>,
+        config: Option<RpcAccountInfoConfig>,
+    ) -> Result<RpcResponse<Vec<Option<UiAccount>>>> {
+        let storage_addresses = pubkeys
+            .iter()
+            .map(solana_transaction_context::subaccount_storage_address)
+            .collect();
+        self.get_multiple_accounts(storage_addresses, config).await
+    }
+
     pub async fn get_multiple_accounts(
         &self,
         pubkeys: Vec<Pubkey>,
@@ -3170,6 +3202,22 @@ pub mod rpc_accounts {
             config: Option<RpcAccountInfoConfig>,
         ) -> BoxFuture<Result<RpcResponse<Vec<Option<UiAccount>>>>>;
 
+        #[rpc(meta, name = "getSubaccount")]
+        fn get_subaccount(
+            &self,
+            meta: Self::Metadata,
+            pubkey_str: String,
+            config: Option<RpcAccountInfoConfig>,
+        ) -> BoxFuture<Result<RpcResponse<Option<UiAccount>>>>;
+
+        #[rpc(meta, name = "getMultipleSubaccounts")]
+        fn get_multiple_subaccounts(
+            &self,
+            meta: Self::Metadata,
+            pubkey_strs: Vec<String>,
+            config: Option<RpcAccountInfoConfig>,
+        ) -> BoxFuture<Result<RpcResponse<Vec<Option<UiAccount>>>>>;
+
         #[rpc(meta, name = "getBlockCommitment")]
         fn get_block_commitment(
             &self,
@@ -3241,6 +3289,49 @@ pub mod rpc_accounts {
                     .map(|pubkey_str| verify_pubkey(&pubkey_str))
                     .collect::<Result<Vec<_>>>()?;
                 meta.get_multiple_accounts(pubkeys, config).await
+            }
+            .boxed()
+        }
+
+        fn get_subaccount(
+            &self,
+            meta: Self::Metadata,
+            pubkey_str: String,
+            config: Option<RpcAccountInfoConfig>,
+        ) -> BoxFuture<Result<RpcResponse<Option<UiAccount>>>> {
+            debug!("get_subaccount rpc request received: {pubkey_str:?}");
+            async move {
+                let pubkey = verify_pubkey(&pubkey_str)?;
+                meta.get_subaccount(pubkey, config).await
+            }
+            .boxed()
+        }
+
+        fn get_multiple_subaccounts(
+            &self,
+            meta: Self::Metadata,
+            pubkey_strs: Vec<String>,
+            config: Option<RpcAccountInfoConfig>,
+        ) -> BoxFuture<Result<RpcResponse<Vec<Option<UiAccount>>>>> {
+            debug!(
+                "get_multiple_subaccounts rpc request received: {:?}",
+                pubkey_strs.len()
+            );
+            async move {
+                let max_multiple_accounts = meta
+                    .config
+                    .max_multiple_accounts
+                    .unwrap_or(MAX_MULTIPLE_ACCOUNTS);
+                if pubkey_strs.len() > max_multiple_accounts {
+                    return Err(Error::invalid_params(format!(
+                        "Too many inputs provided; max {max_multiple_accounts}"
+                    )));
+                }
+                let pubkeys = pubkey_strs
+                    .into_iter()
+                    .map(|pubkey_str| verify_pubkey(&pubkey_str))
+                    .collect::<Result<Vec<_>>>()?;
+                meta.get_multiple_subaccounts(pubkeys, config).await
             }
             .boxed()
         }

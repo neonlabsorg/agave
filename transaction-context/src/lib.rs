@@ -71,6 +71,21 @@ pub type IndexOfAccount = u16;
 /// main account lane.
 pub const SUBACCOUNT_MARKER: u16 = 1 << 15;
 
+/// F10: derives the on-chain storage address for a subaccount given its
+/// owner-facing pubkey (the PDA the program receives from
+/// `sol_create_subaccount` / `sol_load_subaccount`). The storage address is
+/// the sha256 hash of `[0x01, owner_pubkey]` and names the entry in
+/// accounts-db that backs the subaccount across transactions.
+///
+/// Shared by the runtime (subaccount serializer, end-of-tx
+/// `From<TransactionContext>` for accounts-db) and the RPC layer so callers
+/// can resolve a subaccount pubkey to its persisted storage entry.
+pub fn subaccount_storage_address(pubkey: &Pubkey) -> Pubkey {
+    Pubkey::new_from_array(
+        solana_sha256_hasher::hashv(&[&[1u8], pubkey.as_ref()]).to_bytes(),
+    )
+}
+
 /// Contains account meta data which varies between instruction.
 ///
 /// It also contains indices to other structures for faster lookup.

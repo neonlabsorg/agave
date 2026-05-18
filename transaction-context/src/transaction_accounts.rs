@@ -2,8 +2,8 @@
 use qualifier_attr::qualifiers;
 use {
     crate::{
-        vm_slice::VmSlice, IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION,
-        MAX_ACCOUNT_DATA_LEN, SUBACCOUNT_MARKER,
+        subaccount_storage_address, vm_slice::VmSlice, IndexOfAccount,
+        MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION, MAX_ACCOUNT_DATA_LEN, SUBACCOUNT_MARKER,
     },
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_instruction::error::InstructionError,
@@ -701,9 +701,7 @@ impl TransactionAccounts {
         for (shared_box, private_box) in sub_shared.into_iter().zip(sub_private.into_iter()) {
             let shared = (*shared_box).into_inner();
             let private = (*private_box).into_inner();
-            let storage_address = Pubkey::new_from_array(
-                solana_sha256_hasher::hashv(&[&[1u8], shared.key.as_ref()]).to_bytes(),
-            );
+            let storage_address = subaccount_storage_address(&shared.key);
             accounts.push((
                 storage_address,
                 AccountSharedData::create_from_existing_shared_data(

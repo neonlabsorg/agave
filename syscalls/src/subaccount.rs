@@ -17,11 +17,11 @@ use {
         memory_region::{MemoryMapping, MemoryRegion},
     },
     solana_sdk_ids::system_program,
-    solana_sha256_hasher::hashv,
     solana_svm_log_collector::ic_msg,
     solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
     solana_transaction_context::{
-        vm_slice::VmSlice, InstructionAccount, MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
+        subaccount_storage_address, vm_slice::VmSlice, InstructionAccount,
+        MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
     },
 };
 
@@ -33,13 +33,6 @@ use {
  // `sol_set_subaccount_slice` and `sol_self_invoke_*`, but those syscalls are
  // not part of the current design and are intentionally not described here.
  // ============================================================================
-
-// Derives the on-chain storage address for a subaccount given its owner-side
-// pubkey. Mirrors `subaccount_address` from parasol-dev `syscalls/src/lib.rs`.
-fn subaccount_address(pubkey: &Pubkey) -> Pubkey {
-    let subaccount_address = hashv(&[&[1u8], pubkey.as_ref()]);
-    Pubkey::new_from_array(subaccount_address.to_bytes())
-}
 
 fn create_subaccount_address(
     seeds: &[&[u8]],
@@ -121,9 +114,9 @@ declare_builtin_function!(
         {
             subaccount_index
         } else {
-            let subaccount_address = subaccount_address(&subaccount_pubkey);
+            let storage_address = subaccount_storage_address(&subaccount_pubkey);
             let (subaccount, _slot) = invoke_context
-                .get_account_shared_data(&subaccount_address)
+                .get_account_shared_data(&storage_address)
                 .unwrap_or_else(|| (AccountSharedData::default(), 0));
             let data_len_cost = (subaccount.data().len() as u64)
                 .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
@@ -650,7 +643,7 @@ fn load_subaccount_impl(
         let subaccount_index = if let Some(idx) = existing {
             idx
         } else {
-            let on_chain_address = subaccount_address(&subaccount_pubkey);
+            let on_chain_address = subaccount_storage_address(&subaccount_pubkey);
             let (loaded, _slot) = invoke_context
                 .get_account_shared_data(&on_chain_address)
                 .unwrap_or_else(|| (AccountSharedData::default(), 0));
