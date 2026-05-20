@@ -225,6 +225,14 @@ declare_builtin_function!(
                     );
                     return Err(InstructionError::MissingRequiredSignature.into());
                 }
+                if !outer_ix_ctx.is_instruction_account_writable(payer_index_in_outer)? {
+                    ic_msg!(
+                        invoke_context,
+                        "Transfer: payer {} must be writable",
+                        payer_pubkey,
+                    );
+                    return Err(InstructionError::ReadonlyLamportChange.into());
+                }
             }
 
             let mut dedup_map = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
@@ -739,17 +747,16 @@ fn load_subaccount_impl(
 
     // Stash the metadata + ABI kind on the slot for later sync.
     let syscall_context = invoke_context.get_syscall_context_mut()?;
+    let header_out = translate_type_mut::<u64>(memory_mapping, out_header_addr, check_aligned)?;
+    let view_out = translate_type_mut::<u64>(memory_mapping, out_account_view_addr, check_aligned)?;
+
     if let Some(slot) = syscall_context.subaccount_slots.get_mut(slot_index) {
         slot.occupied_subaccount_index = Some(subaccount_index);
         slot.caller_account_metadata = Some(metadata);
         slot.account_view_kind = Some(kind);
         slot.is_writable = is_writable;
     }
-
-    let header_out = translate_type_mut::<u64>(memory_mapping, out_header_addr, check_aligned)?;
     *header_out = vm_header_addr;
-    let view_out =
-        translate_type_mut::<u64>(memory_mapping, out_account_view_addr, check_aligned)?;
     *view_out = vm_account_view_addr;
 
     load_subaccount_time.stop();
