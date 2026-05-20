@@ -11,7 +11,7 @@ use {
         cpi::{CallerAccount, SolAccountInfo,},
         invoke_context::{InvokeContext, SerializedAccountMetadata},
     },
-    solana_pubkey::{Pubkey, MAX_SEEDS, PUBKEY_BYTES},
+    solana_pubkey::{Pubkey, MAX_SEED_LEN, MAX_SEEDS, PUBKEY_BYTES},
     solana_sbpf::{
         declare_builtin_function,
         memory_region::{MemoryMapping, MemoryRegion},
@@ -20,19 +20,19 @@ use {
     solana_sha256_hasher::hashv,
     solana_svm_log_collector::ic_msg,
     solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
-    solana_transaction_context::{vm_slice::VmSlice, SUBACCOUNT_MARKER},
+    solana_transaction_context::{vm_slice::VmSlice, 
+        MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER
+    },
 };
 
 // ============================================================================
 // F10 — Subaccounts syscalls (PRS-153)
 //
-// Waves 7 and 8 register four syscall names. Wave 8c lands the real bodies
-// for `sol_create_subaccount` and `sol_set_subaccount_slice`, plus the shared
-// `translate_subaccount_seeds` helper on `SyscallSelfInvokeRust`. The two
-// `sol_self_invoke_*` syscalls remain stubs until W8d (CPI translation
-// helpers in `program-runtime/src/cpi.rs`) and W8e (self-invoke bodies) land.
-// See `.bgv/shared/plans/2026-04-24/170000-F10-subaccounts-reimplement-plan.md`.
-// ============================================================================
+ // This module implements the currently supported subaccount syscall surface:
+ // create, load, and unload. Earlier rollout notes referenced
+ // `sol_set_subaccount_slice` and `sol_self_invoke_*`, but those syscalls are
+ // not part of the current design and are intentionally not described here.
+ // ============================================================================
 
 // Derives the on-chain storage address for a subaccount given its owner-side
 // pubkey. Mirrors `subaccount_address` from parasol-dev `syscalls/src/lib.rs`.
@@ -45,8 +45,6 @@ fn create_subaccount_address(
     seeds: &[&[u8]],
     program_id: &Address,
 ) -> Result<Address, AddressError> {
-    use crate::{MAX_SEEDS, MAX_SEED_LEN};
-
     if seeds.len() > MAX_SEEDS {
         return Err(AddressError::MaxSeedLengthExceeded);
     }
@@ -142,12 +140,13 @@ declare_builtin_function!(
             .find_index_of_account(&system_program::id())
             .ok_or(InstructionError::MissingAccount)?;
 
+        let dedup_map = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
         invoke_context
             .transaction_context
             .configure_next_instruction(
                 system_program_index,
                 Vec::new(),
-                Vec::new(),
+                dedup_map,
                 std::borrow::Cow::Borrowed(&[]),
             )?;
         invoke_context.transaction_context.push()?;
