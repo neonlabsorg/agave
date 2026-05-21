@@ -1,5 +1,6 @@
 use solana_program_runtime::memory::translate_vm_slice;
 use solana_svm_measure::measure::Measure;
+use solana_svm_timings::ExecuteTimings;
 #[allow(deprecated)]
 use {
     crate::{Error, consume_compute_meter, translate_slice, translate_slice_mut, translate_type, translate_type_mut,},
@@ -18,7 +19,7 @@ use {
     },
     solana_sdk_ids::system_program,
     solana_svm_log_collector::ic_msg,
-    solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
+    solana_system_interface::{instruction::SystemInstruction, MAX_PERMITTED_DATA_LENGTH},
     solana_transaction_context::{
         subaccount_storage_address, vm_slice::VmSlice, InstructionAccount,
         MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
@@ -28,11 +29,9 @@ use {
 // ============================================================================
 // F10 — Subaccounts syscalls (PRS-153)
 //
- // This module implements the currently supported subaccount syscall surface:
- // create, load, and unload. Earlier rollout notes referenced
- // `sol_set_subaccount_slice` and `sol_self_invoke_*`, but those syscalls are
- // not part of the current design and are intentionally not described here.
- // ============================================================================
+// This module implements the currently supported subaccount syscall surface:
+// create, load, and unload.
+// ============================================================================
 
 fn create_subaccount_address(
     seeds: &[&[u8]],
@@ -48,13 +47,13 @@ fn create_subaccount_address(
     // Perform the calculation inline, calling this from within a program is
     // not supported
     {
-        const SUBACCOUNT_MARKER: &[u8; 10] = b"SubAccount";
+        const SUBACCOUNT_HASH_DOMAIN_TAG: &[u8; 10] = b"SubAccount";
 
         let mut hasher = solana_sha256_hasher::Hasher::default();
         for seed in seeds.iter() {
             hasher.hash(seed);
         }
-        hasher.hashv(&[program_id.as_ref(), SUBACCOUNT_MARKER]);
+        hasher.hashv(&[program_id.as_ref(), SUBACCOUNT_HASH_DOMAIN_TAG]);
         let hash = hasher.result();
 
         Ok(Address::from(hash.to_bytes()))
@@ -142,6 +141,20 @@ declare_builtin_function!(
                 dedup_map,
                 std::borrow::Cow::Borrowed(&[]),
             )?;
+
+        // F10 host-pinning: if a slot currently owns this subaccount, detach
+        // its writable data region before the `set_data_length` below may
+        // relocate the underlying `Vec<u8>`. The guard is consumed by
+        // `sync_subaccount_slot_after_mutation` at the end of this syscall,
+        // which re-installs a fresh region against the (possibly-moved)
+        // host buffer. On any `?` between here and that call, the guard
+        // drops and the placeholder stays in the slot — safe for an aborted
+        // instruction.
+        let data_guard = SubaccountDataGuard::detach_if_loaded(
+            invoke_context,
+            memory_mapping,
+            subaccount_index,
+        )?;
         invoke_context.transaction_context.push()?;
         {
             let instruction_context = invoke_context
@@ -178,15 +191,30 @@ declare_builtin_function!(
         invoke_context.transaction_context.pop()?;
 
         if lamports > 0 {
-            // Fund the subaccount by inlining a `system_program::Transfer`.
-            // The subaccount lives in the subaccount lane and isn't reachable
-            // through the regular instruction-accounts list, so a true CPI
-            // can't dispatch to `system_processor::transfer` directly. We
-            // mirror its semantics: enforce the payer-signed-by-caller
-            // invariant, push a system_program frame with the payer as the
-            // lone signed-writable instruction account, then debit the payer
-            // / credit the subaccount under system_program's authority (so
-            // `set_lamports` allows the decrease of a system-owned payer).
+            // Fund the subaccount via a CPI into `system_program::Transfer`.
+            // The subaccount is exposed to the callee as a regular
+            // instruction account at callee-index 1 — its `index_in_transaction`
+            // carries `SUBACCOUNT_MARKER`, so the runtime's
+            // `try_borrow_instruction_account` → `try_borrow_mut` dispatch
+            // routes the borrow into the subaccount lane (see
+            // `transaction_accounts::try_borrow_mut`). The system_processor
+            // therefore reads the subaccount just like any other writable
+            // `BorrowedInstructionAccount` without lane-awareness.
+            //
+            // We bypass `native_invoke` / `prepare_next_instruction` because
+            // the latter resolves `AccountMeta::pubkey` only through the
+            // main account lane and would not find a subaccount pubkey. The
+            // dedup_map similarly indexes only the main lane (its length is
+            // `MAX_ACCOUNTS_PER_TRANSACTION`), so the subaccount tx-index is
+            // intentionally absent from it.
+            //
+            // Privilege escalation is prevented by *propagating* the payer's
+            // caller-side signer/writable bits verbatim into the callee
+            // instruction account: by construction the callee cannot have
+            // more privileges than the caller. If the caller granted
+            // neither signer nor writable, `system_program::Transfer` will
+            // refuse the operation with `MissingRequiredSignature` /
+            // `ReadonlyLamportChange` itself.
             let payer_pubkey = *translate_type::<Pubkey>(
                 memory_mapping,
                 payer_pubkey_addr,
@@ -203,7 +231,7 @@ declare_builtin_function!(
                     );
                     InstructionError::MissingAccount
                 })?;
-            {
+            let (payer_is_signer, payer_is_writable) = {
                 let outer_ix_ctx = invoke_context
                     .transaction_context
                     .get_current_instruction_context()?;
@@ -217,24 +245,14 @@ declare_builtin_function!(
                         );
                         InstructionError::MissingAccount
                     })?;
-                if !outer_ix_ctx.is_instruction_account_signer(payer_index_in_outer)? {
-                    ic_msg!(
-                        invoke_context,
-                        "Transfer: payer {} must sign",
-                        payer_pubkey,
-                    );
-                    return Err(InstructionError::MissingRequiredSignature.into());
-                }
-                if !outer_ix_ctx.is_instruction_account_writable(payer_index_in_outer)? {
-                    ic_msg!(
-                        invoke_context,
-                        "Transfer: payer {} must be writable",
-                        payer_pubkey,
-                    );
-                    return Err(InstructionError::ReadonlyLamportChange.into());
-                }
-            }
+                (
+                    outer_ix_ctx.is_instruction_account_signer(payer_index_in_outer)?,
+                    outer_ix_ctx.is_instruction_account_writable(payer_index_in_outer)?,
+                )
+            };
 
+            let transfer_data = bincode::serialize(&SystemInstruction::Transfer { lamports })
+                .map_err(|_| InstructionError::InvalidInstructionData)?;
             let mut dedup_map = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
             *dedup_map
                 .get_mut(payer_index_in_transaction as usize)
@@ -243,27 +261,26 @@ declare_builtin_function!(
                 .transaction_context
                 .configure_next_instruction(
                     system_program_index,
-                    vec![InstructionAccount::new(
-                        payer_index_in_transaction,
-                        true, // is_signer
-                        true, // is_writable
-                    )],
+                    vec![
+                        InstructionAccount::new(
+                            payer_index_in_transaction,
+                            payer_is_signer,
+                            payer_is_writable,
+                        ),
+                        InstructionAccount::new_subaccount(
+                            subaccount_index,
+                            false, // is_signer — subaccounts can't sign
+                            true,  // is_writable — funding mutates lamports
+                        ),
+                    ],
                     dedup_map,
-                    std::borrow::Cow::Borrowed(&[]),
+                    std::borrow::Cow::Owned(transfer_data),
                 )?;
-            invoke_context.transaction_context.push()?;
-            {
-                let ix_ctx = invoke_context
-                    .transaction_context
-                    .get_current_instruction_context()?;
-                let mut payer = ix_ctx.try_borrow_instruction_account(0)?;
-                payer.checked_sub_lamports(lamports)?;
-                drop(payer);
-                let mut subaccount =
-                    ix_ctx.try_borrow_subaccount_by_tx_index(subaccount_index, true)?;
-                subaccount.checked_add_lamports(lamports)?;
-            }
-            invoke_context.transaction_context.pop()?;
+            let mut compute_units_consumed = 0;
+            invoke_context.process_instruction(
+                &mut compute_units_consumed,
+                &mut ExecuteTimings::default(),
+            )?;
         }
 
         // Mark the account as a subaccount via the SDK-side `rent_epoch`
@@ -282,13 +299,15 @@ declare_builtin_function!(
         // `CallerAccount::from_account_info` / `from_sol_account_info`
         // verifies the program hasn't drifted those pointers and yields mut
         // handles to the lamports / owner fields the program reads. The data
-        // region is re-installed because `set_data_length(space)` may have
-        // reallocated the underlying `AccountSharedData` buffer.
+        // region is re-installed via `data_guard` because
+        // `set_data_length(space)` above may have reallocated the underlying
+        // `AccountSharedData` buffer.
         sync_subaccount_slot_after_mutation(
             invoke_context,
             memory_mapping,
             check_aligned,
             subaccount_index,
+            data_guard,
         )?;
 
         Ok(SUCCESS)
@@ -419,9 +438,93 @@ fn restore_subaccount_data_placeholder(
     Ok(())
 }
 
+/// RAII handle around the danger window between detaching the slot's writable
+/// data region and re-installing it against the (possibly-relocated) host
+/// `AccountSharedData::data` slice.
+///
+/// While the guard is alive the slot's data region is the empty readonly
+/// placeholder, so a VM access cannot read through a stale host pointer if
+/// the underlying `Vec<u8>` reallocates during the wrapped mutation.
+///
+/// Exits:
+///   * [`reinstall`](Self::reinstall) — happy path: install a fresh region
+///     against the current host slice; consumes the guard.
+///   * [`dismiss`](Self::dismiss) — explicitly drop without re-installing;
+///     used when the slot is being freed (e.g. unload).
+///   * implicit `Drop` — same as `dismiss`. Deliberately a no-op so that an
+///     error-path unwind cannot silently re-install a region whose backing
+///     slice may already be borrowed elsewhere on the stack.
+#[must_use = "SubaccountDataGuard must be reinstalled or explicitly dismissed"]
+struct SubaccountDataGuard {
+    subaccount_index: solana_transaction_context::IndexOfAccount,
+    vm_data_addr: u64,
+    is_writable: bool,
+}
+
+impl SubaccountDataGuard {
+    /// Detach the data region for `subaccount_index` if any slot currently
+    /// owns it. Returns `Ok(None)` when no slot owns the subaccount — the
+    /// caller can mutate freely with no re-install obligation.
+    fn detach_if_loaded(
+        invoke_context: &InvokeContext,
+        memory_mapping: &mut MemoryMapping,
+        subaccount_index: solana_transaction_context::IndexOfAccount,
+    ) -> Result<Option<Self>, Error> {
+        let slot_info = {
+            let syscall_context = invoke_context.get_syscall_context()?;
+            syscall_context
+                .subaccount_slots
+                .iter()
+                .find(|s| s.occupied_subaccount_index == Some(subaccount_index))
+                .map(|s| (s.vm_data_addr, s.is_writable))
+        };
+        let Some((vm_data_addr, is_writable)) = slot_info else {
+            return Ok(None);
+        };
+        restore_subaccount_data_placeholder(memory_mapping, vm_data_addr)?;
+        Ok(Some(Self {
+            subaccount_index,
+            vm_data_addr,
+            is_writable,
+        }))
+    }
+
+    /// VM address of the slot's data region (captured at detach time).
+    fn vm_data_addr(&self) -> u64 {
+        self.vm_data_addr
+    }
+
+    /// Re-install the slot's data region against the current
+    /// `AccountSharedData::data_as_mut_slice()`. Consumes the guard.
+    fn reinstall(
+        self,
+        invoke_context: &mut InvokeContext,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<(), Error> {
+        install_subaccount_data_region(
+            invoke_context,
+            memory_mapping,
+            self.subaccount_index,
+            self.vm_data_addr,
+            self.is_writable,
+        )
+    }
+
+    /// Discards the guard without re-installing. The slot's data region
+    /// stays as the readonly placeholder.
+    fn dismiss(self) {}
+}
+
 /// Syncs a subaccount's freshly-mutated `AccountSharedData` state back into
 /// the matching `SubaccountSlot` (if any). Called from `SyscallCreateSubaccount`
 /// after a `system_program::Allocate` push/pop frame mutates the subaccount.
+///
+/// `data_guard` must have been acquired BEFORE the mutation (see
+/// [`SubaccountDataGuard::detach_if_loaded`]) so the slot's data region was
+/// detached while the underlying `Vec<u8>` may relocate. The guard is
+/// consumed at the end to re-install the region against the moved buffer.
+/// A `None` guard means no slot owned the subaccount at detach time —
+/// nothing to sync.
 ///
 /// Verification: the program's account-view pointers (in the program-written
 /// `AccountInfo` / `SolAccountInfo` at `slot.vm_account_view_addr`) must
@@ -439,17 +542,25 @@ fn restore_subaccount_data_placeholder(
 ///      through `caller_account.ref_to_len_in_vm`.
 ///   3. Slot header `data_len` field at `vm_data_addr - 8` (== slot header
 ///      offset 80).
-///   4. Slot data region — re-installed because `set_data_length` may have
-///      reallocated the underlying `AccountSharedData` storage.
+///   4. Slot data region — re-installed via the guard, since `set_data_length`
+///      may have reallocated the underlying `AccountSharedData` storage.
 fn sync_subaccount_slot_after_mutation(
     invoke_context: &mut InvokeContext,
     memory_mapping: &mut MemoryMapping,
     check_aligned: bool,
     subaccount_index: solana_transaction_context::IndexOfAccount,
+    data_guard: Option<SubaccountDataGuard>,
 ) -> Result<(), Error> {
-    // Look up the matching slot. Clone out everything we need so we don't
-    // hold a borrow on `syscall_context` across the AccountSharedData read.
-    let Some((view_addr, kind, metadata, vm_data_addr, is_writable)) = ({
+    // No slot owned this subaccount at detach time → no view to sync.
+    let Some(data_guard) = data_guard else {
+        return Ok(());
+    };
+    let vm_data_addr = data_guard.vm_data_addr();
+
+    // Look up the matching slot's view metadata. `vm_data_addr` /
+    // `is_writable` come from the guard, captured at detach time and stable
+    // for the slot's lifetime.
+    let Some((view_addr, kind, metadata)) = ({
         let syscall_context = invoke_context.get_syscall_context()?;
         syscall_context
             .subaccount_slots
@@ -457,18 +568,17 @@ fn sync_subaccount_slot_after_mutation(
             .find(|s| s.occupied_subaccount_index == Some(subaccount_index))
             .and_then(|s| {
                 match (s.caller_account_metadata.as_ref(), s.account_view_kind) {
-                    (Some(m), Some(kind)) => Some((
-                        s.vm_account_view_addr,
-                        kind,
-                        m.clone(),
-                        s.vm_data_addr,
-                        s.is_writable,
-                    )),
+                    (Some(m), Some(kind)) => {
+                        Some((s.vm_account_view_addr, kind, m.clone()))
+                    }
                     _ => None,
                 }
             })
     }) else {
-        return Ok(());
+        // Defensive: slot was found at detach time but its view metadata is
+        // missing now. Re-install the region anyway so VM access continues
+        // to work; skip header sync.
+        return data_guard.reinstall(invoke_context, memory_mapping);
     };
 
     // Read fresh state from the AccountSharedData storage.
@@ -531,15 +641,8 @@ fn sync_subaccount_slot_after_mutation(
     *serialized_len_ptr = data_len as u64;
 
     // Re-install the slot's data region against the (possibly-relocated)
-    // `AccountSharedData` buffer.
-    install_subaccount_data_region(
-        invoke_context,
-        memory_mapping,
-        subaccount_index,
-        vm_data_addr,
-        is_writable,
-    )?;
-    Ok(())
+    // host buffer. Consumes the guard.
+    data_guard.reinstall(invoke_context, memory_mapping)
 }
 
 fn translate_subaccount_seeds(
@@ -562,7 +665,6 @@ fn translate_subaccount_seeds(
             translate_vm_slice(untranslated_seed, memory_mapping, check_aligned)
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    // ic_msg!(invoke_context, "2");
     let base_seed: [u8; 32] = (*seeds.first().ok_or(InstructionError::InvalidArgument)?)
         .try_into()
         .map_err(|_| InstructionError::InvalidArgument)?;
@@ -845,7 +947,7 @@ declare_builtin_function!(
         consume_compute_meter(invoke_context, syscall_base_cost)?;
         let check_aligned = invoke_context.get_check_aligned();
 
-        let (slot_index, subaccount_index, vm_data_addr) = {
+        let (slot_index, subaccount_index) = {
             let syscall_context = invoke_context.get_syscall_context()?;
             let entry = syscall_context
                 .subaccount_slots
@@ -868,7 +970,7 @@ declare_builtin_function!(
                 );
                 return Err(InstructionError::InvalidArgument.into());
             };
-            (slot_index, idx, slot.vm_data_addr)
+            (slot_index, idx)
         };
 
         // Read header fields out of VM memory (lamports / owner / data_len).
@@ -896,10 +998,16 @@ declare_builtin_function!(
             check_aligned,
         )? as usize;
 
-        // Restore the data placeholder BEFORE mutating AccountSharedData so
-        // we don't have an outstanding writable region whose len may go stale
-        // when the underlying buffer reallocs on resize.
-        restore_subaccount_data_placeholder(memory_mapping, vm_data_addr)?;
+        // F10 host-pinning: detach the slot's data region BEFORE mutating
+        // `AccountSharedData` so we don't leave a writable region pointing
+        // at a buffer that the upcoming `resize` may reallocate. The slot
+        // is being freed below, so the guard is explicitly dismissed —
+        // never re-installed — leaving the readonly placeholder in place.
+        let data_guard = SubaccountDataGuard::detach_if_loaded(
+            invoke_context,
+            memory_mapping,
+            subaccount_index,
+        )?;
 
         let mut borrowed = invoke_context
             .transaction_context
@@ -916,6 +1024,9 @@ declare_builtin_function!(
             borrowed.set_owner(owner_pubkey);
         }
         drop(borrowed);
+        if let Some(guard) = data_guard {
+            guard.dismiss();
+        }
 
         // Zero the slot header so a stale read can't observe the prior key /
         // owner / lamports. Free the slot in the syscall context.
