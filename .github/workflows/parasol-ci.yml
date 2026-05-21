@@ -4,8 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - parasol-dev
-      - parasol-fork-dev-ci
+      - '*'
 
 
 permissions:
