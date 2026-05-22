@@ -231,7 +231,7 @@ declare_builtin_function!(
                     );
                     InstructionError::MissingAccount
                 })?;
-            let (payer_is_signer, payer_is_writable) = {
+            let (payer_index_in_outer, payer_is_signer, payer_is_writable) = {
                 let outer_ix_ctx = invoke_context
                     .transaction_context
                     .get_current_instruction_context()?;
@@ -246,6 +246,7 @@ declare_builtin_function!(
                         InstructionError::MissingAccount
                     })?;
                 (
+                    payer_index_in_outer,
                     outer_ix_ctx.is_instruction_account_signer(payer_index_in_outer)?,
                     outer_ix_ctx.is_instruction_account_writable(payer_index_in_outer)?,
                 )
@@ -281,6 +282,31 @@ declare_builtin_function!(
                 &mut compute_units_consumed,
                 &mut ExecuteTimings::default(),
             )?;
+
+            // Sync the payer's new lamports back to the outer frame's VM
+            // buffer. `system_program::Transfer` modified the runtime account
+            // via `add_lamports_delta`, but the BPF input buffer (which the
+            // outer instruction's `AccountInfo.lamports` points at) was
+            // populated by `serialize_parameters` at the start of the
+            // instruction and is now stale. Without this sync,
+            // `deserialize_parameters` at end-of-instruction would observe a
+            // mismatch (VM buffer = pre-transfer lamports, runtime =
+            // post-transfer lamports) and call `set_lamports` on the runtime
+            // account, applying the delta a second time and tripping
+            // `UnbalancedInstruction` at the outer pop.
+            let payer_lamports_after = invoke_context
+                .transaction_context
+                .get_current_instruction_context()?
+                .try_borrow_instruction_account(payer_index_in_outer)?
+                .get_lamports();
+            let vm_lamports_addr = invoke_context
+                .get_syscall_context()?
+                .accounts_metadata
+                .get(payer_index_in_outer as usize)
+                .ok_or(InstructionError::MissingAccount)?
+                .vm_lamports_addr;
+            *translate_type_mut::<u64>(memory_mapping, vm_lamports_addr, check_aligned)? =
+                payer_lamports_after;
         }
 
         // Mark the account as a subaccount via the SDK-side `rent_epoch`
