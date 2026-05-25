@@ -106,6 +106,10 @@ pub fn create_subaccount_address(
     if seeds.iter().any(|seed| seed.len() > solana_pubkey::MAX_SEED_LEN) {
         return Err(solana_pubkey::PubkeyError::MaxSeedLengthExceeded);
     }
+    /// Domain-separation tag mixed into the subaccount-address hash.
+    /// Appended after the seeds and the program id so the resulting digest
+    /// lives in a hash domain disjoint from regular PDAs (which use
+    /// `b"ProgramDerivedAddress"`).
     const SUBACCOUNT_HASH_DOMAIN_TAG: &[u8; 10] = b"SubAccount";
     let mut hasher = solana_sha256_hasher::Hasher::default();
     for seed in seeds {
