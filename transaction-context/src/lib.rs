@@ -86,6 +86,35 @@ pub fn subaccount_storage_address(pubkey: &Pubkey) -> Pubkey {
     )
 }
 
+/// F10/PRS-310: derives the owner-facing pubkey of a subaccount from its
+/// seeds and the owning program id.
+///
+/// The address is `sha256(seed_0 || seed_1 || ... || program_id || "SubAccount")`.
+/// Paired with [`subaccount_storage_address`]: the runtime persists the
+/// subaccount under `subaccount_storage_address(create_subaccount_address(..))`.
+///
+/// Host-side only — the `sol_create_subaccount` / `sol_load_subaccount`
+/// syscalls perform the same calculation inline against VM memory rather
+/// than calling through to this helper.
+pub fn create_subaccount_address(
+    seeds: &[&[u8]],
+    program_id: &Pubkey,
+) -> Result<Pubkey, solana_pubkey::PubkeyError> {
+    if seeds.len() > solana_pubkey::MAX_SEEDS {
+        return Err(solana_pubkey::PubkeyError::MaxSeedLengthExceeded);
+    }
+    if seeds.iter().any(|seed| seed.len() > solana_pubkey::MAX_SEED_LEN) {
+        return Err(solana_pubkey::PubkeyError::MaxSeedLengthExceeded);
+    }
+    const SUBACCOUNT_HASH_DOMAIN_TAG: &[u8; 10] = b"SubAccount";
+    let mut hasher = solana_sha256_hasher::Hasher::default();
+    for seed in seeds {
+        hasher.hash(seed);
+    }
+    hasher.hashv(&[program_id.as_ref(), SUBACCOUNT_HASH_DOMAIN_TAG]);
+    Ok(Pubkey::new_from_array(hasher.result().to_bytes()))
+}
+
 /// Contains account meta data which varies between instruction.
 ///
 /// It also contains indices to other structures for faster lookup.

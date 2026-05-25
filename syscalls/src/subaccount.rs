@@ -5,14 +5,13 @@ use solana_svm_timings::ExecuteTimings;
 use {
     crate::{Error, consume_compute_meter, translate_slice, translate_slice_mut, translate_type, translate_type_mut,},
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
-    solana_address::{Address, error::AddressError},
     solana_instruction::error::InstructionError,
     solana_program_entrypoint::SUCCESS,
     solana_program_runtime::{
         cpi::{CallerAccount, SolAccountInfo,},
         invoke_context::{AccountViewKind, InvokeContext, SerializedAccountMetadata},
     },
-    solana_pubkey::{Pubkey, MAX_SEED_LEN, MAX_SEEDS, PUBKEY_BYTES},
+    solana_pubkey::{Pubkey, MAX_SEEDS, PUBKEY_BYTES},
     solana_sbpf::{
         declare_builtin_function,
         memory_region::{MemoryMapping, MemoryRegion},
@@ -21,8 +20,8 @@ use {
     solana_svm_log_collector::ic_msg,
     solana_system_interface::{instruction::SystemInstruction, MAX_PERMITTED_DATA_LENGTH},
     solana_transaction_context::{
-        subaccount_storage_address, vm_slice::VmSlice, InstructionAccount,
-        MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
+        create_subaccount_address, subaccount_storage_address, vm_slice::VmSlice,
+        InstructionAccount, MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
     },
 };
 
@@ -32,33 +31,6 @@ use {
 // This module implements the currently supported subaccount syscall surface:
 // create, load, and unload.
 // ============================================================================
-
-fn create_subaccount_address(
-    seeds: &[&[u8]],
-    program_id: &Address,
-) -> Result<Address, AddressError> {
-    if seeds.len() > MAX_SEEDS {
-        return Err(AddressError::MaxSeedLengthExceeded);
-    }
-    if seeds.iter().any(|seed| seed.len() > MAX_SEED_LEN) {
-        return Err(AddressError::MaxSeedLengthExceeded);
-    }
-
-    // Perform the calculation inline, calling this from within a program is
-    // not supported
-    {
-        const SUBACCOUNT_HASH_DOMAIN_TAG: &[u8; 10] = b"SubAccount";
-
-        let mut hasher = solana_sha256_hasher::Hasher::default();
-        for seed in seeds.iter() {
-            hasher.hash(seed);
-        }
-        hasher.hashv(&[program_id.as_ref(), SUBACCOUNT_HASH_DOMAIN_TAG]);
-        let hash = hasher.result();
-
-        Ok(Address::from(hash.to_bytes()))
-    }
-}
 
 declare_builtin_function!(
     /// F10: allocate a subaccount for the current program and return its index.

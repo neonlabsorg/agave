@@ -5622,3 +5622,112 @@ fn test_mem_syscalls_overlap_account_begin_or_end() {
         }
     }
 }
+
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_create_load_write_unload() {
+    use {
+        solana_system_interface::instruction as system_instruction,
+        solana_transaction_context::{create_subaccount_address, subaccount_storage_address},
+    };
+
+    agave_logger::setup();
+
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(1_000_000_000);
+
+    let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let mut bank_client = BankClient::new_shared(bank);
+    let authority_keypair = Keypair::new();
+
+    let (bank, program_id) = load_program_of_loader_v4(
+        &mut bank_client,
+        &bank_forks,
+        &mint_keypair,
+        &authority_keypair,
+        "solana_sbf_rust_subaccount",
+    );
+
+    // Must agree with the program's SEED_TAG / FUNDING_LAMPORTS constants
+    // (programs/sbf/rust/subaccount/src/lib.rs).
+    const SEED_TAG: &[u8] = b"test-sub";
+    const FUNDING_LAMPORTS: u64 = 2_000_000;
+    let payload: &[u8] = b"hello, subaccount world!";
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let account_metas = vec![
+        AccountMeta::new(payer_pubkey, true),
+        AccountMeta::new_readonly(system_program::id(), false),
+    ];
+
+    let mut ix_data = Vec::with_capacity(1 + payload.len());
+    ix_data.push(0u8); // discriminator: create + load + write + unload
+    ix_data.extend_from_slice(payload);
+    let instruction = Instruction::new_with_bytes(program_id, &ix_data, account_metas);
+
+    let payer_lamports_before = bank.get_balance(&payer_pubkey);
+
+    let blockhash = bank.last_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[instruction],
+        Some(&payer_pubkey),
+        &[&mint_keypair],
+        blockhash,
+    );
+    let (status, inner_instructions, log_messages, _units) =
+        process_transaction_and_record_inner(&bank, tx);
+    assert!(
+        status.is_ok(),
+        "tx failed: {status:?}\nlogs:\n{}",
+        log_messages.join("\n"),
+    );
+
+    let subaccount_pubkey =
+        create_subaccount_address(&[payer_pubkey.as_ref(), SEED_TAG], &program_id)
+            .expect("derive subaccount address");
+    let storage_addr = subaccount_storage_address(&subaccount_pubkey);
+
+    let stored = bank.get_account(&storage_addr).unwrap_or_else(|| {
+        panic!(
+            "subaccount storage account {storage_addr} missing\nlogs:\n{}",
+            log_messages.join("\n"),
+        )
+    });
+    assert_eq!(
+        stored.lamports(),
+        FUNDING_LAMPORTS,
+        "subaccount lamports mismatch",
+    );
+    assert_eq!(stored.owner(), &program_id, "subaccount owner mismatch");
+    assert_eq!(stored.data(), payload, "subaccount data mismatch");
+
+    let payer_lamports_after = bank.get_balance(&payer_pubkey);
+    let debited = payer_lamports_before.saturating_sub(payer_lamports_after);
+    assert!(
+        debited == FUNDING_LAMPORTS,
+        "payer not debited enough: before={payer_lamports_before} after={payer_lamports_after} (debited={debited}, expected == {FUNDING_LAMPORTS})",
+    );
+
+    // The funding CPI must surface as a system_program::Transfer of exactly
+    // FUNDING_LAMPORTS in the recorded inner instructions.
+    let transfer_seen = inner_instructions
+        .iter()
+        .flatten()
+        .any(|inner| {
+            matches!(
+                bincode::deserialize::<system_instruction::SystemInstruction>(
+                    &inner.instruction.data,
+                ),
+                Ok(system_instruction::SystemInstruction::Transfer { lamports })
+                    if lamports == FUNDING_LAMPORTS
+            )
+        });
+    assert!(
+        transfer_seen,
+        "expected a system_program::Transfer of {FUNDING_LAMPORTS} in inner instructions\nlogs:\n{}",
+        log_messages.join("\n"),
+    );
+}
