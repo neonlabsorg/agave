@@ -5727,6 +5727,94 @@ pub mod tests {
         );
     }
 
+    // F10/PRS-314: `getSubaccount` resolves an owner-facing subaccount pubkey
+    // (the PDA returned by `sol_create_subaccount` / `sol_load_subaccount`) to
+    // its on-chain storage entry at `subaccount_storage_address(pubkey)` and
+    // returns the same `Option<UiAccount>` shape as `getAccountInfo`.
+    #[test]
+    fn test_rpc_get_subaccount() {
+        let rpc = RpcHandler::start();
+        let bank = rpc.working_bank();
+
+        let owner_pubkey = Pubkey::new_unique();
+        let storage_addr =
+            solana_transaction_context::subaccount_storage_address(&owner_pubkey);
+
+        // No data stored yet → both calls (direct getAccountInfo and the
+        // owner-facing getSubaccount) return null.
+        let req = create_test_request(
+            "getSubaccount",
+            Some(json!([owner_pubkey.to_string()])),
+        );
+        let result: Value = parse_success_result(rpc.handle_request_sync(req));
+        assert_eq!(result["value"], Value::Null, "missing subaccount → null");
+
+        // Plant a subaccount storage entry directly in the bank (no SBF
+        // execution needed — getSubaccount only does the address translation
+        // and delegates to the standard account lookup).
+        let owner_program = Pubkey::new_unique();
+        let data = vec![0xab, 0xcd, 0xef, 0x42];
+        let account = AccountSharedData::create(
+            12_345,
+            data.clone(),
+            owner_program,
+            false,
+            0,
+        );
+        bank.store_account(&storage_addr, &account);
+
+        // getSubaccount(owner_pubkey) must return the planted account.
+        let req = create_test_request(
+            "getSubaccount",
+            Some(json!([owner_pubkey.to_string(), {"encoding": "base64"}])),
+        );
+        let result: Value = parse_success_result(rpc.handle_request_sync(req));
+        let expected_data = json!([BASE64_STANDARD.encode(&data), "base64"]);
+        assert_eq!(result["value"]["data"], expected_data);
+        assert_eq!(result["value"]["lamports"], 12_345);
+        assert_eq!(result["value"]["owner"], owner_program.to_string());
+        assert_eq!(result["value"]["space"], data.len());
+
+        // getAccountInfo on the OWNER-facing pubkey must NOT see the entry
+        // (it lives at the translated `storage_addr`, not at owner_pubkey).
+        // This proves the RPC actually applies the address translation.
+        let req = create_test_request(
+            "getAccountInfo",
+            Some(json!([owner_pubkey.to_string()])),
+        );
+        let result: Value = parse_success_result(rpc.handle_request_sync(req));
+        assert_eq!(
+            result["value"], Value::Null,
+            "owner-facing pubkey must not resolve via plain getAccountInfo",
+        );
+
+        // getAccountInfo on the storage address — same data as getSubaccount.
+        let req = create_test_request(
+            "getAccountInfo",
+            Some(json!([storage_addr.to_string(), {"encoding": "base64"}])),
+        );
+        let result: Value = parse_success_result(rpc.handle_request_sync(req));
+        assert_eq!(result["value"]["data"], expected_data);
+
+        // getMultipleSubaccounts: mix one existing + one missing pubkey. The
+        // response must preserve order and report `null` for the missing slot.
+        let missing_pubkey = Pubkey::new_unique();
+        let req = create_test_request(
+            "getMultipleSubaccounts",
+            Some(json!([
+                [owner_pubkey.to_string(), missing_pubkey.to_string()],
+                {"encoding": "base64"},
+            ])),
+        );
+        let result: Value = parse_success_result(rpc.handle_request_sync(req));
+        let arr = result["value"]
+            .as_array()
+            .expect("getMultipleSubaccounts must return an array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["data"], expected_data);
+        assert_eq!(arr[1], Value::Null);
+    }
+
     #[test]
     fn test_encode_account_does_not_throw_when_slice_larger_than_account() {
         let data = vec![42; 5];

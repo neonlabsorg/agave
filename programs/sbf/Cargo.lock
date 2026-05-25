@@ -9182,6 +9182,8 @@ name = "solana-sbf-rust-subaccount"
 version = "3.1.13"
 dependencies = [
  "solana-account-info",
+ "solana-cpi",
+ "solana-instruction",
  "solana-program-entrypoint",
  "solana-program-error",
  "solana-pubkey",

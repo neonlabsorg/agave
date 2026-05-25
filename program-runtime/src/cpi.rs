@@ -1169,10 +1169,15 @@ fn consume_compute_meter(invoke_context: &InvokeContext, amount: u64) -> Result<
 /// `sol_load_subaccount` slot, performing the pre-CPI sync (caller's view →
 /// `AccountSharedData`) inline.
 ///
-/// Each occupied slot's `caller_account_view_addr` is interpreted by the
-/// language-specific `do_translate` closure (Rust impls dereference it as
-/// `solana_account_info::AccountInfo`, C impls dereference it as
-/// [`SolAccountInfo`]). The returned `CallerAccount` is verified against
+/// Each occupied slot is decoded according to the ABI recorded at load time
+/// (`slot.account_view_kind` — `Rust` ⇒ `AccountInfo`, `C` ⇒ `SolAccountInfo`),
+/// independently of which CPI syscall is making this call. That way a
+/// program may load a subaccount via `sol_load_subaccount_c` (and stamp a
+/// `SolAccountInfo` at the view buffer) and still invoke the callee via
+/// `sol_invoke_signed_rust` — the slot is decoded as C regardless of the
+/// outer CPI ABI.
+///
+/// The returned `CallerAccount` is verified against
 /// `slot.caller_account_metadata` via `check_account_info_pointer` inside
 /// `from_(sol_)account_info` under `stricter_abi_and_runtime_constraints`.
 ///
@@ -1180,22 +1185,11 @@ fn consume_compute_meter(invoke_context: &InvokeContext, amount: u64) -> Result<
 /// `stricter_abi_and_runtime_constraints`) so the callee always sees the
 /// program's most recent header writes via the slot, mirroring what the
 /// standard CPI machinery does for declared subaccounts under stricter ABI.
-pub fn translate_subaccount_slots<'a, T, F>(
+pub fn translate_subaccount_slots<'a>(
     invoke_context: &mut InvokeContext,
     memory_mapping: &MemoryMapping<'_>,
     check_aligned: bool,
-    do_translate: F,
-) -> Result<Vec<TranslatedAccount<'a>>, Error>
-where
-    F: Fn(
-        &InvokeContext,
-        &MemoryMapping<'_>,
-        bool,
-        u64,
-        &T,
-        &crate::invoke_context::SerializedAccountMetadata,
-    ) -> Result<CallerAccount<'a>, Error>,
-{
+) -> Result<Vec<TranslatedAccount<'a>>, Error> {
     use crate::memory::translate_type;
 
     let slot_infos: Vec<(
@@ -1203,6 +1197,7 @@ where
         crate::invoke_context::SerializedAccountMetadata,
         IndexOfAccount,
         bool,
+        crate::invoke_context::AccountViewKind,
     )> = {
         let syscall_context = invoke_context.get_syscall_context()?;
         syscall_context
@@ -1212,12 +1207,14 @@ where
                 match (
                     s.occupied_subaccount_index,
                     s.caller_account_metadata.as_ref(),
+                    s.account_view_kind,
                 ) {
-                    (Some(idx), Some(meta)) => Some((
+                    (Some(idx), Some(meta), Some(kind)) => Some((
                         s.vm_account_view_addr,
                         meta.clone(),
                         idx,
                         s.is_writable,
+                        kind,
                     )),
                     _ => None,
                 }
@@ -1235,10 +1232,39 @@ where
     let account_data_direct_mapping = invoke_context.get_feature_set().account_data_direct_mapping;
 
     let mut result = Vec::with_capacity(slot_infos.len());
-    for (view_addr, metadata, tx_idx, is_writable) in slot_infos {
-        let view = translate_type::<T>(memory_mapping, view_addr, check_aligned)?;
-        let caller_account =
-            do_translate(invoke_context, memory_mapping, check_aligned, view_addr, view, &metadata)?;
+    for (view_addr, metadata, tx_idx, is_writable, kind) in slot_infos {
+        let caller_account = match kind {
+            crate::invoke_context::AccountViewKind::Rust => {
+                let view = translate_type::<solana_account_info::AccountInfo>(
+                    memory_mapping,
+                    view_addr,
+                    check_aligned,
+                )?;
+                CallerAccount::from_account_info(
+                    invoke_context,
+                    memory_mapping,
+                    check_aligned,
+                    view_addr,
+                    view,
+                    &metadata,
+                )?
+            }
+            crate::invoke_context::AccountViewKind::C => {
+                let view = translate_type::<SolAccountInfo>(
+                    memory_mapping,
+                    view_addr,
+                    check_aligned,
+                )?;
+                CallerAccount::from_sol_account_info(
+                    invoke_context,
+                    memory_mapping,
+                    check_aligned,
+                    view_addr,
+                    view,
+                    &metadata,
+                )?
+            }
+        };
 
         // Pre-CPI: push the caller's view → host AccountSharedData so the
         // callee sees the latest state. Run unconditionally; the standard
