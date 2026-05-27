@@ -3537,6 +3537,79 @@ impl RpcClient {
             })
     }
 
+    /// Returns all information associated with the subaccount of the provided
+    /// owner-facing pubkey.
+    ///
+    /// If the subaccount has no on-chain storage, this method returns an error.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method is built on the [`getSubaccount`] RPC method, which resolves
+    /// the owner-facing subaccount pubkey to its `subaccount_storage_address`
+    /// and returns the stored account (or `None` when no storage exists).
+    ///
+    /// [`getSubaccount`]: getSubaccount
+    pub async fn get_subaccount(&self, pubkey: &Pubkey) -> ClientResult<Account> {
+        self.get_subaccount_with_commitment(pubkey, self.commitment())
+            .await?
+            .value
+            .ok_or_else(|| RpcError::ForUser(format!("SubaccountNotFound: pubkey={pubkey}")).into())
+    }
+
+    /// Returns all information associated with the subaccount of the provided
+    /// owner-facing pubkey.
+    ///
+    /// If the subaccount has no on-chain storage, this method returns
+    /// `Ok(None)`.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method is built on the [`getSubaccount`] RPC method.
+    ///
+    /// [`getSubaccount`]: getSubaccount
+    pub async fn get_subaccount_with_commitment(
+        &self,
+        pubkey: &Pubkey,
+        commitment_config: CommitmentConfig,
+    ) -> RpcResult<Option<Account>> {
+        let config = RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64Zstd),
+            commitment: Some(commitment_config),
+            data_slice: None,
+            min_context_slot: None,
+        };
+
+        let response = self
+            .send(
+                RpcRequest::GetSubaccount,
+                json!([pubkey.to_string(), config]),
+            )
+            .await;
+
+        response
+            .map(|result_json: Value| {
+                if result_json.is_null() {
+                    return Err(
+                        RpcError::ForUser(format!("SubaccountNotFound: pubkey={pubkey}")).into(),
+                    );
+                }
+                let Response {
+                    context,
+                    value: ui_account,
+                } = serde_json::from_value::<Response<Option<UiAccount>>>(result_json)?;
+                trace!("Response subaccount {pubkey:?} {ui_account:?}");
+                Ok(Response {
+                    context,
+                    value: ui_account.and_then(|ui_account| ui_account.decode()),
+                })
+            })
+            .map_err(|err| {
+                Into::<ClientError>::into(RpcError::ForUser(format!(
+                    "SubaccountNotFound: pubkey={pubkey}: {err}"
+                )))
+            })?
+    }
+
     #[deprecated(
         note = "Use `get_ui_account_with_config()` instead. This function will be removed in a \
                 future version of `solana_rpc_client`."
