@@ -1207,7 +1207,7 @@ impl ConsumeWorkerMetrics {
         self.timing_metrics
             .load_check_us
             .fetch_add(
-                execute_timings.metrics.index(ExecuteTimingType::CheckUs).0, 
+                execute_timings.metrics.index(ExecuteTimingType::CheckUs).0,
                 Ordering::Relaxed,
             );
 
@@ -1335,7 +1335,6 @@ impl ConsumeWorkerMetrics {
             execute_timings.metrics.index(ExecuteTimingType::UpdateTransactionStatuses).0,
             Ordering::Relaxed,
         );
-        
     }
 
     fn update_on_error_counters(

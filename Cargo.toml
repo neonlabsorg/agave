@@ -51,7 +51,7 @@ members = [
     "merkle-tree",
     "metrics",
     "net-utils",
-    "notifier",
+    "notifier", "parasol-scheduler",
     "perf",
     "platform-tools-sdk/cargo-build-sbf",
     "platform-tools-sdk/cargo-test-sbf",

@@ -538,6 +538,13 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                 .help("Enable the faucet on this port"),
         )
         .arg(
+            Arg::with_name("scheduler_bind")
+                .long("scheduler-bind")
+                .value_name("PATH")
+                .takes_value(true)
+                .help("path to unix socket to listen on")
+        )
+        .arg(
             Arg::with_name("rpc_port")
                 .long("rpc-port")
                 .value_name("PORT")
