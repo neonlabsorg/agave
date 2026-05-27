@@ -2,8 +2,8 @@
 use qualifier_attr::qualifiers;
 use {
     crate::{
-        subaccount_storage_address, vm_slice::VmSlice, IndexOfAccount,
-        MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION, MAX_ACCOUNT_DATA_LEN, SUBACCOUNT_MARKER,
+        vm_slice::VmSlice, IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION,
+        MAX_ACCOUNT_DATA_LEN, SUBACCOUNT_MARKER,
     },
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_instruction::error::InstructionError,
@@ -707,14 +707,16 @@ impl TransactionAccounts {
                 )
             })
             .collect();
-        // F10 W10: drain the subaccount lane and append entries to the main
-        // accounts vec under the *storage* address (`hashv(&[&[1u8], pda])`).
-        // Without this, subaccount data created by `sol_create_subaccount`
-        // is silently dropped at tx commit and accounts-db never receives
-        // any state — the next transaction's `get_account_shared_data` then
-        // returns `None` and downstream programs see empty payloads.
-        // Mirrors the parasol-dev `From<TransactionContext> for ExecutionRecord`
-        // contract.
+        // F10 W10 / PRS-314: drain the subaccount lane and append entries to
+        // the main accounts vec keyed by the **owner-facing** pubkey (i.e.
+        // the address `sol_create_subaccount` / `sol_load_subaccount` returns
+        // to the program). Consumers that need accounts-db addressing —
+        // `account_saver::collect_accounts_to_store` and
+        // `AccountLoader::update_accounts_for_successful_tx` — apply
+        // `subaccount_storage_address` at the boundary themselves. Keeping
+        // owner pubkeys in the lane lets the balance collector report them
+        // verbatim in the transaction recipe without a parallel owner-keys
+        // channel.
         let sub_shared = std::mem::take(&mut *self.subaccount_shared_fields.borrow_mut());
         let sub_private = std::mem::take(&mut *self.subaccount_private_fields.borrow_mut());
         let sub_touched = std::mem::take(&mut *self.touched_subaccounts.borrow_mut());
@@ -735,9 +737,8 @@ impl TransactionAccounts {
             }
             let shared = (*shared_box).into_inner();
             let private = (*private_box).into_inner();
-            let storage_address = subaccount_storage_address(&shared.key);
             accounts.push((
-                storage_address,
+                shared.key,
                 AccountSharedData::create_from_existing_shared_data(
                     shared.lamports,
                     private.payload,
@@ -1259,10 +1260,6 @@ mod tests {
             "dynamic_accounts_lamports_sum must reflect added subaccount lamports",
         );
 
-        let derived_storage = Pubkey::new_from_array(
-            solana_sha256_hasher::hashv(&[&[1u8], subaccount_pda.as_ref()]).to_bytes(),
-        );
-
         let (accounts, _touched, _resize) = tx_accounts.take();
         assert_eq!(
             accounts.len(),
@@ -1272,10 +1269,10 @@ mod tests {
         let (main_key, _) = accounts.first().unwrap();
         assert_eq!(*main_key, main_pubkey, "main account preserved");
         let (sub_key, sub_account) = accounts.get(1).unwrap();
-        assert_eq!(
-            *sub_key, derived_storage,
-            "subaccount mapped to storage address"
-        );
+        // PRS-314: the subaccount lane carries the owner-facing pubkey;
+        // `subaccount_storage_address` is applied later at the accounts-db
+        // / loader-cache boundary.
+        assert_eq!(*sub_key, subaccount_pda, "subaccount keyed by owner pubkey");
         assert_eq!(sub_account.lamports(), 1_000);
         assert_eq!(sub_account.data(), subaccount.data());
         assert_eq!(sub_account.owner(), &owner);

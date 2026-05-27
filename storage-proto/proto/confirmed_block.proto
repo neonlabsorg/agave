@@ -67,6 +67,13 @@ message TransactionStatusMeta {
     optional uint64 compute_units_consumed = 16;
     // Total transaction cost
     optional uint64 cost_units = 17;
+
+    // F10/PRS-314: owner-facing pubkeys of subaccounts touched by this
+    // transaction, in the same order as the tail of `pre_balances`/
+    // `post_balances` (positions [account_keys.len()..)). Empty for
+    // transactions that don't use subaccounts. Always-empty for txs
+    // committed by older nodes (proto3 default).
+    repeated bytes subaccount_addresses = 18;
 }
 
 message TransactionError {

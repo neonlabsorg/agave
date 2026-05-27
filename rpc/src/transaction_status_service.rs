@@ -138,6 +138,7 @@ impl TransactionStatusService {
                     token_balances,
                     costs,
                     transaction_indexes,
+                    subaccount_keys,
                 },
                 work_id,
             )) => {
@@ -156,6 +157,7 @@ impl TransactionStatusService {
                     post_token_balances,
                     cost,
                     transaction_index,
+                    subaccount_addresses,
                 ) in izip!(
                     transactions,
                     commit_results,
@@ -165,6 +167,7 @@ impl TransactionStatusService {
                     token_balances.post_token_balances,
                     costs,
                     transaction_indexes,
+                    subaccount_keys,
                 ) {
                     let Ok(committed_tx) = commit_result else {
                         continue;
@@ -203,6 +206,7 @@ impl TransactionStatusService {
                         return_data,
                         compute_units_consumed: Some(executed_units),
                         cost_units: cost,
+                        subaccount_addresses,
                     };
 
                     if let Some(transaction_notifier) = transaction_notifier.as_ref() {
@@ -515,6 +519,7 @@ pub(crate) mod tests {
             token_balances,
             costs: vec![Some(123)],
             transaction_indexes: vec![transaction_index],
+            subaccount_keys: vec![vec![]],
         };
 
         let test_notifier = Arc::new(TestTransactionNotifier::new());
@@ -623,6 +628,7 @@ pub(crate) mod tests {
             token_balances,
             costs: vec![Some(123), Some(456)],
             transaction_indexes: vec![transaction_index1, transaction_index2],
+            subaccount_keys: vec![vec![], vec![]],
         };
 
         let test_notifier = Arc::new(TestTransactionNotifier::new());

@@ -3594,8 +3594,13 @@ mod balance_collector {
                 .enable_transaction_balance_recording = true;
 
             let batch_output = env.execute();
-            let (pre_lamport_vecs, post_lamport_vecs, pre_token_vecs, post_token_vecs) =
-                batch_output.balance_collector.unwrap().into_vecs();
+            let (
+                pre_lamport_vecs,
+                post_lamport_vecs,
+                pre_token_vecs,
+                post_token_vecs,
+                _subaccount_keys,
+            ) = batch_output.balance_collector.unwrap().into_vecs();
 
             // first test the fee-payer balances
             let mut running_fee_payer_balance = STARTING_BALANCE;

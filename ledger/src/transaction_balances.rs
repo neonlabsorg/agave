@@ -2,6 +2,7 @@ use {
     solana_account_decoder::{
         parse_account_data::SplTokenAdditionalDataV2, parse_token::token_amount_to_ui_amount_v3,
     },
+    solana_pubkey::Pubkey,
     solana_runtime::bank::TransactionBalancesSet,
     solana_svm::transaction_balances::{BalanceCollector, SvmTokenInfo},
     solana_transaction_status::{
@@ -9,11 +10,16 @@ use {
     },
 };
 
-// decompose the contents of BalanceCollector into the two structs required by TransactionStatusSender
+// decompose the contents of BalanceCollector into the structs required by TransactionStatusSender
 pub fn compile_collected_balances(
     balance_collector: BalanceCollector,
-) -> (TransactionBalancesSet, TransactionTokenBalancesSet) {
-    let (native_pre, native_post, token_pre, token_post) = balance_collector.into_vecs();
+) -> (
+    TransactionBalancesSet,
+    TransactionTokenBalancesSet,
+    Vec<Vec<Pubkey>>,
+) {
+    let (native_pre, native_post, token_pre, token_post, subaccount_keys) =
+        balance_collector.into_vecs();
 
     let native_balances = TransactionBalancesSet::new(native_pre, native_post);
     let token_balances = TransactionTokenBalancesSet::new(
@@ -21,7 +27,7 @@ pub fn compile_collected_balances(
         collected_token_infos_to_token_balances(token_post),
     );
 
-    (native_balances, token_balances)
+    (native_balances, token_balances, subaccount_keys)
 }
 
 fn collected_token_infos_to_token_balances(
@@ -142,9 +148,11 @@ mod tests {
             native_post,
             token_pre,
             token_post,
+            subaccount_keys: vec![vec![], vec![]],
         };
 
-        let (actual_native, actual_token) = compile_collected_balances(balance_collector);
+        let (actual_native, actual_token, actual_subaccount_keys) =
+            compile_collected_balances(balance_collector);
 
         assert_eq!(expected_native.pre_balances, actual_native.pre_balances);
         assert_eq!(expected_native.post_balances, actual_native.post_balances);
@@ -156,6 +164,10 @@ mod tests {
         assert_eq!(
             expected_token.post_token_balances,
             actual_token.post_token_balances
+        );
+        assert_eq!(
+            actual_subaccount_keys,
+            vec![Vec::<Pubkey>::new(), Vec::<Pubkey>::new()]
         );
     }
 }

@@ -14,6 +14,7 @@ use {
         StringAmount,
     },
     solana_message::v0::LoadedAddresses,
+    solana_pubkey::Pubkey,
     solana_serde::default_on_eof,
     solana_transaction_context::TransactionReturnData,
     solana_transaction_error::{TransactionError, TransactionResult as Result},
@@ -205,6 +206,10 @@ pub struct StoredTransactionStatusMeta {
     pub compute_units_consumed: Option<u64>,
     #[serde(deserialize_with = "default_on_eof")]
     pub cost_units: Option<u64>,
+    // F10/PRS-314: appended in a backward-compatible way via default_on_eof;
+    // old bincode blobs deserialize this as an empty Vec.
+    #[serde(default, deserialize_with = "default_on_eof")]
+    pub subaccount_addresses: Vec<Pubkey>,
 }
 
 impl From<StoredTransactionStatusMeta> for TransactionStatusMeta {
@@ -222,6 +227,7 @@ impl From<StoredTransactionStatusMeta> for TransactionStatusMeta {
             return_data,
             compute_units_consumed,
             cost_units,
+            subaccount_addresses,
         } = value;
         Self {
             status,
@@ -240,6 +246,7 @@ impl From<StoredTransactionStatusMeta> for TransactionStatusMeta {
             return_data,
             compute_units_consumed,
             cost_units,
+            subaccount_addresses,
         }
     }
 }
@@ -261,6 +268,7 @@ impl TryFrom<TransactionStatusMeta> for StoredTransactionStatusMeta {
             return_data,
             compute_units_consumed,
             cost_units,
+            subaccount_addresses,
         } = value;
 
         if !loaded_addresses.is_empty() {
@@ -287,6 +295,7 @@ impl TryFrom<TransactionStatusMeta> for StoredTransactionStatusMeta {
             return_data,
             compute_units_consumed,
             cost_units,
+            subaccount_addresses,
         })
     }
 }

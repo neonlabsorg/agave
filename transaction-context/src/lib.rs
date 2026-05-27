@@ -1181,6 +1181,11 @@ impl BorrowedInstructionAccount<'_, '_> {
 /// Everything that needs to be recorded from a TransactionContext after execution
 #[cfg(not(target_os = "solana"))]
 pub struct ExecutionRecord {
+    /// Account values after execution. Indices `[0..main_account_count)`
+    /// correspond to the transaction's message account keys; the tail
+    /// `[main_account_count..)` is the subaccount lane, keyed by the
+    /// **owner-facing** pubkey. `subaccount_storage_address` is applied
+    /// only at the accounts-db / loader-cache boundary.
     pub accounts: Vec<KeyedAccountSharedData>,
     pub return_data: TransactionReturnData,
     pub touched_account_count: u64,

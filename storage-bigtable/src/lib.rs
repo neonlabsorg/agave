@@ -264,6 +264,7 @@ impl From<StoredConfirmedBlockTransactionStatusMeta> for TransactionStatusMeta {
             return_data: None,
             compute_units_consumed: None,
             cost_units: None,
+            subaccount_addresses: vec![],
         }
     }
 }

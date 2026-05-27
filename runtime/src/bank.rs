@@ -3194,8 +3194,13 @@ impl Bank {
         let (pre_balances, post_balances, pre_token_balances, post_token_balances) =
             match balance_collector {
                 Some(balance_collector) => {
-                    let (mut native_pre, mut native_post, mut token_pre, mut token_post) =
-                        balance_collector.into_vecs();
+                    let (
+                        mut native_pre,
+                        mut native_post,
+                        mut token_pre,
+                        mut token_post,
+                        _subaccount_keys,
+                    ) = balance_collector.into_vecs();
 
                     (
                         native_pre.pop(),

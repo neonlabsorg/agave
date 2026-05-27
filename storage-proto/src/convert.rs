@@ -422,6 +422,7 @@ impl From<TransactionStatusMeta> for generated::TransactionStatusMeta {
             return_data,
             compute_units_consumed,
             cost_units,
+            subaccount_addresses,
         } = value;
         let err = match status {
             Ok(()) => None,
@@ -464,6 +465,10 @@ impl From<TransactionStatusMeta> for generated::TransactionStatusMeta {
             .collect();
         let return_data_none = return_data.is_none();
         let return_data = return_data.map(|return_data| return_data.into());
+        let subaccount_addresses = subaccount_addresses
+            .into_iter()
+            .map(|key| <Pubkey as AsRef<[u8]>>::as_ref(&key).into())
+            .collect();
 
         Self {
             err,
@@ -483,6 +488,7 @@ impl From<TransactionStatusMeta> for generated::TransactionStatusMeta {
             return_data_none,
             compute_units_consumed,
             cost_units,
+            subaccount_addresses,
         }
     }
 }
@@ -516,6 +522,7 @@ impl TryFrom<generated::TransactionStatusMeta> for TransactionStatusMeta {
             return_data_none,
             compute_units_consumed,
             cost_units,
+            subaccount_addresses,
         } = value;
         let status = match &err {
             None => Ok(()),
@@ -572,6 +579,14 @@ impl TryFrom<generated::TransactionStatusMeta> for TransactionStatusMeta {
         } else {
             return_data.map(|return_data| return_data.into())
         };
+        let subaccount_addresses = subaccount_addresses
+            .into_iter()
+            .map(Pubkey::try_from)
+            .collect::<Result<_, _>>()
+            .map_err(|err| {
+                let err = format!("Invalid subaccount address: {err:?}");
+                Self::Error::new(bincode::ErrorKind::Custom(err))
+            })?;
         Ok(Self {
             status,
             fee,
@@ -586,6 +601,7 @@ impl TryFrom<generated::TransactionStatusMeta> for TransactionStatusMeta {
             return_data,
             compute_units_consumed,
             cost_units,
+            subaccount_addresses,
         })
     }
 }

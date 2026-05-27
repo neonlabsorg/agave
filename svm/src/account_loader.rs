@@ -35,7 +35,9 @@ use {
     solana_svm_callback::{AccountState, TransactionProcessingCallback},
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_transaction::svm_message::SVMMessage,
-    solana_transaction_context::{transaction_accounts::KeyedAccountSharedData, IndexOfAccount},
+    solana_transaction_context::{
+        subaccount_storage_address, transaction_accounts::KeyedAccountSharedData, IndexOfAccount,
+    },
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::num::{NonZeroU32, Saturating},
 };
@@ -153,6 +155,13 @@ pub(crate) struct LoadedTransactionAccount {
     field_qualifiers(program_indices(pub), compute_budget(pub))
 )]
 pub struct LoadedTransaction {
+    /// Account values for the transaction. Indices
+    /// `[0..message.account_keys().len())` correspond to the message account
+    /// keys; the tail `[message.account_keys().len()..)` is the subaccount
+    /// lane, keyed by the **owner-facing** pubkey. The accounts-db storage
+    /// address (`subaccount_storage_address(owner)`) is applied at the
+    /// commit boundary by `account_saver::collect_accounts_to_store` and
+    /// matched on lookup by `AccountLoader::update_accounts_for_successful_tx`.
     pub accounts: Vec<KeyedAccountSharedData>,
     pub(crate) program_indices: Vec<IndexOfAccount>,
     pub fee_details: FeeDetails,
@@ -344,14 +353,22 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
 
             self.loaded_accounts.insert(*address, account.clone());
         }
-        for (address, account) in transaction_accounts
+        // F10/PRS-314: subaccount tail is keyed by the owner-facing pubkey;
+        // accounts-db addresses subaccounts by
+        // `subaccount_storage_address(owner)`, so apply the transform here at
+        // the cache-write boundary so subsequent
+        // `load_account(&storage_address(owner))` calls hit post-execution
+        // state.
+        for (owner_address, account) in transaction_accounts
             .iter()
             .skip(message.account_keys().len())
         {
-            self.loaded_accounts.insert(*address, account.clone());
+            self.loaded_accounts.insert(
+                subaccount_storage_address(owner_address),
+                account.clone(),
+            );
         }
     }
-
 }
 
 // Program loaders and parsers require a type that impls TransactionProcessingCallback,

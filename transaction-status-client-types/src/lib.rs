@@ -26,6 +26,7 @@ use {
         v0::{LoadedAddresses, MessageAddressTableLookup},
         MessageHeader,
     },
+    solana_pubkey::Pubkey,
     solana_reward_info::RewardType,
     solana_signature::Signature,
     solana_transaction::versioned::{TransactionVersion, VersionedTransaction},
@@ -380,10 +381,25 @@ pub struct UiTransactionStatusMeta {
         skip_serializing_if = "OptionSerializer::should_skip"
     )]
     pub cost_units: OptionSerializer<u64>,
+    #[serde(
+        default = "OptionSerializer::skip",
+        skip_serializing_if = "OptionSerializer::should_skip"
+    )]
+    pub subaccount_addresses: OptionSerializer<Vec<String>>,
 }
 
 impl From<TransactionStatusMeta> for UiTransactionStatusMeta {
     fn from(meta: TransactionStatusMeta) -> Self {
+        let subaccount_addresses = if meta.subaccount_addresses.is_empty() {
+            OptionSerializer::Skip
+        } else {
+            OptionSerializer::Some(
+                meta.subaccount_addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            )
+        };
         Self {
             err: meta.status.clone().map_err(Into::into).err(),
             status: meta.status.map_err(Into::into),
@@ -410,6 +426,7 @@ impl From<TransactionStatusMeta> for UiTransactionStatusMeta {
             ),
             compute_units_consumed: OptionSerializer::or_skip(meta.compute_units_consumed),
             cost_units: OptionSerializer::or_skip(meta.cost_units),
+            subaccount_addresses,
         }
     }
 }
@@ -654,6 +671,11 @@ pub struct TransactionStatusMeta {
     pub return_data: Option<TransactionReturnData>,
     pub compute_units_consumed: Option<u64>,
     pub cost_units: Option<u64>,
+    /// F10/PRS-314: owner-facing pubkeys of subaccounts touched by this
+    /// transaction, in the order they appear in the tail of
+    /// `pre_balances`/`post_balances` (positions `[account_keys.len()..)`).
+    /// Empty for transactions that don't use subaccounts.
+    pub subaccount_addresses: Vec<Pubkey>,
 }
 
 impl Default for TransactionStatusMeta {
@@ -672,6 +694,7 @@ impl Default for TransactionStatusMeta {
             return_data: None,
             compute_units_consumed: None,
             cost_units: None,
+            subaccount_addresses: vec![],
         }
     }
 }

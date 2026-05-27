@@ -283,7 +283,7 @@ pub fn execute_batch<'a>(
         // Therefore this should always be true.
         debug_assert!(balance_collector.is_some());
 
-        let (balances, token_balances) =
+        let (balances, token_balances, subaccount_keys) =
             compile_collected_balances(balance_collector.unwrap_or_default());
 
         // The length of costs vector needs to be consistent with all other
@@ -302,6 +302,7 @@ pub fn execute_batch<'a>(
             token_balances,
             tx_costs,
             transaction_indexes.into_owned(),
+            subaccount_keys,
         );
     }
 
@@ -2269,6 +2270,11 @@ pub struct TransactionStatusBatch {
     pub token_balances: TransactionTokenBalancesSet,
     pub costs: Vec<Option<u64>>,
     pub transaction_indexes: Vec<usize>,
+    // F10/PRS-314: per-tx owner-facing pubkeys of subaccounts touched, aligned
+    // with the tail of `balances.pre_balances`/`balances.post_balances`
+    // (positions [account_keys.len()..)). Empty inner Vec for txs without
+    // subaccount activity.
+    pub subaccount_keys: Vec<Vec<Pubkey>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2287,6 +2293,7 @@ impl TransactionStatusSender {
         token_balances: TransactionTokenBalancesSet,
         costs: Vec<Option<u64>>,
         transaction_indexes: Vec<usize>,
+        subaccount_keys: Vec<Vec<Pubkey>>,
     ) {
         let work_sequence = self
             .dependency_tracker
@@ -2302,6 +2309,7 @@ impl TransactionStatusSender {
                 token_balances,
                 costs,
                 transaction_indexes,
+                subaccount_keys,
             },
             work_sequence,
         ))) {

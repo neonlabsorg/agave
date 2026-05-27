@@ -521,6 +521,26 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                         config,
                     );
 
+                    // F10/PRS-314: capture subaccount pre-balances **before**
+                    // `update_accounts_for_executed_tx` populates the loader
+                    // cache with post-execution state. The lane lives at
+                    // `loaded_transaction.accounts[account_keys.len()..]` and
+                    // is keyed by the owner-facing pubkey;
+                    // `subaccount_storage_address` is applied inside the
+                    // balance collector when reading pre-state from the
+                    // loader cache. Failed executions roll back subaccount
+                    // changes, so we skip the capture there.
+                    if executed_tx.was_successful() {
+                        let head = tx.account_keys().len();
+                        let lane = executed_tx
+                            .loaded_transaction
+                            .accounts
+                            .get(head..)
+                            .unwrap_or(&[]);
+                        balance_collector
+                            .collect_subaccount_pre_balances(&mut account_loader, lane);
+                    }
+
                     // Update loaded accounts cache with account states which might have changed.
                     // Also update local program cache with modifications made by the transaction,
                     // if it executed successfully.
@@ -535,8 +555,28 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             });
             execution_us = execution_us.saturating_add(single_execution_us);
 
-            let ((), collect_balances_us) =
-                measure_us!(balance_collector.collect_post_balances(&mut account_loader, tx));
+            // F10/PRS-314: the subaccount lane lives in
+            // `loaded_transaction.accounts[account_keys.len()..]` after a
+            // successful execution; we expose that slice to the balance
+            // collector so it can extend pre/post-balance vectors with the
+            // subaccounts the program actually touched. For
+            // failed/non-executed transactions, subaccount changes are rolled
+            // back, so we pass an empty slice.
+            let subaccount_lane: &[_] = match &processing_result {
+                Ok(ProcessedTransaction::Executed(executed_tx))
+                    if executed_tx.was_successful() =>
+                {
+                    let head = tx.account_keys().len();
+                    executed_tx
+                        .loaded_transaction
+                        .accounts
+                        .get(head..)
+                        .unwrap_or(&[])
+                }
+                _ => &[],
+            };
+            let ((), collect_balances_us) = measure_us!(balance_collector
+                .collect_post_balances(&mut account_loader, tx, subaccount_lane));
             execute_timings
                 .saturating_add_in_place(ExecuteTimingType::CollectBalancesUs, collect_balances_us);
 
