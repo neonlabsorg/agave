@@ -185,37 +185,63 @@ pub struct SyscallContext {
     pub trace_log: Vec<[u64; 12]>,
 }
 
+/// Source-language ABI of the account-view bytes a program writes into a
+/// subaccount slot's reserved view buffer. Captured by the `sol_load_subaccount_*`
+/// syscalls so the runtime can dispatch the CPI sync path to the matching
+/// `CallerAccount::from_*` decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountViewKind {
+    /// Rust SDK `solana_account_info::AccountInfo<'_>` layout.
+    Rust,
+    /// C ABI `SolAccountInfo` layout (mirrors `solana_program_runtime::cpi::SolAccountInfo`).
+    C,
+}
+
 /// Per-slot bookkeeping for a `sol_load_subaccount` reservation.
 ///
 /// At VM creation `serialize_parameters_aligned` reserves
 /// [`MAX_SUBACCOUNT_SLOTS`] slots, each backed by **two** memory regions:
-/// a fixed-size header region (88 bytes, holding NON_DUP_MARKER + flags +
-/// key/owner/lamports/data_len) and a placeholder data region whose VM
-/// address is stable across the VM's lifetime but whose host-side backing
-/// is empty until `sol_load_subaccount` swaps it for one pointing at the
-/// loaded subaccount's `AccountSharedData` storage (direct mapping).
+/// a writable region containing a runtime-owned account-view buffer
+/// (`SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE` bytes for an `AccountInfo` /
+/// `SolAccountInfo`) followed by the fixed-size 88-byte header
+/// (NON_DUP_MARKER + flags + key/owner/lamports/data_len), and a placeholder
+/// data region whose VM address is stable across the VM's lifetime but
+/// whose host-side backing is empty until `sol_load_subaccount` swaps it
+/// for one pointing at the loaded subaccount's `AccountSharedData` storage
+/// (direct mapping).
 ///
-/// The syscall also accepts a caller-supplied `SolAccountInfo` pointer
-/// (`caller_account_view_addr`), fills it to point at the slot's regions,
-/// and stamps `caller_account_metadata` with the VM addresses of the
-/// individual fields — the same metadata layout the CPI sync path uses to
-/// flow state changes back to the program's view after a CPI returns.
+/// `sol_load_subaccount` returns the view buffer address through an
+/// out-pointer; the program writes its `AccountInfo` / `SolAccountInfo`
+/// there and the runtime stamps `caller_account_metadata` with the VM
+/// addresses of the individual fields — the same metadata layout the CPI
+/// sync path uses to flow state changes back to the program's view after a
+/// CPI returns.
 #[derive(Debug, Clone)]
 pub struct SubaccountSlot {
     pub buffer_position: usize,
+    /// Stable VM address of the slot's runtime-owned account-view buffer.
+    /// `sol_load_subaccount` returns this address to the program through an
+    /// out-pointer; the program writes its `AccountInfo` / `SolAccountInfo`
+    /// view here.
+    pub vm_account_view_addr: u64,
     /// Stable VM address of the slot's 88-byte header region.
     pub vm_header_addr: u64,
     /// Stable VM address of the slot's data region. Points at an empty
     /// readonly placeholder until `sol_load_subaccount` replaces it with a
     /// region backed by the on-chain `AccountSharedData`.
     pub vm_data_addr: u64,
-    /// Caller-supplied `SolAccountInfo` pointer captured by `load_subaccount`.
-    /// Zero when the slot is empty.
-    pub caller_account_view_addr: u64,
-    /// Field-pointer metadata for the caller's account view. Populated
-    /// alongside `caller_account_view_addr` so CPI sync (and end-of-
-    /// instruction flush) can locate lamports/owner/data fields in VM memory.
+    /// Field-pointer metadata for the slot's account view. Populated when
+    /// the slot is loaded so CPI sync (and end-of-instruction flush) can
+    /// locate lamports/owner/data fields in VM memory.
     pub caller_account_metadata: Option<SerializedAccountMetadata>,
+    /// Source-language ABI of the bytes the program wrote into the view
+    /// buffer at `vm_account_view_addr`. `Some(Rust)` when
+    /// `sol_load_subaccount_rust` loaded the slot, `Some(C)` when
+    /// `sol_load_subaccount_c` loaded it, and `None` when the slot is empty.
+    /// CPI sync uses this to dispatch between
+    /// [`crate::cpi::CallerAccount::from_account_info`] and
+    /// [`crate::cpi::CallerAccount::from_sol_account_info`].
+    pub account_view_kind: Option<AccountViewKind>,
     /// `Some(index)` once the slot is occupied, naming the subaccount index
     /// inside `TransactionAccounts` whose state the slot mirrors.
     pub occupied_subaccount_index: Option<IndexOfAccount>,
@@ -739,10 +765,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
     /// `TransactionProcessingCallback` carried by `EnvironmentConfig`. Used
     /// by subaccount syscalls to materialize pre-existing on-chain state for
     /// addresses that are not part of the transaction's main account list.
-    pub fn get_account_shared_data(
-        &self,
-        pubkey: &Pubkey,
-    ) -> Option<(AccountSharedData, Slot)> {
+    pub fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
         self.environment_config
             .transaction_processing_callback
             .get_account_shared_data(pubkey)

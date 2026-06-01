@@ -2,7 +2,6 @@
 
 use {
     crate::invoke_context::{SerializedAccountMetadata, SubaccountSlot},
-    solana_account::{ReadableAccount, WritableAccount},
     solana_instruction::error::InstructionError,
     solana_program_entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER},
     solana_pubkey::Pubkey,
@@ -14,8 +13,8 @@ use {
     solana_sdk_ids::bpf_loader_deprecated,
     solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
     solana_transaction_context::{
-        BorrowedInstructionAccount, IndexOfAccount, InstructionContext,
-        TransactionContext, MAX_ACCOUNTS_PER_INSTRUCTION,
+        BorrowedInstructionAccount, IndexOfAccount, InstructionContext, TransactionContext,
+        MAX_ACCOUNTS_PER_INSTRUCTION,
     },
     std::mem::{self, size_of},
 };
@@ -31,6 +30,12 @@ pub const MAX_SUBACCOUNT_SLOTS: usize = 16;
 ///   NON_DUP_MARKER (1) + is_signer (1) + is_writable (1) + executable (1) +
 ///   padding (4) + key (32) + owner (32) + lamports (8) + data_len (8).
 pub const SUBACCOUNT_SLOT_HEADER_SIZE: usize = 88;
+
+/// F10: bytes reserved at the start of each subaccount slot for the program's
+/// account-view buffer. Canonically defined in the SDK (`solana-program-subaccount`)
+/// alongside the `load_subaccount` writer that the reservation must accommodate;
+/// re-exported here for the serialization layer.
+pub use solana_program_subaccount::SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE;
 
 /// F10: VM address space reserved per slot's data region. The slot's data
 /// region starts as an empty readonly placeholder; `sol_load_subaccount`
@@ -390,24 +395,21 @@ pub fn flush_subaccount_slots(
                 .try_into()
                 .map_err(|_| InstructionError::InvalidArgument)?,
         ) as usize;
-        if data_len > MAX_PERMITTED_DATA_LENGTH as usize {
-            return Err(InstructionError::InvalidRealloc);
-        }
-        let mut borrowed = transaction_context
-            .accounts()
-            .try_borrow_mut_subaccount(subaccount_index)?;
-        if borrowed.lamports() != lamports {
-            borrowed.set_lamports(lamports);
+        let instruction_context = transaction_context.get_current_instruction_context()?;
+        let mut borrowed = instruction_context
+            .try_borrow_subaccount_by_tx_index(subaccount_index, slot.is_writable)?;
+        if borrowed.get_lamports() != lamports {
+            borrowed.set_lamports(lamports)?;
         }
         // Data was direct-mapped, so any in-place mutation already lives in
         // `AccountSharedData`; only resize is required if the program changed
         // data_len through the header.
-        if borrowed.data().len() != data_len {
-            borrowed.resize(data_len, 0);
+        if borrowed.get_data().len() != data_len {
+            borrowed.set_data_length(data_len)?;
         }
         let owner_pubkey = Pubkey::new_from_array(owner_bytes);
-        if *borrowed.owner() != owner_pubkey {
-            borrowed.set_owner(owner_pubkey);
+        if *borrowed.get_owner() != owner_pubkey {
+            borrowed.set_owner(&owner_bytes)?;
         }
     }
     Ok(())
@@ -637,13 +639,19 @@ fn serialize_parameters_aligned(
     // boundary, matching parasol-dev PRS-153 layout.
     + (instruction_data.len() as *const u8).align_offset(BPF_ALIGN_OF_U128);
 
-    // F10: per slot, reserve `SUBACCOUNT_SLOT_HEADER_SIZE` bytes inside the
-    // input buffer for the slot's header region. The data region is set up
-    // outside the input buffer as an empty readonly placeholder whose VM
-    // address `sol_load_subaccount` later replaces with one backed by the
-    // loaded subaccount's `AccountSharedData` storage (direct mapping — no
-    // input-buffer space is reserved for the data, only VM address space).
-    size += MAX_SUBACCOUNT_SLOTS.saturating_mul(SUBACCOUNT_SLOT_HEADER_SIZE);
+    // F10: per slot, reserve a runtime-owned account-view buffer
+    // (`SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE` bytes) followed by the
+    // 88-byte header region. `sol_load_subaccount` returns the view buffer
+    // address to the program through an out-pointer, so the program does not
+    // need to allocate its own `AccountInfo` / `SolAccountInfo` storage. The
+    // data region is set up outside the input buffer as an empty readonly
+    // placeholder whose VM address `sol_load_subaccount` later replaces with
+    // one backed by the loaded subaccount's `AccountSharedData` storage
+    // (direct mapping — no input-buffer space is reserved for the data, only
+    // VM address space).
+    size += MAX_SUBACCOUNT_SLOTS.saturating_mul(
+        SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE.saturating_add(SUBACCOUNT_SLOT_HEADER_SIZE),
+    );
 
     let mut s = Serializer::new(
         size,
@@ -701,7 +709,11 @@ fn serialize_parameters_aligned(
 
     // F10: reserve `MAX_SUBACCOUNT_SLOTS` slots after the existing-subaccount
     // region. Each slot consists of two memory regions:
-    //   1. an 88-byte writable header region inside the input buffer
+    //   1. a writable region inside the input buffer containing the
+    //      runtime-owned account-view buffer
+    //      (`SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE` bytes, used by the program
+    //      as either `AccountInfo` or `SolAccountInfo`) immediately followed
+    //      by the 88-byte serialized slot header
     //      (NON_DUP_MARKER + flags + key + owner + lamports + data_len),
     //   2. an empty readonly placeholder data region whose VM address is
     //      reserved with `SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES` so a later
@@ -712,11 +724,18 @@ fn serialize_parameters_aligned(
     // loop (which iterates only `instruction_subaccounts`).
     //
     // After the previous loop, `s` may have unflushed bytes from real
-    // subaccount records — close that region first so each slot header lives
-    // in its own region.
+    // subaccount records — close that region first so each slot's
+    // view-buffer + header pair lives in its own region.
     s.push_region();
     let mut subaccount_slots: Vec<SubaccountSlot> = Vec::with_capacity(MAX_SUBACCOUNT_SLOTS);
     for _ in 0..MAX_SUBACCOUNT_SLOTS {
+        // Runtime-owned account-view buffer: the program writes its
+        // `AccountInfo` or `SolAccountInfo` into these bytes after
+        // `sol_load_subaccount` returns the address. Initialized to zeros so
+        // the program observes a clean slate per slot.
+        let vm_account_view_addr = s.current_vaddr();
+        s.fill_write(SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE, 0)
+            .map_err(|_| InstructionError::InvalidArgument)?;
         let vm_header_addr = s.current_vaddr();
         let buffer_position = s.current_len();
         s.write::<u8>(NON_DUP_MARKER);
@@ -732,7 +751,8 @@ fn serialize_parameters_aligned(
             s.current_vaddr().saturating_sub(vm_header_addr),
             SUBACCOUNT_SLOT_HEADER_SIZE as u64,
         );
-        // Close the header region so it lives at vm_header_addr..+88 only.
+        // Close the [view + header] region so it lives at
+        // vm_account_view_addr..+(view+header) only.
         s.push_region();
         // Reserve the slot's data VM address space behind an empty readonly
         // region; `sol_load_subaccount` swaps this for a writable region
@@ -741,10 +761,11 @@ fn serialize_parameters_aligned(
         s.push_data_placeholder(SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES);
         subaccount_slots.push(SubaccountSlot {
             buffer_position,
+            vm_account_view_addr,
             vm_header_addr,
             vm_data_addr,
-            caller_account_view_addr: 0,
             caller_account_metadata: None,
+            account_view_kind: None,
             occupied_subaccount_index: None,
             is_writable: false,
         });
@@ -1191,11 +1212,8 @@ mod tests {
             // modes — with `account_data_direct_mapping = false`, all account
             // bytes live in the input AlignedMemory regardless of the
             // VM-side region split.
-            let (de_program_id, de_accounts, de_instruction_data) = unsafe {
-                deserialize(
-                    serialized.as_slice_mut().first_mut().unwrap() as *mut u8,
-                )
-            };
+            let (de_program_id, de_accounts, de_instruction_data) =
+                unsafe { deserialize(serialized.as_slice_mut().first_mut().unwrap() as *mut u8) };
             let _ = serialized_regions;
 
             assert_eq!(&program_id, de_program_id);

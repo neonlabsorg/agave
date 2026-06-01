@@ -5622,3 +5622,825 @@ fn test_mem_syscalls_overlap_account_begin_or_end() {
         }
     }
 }
+
+// ============================================================================
+// F10 subaccount tests — must agree with the constants in
+// programs/sbf/rust/subaccount/src/lib.rs.
+// ============================================================================
+
+#[cfg(feature = "sbf_rust")]
+const SUBACCOUNT_SEED_TAG: &[u8] = b"test-sub";
+#[cfg(feature = "sbf_rust")]
+const SUBACCOUNT_FUNDING_LAMPORTS: u64 = 2_000_000;
+
+#[cfg(feature = "sbf_rust")]
+fn deploy_subaccount_program(
+    mint_lamports: u64,
+) -> (
+    Arc<Bank>,
+    BankClient,
+    Arc<RwLock<BankForks>>,
+    Keypair,
+    Pubkey,
+) {
+    agave_logger::setup();
+
+    let GenesisConfigInfo {
+        genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config(mint_lamports);
+
+    let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+    let mut bank_client = BankClient::new_shared(bank);
+    let authority_keypair = Keypair::new();
+    let (bank, program_id) = load_program_of_loader_v4(
+        &mut bank_client,
+        &bank_forks,
+        &mint_keypair,
+        &authority_keypair,
+        "solana_sbf_rust_subaccount",
+    );
+    (bank, bank_client, bank_forks, mint_keypair, program_id)
+}
+
+#[cfg(feature = "sbf_rust")]
+fn subaccount_storage_addr_for(base: &Pubkey, program_id: &Pubkey) -> Pubkey {
+    use solana_transaction_context::{create_subaccount_address, subaccount_storage_address};
+    let owner_pubkey = create_subaccount_address(&[base.as_ref(), SUBACCOUNT_SEED_TAG], program_id)
+        .expect("derive subaccount address");
+    subaccount_storage_address(&owner_pubkey)
+}
+
+#[cfg(feature = "sbf_rust")]
+fn subaccount_create_instruction(
+    program_id: Pubkey,
+    base: Pubkey,
+    payer: Pubkey,
+    discriminator: u8,
+    payload: &[u8],
+    extra_metas: Vec<AccountMeta>,
+) -> Instruction {
+    let mut account_metas = vec![
+        AccountMeta::new(base, false),
+        AccountMeta::new(payer, true),
+        AccountMeta::new_readonly(system_program::id(), false),
+    ];
+    account_metas.extend(extra_metas);
+    let mut ix_data = Vec::with_capacity(1 + payload.len());
+    ix_data.push(discriminator);
+    ix_data.extend_from_slice(payload);
+    Instruction::new_with_bytes(program_id, &ix_data, account_metas)
+}
+
+#[cfg(feature = "sbf_rust")]
+fn subaccount_instruction(
+    program_id: Pubkey,
+    base: Pubkey,
+    is_writable: bool,
+    discriminator: u8,
+    payload: &[u8],
+    extra_metas: Vec<AccountMeta>,
+) -> Instruction {
+    let mut account_metas = vec![if is_writable {
+        AccountMeta::new(base, false)
+    } else {
+        AccountMeta::new_readonly(base, false)
+    }];
+    account_metas.extend(extra_metas);
+    let mut ix_data = Vec::with_capacity(1 + payload.len());
+    ix_data.push(discriminator);
+    ix_data.extend_from_slice(payload);
+    Instruction::new_with_bytes(program_id, &ix_data, account_metas)
+}
+
+#[cfg(feature = "sbf_rust")]
+fn run_subaccount_tx(
+    bank: &Bank,
+    mint_keypair: &Keypair,
+    instruction: Instruction,
+) -> (
+    Result<(), TransactionError>,
+    Vec<Vec<InnerInstruction>>,
+    Vec<String>,
+) {
+    let blockhash = bank.last_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[instruction],
+        Some(&mint_keypair.pubkey()),
+        &[mint_keypair],
+        blockhash,
+    );
+    let (status, inner_instructions, log_messages, _units) =
+        process_transaction_and_record_inner(bank, tx);
+    (status, inner_instructions, log_messages)
+}
+
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_create_load_write_unload() {
+    use solana_system_interface::instruction as system_instruction;
+
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let base_pubkey = Pubkey::new_unique();
+    let payload: &[u8] = b"hello, subaccount world!";
+    let payer_pubkey = mint_keypair.pubkey();
+    let payer_lamports_before = bank.get_balance(&payer_pubkey);
+
+    let instruction =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, payload, vec![]);
+    let (status, inner_instructions, log_messages) =
+        run_subaccount_tx(&bank, &mint_keypair, instruction);
+    assert!(
+        status.is_ok(),
+        "tx failed: {status:?}\nlogs:\n{}",
+        log_messages.join("\n"),
+    );
+
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    let stored = bank.get_account(&storage_addr).unwrap_or_else(|| {
+        panic!(
+            "subaccount storage account {storage_addr} missing\nlogs:\n{}",
+            log_messages.join("\n"),
+        )
+    });
+    assert_eq!(stored.lamports(), SUBACCOUNT_FUNDING_LAMPORTS);
+    assert_eq!(stored.owner(), &program_id);
+    assert_eq!(stored.data(), payload);
+
+    let payer_lamports_after = bank.get_balance(&payer_pubkey);
+    let debited = payer_lamports_before.saturating_sub(payer_lamports_after);
+    assert_eq!(
+        debited, SUBACCOUNT_FUNDING_LAMPORTS,
+        "payer debited {debited}, expected {SUBACCOUNT_FUNDING_LAMPORTS}",
+    );
+
+    let transfer_seen = inner_instructions.iter().flatten().any(|inner| {
+        matches!(
+            bincode::deserialize::<system_instruction::SystemInstruction>(
+                &inner.instruction.data,
+            ),
+            Ok(system_instruction::SystemInstruction::Transfer { lamports })
+                if lamports == SUBACCOUNT_FUNDING_LAMPORTS
+        )
+    });
+    assert!(
+        transfer_seen,
+        "expected system_program::Transfer of {SUBACCOUNT_FUNDING_LAMPORTS} in inner instructions",
+    );
+}
+
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_program_isolation() {
+    let (_bank, mut bank_client, bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let (bank, program_id2) = load_program_of_loader_v4(
+        &mut bank_client,
+        &bank_forks,
+        &mint_keypair,
+        &Keypair::new(),
+        "solana_sbf_rust_subaccount",
+    );
+
+    let base_pubkey = Pubkey::new_unique();
+    let payload: &[u8] = b"hello, subaccount world!";
+    let payload2: &[u8] = b"hello from another program!";
+    let payer_pubkey = mint_keypair.pubkey();
+
+    let instruction =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, payload, vec![]);
+    let (status, _, log_messages) = run_subaccount_tx(&bank, &mint_keypair, instruction);
+    assert!(
+        status.is_ok(),
+        "tx failed: {status:?}\nlogs:\n{}",
+        log_messages.join("\n"),
+    );
+
+    let instruction2 =
+        subaccount_create_instruction(program_id2, base_pubkey, payer_pubkey, 0, payload2, vec![]);
+    let (status2, _, log_messages2) = run_subaccount_tx(&bank, &mint_keypair, instruction2);
+    assert!(
+        status2.is_ok(),
+        "tx failed: {status2:?}\nlogs:\n{}",
+        log_messages2.join("\n"),
+    );
+
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    let stored = bank.get_account(&storage_addr).unwrap_or_else(|| {
+        panic!(
+            "subaccount storage account {storage_addr} missing\nlogs:\n{}",
+            log_messages.join("\n"),
+        )
+    });
+    assert_eq!(stored.lamports(), SUBACCOUNT_FUNDING_LAMPORTS);
+    assert_eq!(stored.owner(), &program_id);
+    assert_eq!(stored.data(), payload);
+
+    let storage_addr2 = subaccount_storage_addr_for(&base_pubkey, &program_id2);
+    let stored2 = bank.get_account(&storage_addr2).unwrap_or_else(|| {
+        panic!(
+            "subaccount storage account2 {storage_addr2} missing\nlogs:\n{}",
+            log_messages2.join("\n"),
+        )
+    });
+    assert_eq!(stored2.lamports(), SUBACCOUNT_FUNDING_LAMPORTS);
+    assert_eq!(stored2.owner(), &program_id2);
+    assert_eq!(stored2.data(), payload2);
+
+    assert_ne!(
+        storage_addr, storage_addr2,
+        "storage addresses must be different for different programs"
+    );
+}
+
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_create_empty_subaccount() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let base_pubkey = Pubkey::new_unique();
+    let payer_pubkey = mint_keypair.pubkey();
+
+    let payload: &[u8] = &[]; // empty payload, tests that zero-length accounts work and that the program can handle them
+    let instruction =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, payload, vec![]);
+    let (status, _, log_messages) = run_subaccount_tx(&bank, &mint_keypair, instruction);
+    assert!(
+        status.is_ok(),
+        "tx failed: {status:?}\nlogs:\n{}",
+        log_messages.join("\n"),
+    );
+
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    let stored = bank.get_account(&storage_addr).unwrap_or_else(|| {
+        panic!(
+            "subaccount storage account {storage_addr} missing\nlogs:\n{}",
+            log_messages.join("\n"),
+        )
+    });
+    assert_eq!(stored.lamports(), SUBACCOUNT_FUNDING_LAMPORTS);
+    assert_eq!(stored.owner(), &program_id);
+    assert_eq!(stored.data(), payload);
+    assert_eq!(
+        stored.data().len(),
+        0,
+        "stored data length must be zero for empty payload"
+    );
+}
+
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_transfer_lamports() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let base_pubkey = Pubkey::new_unique();
+    let payer_pubkey = mint_keypair.pubkey();
+
+    let payload: &[u8] = &[]; // empty payload, tests that zero-length accounts work and that the program can handle them
+    let instruction =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, payload, vec![]);
+    let (status, _, log_messages) = run_subaccount_tx(&bank, &mint_keypair, instruction);
+    assert!(
+        status.is_ok(),
+        "tx failed: {status:?}\nlogs:\n{}",
+        log_messages.join("\n"),
+    );
+
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    let stored = bank.get_account(&storage_addr).unwrap_or_else(|| {
+        panic!(
+            "subaccount storage account {storage_addr} missing\nlogs:\n{}",
+            log_messages.join("\n"),
+        )
+    });
+    assert_eq!(stored.lamports(), SUBACCOUNT_FUNDING_LAMPORTS);
+    assert_eq!(stored.owner(), &program_id);
+
+    const BALANCED: bool = true;
+    const UNLOAD: bool = true;
+
+    // The program can't spend the lamports from the readolny subaccount
+    let extra_metas = vec![AccountMeta::new(payer_pubkey, false)];
+    let instruction = subaccount_instruction(
+        program_id,
+        base_pubkey,
+        false,
+        7,
+        &[BALANCED as u8, UNLOAD as u8],
+        extra_metas,
+    );
+    let (status, _, log_messages) = run_subaccount_tx(&bank, &mint_keypair, instruction);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::ReadonlyLamportChange
+        )),
+        "tx status mismatch: {status:?}\nlogs:\n{}",
+        log_messages.join("\n"),
+    );
+
+    // The program can spend the lamports from the subaccount
+    let extra_metas = vec![AccountMeta::new(payer_pubkey, false)];
+    let instruction = subaccount_instruction(
+        program_id,
+        base_pubkey,
+        true,
+        7,
+        &[BALANCED as u8, UNLOAD as u8],
+        extra_metas,
+    );
+    let (status, _, log_messages) = run_subaccount_tx(&bank, &mint_keypair, instruction);
+    assert!(
+        status.is_ok(),
+        "tx failed: {status:?}\nlogs:\n{}",
+        log_messages.join("\n"),
+    );
+    let extra_metas = vec![AccountMeta::new(payer_pubkey, false)];
+    let instruction = subaccount_instruction(
+        program_id,
+        base_pubkey,
+        true,
+        7,
+        &[BALANCED as u8, !UNLOAD as u8],
+        extra_metas,
+    );
+    let (status, _, log_messages) = run_subaccount_tx(&bank, &mint_keypair, instruction);
+    assert!(
+        status.is_ok(),
+        "tx failed: {status:?}\nlogs:\n{}",
+        log_messages.join("\n"),
+    );
+
+    // The transaction fails if the program tries unbalanced transfer
+    let extra_metas = vec![AccountMeta::new(payer_pubkey, false)];
+    let instruction = subaccount_instruction(
+        program_id,
+        base_pubkey,
+        true,
+        7,
+        &[!BALANCED as u8, UNLOAD as u8],
+        extra_metas,
+    );
+    let (status, _, log_messages) = run_subaccount_tx(&bank, &mint_keypair, instruction);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::UnbalancedInstruction
+        )),
+        "tx status mismatch: {status:?}\nlogs:\n{}",
+        log_messages.join("\n"),
+    );
+    let extra_metas = vec![AccountMeta::new(payer_pubkey, false)];
+    let instruction = subaccount_instruction(
+        program_id,
+        base_pubkey,
+        true,
+        7,
+        &[!BALANCED as u8, !UNLOAD as u8],
+        extra_metas,
+    );
+    let (status, _, log_messages) = run_subaccount_tx(&bank, &mint_keypair, instruction);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::UnbalancedInstruction
+        )),
+        "tx status mismatch: {status:?}\nlogs:\n{}",
+        log_messages.join("\n"),
+    );
+}
+
+/// Scenario 2: subaccount state persists across two separate transactions.
+/// Tx1 creates the subaccount and writes "v1"-sized payload; Tx2 finds the
+/// existing subaccount by seeds (load syscall must locate the persisted
+/// on-chain entry), then overwrites its data with a different payload.
+/// Final on-chain state must match Tx2's payload while lamports stay at the
+/// funding amount from Tx1 (no second Transfer).
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_persists_across_transactions() {
+    let (bank, mut bank_client, bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payload_v1: &[u8] = b"persist-marker-v1______________"; // 31 bytes
+    let payload_v2: &[u8] = b"###tx2-overwrite-payload###____"; // 31 bytes, same len
+    assert_eq!(payload_v1.len(), payload_v2.len());
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    // Tx1 — create + write v1.
+    let ix1 =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, payload_v1, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix1);
+    assert!(
+        status.is_ok(),
+        "Tx1 failed: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+
+    // Advance into a new bank slot so Tx2 runs on a fresh frame.
+    let bank = bank_client
+        .advance_slot(1, bank_forks.as_ref(), &Pubkey::default())
+        .expect("advance slot for Tx2");
+
+    // Tx2 — load existing + overwrite with v2.
+    let ix2 = subaccount_instruction(program_id, base_pubkey, true, 1, payload_v2, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix2);
+    assert!(
+        status.is_ok(),
+        "Tx2 failed: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    let stored = bank
+        .get_account(&storage_addr)
+        .expect("subaccount must still exist after Tx2");
+    assert_eq!(
+        stored.data(),
+        payload_v2,
+        "Tx2's overwrite must be on-chain (proves Tx1's storage was loaded by Tx2)",
+    );
+    // Lamports are unchanged from Tx1 — Tx2 did no funding.
+    assert_eq!(stored.lamports(), SUBACCOUNT_FUNDING_LAMPORTS);
+    assert_eq!(stored.owner(), &program_id);
+}
+
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_cant_modify_readonly_data() {
+    let (bank, mut bank_client, bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payload_v1: &[u8] = b"persist-marker-v1______________"; // 31 bytes
+    let payload_v2: &[u8] = b"###tx2-overwrite-payload###____"; // 31 bytes, same len
+    assert_eq!(payload_v1.len(), payload_v2.len());
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    // Tx1 — create + write v1.
+    let ix1 =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, payload_v1, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix1);
+    assert!(
+        status.is_ok(),
+        "Tx1 failed: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+
+    // Advance into a new bank slot so Tx2 runs on a fresh frame.
+    let bank = bank_client
+        .advance_slot(1, bank_forks.as_ref(), &Pubkey::default())
+        .expect("advance slot for Tx2");
+
+    // Tx2 — load existing + overwrite with v2.
+    let ix2 = subaccount_instruction(program_id, base_pubkey, false, 1, payload_v2, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix2);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::ReadonlyDataModified
+        )),
+        "Tx2 status mismatch: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    let stored = bank
+        .get_account(&storage_addr)
+        .expect("subaccount must still exist after Tx2");
+    assert_eq!(
+        stored.data(),
+        payload_v1,
+        "Tx2's overwrite must not be on-chain (proves readonly data was not modified)",
+    );
+    // Lamports are unchanged from Tx1 — Tx2 did no funding.
+    assert_eq!(stored.lamports(), SUBACCOUNT_FUNDING_LAMPORTS);
+    assert_eq!(stored.owner(), &program_id);
+}
+
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_cant_modify_out_of_bounds() {
+    let (bank, mut bank_client, bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payload_v1: &[u8] = b"persist-marker-v1______________"; // 31 bytes
+    let payload_v2: &[u8] = b"###tx2-overwrite-payload###____"; // 31 bytes, same len
+    assert_eq!(payload_v1.len(), payload_v2.len());
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    // Tx1 — create + write v1.
+    let ix1 =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, payload_v1, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix1);
+    assert!(
+        status.is_ok(),
+        "Tx1 failed: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+
+    // Advance into a new bank slot so Tx2 runs on a fresh frame.
+    let bank = bank_client
+        .advance_slot(1, bank_forks.as_ref(), &Pubkey::default())
+        .expect("advance slot for Tx2");
+
+    // Tx2 — load existing + increment counter at offset
+    let offset_bytes = ((payload_v1.len() - 7) as u64).to_le_bytes(); // offset past the end of the subaccount data
+    let ix2 = subaccount_instruction(program_id, base_pubkey, true, 5, &offset_bytes, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix2);
+    // "Access violation in input section at address"
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::InvalidRealloc
+        )),
+        "Tx2 status mismatch: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    let stored = bank
+        .get_account(&storage_addr)
+        .expect("subaccount must still exist after Tx2");
+    assert_eq!(
+        stored.data(),
+        payload_v1,
+        "Tx2's overwrite must not be on-chain (proves readonly data was not modified)",
+    );
+    // Lamports are unchanged from Tx1 — Tx2 did no funding.
+    assert_eq!(stored.lamports(), SUBACCOUNT_FUNDING_LAMPORTS);
+    assert_eq!(stored.owner(), &program_id);
+}
+
+/// Scenario 3a: a second `sol_create_subaccount` with the same seeds in a
+/// single transaction must fail (`AccountAlreadyInitialized`), and the
+/// original subaccount state must not be corrupted.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_create_twice_fails() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payload: &[u8] = b"double-create-payload";
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 2, payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::AccountAlreadyInitialized
+        )),
+        "expected tx to fail, but it succeeded\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    // First create did partially run (the second create is the one that
+    // fails); the host tx is aborted, so the subaccount must NOT be
+    // persisted to accounts-db.
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    assert!(
+        bank.get_account(&storage_addr).is_none(),
+        "failed tx must not persist any subaccount state",
+    );
+}
+
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_load_twice_fails() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payload: &[u8] = b"double-load-payload";
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 8, payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::AccountAlreadyInitialized
+        )),
+        "expected tx to fail, but it succeeded\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    // First create did partially run (the second create is the one that
+    // fails); the host tx is aborted, so the subaccount must NOT be
+    // persisted to accounts-db.
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    assert!(
+        bank.get_account(&storage_addr).is_none(),
+        "failed tx must not persist any subaccount state",
+    );
+}
+
+/// Scenario 3b: a second `sol_unload_subaccount` on an already-freed slot
+/// must fail (`InvalidArgument`: slot at vm_header_addr is not loaded).
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_unload_twice_fails() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payload: &[u8] = b"double-unload-payload";
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 3, payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::InvalidArgument
+        )),
+        "expected tx to fail on second unload, but it succeeded\nlogs:\n{}",
+        logs.join("\n"),
+    );
+}
+
+/// Scenario 3b: try `sol_unload_subaccount` on an oversized data
+/// must fail (`InvalidRealloc`).
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_unload_oversized_data_fails() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payload: &[u8] = b"oversized-data-payload";
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 6, payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::InvalidRealloc
+        )),
+        "expected tx to fail on unload, but it succeeded\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    // The host tx is aborted, so the subaccount must NOT be persisted to accounts-db.
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    let account = bank.get_account(&storage_addr);
+    assert!(
+        account.is_none(),
+        "failed tx must not persist any subaccount state: {account:?}",
+    );
+}
+
+/// Scenario 3c: payer has fewer lamports than the requested funding amount.
+/// The embedded system_program::Transfer CPI inside `sol_create_subaccount`
+/// must fail, the outer tx aborts, and no subaccount is persisted.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_insufficient_payer() {
+    // Mint balance < SUBACCOUNT_FUNDING_LAMPORTS (2_000_000). The program is
+    // deployed with this mint as payer, so the deploy needs to succeed first;
+    // we choose a value that's enough for the loader-v4 deploy but less than
+    // the funding amount the test instruction will attempt to transfer.
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    // Drain the mint down so its remaining balance can't cover FUNDING_LAMPORTS.
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+    let drain_target_keypair = Keypair::new();
+    {
+        use solana_system_interface::instruction as system_instruction;
+        let remaining = bank.get_balance(&payer_pubkey);
+        let keep = SUBACCOUNT_FUNDING_LAMPORTS / 2; // strictly less than funding
+        let to_drain = remaining.saturating_sub(keep);
+        let transfer_ix =
+            system_instruction::transfer(&payer_pubkey, &drain_target_keypair.pubkey(), to_drain);
+        let blockhash = bank.last_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[transfer_ix],
+            Some(&payer_pubkey),
+            &[&mint_keypair],
+            blockhash,
+        );
+        let (status, _, logs, _) = process_transaction_and_record_inner(&bank, tx);
+        assert!(
+            status.is_ok(),
+            "drain tx failed: {status:?}\nlogs:\n{}",
+            logs.join("\n")
+        );
+    }
+
+    let payload: &[u8] = b"insufficient-payer";
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::Custom(1)
+        )), // the custom error code for insufficient funds in the system program
+        "expected tx to fail on insufficient payer, but it succeeded\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    let storage_addr = subaccount_storage_addr_for(&payer_pubkey, &program_id);
+    assert!(
+        bank.get_account(&storage_addr).is_none(),
+        "failed tx must not persist any subaccount state",
+    );
+}
+
+/// Scenario 4: a callee invoked via CPI loads the caller's subaccount and
+/// mutates it; on-chain state after the tx reflects the callee's write.
+///
+/// The "callee" is the same program reentered via self-CPI with a
+/// different discriminator (BPF→BPF CPI can't expose a subaccount through
+/// `AccountMeta`s — `prepare_next_instruction` resolves pubkeys against
+/// the main account lane only — so the callee must derive the subaccount
+/// pubkey itself via `sol_load_subaccount`; using the same program means
+/// `program_id` is identical and the PDA collapses to the same persisted
+/// entry).
+///
+/// Flow (handled in [programs/sbf/rust/subaccount/src/lib.rs] disc 4 / 5):
+///   1. Outer (disc=4): create subaccount sized for one u64; load +
+///      write `initial` + unload; self-CPI to disc=5 with payer as the
+///      sole `AccountMeta`.
+///   2. Inner (disc=5): load same subaccount (same seeds + program_id ⇒
+///      same `subaccount_storage_address`); read u64; write u64+1; unload.
+///   3. On-chain data after the tx must equal `initial + 1`.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_cpi_increment() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let initial_value: u64 = 41;
+    let payload = initial_value.to_le_bytes();
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    // For self-CPI the callee program account must be present in the outer
+    // instruction's accounts (see invoke_context.rs:485-498 — the runtime
+    // requires `find_index_of_account(callee_program_id)` to resolve AND
+    // the callee to be listed in the caller's `instruction_accounts`).
+    let extra_metas = vec![AccountMeta::new_readonly(program_id, false)];
+    let ix = subaccount_create_instruction(
+        program_id,
+        base_pubkey,
+        payer_pubkey,
+        4,
+        &payload,
+        extra_metas,
+    );
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert!(
+        status.is_ok(),
+        "tx failed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    let stored = bank
+        .get_account(&storage_addr)
+        .expect("subaccount must exist");
+    let on_chain = u64::from_le_bytes(
+        stored
+            .data()
+            .try_into()
+            .expect("subaccount data must be exactly 8 bytes"),
+    );
+    assert_eq!(
+        on_chain,
+        initial_value + 1,
+        "inner CPI must have incremented the counter (initial={initial_value})",
+    );
+    assert_eq!(stored.owner(), &program_id);
+    assert_eq!(stored.lamports(), SUBACCOUNT_FUNDING_LAMPORTS);
+}

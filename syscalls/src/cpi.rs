@@ -1,12 +1,10 @@
 use {
     super::*,
-    solana_account_info::AccountInfo,
     solana_instruction::Instruction,
     solana_program_runtime::cpi::{
-        cpi_common, translate_accounts_c, translate_accounts_rust,
-        translate_instruction_c, translate_instruction_rust, translate_signers_c,
-        translate_signers_rust, translate_subaccount_slots,
-        CallerAccount, SolAccountInfo, SyscallInvokeSigned, TranslatedAccount,
+        cpi_common, translate_accounts_c, translate_accounts_rust, translate_instruction_c,
+        translate_instruction_rust, translate_signers_c, translate_signers_rust,
+        translate_subaccount_slots, SyscallInvokeSigned, TranslatedAccount,
     },
 };
 
@@ -65,12 +63,7 @@ impl SyscallInvokeSigned for SyscallInvokeSignedRust {
         invoke_context: &mut InvokeContext,
         check_aligned: bool,
     ) -> Result<Vec<TranslatedAccount<'a>>, Error> {
-        translate_subaccount_slots::<AccountInfo, _>(
-            invoke_context,
-            memory_mapping,
-            check_aligned,
-            CallerAccount::from_account_info,
-        )
+        translate_subaccount_slots(invoke_context, memory_mapping, check_aligned)
     }
 
     fn translate_signers(
@@ -145,12 +138,7 @@ impl SyscallInvokeSigned for SyscallInvokeSignedC {
         invoke_context: &mut InvokeContext,
         check_aligned: bool,
     ) -> Result<Vec<TranslatedAccount<'a>>, Error> {
-        translate_subaccount_slots::<SolAccountInfo, _>(
-            invoke_context,
-            memory_mapping,
-            check_aligned,
-            CallerAccount::from_sol_account_info,
-        )
+        translate_subaccount_slots(invoke_context, memory_mapping, check_aligned)
     }
 
     fn translate_signers(
