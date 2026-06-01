@@ -691,7 +691,7 @@ fn translate_subaccount_seeds(
     let base_index_in_transaction = invoke_context
         .transaction_context
         .find_index_of_account(&base_pubkey)
-        .ok_or({
+        .ok_or_else(|| {
             ic_msg!(invoke_context, "Base account {} not in transaction", base_pubkey);
             InstructionError::InvalidArgument
         })?;

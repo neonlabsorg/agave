@@ -27,10 +27,14 @@ pub mod transaction_accounts;
 pub mod vm_slice;
 
 pub const MAX_ACCOUNTS_PER_TRANSACTION: usize = 256;
-pub const MAX_SUBACCOUNTS_PER_TRANSACTION: usize = 2048;
 // This is one less than MAX_ACCOUNTS_PER_TRANSACTION because
 // one index is used as NON_DUP_MARKER in ABI v0 and v1.
 pub const MAX_ACCOUNTS_PER_INSTRUCTION: usize = 255;
+// Programs can load more subaccounts from the transaction context as needed,
+// but these subaccounts cannot be passed in as instruction accounts. This 
+// limit is to prevent abuse of this mechanism to load an unbounded number 
+// of subaccounts.
+pub const MAX_SUBACCOUNTS_PER_TRANSACTION: usize = 2048;
 pub const MAX_INSTRUCTION_DATA_LEN: usize = 10 * 1024;
 pub const MAX_ACCOUNT_DATA_LEN: u64 = 10 * 1024 * 1024;
 // Note: With stricter_abi_and_runtime_constraints programs can grow accounts
