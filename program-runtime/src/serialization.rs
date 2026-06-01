@@ -33,12 +33,10 @@ pub const MAX_SUBACCOUNT_SLOTS: usize = 16;
 pub const SUBACCOUNT_SLOT_HEADER_SIZE: usize = 88;
 
 /// F10: bytes reserved at the start of each subaccount slot for the program's
-/// account-view buffer. Sized to fit the larger of the two view layouts a
-/// program may write here — the C-ABI `SolAccountInfo` (56 bytes,
-/// 6× u64 + 3× bool padded to 8) or the Rust SDK `AccountInfo<'_>` (48 bytes,
-/// 5× pointer-sized + 3× bool padded to 8). 56 is u64-aligned, so the
-/// subsequent slot header keeps its 8-byte field alignment.
-pub const SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE: usize = 56;
+/// account-view buffer. Canonically defined in the SDK (`solana-program-subaccount`)
+/// alongside the `load_subaccount` writer that the reservation must accommodate;
+/// re-exported here for the serialization layer.
+pub use solana_program_subaccount::SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE;
 
 /// F10: VM address space reserved per slot's data region. The slot's data
 /// region starts as an empty readonly placeholder; `sol_load_subaccount`
