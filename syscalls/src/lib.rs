@@ -14,7 +14,8 @@ pub use self::{
     },
     mem_ops::{SyscallMemcmp, SyscallMemcpy, SyscallMemmove, SyscallMemset},
     subaccount::{
-        SyscallCreateSubaccount, SyscallLoadSubaccount, SyscallUnloadSubaccount,
+        SyscallCreateSubaccount, SyscallLoadSubaccountC, SyscallLoadSubaccountRust,
+        SyscallUnloadSubaccount,
     },
     sysvar::{
         SyscallGetClockSysvar, SyscallGetEpochRewardsSysvar, SyscallGetEpochScheduleSysvar,
@@ -68,8 +69,8 @@ use {
 mod cpi;
 mod logging;
 mod mem_ops;
-mod sysvar;
 mod subaccount;
+mod sysvar;
 
 /// Error definitions
 #[derive(Debug, ThisError, PartialEq, Eq)]
@@ -447,9 +448,12 @@ pub fn create_program_runtime_environment_v1<'a, 'ix_data>(
     result.register_function("sol_invoke_signed_c", SyscallInvokeSignedC::vm)?;
     result.register_function("sol_invoke_signed_rust", SyscallInvokeSignedRust::vm)?;
 
-    // F10: subaccount syscalls (Wave 7 — stubbed names; Wave 8 implements bodies)
+    // F10: subaccount syscalls. `sol_load_subaccount_{rust,c}` differ only in
+    // which ABI (Rust `AccountInfo` vs C `SolAccountInfo`) they record on the
+    // slot for CPI sync to dispatch through.
     result.register_function("sol_create_subaccount", SyscallCreateSubaccount::vm)?;
-    result.register_function("sol_load_subaccount", SyscallLoadSubaccount::vm)?;
+    result.register_function("sol_load_subaccount_rust", SyscallLoadSubaccountRust::vm)?;
+    result.register_function("sol_load_subaccount_c", SyscallLoadSubaccountC::vm)?;
     result.register_function("sol_unload_subaccount", SyscallUnloadSubaccount::vm)?;
 
     // Memory allocator

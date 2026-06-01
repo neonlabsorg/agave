@@ -50,8 +50,8 @@ use {
         time::Duration,
     },
     transaction_scheduler::{
-        hot_pinned_scheduler::{HotPinnedScheduler, HotPinnedSchedulerConfig},
         greedy_scheduler::{GreedyScheduler, GreedySchedulerConfig},
+        hot_pinned_scheduler::{HotPinnedScheduler, HotPinnedSchedulerConfig},
         prio_graph_scheduler::PrioGraphSchedulerConfig,
         receive_and_buffer::{ReceiveAndBuffer, TransactionViewReceiveAndBuffer},
     },

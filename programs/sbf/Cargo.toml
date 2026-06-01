@@ -67,6 +67,7 @@ members = [
     "rust/simulation",
     "rust/spoof1",
     "rust/spoof1_system",
+    "rust/subaccount",
     "rust/syscall-get-epoch-stake",
     "rust/sysvar",
     "rust/upgradeable",
@@ -308,3 +309,117 @@ name = "bpf_loader"
 # There is a similar override in `../../Cargo.toml`.  Please keep both comments
 # and the overrides in sync.
 solana-curve25519 = { path = "../../curves/curve25519" }
+
+# --------------------------------------------------------------------------
+# Parasol fork — mirror of the matching block in ../../Cargo.toml.
+# The sbf workspace is excluded from the main workspace (see
+# `exclude = [..., "programs/sbf", ...]` there), so it does NOT inherit
+# those patches; we must mirror them here. Without these overrides,
+# crates.io versions of solana-* are pulled in and conflict with the
+# parasol additions (e.g. `WritableAccount::set_subaccount_mark` used by
+# agave-syscalls).
+# --------------------------------------------------------------------------
+solana-account = { path = "../../parasol/solana-sdk/account" }
+solana-account-info = { path = "../../parasol/solana-sdk/account-info" }
+solana-address = { path = "../../parasol/solana-sdk/address" }
+solana-address-lookup-table-interface = { path = "../../parasol/solana-sdk/address-lookup-table-interface" }
+solana-atomic-u64 = { path = "../../parasol/solana-sdk/atomic-u64" }
+solana-big-mod-exp = { path = "../../parasol/solana-sdk/big-mod-exp" }
+solana-bincode = { path = "../../parasol/solana-sdk/bincode" }
+solana-blake3-hasher = { path = "../../parasol/solana-sdk/blake3-hasher" }
+solana-bls-signatures = { path = "../../parasol/solana-sdk/bls-signatures" }
+solana-bn254 = { path = "../../parasol/solana-sdk/bn254" }
+solana-borsh = { path = "../../parasol/solana-sdk/borsh" }
+solana-client-traits = { path = "../../parasol/solana-sdk/client-traits" }
+solana-clock = { path = "../../parasol/solana-sdk/clock" }
+solana-cluster-type = { path = "../../parasol/solana-sdk/cluster-type" }
+solana-commitment-config = { path = "../../parasol/solana-sdk/commitment-config" }
+solana-compute-budget-interface = { path = "../../parasol/solana-sdk/compute-budget-interface" }
+solana-cpi = { path = "../../parasol/solana-sdk/cpi" }
+solana-define-syscall = { path = "../../parasol/solana-sdk/define-syscall" }
+solana-derivation-path = { path = "../../parasol/solana-sdk/derivation-path" }
+solana-ed25519-program = { path = "../../parasol/solana-sdk/ed25519-program" }
+solana-epoch-info = { path = "../../parasol/solana-sdk/epoch-info" }
+solana-epoch-rewards = { path = "../../parasol/solana-sdk/epoch-rewards" }
+solana-epoch-rewards-hasher = { path = "../../parasol/solana-sdk/epoch-rewards-hasher" }
+solana-epoch-schedule = { path = "../../parasol/solana-sdk/epoch-schedule" }
+solana-epoch-stake = { path = "../../parasol/solana-sdk/epoch-stake" }
+solana-example-mocks = { path = "../../parasol/solana-sdk/example-mocks" }
+solana-feature-gate-interface = { path = "../../parasol/solana-sdk/feature-gate-interface" }
+solana-fee-calculator = { path = "../../parasol/solana-sdk/fee-calculator" }
+solana-fee-structure = { path = "../../parasol/solana-sdk/fee-structure" }
+solana-file-download = { path = "../../parasol/solana-sdk/file-download" }
+solana-frozen-abi = { path = "../../parasol/solana-sdk/frozen-abi" }
+solana-frozen-abi-macro = { path = "../../parasol/solana-sdk/frozen-abi-macro" }
+solana-genesis-config = { path = "../../parasol/solana-sdk/genesis-config" }
+solana-hard-forks = { path = "../../parasol/solana-sdk/hard-forks" }
+solana-hash = { path = "../../parasol/solana-sdk/hash" }
+solana-inflation = { path = "../../parasol/solana-sdk/inflation" }
+solana-instruction = { path = "../../parasol/solana-sdk/instruction" }
+solana-instruction-error = { path = "../../parasol/solana-sdk/instruction-error" }
+solana-instructions-sysvar = { path = "../../parasol/solana-sdk/instructions-sysvar" }
+solana-keccak-hasher = { path = "../../parasol/solana-sdk/keccak-hasher" }
+solana-keypair = { path = "../../parasol/solana-sdk/keypair" }
+solana-last-restart-slot = { path = "../../parasol/solana-sdk/last-restart-slot" }
+solana-loader-v2-interface = { path = "../../parasol/solana-sdk/loader-v2-interface" }
+solana-loader-v3-interface = { path = "../../parasol/solana-sdk/loader-v3-interface" }
+solana-loader-v4-interface = { path = "../../parasol/solana-sdk/loader-v4-interface" }
+solana-logger = { path = "../../parasol/solana-sdk/logger" }
+solana-message = { path = "../../parasol/solana-sdk/message" }
+solana-msg = { path = "../../parasol/solana-sdk/msg" }
+solana-native-token = { path = "../../parasol/solana-sdk/native-token" }
+solana-nonce = { path = "../../parasol/solana-sdk/nonce" }
+solana-nonce-account = { path = "../../parasol/solana-sdk/nonce-account" }
+solana-offchain-message = { path = "../../parasol/solana-sdk/offchain-message" }
+solana-package-metadata = { path = "../../parasol/solana-sdk/package-metadata" }
+solana-package-metadata-macro = { path = "../../parasol/solana-sdk/package-metadata-macro" }
+solana-packet = { path = "../../parasol/solana-sdk/packet" }
+solana-poh-config = { path = "../../parasol/solana-sdk/poh-config" }
+solana-precompile-error = { path = "../../parasol/solana-sdk/precompile-error" }
+solana-presigner = { path = "../../parasol/solana-sdk/presigner" }
+solana-program = { path = "../../parasol/solana-sdk/program" }
+solana-program-entrypoint = { path = "../../parasol/solana-sdk/program-entrypoint" }
+solana-program-error = { path = "../../parasol/solana-sdk/program-error" }
+solana-program-log = { path = "../../parasol/solana-sdk/program-log" }
+solana-program-log-macro = { path = "../../parasol/solana-sdk/program-log-macro" }
+solana-program-memory = { path = "../../parasol/solana-sdk/program-memory" }
+solana-program-option = { path = "../../parasol/solana-sdk/program-option" }
+solana-program-pack = { path = "../../parasol/solana-sdk/program-pack" }
+solana-program-subaccount = { path = "../../parasol/solana-sdk/program-subaccount" }
+solana-pubkey = { path = "../../parasol/solana-sdk/pubkey" }
+solana-quic-definitions = { path = "../../parasol/solana-sdk/quic-definitions" }
+solana-rent = { path = "../../parasol/solana-sdk/rent" }
+solana-reward-info = { path = "../../parasol/solana-sdk/reward-info" }
+solana-sanitize = { path = "../../parasol/solana-sdk/sanitize" }
+solana-sdk = { path = "../../parasol/solana-sdk/sdk" }
+solana-sdk-ids = { path = "../../parasol/solana-sdk/sdk-ids" }
+solana-sdk-macro = { path = "../../parasol/solana-sdk/sdk-macro" }
+solana-sdk-wasm-js = { path = "../../parasol/solana-sdk/sdk-wasm-js" }
+solana-sdk-wasm-js-tests = { path = "../../parasol/solana-sdk/sdk-wasm-js-tests" }
+solana-secp256k1-program = { path = "../../parasol/solana-sdk/secp256k1-program" }
+solana-secp256k1-recover = { path = "../../parasol/solana-sdk/secp256k1-recover" }
+solana-secp256r1-program = { path = "../../parasol/solana-sdk/secp256r1-program" }
+solana-seed-derivable = { path = "../../parasol/solana-sdk/seed-derivable" }
+solana-seed-phrase = { path = "../../parasol/solana-sdk/seed-phrase" }
+solana-serde = { path = "../../parasol/solana-sdk/serde" }
+solana-serde-varint = { path = "../../parasol/solana-sdk/serde-varint" }
+solana-serialize-utils = { path = "../../parasol/solana-sdk/serialize-utils" }
+solana-sha256-hasher = { path = "../../parasol/solana-sdk/sha256-hasher" }
+solana-short-vec = { path = "../../parasol/solana-sdk/short-vec" }
+solana-shred-version = { path = "../../parasol/solana-sdk/shred-version" }
+solana-signature = { path = "../../parasol/solana-sdk/signature" }
+solana-signer = { path = "../../parasol/solana-sdk/signer" }
+solana-signer-store = { path = "../../parasol/solana-sdk/signer-store" }
+solana-slot-hashes = { path = "../../parasol/solana-sdk/slot-hashes" }
+solana-slot-history = { path = "../../parasol/solana-sdk/slot-history" }
+solana-stable-layout = { path = "../../parasol/solana-sdk/stable-layout" }
+solana-system-interface = { path = "../../parasol/solana-sdk/system-interface" }
+solana-system-transaction = { path = "../../parasol/solana-sdk/system-transaction" }
+solana-system-wasm-js = { path = "../../parasol/solana-sdk/system-wasm-js" }
+solana-sysvar = { path = "../../parasol/solana-sdk/sysvar" }
+solana-sysvar-id = { path = "../../parasol/solana-sdk/sysvar-id" }
+solana-time-utils = { path = "../../parasol/solana-sdk/time-utils" }
+solana-transaction = { path = "../../parasol/solana-sdk/transaction" }
+solana-transaction-error = { path = "../../parasol/solana-sdk/transaction-error" }
+solana-validator-exit = { path = "../../parasol/solana-sdk/validator-exit" }
+solana-vote-interface = { path = "../../parasol/solana-sdk/vote-interface" }

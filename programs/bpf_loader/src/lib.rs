@@ -1486,18 +1486,13 @@ fn execute<'a, 'b: 'a>(
         .provide_instruction_data_offset_in_vm_r2;
 
     let mut serialize_time = Measure::start("serialize");
-    let (
-        parameter_bytes,
-        regions,
-        accounts_metadata,
-        subaccount_slots,
-        instruction_data_offset,
-    ) = serialization::serialize_parameters(
-        &instruction_context,
-        stricter_abi_and_runtime_constraints,
-        account_data_direct_mapping,
-        mask_out_rent_epoch_in_vm_serialization,
-    )?;
+    let (parameter_bytes, regions, accounts_metadata, subaccount_slots, instruction_data_offset) =
+        serialization::serialize_parameters(
+            &instruction_context,
+            stricter_abi_and_runtime_constraints,
+            account_data_direct_mapping,
+            mask_out_rent_epoch_in_vm_serialization,
+        )?;
     serialize_time.stop();
 
     // save the account addresses so in case we hit an AccessViolation error we
@@ -1611,18 +1606,81 @@ fn execute<'a, 'b: 'a>(
                         // If stricter_abi_and_runtime_constraints is enabled and a program tries to write to a readonly
                         // region we'll get a memory access violation. Map it to a more specific
                         // error so it's easier for developers to see what happened.
-                        if let Some((instruction_account_index, vm_addr_range)) =
-                            account_region_addrs
-                                .iter()
-                                .enumerate()
-                                .find(|(_, vm_addr_range)| vm_addr_range.contains(&vm_addr))
-                        {
+                        //
+                        // The faulting address can fall inside a regular instruction
+                        // account's region or inside one of the runtime-owned subaccount
+                        // slots a program loaded via `sol_load_subaccount`. Resolve which
+                        // one it is, then borrow the matching account so we can produce
+                        // the same specific error in both cases.
+                        enum FaultingRegion {
+                            Account(IndexOfAccount),
+                            Subaccount {
+                                subaccount_index: IndexOfAccount,
+                                is_writable: bool,
+                            },
+                        }
+                        let faulting_region = account_region_addrs
+                            .iter()
+                            .enumerate()
+                            .find(|(_, vm_addr_range)| vm_addr_range.contains(&vm_addr))
+                            .map(|(instruction_account_index, vm_addr_range)| {
+                                (
+                                    FaultingRegion::Account(
+                                        instruction_account_index as IndexOfAccount,
+                                    ),
+                                    vm_addr_range.clone(),
+                                )
+                            })
+                            .or_else(|| {
+                                // Walk the occupied subaccount slots, building each
+                                // slot's reserved data range the same way
+                                // `account_region_addrs` does for accounts, and pick
+                                // the one containing the faulting address.
+                                invoke_context
+                                    .get_syscall_context()
+                                    .ok()?
+                                    .subaccount_slots
+                                    .iter()
+                                    .find_map(|slot| {
+                                        let subaccount_index = slot.occupied_subaccount_index?;
+                                        let metadata = slot.caller_account_metadata.as_ref()?;
+                                        let vm_end = slot
+                                            .vm_data_addr
+                                            .saturating_add(metadata.original_data_len as u64)
+                                            .saturating_add(if !is_loader_deprecated {
+                                                MAX_PERMITTED_DATA_INCREASE as u64
+                                            } else {
+                                                0
+                                            });
+                                        let vm_addr_range = slot.vm_data_addr..vm_end;
+                                        vm_addr_range.contains(&vm_addr).then(|| {
+                                            (
+                                                FaultingRegion::Subaccount {
+                                                    subaccount_index,
+                                                    is_writable: slot.is_writable,
+                                                },
+                                                vm_addr_range,
+                                            )
+                                        })
+                                    })
+                            });
+                        if let Some((faulting_region, vm_addr_range)) = faulting_region {
                             let transaction_context = &invoke_context.transaction_context;
                             let instruction_context =
                                 transaction_context.get_current_instruction_context()?;
-                            let account = instruction_context.try_borrow_instruction_account(
-                                instruction_account_index as IndexOfAccount,
-                            )?;
+                            let account = match faulting_region {
+                                FaultingRegion::Account(instruction_account_index) => {
+                                    instruction_context
+                                        .try_borrow_instruction_account(instruction_account_index)?
+                                }
+                                FaultingRegion::Subaccount {
+                                    subaccount_index,
+                                    is_writable,
+                                } => instruction_context.try_borrow_subaccount_by_tx_index(
+                                    subaccount_index,
+                                    is_writable,
+                                )?,
+                            };
                             if vm_addr.saturating_add(len) <= vm_addr_range.end {
                                 // The access was within the range of the accounts address space,
                                 // but it might not be within the range of the actual data.
@@ -1682,11 +1740,7 @@ fn execute<'a, 'b: 'a>(
         // it didn't `sol_unload_subaccount`) so VM-side mutations persist at
         // tx commit. Take ownership of the slots vec to avoid borrow conflicts
         // between `invoke_context.transaction_context` and the syscall context.
-        let slots = std::mem::take(
-            &mut invoke_context
-                .get_syscall_context_mut()?
-                .subaccount_slots,
-        );
+        let slots = std::mem::take(&mut invoke_context.get_syscall_context_mut()?.subaccount_slots);
         serialization::flush_subaccount_slots(
             invoke_context.transaction_context,
             parameter_bytes,
