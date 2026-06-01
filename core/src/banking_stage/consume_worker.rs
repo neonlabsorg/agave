@@ -185,13 +185,13 @@ pub(crate) mod external {
         },
         agave_scheduler_bindings::{
             pack_message_flags,
-            worker_message_types::{not_included_reasons, ExecutionResponse, Resolved},
+            worker_message_types::{not_included_reasons, CheckResponse, ExecutionResponse},
             PackToWorkerMessage, SharablePubkeys, TransactionResponseRegion, WorkerToPackMessage,
             MAX_TRANSACTIONS_PER_MESSAGE,
         },
         agave_scheduling_utils::{
             error::transaction_error_to_not_included_reason,
-            responses_region::{execution_responses_from_iter, resolve_responses_from_iter},
+            responses_region::{check_responses_from_iter, execution_responses_from_iter},
             transaction_ptr::{TransactionPtr, TransactionPtrBatch},
         },
         agave_transaction_view::{
@@ -422,7 +422,7 @@ pub(crate) mod external {
                 )
             };
 
-            let responses = resolve_responses_from_iter(
+            let responses = check_responses_from_iter(
                 &self.allocator,
                 self.resolve_response_iterator(batch, &root_bank)?,
             )
@@ -480,7 +480,7 @@ pub(crate) mod external {
             &self,
             batch: TransactionPtrBatch,
             bank: &Bank,
-        ) -> Result<impl ExactSizeIterator<Item = Resolved>, ExternalConsumeWorkerError> {
+        ) -> Result<impl ExactSizeIterator<Item = CheckResponse>, ExternalConsumeWorkerError> {
             let enable_static_instruction_limit = bank
                 .feature_set
                 .is_active(&agave_feature_set::static_instruction_limit::ID);
@@ -677,19 +677,19 @@ pub(crate) mod external {
             })
         }
 
-        /// Translate resolved pubkeys results into [`Resolved`] response.
+        /// Translate resolved pubkeys results into [`CheckResponse`] response.
         fn resolved_pubkeys_to_response(
             resolving_result: Result<Option<(SharablePubkeys, u64)>, ()>,
             slot: Slot,
-        ) -> Resolved {
+        ) -> CheckResponse {
             match resolving_result {
-                Ok(Some((resolved_pubkeys, min_alt_deactivation_slot))) => Resolved {
+                Ok(Some((resolved_pubkeys, min_alt_deactivation_slot))) => CheckResponse {
                     success: agave_scheduler_bindings::worker_message_types::RESOLVE_SUCCESS,
                     slot,
                     min_alt_deactivation_slot,
                     resolved_pubkeys,
                 },
-                _ => Resolved {
+                _ => CheckResponse {
                     success: if resolving_result.is_ok() {
                         agave_scheduler_bindings::worker_message_types::RESOLVE_SUCCESS
                     } else {
@@ -907,7 +907,7 @@ pub(crate) mod external {
             const TEST_SLOT: Slot = 7;
             assert_eq!(
                 ExternalWorker::resolved_pubkeys_to_response(Err(()), TEST_SLOT),
-                Resolved {
+                CheckResponse {
                     success: agave_scheduler_bindings::worker_message_types::RESOLVE_FAILURE,
                     slot: TEST_SLOT,
                     min_alt_deactivation_slot: u64::MAX,
@@ -919,7 +919,7 @@ pub(crate) mod external {
             );
             assert_eq!(
                 ExternalWorker::resolved_pubkeys_to_response(Ok(None), TEST_SLOT),
-                Resolved {
+                CheckResponse {
                     success: agave_scheduler_bindings::worker_message_types::RESOLVE_SUCCESS,
                     slot: TEST_SLOT,
                     min_alt_deactivation_slot: u64::MAX,
@@ -938,7 +938,7 @@ pub(crate) mod external {
                     Ok(Some((resolved_pubkeys, 120))),
                     TEST_SLOT
                 ),
-                Resolved {
+                CheckResponse {
                     success: agave_scheduler_bindings::worker_message_types::RESOLVE_SUCCESS,
                     slot: TEST_SLOT,
                     min_alt_deactivation_slot: 120,

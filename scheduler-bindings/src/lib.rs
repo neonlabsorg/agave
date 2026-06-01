@@ -434,8 +434,8 @@ pub mod worker_message_types {
         // pub const COMMIT_CANCELLED: u8 = 102;
     }
 
-    /// Tag indicating [`Resolved`] inner message.
-    pub const RESOLVED: u8 = 1;
+    /// Tag indicating [`CheckResponse`] inner message.
+    pub const CHECK_RESPONSE: u8 = 1;
 
     /// Resolving was unsuccessful.
     pub const RESOLVE_FAILURE: u8 = 0;
@@ -447,7 +447,7 @@ pub mod worker_message_types {
         derive(Debug, Clone, Copy, PartialEq, Eq)
     )]
     #[repr(C)]
-    pub struct Resolved {
+    pub struct CheckResponse {
         /// Indicates if resolution was successful.
         /// [`RESOLVE_SUCCESS`] if resolving succeeded.
         /// [`RESOLVE_FAILURE`] if resolved failed.
