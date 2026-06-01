@@ -194,7 +194,16 @@ fn build_simple_ui_transaction_status_meta(
         return_data: OptionSerializer::Skip,
         compute_units_consumed: OptionSerializer::Skip,
         cost_units: OptionSerializer::Skip,
-        subaccount_addresses: OptionSerializer::Skip,
+        subaccount_addresses: if meta.subaccount_addresses.is_empty() {
+            OptionSerializer::Skip
+        } else {
+            OptionSerializer::Some(
+                meta.subaccount_addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            )
+        },
     }
 }
 
