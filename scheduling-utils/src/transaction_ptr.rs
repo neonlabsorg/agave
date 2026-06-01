@@ -5,6 +5,7 @@ use {
     rts_alloc::Allocator,
 };
 
+#[derive(Debug)]
 pub struct TransactionPtr {
     ptr: NonNull<u8>,
     len: usize,
