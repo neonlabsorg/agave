@@ -6,6 +6,7 @@ use {
         TransactionResponseRegion,
     },
     rts_alloc::Allocator,
+    std::ptr::NonNull,
 };
 
 /// Prepare a [`TransactionResponseRegion`] with [`ExecutionResponse`].
@@ -60,13 +61,12 @@ unsafe fn from_iterator<T: Sized>(
     })
 }
 
-pub struct CheckResponsesPtr<'a> {
+pub struct CheckResponsesPtr {
     ptr: NonNull<CheckResponse>,
     count: usize,
-    allocator: &'a Allocator,
 }
 
-impl<'a> CheckResponsesPtr<'a> {
+impl CheckResponsesPtr {
     /// Constructs the pointer from a [`TransactionResponseRegion`].
     ///
     /// # Safety
@@ -74,10 +74,9 @@ impl<'a> CheckResponsesPtr<'a> {
     /// - The provided [`TransactionResponseRegion`] must be of type
     ///   [`worker_message_types::CHECK_RESPONSE`].
     /// - The allocation pointed to by this region must not have previously been freed.
-    /// - Pointer must be exclusive so that calling [`Self::free`] is safe.
     pub unsafe fn from_transaction_response_region(
         transaction_response_region: &TransactionResponseRegion,
-        allocator: &'a Allocator,
+        allocator: &Allocator,
     ) -> Self {
         debug_assert!(transaction_response_region.tag == worker_message_types::CHECK_RESPONSE);
 
@@ -86,7 +85,6 @@ impl<'a> CheckResponsesPtr<'a> {
                 .ptr_from_offset(transaction_response_region.transaction_responses_offset)
                 .cast(),
             count: transaction_response_region.num_transaction_responses as usize,
-            allocator,
         }
     }
 
@@ -106,18 +104,21 @@ impl<'a> CheckResponsesPtr<'a> {
     }
 
     /// Free the batch's allocation.
-    pub fn free(self) {
-        unsafe { self.allocator.free(self.ptr.cast()) }
+    ///
+    /// # Safety
+    ///
+    /// - `Self` must be exclusively owned.
+    pub unsafe fn free(self, allocator: &Allocator) {
+        unsafe { allocator.free(self.ptr.cast()) }
     }
 }
 
-pub struct ExecutionResponsesPtr<'a> {
+pub struct ExecutionResponsesPtr {
     ptr: NonNull<ExecutionResponse>,
     count: usize,
-    allocator: &'a Allocator,
 }
 
-impl<'a> ExecutionResponsesPtr<'a> {
+impl ExecutionResponsesPtr {
     /// Constructs the pointer from a [`TransactionResponseRegion`].
     ///
     /// # Safety
@@ -125,10 +126,9 @@ impl<'a> ExecutionResponsesPtr<'a> {
     /// - The provided [`TransactionResponseRegion`] must be of type
     ///   [`worker_message_types::EXECUTION_RESPONSE`].
     /// - The allocation pointed to by this region must not have previously been freed.
-    /// - Pointer must be exclusive so that calling [`Self::free`] is safe.
     pub unsafe fn from_transaction_response_region(
         transaction_response_region: &TransactionResponseRegion,
-        allocator: &'a Allocator,
+        allocator: &Allocator,
     ) -> Self {
         debug_assert!(transaction_response_region.tag == worker_message_types::EXECUTION_RESPONSE);
 
@@ -137,7 +137,6 @@ impl<'a> ExecutionResponsesPtr<'a> {
                 .ptr_from_offset(transaction_response_region.transaction_responses_offset)
                 .cast(),
             count: transaction_response_region.num_transaction_responses as usize,
-            allocator,
         }
     }
 
@@ -157,7 +156,11 @@ impl<'a> ExecutionResponsesPtr<'a> {
     }
 
     /// Free the batch's allocation.
-    pub fn free(self) {
-        unsafe { self.allocator.free(self.ptr.cast()) }
+    ///
+    /// # Safety
+    ///
+    /// - `Self` must be exclusively owned.
+    pub unsafe fn free(self, allocator: &Allocator) {
+        unsafe { allocator.free(self.ptr.cast()) }
     }
 }
