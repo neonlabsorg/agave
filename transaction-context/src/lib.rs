@@ -27,6 +27,7 @@ pub mod transaction_accounts;
 pub mod vm_slice;
 
 pub const MAX_ACCOUNTS_PER_TRANSACTION: usize = 256;
+pub const MAX_SUBACCOUNTS_PER_TRANSACTION: usize = 2048;
 // This is one less than MAX_ACCOUNTS_PER_TRANSACTION because
 // one index is used as NON_DUP_MARKER in ABI v0 and v1.
 pub const MAX_ACCOUNTS_PER_INSTRUCTION: usize = 255;
@@ -281,7 +282,7 @@ impl<'ix_data> TransactionContext<'ix_data> {
         if self.find_index_of_subaccount(&pubkey).is_some() {
             return Err(InstructionError::DuplicateAccountIndex);
         }
-        if (self.accounts.number_of_subaccounts() as usize) >= MAX_ACCOUNTS_PER_TRANSACTION {
+        if (self.accounts.number_of_subaccounts() as usize) >= MAX_SUBACCOUNTS_PER_TRANSACTION {
             return Err(InstructionError::MaxAccountsExceeded);
         }
         Ok(self.accounts.add_subaccount(pubkey, account))

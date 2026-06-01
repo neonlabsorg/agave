@@ -1,15 +1,17 @@
 use solana_program_runtime::memory::translate_vm_slice;
 use solana_svm_measure::measure::Measure;
 use solana_svm_timings::ExecuteTimings;
-#[allow(deprecated)]
+
 use {
     crate::{Error, consume_compute_meter, translate_slice, translate_slice_mut, translate_type, translate_type_mut,},
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
+    solana_account_info::AccountInfo,
     solana_instruction::error::InstructionError,
     solana_program_entrypoint::SUCCESS,
     solana_program_runtime::{
         cpi::{CallerAccount, SolAccountInfo,},
         invoke_context::{AccountViewKind, InvokeContext, SerializedAccountMetadata},
+        serialization::SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE,
     },
     solana_pubkey::{Pubkey, MAX_SEEDS, PUBKEY_BYTES},
     solana_sbpf::{
@@ -24,6 +26,22 @@ use {
         InstructionAccount, MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
     },
 };
+
+/// The runtime reserves exactly [`SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE`] bytes
+/// for the account-view buffer, so the `AccountInfo` written there by
+/// [`load_subaccount`] must fit within that reservation.
+const _: () = assert!(
+    core::mem::size_of::<AccountInfo>() <= SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE,
+    "AccountInfo does not fit within the reserved subaccount account-view buffer",
+);
+
+/// The runtime reserves exactly [`SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE`] bytes
+/// for the account-view buffer, so the `SolAccountInfo` written there by
+/// [`load_subaccount_c`] must fit within that reservation.
+const _: () = assert!(
+    core::mem::size_of::<SolAccountInfo>() <= SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE,
+    "SolAccountInfo does not fit within the reserved subaccount account-view buffer",
+);
 
 // ============================================================================
 // F10 — Subaccounts syscalls (PRS-153)
@@ -595,7 +613,7 @@ fn sync_subaccount_slot_after_mutation(
     {
         let caller_account = match kind {
             AccountViewKind::Rust => {
-                let view = translate_type::<solana_account_info::AccountInfo>(
+                let view = translate_type::<AccountInfo>(
                     memory_mapping,
                     view_addr,
                     check_aligned,
@@ -665,19 +683,31 @@ fn translate_subaccount_seeds(
         .collect::<Result<Vec<_>, Error>>()?;
     let base_seed: [u8; 32] = (*seeds.first().ok_or(InstructionError::InvalidArgument)?)
         .try_into()
-        .map_err(|_| InstructionError::InvalidArgument)?;
+        .map_err(|err: std::array::TryFromSliceError| {
+            ic_msg!(invoke_context, "Invalid base account seed length: {:?}", err);
+            InstructionError::InvalidArgument
+        })?;
     let base_pubkey = Pubkey::new_from_array(base_seed);
     let base_index_in_transaction = invoke_context
         .transaction_context
         .find_index_of_account(&base_pubkey)
-        .ok_or(InstructionError::InvalidArgument)?;
+        .ok_or({
+            ic_msg!(invoke_context, "Base account {} not in transaction", base_pubkey);
+            InstructionError::InvalidArgument
+        })?;
     let base_index_in_instruction = instruction_context
         .get_index_of_account_in_instruction(base_index_in_transaction)
-        .map_err(|_| InstructionError::InvalidArgument)?;
+        .map_err(|_| {
+            ic_msg!(invoke_context, "Base account {} not in instruction", base_pubkey);
+            InstructionError::InvalidArgument
+        })?;
 
     let is_writable = instruction_context
         .is_instruction_account_writable(base_index_in_instruction)
-        .map_err(|_| InstructionError::InvalidArgument)?;
+        .map_err(|_| {
+            ic_msg!(invoke_context, "Can't get writable for base account {} ", base_pubkey);
+            InstructionError::InvalidArgument
+        })?;
 
     let subaccount_pubkey = create_subaccount_address(&seeds, program_id)
         .map_err(|_| InstructionError::InvalidSeeds)?;
