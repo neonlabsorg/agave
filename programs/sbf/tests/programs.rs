@@ -6444,3 +6444,162 @@ fn test_program_sbf_subaccount_cpi_increment() {
     assert_eq!(stored.owner(), &program_id);
     assert_eq!(stored.lamports(), SUBACCOUNT_FUNDING_LAMPORTS);
 }
+
+// ----------------------------------------------------------------------------
+// `sol_read_subaccount` tests (disc=9). The program creates a subaccount with
+// `content`, then reads a `[offset, offset+length)` window back and verifies
+// the bytes. On success the tx is Ok; an out-of-range or missing-subaccount
+// read aborts the instruction with `InstructionError::InvalidArgument`.
+// ----------------------------------------------------------------------------
+
+/// Builds the disc=9 payload: `do_create` flag, `offset`/`length` (u64 LE),
+/// followed by the subaccount `content`.
+#[cfg(feature = "sbf_rust")]
+fn subaccount_read_payload(do_create: bool, offset: u64, length: u64, content: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(17 + content.len());
+    payload.push(do_create as u8);
+    payload.extend_from_slice(&offset.to_le_bytes());
+    payload.extend_from_slice(&length.to_le_bytes());
+    payload.extend_from_slice(content);
+    payload
+}
+
+/// Happy path: create a subaccount with `content`, then read the full range
+/// back through `sol_read_subaccount`. The program asserts the bytes match,
+/// so an Ok status proves the syscall returned the exact stored data.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_success() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+    let content: &[u8] = b"read-subaccount-content-32-bytes";
+    assert_eq!(content.len(), 32);
+
+    let payload = subaccount_read_payload(true, 0, content.len() as u64, content);
+    let ix = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert!(
+        status.is_ok(),
+        "read of full range must succeed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    // The subaccount was created, so the stored data must equal `content`.
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    let stored = bank
+        .get_account(&storage_addr)
+        .expect("subaccount must exist after a successful read tx");
+    assert_eq!(stored.data(), content);
+}
+
+/// Happy path with a non-zero offset: read a window from the middle of the
+/// stored data. The program verifies the returned bytes equal
+/// `content[offset..offset+length]`.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_success_offset() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+    let content: &[u8] = b"read-subaccount-content-32-bytes";
+
+    // Read 8 bytes starting at offset 10 — strictly inside the 32-byte buffer.
+    let payload = subaccount_read_payload(true, 10, 8, content);
+    let ix = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert!(
+        status.is_ok(),
+        "in-range read at offset 10 must succeed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+}
+
+/// Edge case — no subaccount: reading bytes from a subaccount that was never
+/// created sees empty data, so any positive-length read is out of range and
+/// the syscall fails with `InvalidArgument`.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_missing_subaccount() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    // do_create = false ⇒ the subaccount does not exist; read 8 bytes.
+    let payload = subaccount_read_payload(false, 0, 8, &[]);
+    let ix = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::InvalidArgument
+        )),
+        "read of a missing subaccount must fail with InvalidArgument\nlogs:\n{}",
+        logs.join("\n"),
+    );
+}
+
+/// Edge case — fully out of range: the read window starts at `offset == len`,
+/// so none of the requested bytes exist. The syscall fails with
+/// `InvalidArgument`.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_out_of_range_full() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+    let content: &[u8] = b"read-subaccount-content-32-bytes";
+
+    // offset == content.len() ⇒ the entire [offset, offset+8) range is past
+    // the end of the data.
+    let payload = subaccount_read_payload(true, content.len() as u64, 8, content);
+    let ix = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::InvalidArgument
+        )),
+        "fully out-of-range read must fail with InvalidArgument\nlogs:\n{}",
+        logs.join("\n"),
+    );
+}
+
+/// Edge case — partially out of range: the read window starts inside the data
+/// but extends past the end. The syscall must reject the whole read with
+/// `InvalidArgument` (no partial copy).
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_out_of_range_partial() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+    let content: &[u8] = b"read-subaccount-content-32-bytes";
+
+    // offset 28 + length 8 = 36 > 32 ⇒ starts inside the data but runs past
+    // the end.
+    let payload = subaccount_read_payload(true, 28, 8, content);
+    let ix = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::InvalidArgument
+        )),
+        "partially out-of-range read must fail with InvalidArgument\nlogs:\n{}",
+        logs.join("\n"),
+    );
+}

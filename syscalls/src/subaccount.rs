@@ -980,6 +980,85 @@ declare_builtin_function!(
 );
 
 declare_builtin_function!(
+    /// F10: read data from a subaccount without loading it into a slot
+    SyscallReadSubaccount,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        seeds_addr: u64,
+        seeds_len: u64,
+        buff: u64,
+        length: u64,
+        offset: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        let mut load_subaccount_time = Measure::start("load_subaccount");
+        let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+        let check_aligned = invoke_context.get_check_aligned();
+
+        let mut compute_subaccounts_time = Measure::start("compute_subaccounts");
+        // Translate seeds → derive PDA → inherit base account writable bit.
+        let (subaccount_pubkey, _) = {
+            let instruction_context = invoke_context
+                .transaction_context
+                .get_current_instruction_context()?;
+            let program_id = *instruction_context.get_program_key()?;
+            translate_subaccount_seeds(
+                &program_id,
+                seeds_addr,
+                seeds_len,
+                memory_mapping,
+                check_aligned,
+                invoke_context,
+                &instruction_context,
+            )?
+        };
+        compute_subaccounts_time.stop();
+        invoke_context.timings.compute_subaccounts_us += compute_subaccounts_time.as_us();
+
+        let existing = invoke_context
+            .transaction_context
+            .find_index_of_subaccount(&subaccount_pubkey);
+        let subaccount_index = if let Some(idx) = existing {
+            idx
+        } else {
+            let on_chain_address = subaccount_storage_address(&subaccount_pubkey);
+            let (loaded, _slot) = invoke_context
+                .get_account_shared_data(&on_chain_address)
+                .unwrap_or_else(|| (AccountSharedData::default(), 0));
+            let data_len_cost = (loaded.data().len() as u64)
+                .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
+                .unwrap_or(u64::MAX);
+            consume_compute_meter(invoke_context, data_len_cost)?;
+            invoke_context
+                .transaction_context
+                .add_subaccount(subaccount_pubkey, loaded)?
+        };
+
+        let borrowed = invoke_context
+            .transaction_context
+            .accounts()
+            .try_borrow_subaccount(subaccount_index)?;
+
+        let data = borrowed.data();
+        let start = offset as usize;
+        let end = start
+            .checked_add(length as usize)
+            .ok_or(InstructionError::InvalidArgument)?;
+        let src = data
+            .get(start..end)
+            .ok_or(InstructionError::InvalidArgument)?;
+        let dst = translate_slice_mut::<u8>(memory_mapping, buff, length, check_aligned)?;
+        dst.copy_from_slice(src);
+
+        load_subaccount_time.stop();
+        invoke_context.timings.load_subaccounts_us += load_subaccount_time.as_us();
+
+        Ok(0)
+    }
+);
+
+declare_builtin_function!(
     /// F10: release a subaccount slot previously populated by either
     /// `sol_load_subaccount_rust` or `sol_load_subaccount_c`. The data region
     /// was direct-mapped onto the host `AccountSharedData`, so any program

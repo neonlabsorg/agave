@@ -12,6 +12,11 @@
 //!   4 — create + load + write initial u64 + self-CPI(disc=5) +
 //!       verify increment + unload (CPI mutation, slot stays loaded across CPI)
 //!   5 — load + read u64 + write u64+1 + unload (increment, invoked via CPI)
+//!   9 — read_subaccount: optionally create+write content, then read a
+//!       [offset, offset+length) window back via `sol_read_subaccount` and
+//!       (on a successful in-range read) verify the bytes match. Exercises
+//!       the happy path plus the missing-subaccount and out-of-range
+//!       (full/partial) edge cases — see `read_subaccount`.
 //!
 //! Accounts:
 //!   [0] payer / base seed (signer, writable, system-program-owned)
@@ -66,6 +71,13 @@ extern "C" {
         _arg5: u64,
     ) -> u64;
     fn sol_unload_subaccount(vm_header_addr: u64) -> u64;
+    fn sol_read_subaccount(
+        seeds_addr: *const u8,
+        seeds_len: u64,
+        buff: *mut u8,
+        length: u64,
+        offset: u64,
+    ) -> u64;
 }
 
 solana_program_entrypoint::entrypoint!(process_instruction);
@@ -90,6 +102,7 @@ fn process_instruction(
         6 => create_oversized_payload(accounts, payload),
         7 => transfer_lamports(accounts, payload),
         8 => create_load_twice(accounts, payload),
+        9 => read_subaccount(accounts, payload),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -188,6 +201,94 @@ fn create_load_twice(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult 
 
     // If the second load succeeded, we have two slots loaded for the same subaccount, which is not allowed.
     Err(ProgramError::Custom(0x31))
+}
+
+/// Exercises `sol_read_subaccount` (disc=9).
+///
+/// Payload layout:
+///   byte  0       : do_create (1 ⇒ create+load+write `content`+unload first,
+///                   0 ⇒ skip — leaves the subaccount non-existent)
+///   bytes 1..9    : offset (u64 LE) — read start offset
+///   bytes 9..17   : length (u64 LE) — number of bytes to read
+///   bytes 17..    : content — written to the subaccount when do_create=1;
+///                   also the data the read result is verified against
+///
+/// When `sol_read_subaccount` returns an error (out-of-range read, or a
+/// missing subaccount whose data is empty) the syscall aborts the
+/// instruction with that error, so control never returns here and the
+/// transaction fails with the syscall's `InstructionError`. On a successful
+/// in-range read we additionally assert the bytes returned match
+/// `content[offset..offset+length]`, returning `Custom(0x92)` on mismatch so
+/// a silently-wrong read is caught.
+fn read_subaccount(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
+    const MAX_READ: usize = 512;
+
+    let base = accounts.get(0).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let payer = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let seeds = seeds_from_payer(base.key);
+
+    let do_create = *payload.first().ok_or(ProgramError::InvalidInstructionData)? != 0;
+    let offset = u64::from_le_bytes(
+        payload
+            .get(1..9)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(ProgramError::InvalidInstructionData)?,
+    );
+    let length = u64::from_le_bytes(
+        payload
+            .get(9..17)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(ProgramError::InvalidInstructionData)?,
+    );
+    let content = payload.get(17..).ok_or(ProgramError::InvalidInstructionData)?;
+
+    if do_create {
+        let r = unsafe {
+            sol_create_subaccount(
+                payer.key as *const Pubkey as *const u8,
+                seeds.as_ptr() as *const u8,
+                seeds.len() as u64,
+                content.len() as u64,
+                FUNDING_LAMPORTS,
+            )
+        };
+        if r != SUCCESS {
+            return Err(ProgramError::Custom(0x90));
+        }
+        let (header_addr, _view_addr) = load_rust(&seeds)?;
+        write_data(header_addr, content);
+        unload(header_addr)?;
+    }
+
+    let read_len = length as usize;
+    if read_len > MAX_READ {
+        return Err(ProgramError::Custom(0x91));
+    }
+    let mut buffer = [0u8; MAX_READ];
+    let result = unsafe {
+        sol_read_subaccount(
+            seeds.as_ptr() as *const u8,
+            seeds.len() as u64,
+            buffer.as_mut_ptr(),
+            length,
+            offset,
+        )
+    };
+    // An out-of-range or missing-subaccount read aborts the instruction in
+    // the syscall, so reaching here means the read succeeded — verify it.
+    if result != SUCCESS {
+        return Err(ProgramError::from(result));
+    }
+
+    let start = offset as usize;
+    let expected = content
+        .get(start..start.saturating_add(read_len))
+        .ok_or(ProgramError::Custom(0x93))?;
+    if &buffer[..read_len] != expected {
+        return Err(ProgramError::Custom(0x92));
+    }
+
+    Ok(())
 }
 
 fn unload_twice(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
