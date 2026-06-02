@@ -707,25 +707,39 @@ pub(crate) mod external {
             resolving_result: Result<Option<(SharablePubkeys, u64)>, ()>,
             slot: Slot,
         ) -> CheckResponse {
+            use agave_scheduler_bindings::worker_message_types::resolve_flags;
+            const EMPTY_PUBKEYS: SharablePubkeys = SharablePubkeys {
+                offset: 0,
+                num_pubkeys: 0,
+            };
+            let base = CheckResponse {
+                parsing_and_sanitization_flags: 0,
+                status_check_flags: 0,
+                fee_payer_balance_flags: 0,
+                resolve_flags: 0,
+                included_slot: 0,
+                balance_slot: 0,
+                fee_payer_balance: 0,
+                resolution_slot: slot,
+                min_alt_deactivation_slot: u64::MAX,
+                resolved_pubkeys: EMPTY_PUBKEYS,
+            };
             match resolving_result {
                 Ok(Some((resolved_pubkeys, min_alt_deactivation_slot))) => CheckResponse {
-                    success: agave_scheduler_bindings::worker_message_types::RESOLVE_SUCCESS,
-                    slot,
+                    resolve_flags: resolve_flags::REQUESTED | resolve_flags::PERFORMED,
                     min_alt_deactivation_slot,
                     resolved_pubkeys,
+                    ..base
                 },
-                _ => CheckResponse {
-                    success: if resolving_result.is_ok() {
-                        agave_scheduler_bindings::worker_message_types::RESOLVE_SUCCESS
-                    } else {
-                        agave_scheduler_bindings::worker_message_types::RESOLVE_FAILURE
-                    },
-                    slot,
-                    min_alt_deactivation_slot: u64::MAX,
-                    resolved_pubkeys: SharablePubkeys {
-                        offset: 0,
-                        num_pubkeys: 0,
-                    },
+                Ok(None) => CheckResponse {
+                    resolve_flags: resolve_flags::REQUESTED | resolve_flags::PERFORMED,
+                    ..base
+                },
+                Err(()) => CheckResponse {
+                    resolve_flags: resolve_flags::REQUESTED
+                        | resolve_flags::PERFORMED
+                        | resolve_flags::FAILED,
+                    ..base
                 },
             }
         }
@@ -925,29 +939,39 @@ pub(crate) mod external {
 
         #[test]
         fn test_resolved_pubkeys_to_response() {
+            use agave_scheduler_bindings::worker_message_types::resolve_flags;
             const TEST_SLOT: Slot = 7;
+            const EMPTY_PUBKEYS: SharablePubkeys = SharablePubkeys {
+                offset: 0,
+                num_pubkeys: 0,
+            };
+            let base = CheckResponse {
+                parsing_and_sanitization_flags: 0,
+                status_check_flags: 0,
+                fee_payer_balance_flags: 0,
+                resolve_flags: 0,
+                included_slot: 0,
+                balance_slot: 0,
+                fee_payer_balance: 0,
+                resolution_slot: TEST_SLOT,
+                min_alt_deactivation_slot: u64::MAX,
+                resolved_pubkeys: EMPTY_PUBKEYS,
+            };
+
             assert_eq!(
                 ExternalWorker::resolved_pubkeys_to_response(Err(()), TEST_SLOT),
                 CheckResponse {
-                    success: agave_scheduler_bindings::worker_message_types::RESOLVE_FAILURE,
-                    slot: TEST_SLOT,
-                    min_alt_deactivation_slot: u64::MAX,
-                    resolved_pubkeys: SharablePubkeys {
-                        offset: 0,
-                        num_pubkeys: 0
-                    }
+                    resolve_flags: resolve_flags::REQUESTED
+                        | resolve_flags::PERFORMED
+                        | resolve_flags::FAILED,
+                    ..base
                 }
             );
             assert_eq!(
                 ExternalWorker::resolved_pubkeys_to_response(Ok(None), TEST_SLOT),
                 CheckResponse {
-                    success: agave_scheduler_bindings::worker_message_types::RESOLVE_SUCCESS,
-                    slot: TEST_SLOT,
-                    min_alt_deactivation_slot: u64::MAX,
-                    resolved_pubkeys: SharablePubkeys {
-                        offset: 0,
-                        num_pubkeys: 0
-                    }
+                    resolve_flags: resolve_flags::REQUESTED | resolve_flags::PERFORMED,
+                    ..base
                 }
             );
             let resolved_pubkeys = SharablePubkeys {
@@ -960,10 +984,10 @@ pub(crate) mod external {
                     TEST_SLOT
                 ),
                 CheckResponse {
-                    success: agave_scheduler_bindings::worker_message_types::RESOLVE_SUCCESS,
-                    slot: TEST_SLOT,
+                    resolve_flags: resolve_flags::REQUESTED | resolve_flags::PERFORMED,
                     min_alt_deactivation_slot: 120,
-                    resolved_pubkeys
+                    resolved_pubkeys,
+                    ..base
                 }
             );
         }

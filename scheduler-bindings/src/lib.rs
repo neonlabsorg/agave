@@ -445,10 +445,43 @@ pub mod worker_message_types {
     /// Tag indicating [`CheckResponse`] inner message.
     pub const CHECK_RESPONSE: u8 = 1;
 
-    /// Resolving was unsuccessful.
-    pub const RESOLVE_FAILURE: u8 = 0;
-    /// Resolving was successful.
-    pub const RESOLVE_SUCCESS: u8 = 1;
+    pub mod parsing_and_sanitization_flags {
+        /// Flag set if parsing and sanitization failed.
+        pub const FAILED: u8 = 1 << 0;
+    }
+
+    pub mod status_check_flags {
+        /// Flag set if status checks were requested.
+        pub const REQUESTED: u8 = 1 << 0;
+        /// Flag set if status checks were performed. A previous failure
+        /// could have caused checks to be skipped.
+        pub const PERFORMED: u8 = 1 << 1;
+        /// Flag set if status checks failed due to the transaction being
+        /// too old.
+        pub const TOO_OLD: u8 = 1 << 2;
+        /// Flag set if status checks failed due to the transaction already
+        /// being processed.
+        pub const ALREADY_PROCESSED: u8 = 1 << 3;
+        /// Flag set if status checks failed due to an invalid nonce state.
+        pub const INVALID_NONCE: u8 = 1 << 4;
+    }
+
+    pub mod fee_payer_balance_flags {
+        /// Flag set if fee-payer balance was requested.
+        pub const REQUESTED: u8 = 1 << 0;
+        /// Flag set if fee-payer balance fetching was performed. A previous
+        /// failure could have caused balance fetching to be skipped.
+        pub const PERFORMED: u8 = 1 << 1;
+    }
+
+    pub mod resolve_flags {
+        /// Flag set if resolving pubkeys was requested.
+        pub const REQUESTED: u8 = 1 << 0;
+        /// Flag set if resolving pubkeys was performed.
+        pub const PERFORMED: u8 = 1 << 1;
+        /// Flag set if resolving failed.
+        pub const FAILED: u8 = 1 << 2;
+    }
 
     #[cfg_attr(
         feature = "dev-context-only-utils",
@@ -456,16 +489,40 @@ pub mod worker_message_types {
     )]
     #[repr(C)]
     pub struct CheckResponse {
-        /// Indicates if resolution was successful.
-        /// [`RESOLVE_SUCCESS`] if resolving succeeded.
-        /// [`RESOLVE_FAILURE`] if resolved failed.
-        /// Other values should be considered invalid.
-        pub success: u8,
-        /// Slot of the bank used for resolution.
-        pub slot: u64,
+        /// See [`parsing_and_sanitization_flags`] for details.
+        pub parsing_and_sanitization_flags: u8,
+        /// See [`status_check_flags`] for details.
+        pub status_check_flags: u8,
+        /// See [`fee_payer_balance_flags`] for details.
+        pub fee_payer_balance_flags: u8,
+        /// See [`resolve_flags`] for details.
+        pub resolve_flags: u8,
+
+        /// If [`status_check_flags::ALREADY_PROCESSED`] is set,
+        /// this is the slot the transaction was previously included in.
+        /// Otherwise the value is undefined.
+        pub included_slot: u64,
+
+        /// Set only if [`fee_payer_balance_flags::PERFORMED`] is set,
+        /// otherwise the value is undefined.
+        /// The slot of the bank used to fetch fee-payer balance.
+        pub balance_slot: u64,
+        /// Set only if [`fee_payer_balance_flags::PERFORMED`] is set,
+        /// otherwise the value is undefined.
+        /// The balance of the fee-payer.
+        pub fee_payer_balance: u64,
+
+        /// Set only if [`resolve_flags::PERFORMED`] is set,
+        /// otherwise the value is undefined.
+        /// The slot of the bank used to resolve the pubkeys.
+        pub resolution_slot: u64,
+        /// Set only if [`resolve_flags::PERFORMED`] is set,
+        /// otherwise the value is undefined.
         /// Minimum deactivation slot of any ALT if any.
         /// u64::MAX if no ALTs or deactivation.
         pub min_alt_deactivation_slot: u64,
+        /// Set only if [`resolve_flags::PERFORMED`] is set,
+        /// otherwise the value is undefined.
         /// Resolved pubkeys - writable then readonly.
         /// Freeing this memory is the responsibility of the external
         /// pack process.
