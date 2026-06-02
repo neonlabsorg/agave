@@ -243,11 +243,11 @@ pub struct PackToWorkerMessage {
     /// Flags on how to handle this message.
     /// See [`pack_message_flags`] for details.
     pub flags: u16,
-    /// If [`pack_message_flags::RESOLVE`] flag is not set, this is the
-    /// maximum slot the transactions can be processed in. If the working
-    /// bank's slot in the worker thread is greater than this slot,
-    /// the transaction will not be processed.
-    pub max_execution_slot: u64,
+    /// Maximum working bank slot that this message will be processed
+    /// for. For execution, this will check the leader bank if it exists.
+    /// If the working bank is ahead of the slot, the return message will
+    /// be set with [`processed_codes::MAX_WORKING_SLOT_EXCEEDED`].
+    pub max_working_slot: u64,
     /// Offset and number of transactions in the batch.
     /// See [`SharableTransactionBatchRegion`] for details.
     /// Agave will return this batch in the response message, it is
@@ -258,26 +258,42 @@ pub struct PackToWorkerMessage {
 
 pub mod pack_message_flags {
     //! Flags for [`crate::PackToWorkerMessage::flags`].
-    //! These flags can be ORed together so must be unique bits, with
-    //! the exception of [`NONE`].
-    //! The *default* behavior, [`NONE`], is to attempt execution and
-    //! inclusion in the specified `max_execution_slot`.
+    //! Use [`CHECK`] or [`EXECUTE`] to specify how a batch should be processed.
+    //! See [`check_flags`] and [`execution_flags`] for details.
 
-    /// No special handling - execute the transactions normally.
-    pub const NONE: u16 = 0;
+    /// Combine with [`check_flags`] for performing checks on transactions.
+    /// Worker will respond with [`super::worker_message_types::CheckResponse`] if
+    /// the message is processed.
+    pub const CHECK: u16 = 0;
+    /// Combine with additional [`execution_flags`] for executing a batch of transactions.
+    /// Worker will responsd with [`super::worker_message_types::ExecutionResponse`] if
+    /// the message is processed.
+    pub const EXECUTE: u16 = 1;
 
-    /// Transactions on the [`super::PackToWorkerMessage`] should have their
-    /// addresses resolved.
-    ///
-    /// If this flag, the transaction will attempt to be executed and included
-    /// in the current block.
-    pub const RESOLVE: u16 = 1 << 1;
+    pub mod execution_flags {}
+
+    pub mod check_flags {
+        /// Transactions should check status: if transaction has already been processed
+        /// or the nonce is invalid.
+        pub const STATUS_CHECKS: u16 = 1 << 1;
+
+        /// Fee-payer balance should be fetched for transactions.
+        pub const LOAD_FEE_PAYER_BALANCE: u16 = 1 << 2;
+
+        /// Transactions should have ATL pubkeys resolved and returned.
+        pub const LOAD_ADDRESS_LOOKUP_TABLES: u16 = 1 << 3;
+    }
 }
 
-/// The message was not processed.
-pub const NOT_PROCESSED: u8 = 0;
-/// The message was processed.
-pub const PROCESSED: u8 = 1;
+pub mod processed_codes {
+    /// The message was processed.
+    pub const PROCESSED: u8 = 0;
+    /// The message was not processed because the message was invalid.
+    pub const INVALID: u8 = 1;
+    /// The message was not processed because `max_working_slot`
+    /// was exceeded.
+    pub const MAX_WORKING_SLOT_EXCEEDED: u8 = 2;
+}
 
 /// Message: [Worker -> Pack]
 /// Message from worker threads in response to a [`PackToWorkerMessage`].
@@ -294,15 +310,10 @@ pub struct WorkerToPackMessage {
     /// and is safe to do so - agave will hold no references to this memory
     /// after sending this message.
     pub batch: SharableTransactionBatchRegion,
-    /// [`PROCESSED`] if the message was processed.
-    /// [`NOT_PROCESSED`] if the message could not be processed. This will occur
-    /// if the passed message was invalid, and could indicate an issue
-    /// with the external pack process.
-    /// If  [`NOT_PROCESSED`], the value of [`Self::responses`] is undefined.
-    /// Other values should be considered invalid.
-    pub processed: u8,
+    /// See [`processed_codes`] for accepted values.
+    pub processed_code: u8,
     /// Response per transaction in the batch.
-    /// If [`Self::processed`] is false, this field is undefined.
+    /// If message was not processed, this field is undefined.
     /// See [`TransactionResponseRegion`] for details.
     pub responses: TransactionResponseRegion,
 }
@@ -315,7 +326,7 @@ pub mod worker_message_types {
 
     /// Response to pack for a transaction that attempted execution.
     /// This response will only be sent if the original message flags
-    /// requested execution i.e. not [`super::pack_message_flags::RESOLVE`].
+    /// requested execution i.e. [`super::pack_message_flags::EXECUTE`].
     #[cfg_attr(
         feature = "dev-context-only-utils",
         derive(Debug, Clone, Copy, PartialEq, Eq)
@@ -337,9 +348,6 @@ pub mod worker_message_types {
         /// The transaction could not attempt processing because the
         /// working bank was unavailable.
         pub const BANK_NOT_AVAILABLE: u8 = 1;
-        /// The transaction could not be processed because the `slot`
-        /// in the passed message did not match the working bank's slot.
-        pub const SLOT_MISMATCH: u8 = 2;
 
         /// Transaction dropped because the batch was marked as
         /// all_or_nothing and a different transacation failed.

@@ -229,6 +229,13 @@ pub(crate) mod external {
 
     type Tx = RuntimeTransaction<ResolvedTransactionView<TransactionPtr>>;
 
+    /// Fork-local flag combinations matching the two modes this worker supports.
+    /// `FORK_EXECUTE` (= `pack_message_flags::EXECUTE`) replaces the old `NONE`;
+    /// `FORK_CHECK_RESOLVE` (= `CHECK | LOAD_ADDRESS_LOOKUP_TABLES`) replaces the old `RESOLVE`.
+    const FORK_EXECUTE: u16 = pack_message_flags::EXECUTE;
+    const FORK_CHECK_RESOLVE: u16 =
+        pack_message_flags::CHECK | pack_message_flags::check_flags::LOAD_ADDRESS_LOOKUP_TABLES;
+
     impl ExternalWorker {
         pub fn new(
             id: u32,
@@ -307,8 +314,8 @@ pub(crate) mod external {
                 .fetch_add(1, Ordering::Relaxed);
 
             match message.flags {
-                pack_message_flags::NONE => self.execute_batch(message),
-                pack_message_flags::RESOLVE => self.resolve_batch(message),
+                FORK_EXECUTE => self.execute_batch(message),
+                FORK_CHECK_RESOLVE => self.resolve_batch(message),
                 _ => unreachable!("flags verified earlier"),
             }
         }
@@ -337,11 +344,8 @@ pub(crate) mod external {
                 let bank = leader_state
                     .working_bank()
                     .expect("active_leader_state_with_timeout should only return an active bank");
-                if bank.slot() > message.max_execution_slot {
-                    return self.return_not_included_with_reason(
-                        message,
-                        not_included_reasons::SLOT_MISMATCH,
-                    );
+                if bank.slot() > message.max_working_slot {
+                    return self.return_max_working_slot_exceeded(message);
                 }
 
                 // SAFETY: Assumption that external scheduler does not pass messages with batch regions
@@ -370,7 +374,7 @@ pub(crate) mod external {
                 else {
                     // If already ON the last possible execution slot,
                     // immediately give up instead of trying on next slot.
-                    if bank.slot() == message.max_execution_slot {
+                    if bank.slot() == message.max_working_slot {
                         break;
                     }
                     continue; // recording failed, try again on next slot if possible.
@@ -388,7 +392,7 @@ pub(crate) mod external {
                 .ok_or(ExternalConsumeWorkerError::AllocationFailure)?;
                 let response = WorkerToPackMessage {
                     batch: message.batch,
-                    processed: agave_scheduler_bindings::PROCESSED,
+                    processed_code: agave_scheduler_bindings::processed_codes::PROCESSED,
                     responses,
                 };
 
@@ -430,7 +434,7 @@ pub(crate) mod external {
 
             let response = WorkerToPackMessage {
                 batch: message.batch,
-                processed: agave_scheduler_bindings::PROCESSED,
+                processed_code: agave_scheduler_bindings::processed_codes::PROCESSED,
                 responses,
             };
 
@@ -575,7 +579,7 @@ pub(crate) mod external {
 
             let response_message = WorkerToPackMessage {
                 batch: message.batch,
-                processed: agave_scheduler_bindings::PROCESSED,
+                processed_code: agave_scheduler_bindings::processed_codes::PROCESSED,
                 responses: response_region,
             };
 
@@ -596,9 +600,30 @@ pub(crate) mod external {
             &mut self,
             message: &PackToWorkerMessage,
         ) -> Result<(), ExternalConsumeWorkerError> {
-            let invalid_message = WorkerToPackMessage {
+            self.return_with_processed_code(
+                message,
+                agave_scheduler_bindings::processed_codes::INVALID,
+            )
+        }
+
+        fn return_max_working_slot_exceeded(
+            &mut self,
+            message: &PackToWorkerMessage,
+        ) -> Result<(), ExternalConsumeWorkerError> {
+            self.return_with_processed_code(
+                message,
+                agave_scheduler_bindings::processed_codes::MAX_WORKING_SLOT_EXCEEDED,
+            )
+        }
+
+        fn return_with_processed_code(
+            &mut self,
+            message: &PackToWorkerMessage,
+            processed_code: u8,
+        ) -> Result<(), ExternalConsumeWorkerError> {
+            let response_message = WorkerToPackMessage {
                 batch: message.batch,
-                processed: agave_scheduler_bindings::NOT_PROCESSED,
+                processed_code,
                 responses: TransactionResponseRegion {
                     tag: 0,
                     num_transaction_responses: 0,
@@ -613,7 +638,7 @@ pub(crate) mod external {
 
             // SAFETY: `reserve` guarantees a properly aligned space
             //         for a `WorkerToPackMessage`
-            unsafe { send_ptr.write(invalid_message) };
+            unsafe { send_ptr.write(response_message) };
 
             Ok(())
         }
@@ -729,7 +754,7 @@ pub(crate) mod external {
         }
 
         fn validate_message_flags(flags: u16) -> bool {
-            flags == pack_message_flags::NONE || flags == pack_message_flags::RESOLVE
+            flags == FORK_EXECUTE || flags == FORK_CHECK_RESOLVE
         }
 
         fn response_from_commit_details(
@@ -781,8 +806,8 @@ pub(crate) mod external {
         #[test]
         fn test_validate_message() {
             let mut message = PackToWorkerMessage {
-                flags: agave_scheduler_bindings::pack_message_flags::NONE,
-                max_execution_slot: u64::MAX,
+                flags: FORK_EXECUTE,
+                max_working_slot: u64::MAX,
                 batch: agave_scheduler_bindings::SharableTransactionBatchRegion {
                     num_transactions: 0,
                     transactions_offset: 0,
@@ -801,20 +826,16 @@ pub(crate) mod external {
             message.flags = u16::MAX;
             assert!(!ExternalWorker::validate_message(&message));
 
-            message.flags = pack_message_flags::NONE;
+            message.flags = FORK_EXECUTE;
             assert!(ExternalWorker::validate_message(&message));
         }
 
         #[test]
         fn test_validate_message_flags() {
-            assert!(ExternalWorker::validate_message_flags(
-                pack_message_flags::NONE
-            ));
-            assert!(ExternalWorker::validate_message_flags(
-                pack_message_flags::RESOLVE
-            ));
+            assert!(ExternalWorker::validate_message_flags(FORK_EXECUTE));
+            assert!(ExternalWorker::validate_message_flags(FORK_CHECK_RESOLVE));
             assert!(!ExternalWorker::validate_message_flags(
-                pack_message_flags::RESOLVE + 1
+                FORK_CHECK_RESOLVE + 1
             ))
         }
 
