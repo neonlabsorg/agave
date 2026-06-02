@@ -495,6 +495,16 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                 ),
         )
         .arg(
+            Arg::with_name("enable_test_clock_offset")
+                .long("enable-test-clock-offset")
+                .takes_value(false)
+                .help(
+                    "Expose the Parasol test-only `parasol_setClockOffset` / \
+                     `parasol_getClockOffset` JSON-RPC methods on this validator. \
+                     Off by default — only enable on test stands.",
+                ),
+        )
+        .arg(
             Arg::with_name("quiet")
                 .short("q")
                 .long("quiet")

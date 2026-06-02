@@ -24,6 +24,7 @@ pub mod inflation_rewards;
 pub mod installed_scheduler_pool;
 pub mod loader_utils;
 pub mod non_circulating_supply;
+pub mod parasol_clock_offset;
 pub mod prioritization_fee;
 pub mod prioritization_fee_cache;
 mod read_optimized_dashmap;

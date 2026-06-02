@@ -176,6 +176,11 @@ pub struct JsonRpcConfig {
     pub max_request_body_size: Option<usize>,
     /// Disable the health check, used for tests and TestValidator
     pub disable_health_check: bool,
+    /// Parasol test-only: expose `parasol_setClockOffset` /
+    /// `parasol_getClockOffset` RPC methods. Off by default so a stock
+    /// production validator does not accept clock manipulation from
+    /// untrusted RPC callers.
+    pub enable_test_clock_offset: bool,
 }
 
 impl Default for JsonRpcConfig {
@@ -196,6 +201,7 @@ impl Default for JsonRpcConfig {
             rpc_scan_and_fix_roots: Default::default(),
             max_request_body_size: Option::default(),
             disable_health_check: Default::default(),
+            enable_test_clock_offset: Default::default(),
         }
     }
 }
@@ -2933,6 +2939,39 @@ pub mod rpc_minimal {
                     }
                     schedule_by_identity
                 }))
+        }
+    }
+}
+
+// Parasol test-only RPC: lets external tests advance the on-chain clock
+// without warping the slot machinery. Stores a process-wide offset that
+// `Bank::update_clock` adds to the Clock sysvar's `unix_timestamp` field
+// on the next slot transition.
+pub mod rpc_parasol_test {
+    use super::*;
+    #[rpc]
+    pub trait ParasolTest {
+        type Metadata;
+
+        #[rpc(meta, name = "parasol_setClockOffset")]
+        fn set_clock_offset(&self, meta: Self::Metadata, seconds: i64) -> Result<i64>;
+
+        #[rpc(meta, name = "parasol_getClockOffset")]
+        fn get_clock_offset(&self, meta: Self::Metadata) -> Result<i64>;
+    }
+
+    pub struct ParasolTestImpl;
+    impl ParasolTest for ParasolTestImpl {
+        type Metadata = JsonRpcRequestProcessor;
+
+        fn set_clock_offset(&self, _meta: Self::Metadata, seconds: i64) -> Result<i64> {
+            debug!("parasol_setClockOffset rpc request received: {seconds}");
+            solana_runtime::parasol_clock_offset::set(seconds);
+            Ok(seconds)
+        }
+
+        fn get_clock_offset(&self, _meta: Self::Metadata) -> Result<i64> {
+            Ok(solana_runtime::parasol_clock_offset::get())
         }
     }
 }

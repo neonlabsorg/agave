@@ -5,7 +5,10 @@ use {
         cluster_tpu_info::ClusterTpuInfo,
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
-        rpc::{rpc_accounts::*, rpc_accounts_scan::*, rpc_bank::*, rpc_full::*, rpc_minimal::*, *},
+        rpc::{
+            rpc_accounts::*, rpc_accounts_scan::*, rpc_bank::*, rpc_full::*, rpc_minimal::*,
+            rpc_parasol_test::*, *,
+        },
         rpc_cache::LargestAccountsCache,
         rpc_health::*,
     },
@@ -768,6 +771,7 @@ impl JsonRpcService {
             };
 
         let full_api = config.full_api;
+        let enable_test_clock_offset = config.enable_test_clock_offset;
         let max_request_body_size = config
             .max_request_body_size
             .unwrap_or(MAX_REQUEST_BODY_SIZE);
@@ -813,6 +817,9 @@ impl JsonRpcService {
                 let mut io = MetaIoHandler::default();
 
                 io.extend_with(rpc_minimal::MinimalImpl.to_delegate());
+                if enable_test_clock_offset {
+                    io.extend_with(rpc_parasol_test::ParasolTestImpl.to_delegate());
+                }
                 if full_api {
                     io.extend_with(rpc_bank::BankDataImpl.to_delegate());
                     io.extend_with(rpc_accounts::AccountsDataImpl.to_delegate());
