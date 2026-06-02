@@ -39,6 +39,32 @@ const SERIALIZED_ENTRIES_OVERHEAD: u64 = {
     + 8 // Vec<Entry> length
 };
 
+#[derive(Debug)]
+pub struct ExecutionFlags {
+    /// Should failing transactions within the batch be dropped (no fee charged
+    /// & not committed).
+    pub drop_on_failure: bool,
+    /// If any transaction in the batch is not committed then the entire batch
+    /// should not be committed.
+    ///
+    /// # Note
+    ///
+    /// Without `drop_on_failure` this flag will still allow processed but
+    /// failing transactions to be committed. If both flags are set then any
+    /// failing transaction will cause all transactions to be aborted.
+    pub all_or_nothing: bool,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for ExecutionFlags {
+    fn default() -> Self {
+        Self {
+            drop_on_failure: false,
+            all_or_nothing: false,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RetryableIndex {
     pub index: usize,
@@ -207,7 +233,7 @@ impl Consumer {
         // WouldExceedMaxAccountCostLimit, WouldExceedMaxVoteCostLimit
         // and WouldExceedMaxAccountDataCostLimit
         let execute_and_commit_transactions_output =
-            self.execute_and_commit_transactions_locked(bank, &batch);
+            self.execute_and_commit_transactions_locked(bank, &batch, ExecutionFlags::default());
 
         // Once the accounts are new transactions can enter the pipeline to process them
         let (_, unlock_us) = measure_us!(drop(batch));
@@ -249,6 +275,7 @@ impl Consumer {
         &self,
         bank: &Bank,
         batch: &TransactionBatch<impl TransactionWithMeta>,
+        flags: ExecutionFlags,
     ) -> ExecuteAndCommitTransactionsOutput {
         let transaction_status_sender_enabled = self.committer.transaction_status_sender_enabled();
         let mut execute_and_commit_timings = LeaderExecuteAndCommitTimings::default();
@@ -334,6 +361,8 @@ impl Consumer {
                     recording_config: ExecutionRecordingConfig::new_single_setting(
                         transaction_status_sender_enabled
                     ),
+                    drop_on_failure: flags.drop_on_failure,
+                    all_or_nothing: flags.all_or_nothing,
                 }
             ));
         execute_and_commit_timings.load_execute_us = load_execute_us;
