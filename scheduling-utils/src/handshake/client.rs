@@ -186,7 +186,7 @@ pub fn setup_session(
                 };
 
                 Ok(ClientWorkerSession {
-                    pack_to_worker: shaq::Producer::join(pack_to_worker)?,
+                    pack_to_worker: unsafe { shaq::Producer::join(pack_to_worker)? },
                     worker_to_pack: unsafe { shaq::Consumer::join(worker_to_pack)? },
                 })
             })
