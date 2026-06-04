@@ -947,6 +947,10 @@ pub(crate) mod external {
                     Err(TransactionError::AlreadyProcessed) => {
                         check_response.status_check_flags |= status_check_flags::ALREADY_PROCESSED;
                     }
+                    Err(TransactionError::UnsupportedVersion) => {
+                        check_response.status_check_flags |=
+                            status_check_flags::UNSUPPORTED_VERSION;
+                    }
                     _ => {}
                 }
             }
