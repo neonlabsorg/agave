@@ -49,6 +49,7 @@ solana-instruction = { workspace = true }
 solana-last-restart-slot = { workspace = true }
 solana-loader-v3-interface = { workspace = true }
 solana-program-entrypoint = { workspace = true }
+solana-program-subaccount = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-rent = { workspace = true }
 solana-sbpf = { workspace = true, features = ["jit"] }

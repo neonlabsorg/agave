@@ -3021,6 +3021,79 @@ impl RpcClient {
         )
     }
 
+    /// Returns all information associated with the subaccount of the provided
+    /// owner-facing pubkey.
+    ///
+    /// If the subaccount has no on-chain storage, this method returns an error.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method is built on the [`getSubaccount`] RPC method.
+    ///
+    /// [`getSubaccount`]: getSubaccount
+    pub fn get_subaccount(&self, pubkey: &Pubkey) -> ClientResult<Account> {
+        self.invoke((self.rpc_client.as_ref()).get_subaccount(pubkey))
+    }
+
+    /// Returns all information associated with the subaccount of the provided
+    /// owner-facing pubkey.
+    ///
+    /// If the subaccount has no on-chain storage, this method returns
+    /// `Ok(None)`.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method is built on the [`getSubaccount`] RPC method.
+    ///
+    /// [`getSubaccount`]: getSubaccount
+    pub fn get_subaccount_with_commitment(
+        &self,
+        pubkey: &Pubkey,
+        commitment_config: CommitmentConfig,
+    ) -> RpcResult<Option<Account>> {
+        self.invoke(
+            (self.rpc_client.as_ref()).get_subaccount_with_commitment(pubkey, commitment_config),
+        )
+    }
+
+    /// Returns the subaccount information for a list of owner-facing pubkeys.
+    ///
+    /// The returned vector preserves the order of `pubkeys`. An entry is `None`
+    /// when the corresponding subaccount has no on-chain storage.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method is built on the [`getMultipleSubaccounts`] RPC method.
+    ///
+    /// [`getMultipleSubaccounts`]: getMultipleSubaccounts
+    pub fn get_multiple_subaccounts(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> ClientResult<Vec<Option<Account>>> {
+        self.invoke((self.rpc_client.as_ref()).get_multiple_subaccounts(pubkeys))
+    }
+
+    /// Returns the subaccount information for a list of owner-facing pubkeys.
+    ///
+    /// The returned vector preserves the order of `pubkeys`. An entry is `None`
+    /// when the corresponding subaccount has no on-chain storage.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method is built on the [`getMultipleSubaccounts`] RPC method.
+    ///
+    /// [`getMultipleSubaccounts`]: getMultipleSubaccounts
+    pub fn get_multiple_subaccounts_with_commitment(
+        &self,
+        pubkeys: &[Pubkey],
+        commitment_config: CommitmentConfig,
+    ) -> RpcResult<Vec<Option<Account>>> {
+        self.invoke(
+            (self.rpc_client.as_ref())
+                .get_multiple_subaccounts_with_commitment(pubkeys, commitment_config),
+        )
+    }
+
     #[deprecated(
         note = "Use `get_ui_account_with_config()` instead. This function will be removed in a \
                 future version of `solana_rpc_client`."
