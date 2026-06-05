@@ -6455,7 +6455,13 @@ fn test_program_sbf_subaccount_cpi_increment() {
 /// Builds the disc=9 payload: `do_create` flag, `offset`/`length` (u64 LE),
 /// followed by the subaccount `content`.
 #[cfg(feature = "sbf_rust")]
-fn subaccount_read_payload(do_create: bool, do_load: bool, offset: u64, length: u64, content: &[u8]) -> Vec<u8> {
+fn subaccount_read_payload(
+    do_create: bool,
+    do_load: bool,
+    offset: u64,
+    length: u64,
+    content: &[u8],
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(18 + content.len());
     payload.push(do_create as u8);
     payload.push(do_load as u8);
@@ -6480,7 +6486,8 @@ fn test_program_sbf_subaccount_read_success() {
     assert_eq!(content.len(), 32);
 
     let payload = subaccount_read_payload(true, false, 0, content.len() as u64, content);
-    let ix = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
     let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
     assert!(
         status.is_ok(),
@@ -6527,7 +6534,8 @@ fn test_program_sbf_subaccount_read_success_offset() {
 
     // Read 8 bytes starting at offset 10 — strictly inside the 32-byte buffer.
     let payload = subaccount_read_payload(false, false, 10, 8, content);
-    let ix = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
     let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
     assert!(
         status.is_ok(),
@@ -6551,7 +6559,8 @@ fn test_program_sbf_subaccount_read_success_already_loaded() {
 
     // Read 8 bytes starting at offset 10 — strictly inside the 32-byte buffer.
     let payload = subaccount_read_payload(true, true, 10, 8, content);
-    let ix = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
     let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
     assert!(
         status.is_ok(),
@@ -6574,7 +6583,8 @@ fn test_program_sbf_subaccount_read_missing_subaccount() {
 
     // do_create = false ⇒ the subaccount does not exist; read 8 bytes.
     let payload = subaccount_read_payload(false, false, 0, 8, &[]);
-    let ix = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
     let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
     assert_eq!(
         status,
@@ -6607,7 +6617,8 @@ fn test_program_sbf_subaccount_read_zero_length_missing_subaccount() {
 
     // do_create = false ⇒ the subaccount does not exist; read 0 bytes.
     let payload = subaccount_read_payload(false, false, 0, 0, &[]);
-    let ix = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
     let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
     assert!(
         status.is_ok(),
@@ -6639,7 +6650,8 @@ fn test_program_sbf_subaccount_read_out_of_range_full() {
     // offset == content.len() ⇒ the entire [offset, offset+8) range is past
     // the end of the data.
     let payload = subaccount_read_payload(true, false, content.len() as u64, 8, content);
-    let ix = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
     let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
     assert_eq!(
         status,
@@ -6668,7 +6680,8 @@ fn test_program_sbf_subaccount_read_out_of_range_partial() {
     // offset 28 + length 8 = 36 > 32 ⇒ starts inside the data but runs past
     // the end.
     let payload = subaccount_read_payload(true, false, 28, 8, content);
-    let ix = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
     let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
     assert_eq!(
         status,

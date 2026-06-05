@@ -227,7 +227,10 @@ fn read_subaccount(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
     let payer = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let seeds = seeds_from_payer(base.key);
 
-    let do_create = *payload.first().ok_or(ProgramError::InvalidInstructionData)? != 0;
+    let do_create = *payload
+        .first()
+        .ok_or(ProgramError::InvalidInstructionData)?
+        != 0;
     let do_load = *payload.get(1).ok_or(ProgramError::InvalidInstructionData)? != 0;
     let offset = u64::from_le_bytes(
         payload
@@ -241,7 +244,9 @@ fn read_subaccount(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
             .and_then(|s| s.try_into().ok())
             .ok_or(ProgramError::InvalidInstructionData)?,
     );
-    let content = payload.get(18..).ok_or(ProgramError::InvalidInstructionData)?;
+    let content = payload
+        .get(18..)
+        .ok_or(ProgramError::InvalidInstructionData)?;
 
     if do_create {
         let r = unsafe {
