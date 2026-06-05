@@ -75,8 +75,8 @@ extern "C" {
         seeds_addr: *const u8,
         seeds_len: u64,
         buff: *mut u8,
-        length: u64,
         offset: u64,
+        length: u64,
     ) -> u64;
 }
 
@@ -195,9 +195,9 @@ fn create_load_twice(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult 
     if r1 != SUCCESS {
         return Err(ProgramError::Custom(0x30));
     }
-    let (header_addr, _view_addr) = load_rust(&seeds)?;
+    let (_header_addr, _view_addr) = load_rust(&seeds)?;
 
-    let (header_addr2, _view_addr2) = load_rust(&seeds)?;
+    let (_header_addr2, _view_addr2) = load_rust(&seeds)?;
 
     // If the second load succeeded, we have two slots loaded for the same subaccount, which is not allowed.
     Err(ProgramError::Custom(0x31))
@@ -228,19 +228,20 @@ fn read_subaccount(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
     let seeds = seeds_from_payer(base.key);
 
     let do_create = *payload.first().ok_or(ProgramError::InvalidInstructionData)? != 0;
+    let do_load = *payload.get(1).ok_or(ProgramError::InvalidInstructionData)? != 0;
     let offset = u64::from_le_bytes(
         payload
-            .get(1..9)
+            .get(2..10)
             .and_then(|s| s.try_into().ok())
             .ok_or(ProgramError::InvalidInstructionData)?,
     );
     let length = u64::from_le_bytes(
         payload
-            .get(9..17)
+            .get(10..18)
             .and_then(|s| s.try_into().ok())
             .ok_or(ProgramError::InvalidInstructionData)?,
     );
-    let content = payload.get(17..).ok_or(ProgramError::InvalidInstructionData)?;
+    let content = payload.get(18..).ok_or(ProgramError::InvalidInstructionData)?;
 
     if do_create {
         let r = unsafe {
@@ -257,7 +258,16 @@ fn read_subaccount(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
         }
         let (header_addr, _view_addr) = load_rust(&seeds)?;
         write_data(header_addr, content);
-        unload(header_addr)?;
+        if !do_load {
+            unload(header_addr)?;
+        }
+    } else if do_load {
+        // Load an existing subaccount without writing to it first. This
+        // verifies that `sol_read_subaccount` can read from a loaded
+        // subaccount's data, and that the loaded data is correct (it must
+        // be the same bytes the test wrote in a previous instruction, since
+        // the subaccount is never unloaded in between).
+        let (_header_addr, _view_addr) = load_rust(&seeds)?;
     }
 
     let read_len = length as usize;
@@ -270,8 +280,8 @@ fn read_subaccount(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
             seeds.as_ptr() as *const u8,
             seeds.len() as u64,
             buffer.as_mut_ptr(),
-            length,
             offset,
+            length,
         )
     };
     // An out-of-range or missing-subaccount read aborts the instruction in

@@ -26,7 +26,7 @@ use {
     solana_system_interface::{instruction::SystemInstruction, MAX_PERMITTED_DATA_LENGTH},
     solana_transaction_context::{
         create_subaccount_address, subaccount_storage_address, vm_slice::VmSlice,
-        InstructionAccount, MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
+        IndexOfAccount, InstructionAccount, MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
     },
 };
 
@@ -48,6 +48,38 @@ const _: () = assert!(
 
 const _: () = assert!(SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE % BPF_ALIGN_OF_U128 == 0);
 
+fn find_or_add_subaccount(
+    invoke_context: &mut InvokeContext,
+    subaccount_pubkey: Pubkey,
+) -> Result<IndexOfAccount, Error> {
+    // F10 W9: load any pre-existing on-chain state for the subaccount
+    // address through the SVM `TransactionProcessingCallback`. Mirrors
+    // the parasol-dev reference implementation — fresh allocations fall
+    // back to `AccountSharedData::default()` (the common case), while
+    // already-allocated subaccounts re-enter with their full payload so
+    // self-invoke deserialization sees real data instead of empty bytes.
+    let subaccount_index = if let Some(subaccount_index) = invoke_context
+        .transaction_context
+        .find_index_of_subaccount(&subaccount_pubkey)
+    {
+        subaccount_index
+    } else {
+        let storage_address = subaccount_storage_address(&subaccount_pubkey);
+        let (subaccount, _slot) = invoke_context
+            .get_account_shared_data(&storage_address)
+            .unwrap_or_else(|| (AccountSharedData::default(), 0));
+        let data_len_cost = (subaccount.data().len() as u64)
+            .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
+            .unwrap_or(u64::MAX);
+        consume_compute_meter(invoke_context, data_len_cost)?;
+
+        invoke_context
+            .transaction_context
+            .add_subaccount(subaccount_pubkey, subaccount)?
+    };
+
+    Ok(subaccount_index)
+}
 // ============================================================================
 // F10 — Subaccounts syscalls (PRS-153)
 //
@@ -96,32 +128,7 @@ declare_builtin_function!(
         compute_subaccounts_time.stop();
         invoke_context.timings.compute_subaccounts_us += compute_subaccounts_time.as_us();
 
-        // F10 W9: load any pre-existing on-chain state for the subaccount
-        // address through the SVM `TransactionProcessingCallback`. Mirrors
-        // the parasol-dev reference implementation — fresh allocations fall
-        // back to `AccountSharedData::default()` (the common case), while
-        // already-allocated subaccounts re-enter with their full payload so
-        // self-invoke deserialization sees real data instead of empty bytes.
-        let subaccount_index = if let Some(subaccount_index) = invoke_context
-            .transaction_context
-            .find_index_of_subaccount(&subaccount_pubkey)
-        {
-            subaccount_index
-        } else {
-            let storage_address = subaccount_storage_address(&subaccount_pubkey);
-            let (subaccount, _slot) = invoke_context
-                .get_account_shared_data(&storage_address)
-                .unwrap_or_else(|| (AccountSharedData::default(), 0));
-            let data_len_cost = (subaccount.data().len() as u64)
-                .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
-                .unwrap_or(u64::MAX);
-            consume_compute_meter(invoke_context, data_len_cost)?;
-
-            invoke_context
-                .transaction_context
-                .add_subaccount(subaccount_pubkey, subaccount)?
-        };
-
+        let subaccount_index = find_or_add_subaccount(invoke_context, subaccount_pubkey)?;
         let system_program_index = invoke_context
             .transaction_context
             .find_index_of_account(&system_program::id())
@@ -805,24 +812,7 @@ fn load_subaccount_impl(
     // the program reads it from the subaccount data area or from chain
     // when it needs it; the slot header doesn't carry it.
     let (subaccount_index, data_len, lamports, owner_bytes) = {
-        let existing = invoke_context
-            .transaction_context
-            .find_index_of_subaccount(&subaccount_pubkey);
-        let subaccount_index = if let Some(idx) = existing {
-            idx
-        } else {
-            let on_chain_address = subaccount_storage_address(&subaccount_pubkey);
-            let (loaded, _slot) = invoke_context
-                .get_account_shared_data(&on_chain_address)
-                .unwrap_or_else(|| (AccountSharedData::default(), 0));
-            let data_len_cost = (loaded.data().len() as u64)
-                .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
-                .unwrap_or(u64::MAX);
-            consume_compute_meter(invoke_context, data_len_cost)?;
-            invoke_context
-                .transaction_context
-                .add_subaccount(subaccount_pubkey, loaded)?
-        };
+        let subaccount_index = find_or_add_subaccount(invoke_context, subaccount_pubkey)?;
         let mut borrowed = invoke_context
             .transaction_context
             .accounts()
@@ -987,10 +977,12 @@ declare_builtin_function!(
         seeds_addr: u64,
         seeds_len: u64,
         buff: u64,
-        length: u64,
         offset: u64,
+        length: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
+        // We use `load_subaccount` measure here to capture the time spent on loading subaccount
+        // from the AccountsDB.
         let mut load_subaccount_time = Measure::start("load_subaccount");
         let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
         consume_compute_meter(invoke_context, syscall_base_cost)?;
@@ -1016,25 +1008,7 @@ declare_builtin_function!(
         compute_subaccounts_time.stop();
         invoke_context.timings.compute_subaccounts_us += compute_subaccounts_time.as_us();
 
-        let existing = invoke_context
-            .transaction_context
-            .find_index_of_subaccount(&subaccount_pubkey);
-        let subaccount_index = if let Some(idx) = existing {
-            idx
-        } else {
-            let on_chain_address = subaccount_storage_address(&subaccount_pubkey);
-            let (loaded, _slot) = invoke_context
-                .get_account_shared_data(&on_chain_address)
-                .unwrap_or_else(|| (AccountSharedData::default(), 0));
-            let data_len_cost = (loaded.data().len() as u64)
-                .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
-                .unwrap_or(u64::MAX);
-            consume_compute_meter(invoke_context, data_len_cost)?;
-            invoke_context
-                .transaction_context
-                .add_subaccount(subaccount_pubkey, loaded)?
-        };
-
+        let subaccount_index = find_or_add_subaccount(invoke_context, subaccount_pubkey)?;
         let borrowed = invoke_context
             .transaction_context
             .accounts()
@@ -1050,6 +1024,15 @@ declare_builtin_function!(
             .ok_or(InstructionError::InvalidArgument)?;
         let dst = translate_slice_mut::<u8>(memory_mapping, buff, length, check_aligned)?;
         dst.copy_from_slice(src);
+
+        // Charge for copying `length` bytes into guest memory.
+        let compute_cost = invoke_context.get_execution_cost();
+        let copy_cost = compute_cost.mem_op_base_cost.max(
+            length
+                .checked_div(compute_cost.cpi_bytes_per_unit)
+                .unwrap_or(u64::MAX),
+        );
+        consume_compute_meter(invoke_context, copy_cost)?;
 
         load_subaccount_time.stop();
         invoke_context.timings.load_subaccounts_us += load_subaccount_time.as_us();
