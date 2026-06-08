@@ -303,8 +303,10 @@ impl TryFrom<TransactionStatusMeta> for StoredTransactionStatusMeta {
 #[cfg(test)]
 mod tests {
     use {
-        crate::StoredTransactionError, solana_instruction::error::InstructionError,
-        solana_transaction_error::TransactionError, test_case::test_case,
+        crate::{StoredTransactionError, StoredTransactionStatusMeta},
+        solana_instruction::error::InstructionError,
+        solana_transaction_error::TransactionError,
+        test_case::test_case,
     };
 
     #[test_case(TransactionError::InsufficientFundsForFee; "Named variant error")]
@@ -398,5 +400,78 @@ mod tests {
     ) {
         let StoredTransactionError(serialized_bytes) = transaction_error.into();
         assert_eq!(serialized_bytes, expected_serialized_bytes);
+    }
+
+    // PRS-155: `subaccount_addresses` is appended last in
+    // `StoredTransactionStatusMeta` with `#[serde(default, deserialize_with =
+    // "default_on_eof")]`. These tests pin both directions of the wire
+    // contract: new blobs round-trip the addresses, and old blobs written
+    // before the field existed (i.e. the byte stream ends right after
+    // `cost_units`) still deserialize, defaulting the field to an empty Vec.
+    fn stored_meta_with(subaccount_addresses: Vec<solana_pubkey::Pubkey>) -> StoredTransactionStatusMeta {
+        StoredTransactionStatusMeta {
+            status: Ok(()),
+            fee: 42,
+            pre_balances: vec![1, 2, 3],
+            post_balances: vec![4, 5, 6],
+            inner_instructions: None,
+            log_messages: None,
+            pre_token_balances: None,
+            post_token_balances: None,
+            rewards: None,
+            return_data: None,
+            compute_units_consumed: Some(1234),
+            cost_units: Some(5678),
+            subaccount_addresses,
+        }
+    }
+
+    #[test]
+    fn test_stored_transaction_status_meta_subaccount_addresses_round_trip() {
+        use solana_pubkey::Pubkey;
+
+        let subaccount_addresses = vec![
+            Pubkey::new_from_array([7u8; 32]),
+            Pubkey::new_from_array([9u8; 32]),
+        ];
+        let bytes = bincode::serialize(&stored_meta_with(subaccount_addresses.clone())).unwrap();
+        let decoded: StoredTransactionStatusMeta = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.subaccount_addresses, subaccount_addresses);
+    }
+
+    #[test]
+    fn test_stored_transaction_status_meta_old_blob_defaults_subaccount_addresses() {
+        // An empty trailing Vec encodes as an 8-byte length prefix of 0. Since
+        // `subaccount_addresses` is the final field, stripping those 8 bytes
+        // reproduces the exact byte stream an old node (without the field)
+        // would have written.
+        let bytes = bincode::serialize(&stored_meta_with(vec![])).unwrap();
+        let (old_blob, length_prefix) = bytes.split_at(bytes.len() - 8);
+        assert_eq!(
+            length_prefix,
+            &[0u8; 8],
+            "an empty subaccount_addresses Vec must encode as a zero u64 length prefix",
+        );
+
+        let decoded: StoredTransactionStatusMeta = bincode::deserialize(old_blob).unwrap();
+        assert!(
+            decoded.subaccount_addresses.is_empty(),
+            "old blobs must deserialize with an empty subaccount_addresses Vec",
+        );
+        // The rest of the meta must survive the truncated decode intact.
+        assert_eq!(decoded.fee, 42);
+        assert_eq!(decoded.pre_balances, vec![1, 2, 3]);
+        assert_eq!(decoded.post_balances, vec![4, 5, 6]);
+        assert_eq!(decoded.compute_units_consumed, Some(1234));
+        assert_eq!(decoded.cost_units, Some(5678));
+    }
+
+    #[test]
+    fn test_stored_transaction_status_meta_to_status_meta_preserves_subaccounts() {
+        use {solana_pubkey::Pubkey, solana_transaction_status::TransactionStatusMeta};
+
+        let subaccount_addresses = vec![Pubkey::new_from_array([3u8; 32])];
+        let meta: TransactionStatusMeta = stored_meta_with(subaccount_addresses.clone()).into();
+        assert_eq!(meta.subaccount_addresses, subaccount_addresses);
     }
 }

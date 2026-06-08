@@ -6814,3 +6814,142 @@ fn test_program_sbf_subaccount_read_only_does_not_restore() {
          (expected {tx2_slot}, got {mod_modified_slot})",
     );
 }
+
+/// PRS-155: end-to-end check that a subaccount-touching transaction surfaces
+/// its subaccount addresses through the balance-recording pipeline and into
+/// `TransactionStatusMeta` / `UiTransactionStatusMeta`.
+///
+/// Executes a real `sol_create_subaccount` + `sol_load_subaccount` tx with
+/// transaction balance recording enabled, then verifies:
+///   (a) `subaccount_addresses` is non-empty in the (Ui)meta;
+///   (b) the recorded address equals the owner-facing pubkey
+///       `sol_load_subaccount` derives from the seeds + program id;
+///   (c) the tail of `pre_balances`/`post_balances` (positions
+///       `[account_keys.len()..)`) lines up one-for-one with
+///       `subaccount_addresses`, carrying the subaccount's pre/post lamports.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_addresses_in_status_meta() {
+    use {
+        solana_ledger::transaction_balances::compile_collected_balances,
+        solana_transaction_context::create_subaccount_address,
+        solana_transaction_status::{
+            option_serializer::OptionSerializer, TransactionStatusMeta, UiTransactionStatusMeta,
+        },
+    };
+
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let base_pubkey = Pubkey::new_unique();
+    let payer_pubkey = mint_keypair.pubkey();
+    let payload: &[u8] = b"subaccount-meta-payload";
+
+    // disc=0 — create + load + write + unload. The `sol_load_subaccount` here
+    // is what materializes the subaccount lane the balance collector reads.
+    let instruction =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, payload, vec![]);
+    let tx = Transaction::new_signed_with_payer(
+        &[instruction],
+        Some(&payer_pubkey),
+        &[&mint_keypair],
+        bank.last_blockhash(),
+    );
+    let account_keys_len = tx.message.account_keys.len();
+
+    let tx_batch = bank.prepare_batch_for_tests(vec![tx]);
+    let (mut commit_results, balance_collector) = bank.load_execute_and_commit_transactions(
+        &tx_batch,
+        MAX_PROCESSING_AGE,
+        ExecutionRecordingConfig {
+            enable_cpi_recording: false,
+            enable_log_recording: true,
+            enable_return_data_recording: false,
+            enable_transaction_balance_recording: true,
+        },
+        &mut ExecuteTimings::default(),
+        None,
+    );
+
+    let committed = commit_results.pop().unwrap().expect("tx must commit");
+    let logs = committed.log_messages.clone().unwrap_or_default();
+    assert!(
+        committed.status.is_ok(),
+        "tx failed: {:?}\nlogs:\n{}",
+        committed.status,
+        logs.join("\n"),
+    );
+
+    let balance_collector =
+        balance_collector.expect("balance recording was enabled, collector must exist");
+    let (balances, _token_balances, subaccount_keys) =
+        compile_collected_balances(balance_collector);
+
+    // Single-transaction batch ⇒ index 0.
+    let pre_balances = &balances.pre_balances[0];
+    let post_balances = &balances.post_balances[0];
+    let tx_subaccount_keys = &subaccount_keys[0];
+
+    // (b) The recorded subaccount key is the owner-facing pubkey the program
+    // sees from `sol_load_subaccount`, derived from `[base, "test-sub"]`.
+    let expected_owner =
+        create_subaccount_address(&[base_pubkey.as_ref(), SUBACCOUNT_SEED_TAG], &program_id)
+            .expect("derive owner-facing subaccount pubkey");
+    assert_eq!(
+        tx_subaccount_keys,
+        &vec![expected_owner],
+        "balance collector must record exactly the touched subaccount's owner pubkey",
+    );
+
+    // (c) `pre_balances`/`post_balances` carry one tail entry per subaccount,
+    // appended after the `account_keys.len()` regular accounts, in the same
+    // order as `subaccount_keys`.
+    assert_eq!(
+        pre_balances.len(),
+        account_keys_len + tx_subaccount_keys.len(),
+        "pre_balances must extend the {account_keys_len} account-key slots with one entry per subaccount",
+    );
+    assert_eq!(
+        post_balances.len(),
+        pre_balances.len(),
+        "pre/post balance vectors must stay aligned",
+    );
+    // The subaccount is created in this tx, so its pre-lamports (read from the
+    // loader cache before `update_accounts_for_executed_tx`) are 0, and its
+    // post-lamports equal the funding the program transferred in.
+    assert_eq!(
+        &pre_balances[account_keys_len..],
+        &[0],
+        "subaccount pre-balance tail must be the pre-execution lamports (0 for a freshly created subaccount)",
+    );
+    assert_eq!(
+        &post_balances[account_keys_len..],
+        &[SUBACCOUNT_FUNDING_LAMPORTS],
+        "subaccount post-balance tail must be the funded lamports",
+    );
+
+    // (a) The addresses survive into the meta and its Ui projection.
+    let meta = TransactionStatusMeta {
+        status: committed.status.clone(),
+        pre_balances: pre_balances.clone(),
+        post_balances: post_balances.clone(),
+        subaccount_addresses: tx_subaccount_keys.clone(),
+        ..TransactionStatusMeta::default()
+    };
+    assert!(
+        !meta.subaccount_addresses.is_empty(),
+        "meta.subaccount_addresses must be populated for a subaccount-touching tx",
+    );
+
+    let ui_meta: UiTransactionStatusMeta = meta.into();
+    match ui_meta.subaccount_addresses {
+        OptionSerializer::Some(ref addrs) => {
+            assert_eq!(
+                addrs,
+                &vec![expected_owner.to_string()],
+                "Ui meta must expose the owner-facing subaccount address as a base58 string",
+            );
+        }
+        other => panic!("expected Ui subaccount_addresses to be Some, got {other:?}"),
+    }
+}
