@@ -6444,3 +6444,373 @@ fn test_program_sbf_subaccount_cpi_increment() {
     assert_eq!(stored.owner(), &program_id);
     assert_eq!(stored.lamports(), SUBACCOUNT_FUNDING_LAMPORTS);
 }
+
+// ----------------------------------------------------------------------------
+// `sol_read_subaccount` tests (disc=9). The program creates a subaccount with
+// `content`, then reads a `[offset, offset+length)` window back and verifies
+// the bytes. On success the tx is Ok; an out-of-range or missing-subaccount
+// read aborts the instruction with `InstructionError::InvalidArgument`.
+// ----------------------------------------------------------------------------
+
+/// Builds the disc=9 payload: `do_create` flag, `offset`/`length` (u64 LE),
+/// followed by the subaccount `content`.
+#[cfg(feature = "sbf_rust")]
+fn subaccount_read_payload(
+    do_create: bool,
+    do_load: bool,
+    offset: u64,
+    length: u64,
+    content: &[u8],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(18 + content.len());
+    payload.push(do_create as u8);
+    payload.push(do_load as u8);
+    payload.extend_from_slice(&offset.to_le_bytes());
+    payload.extend_from_slice(&length.to_le_bytes());
+    payload.extend_from_slice(content);
+    payload
+}
+
+/// Happy path: create a subaccount with `content`, then read the full range
+/// back through `sol_read_subaccount`. The program asserts the bytes match,
+/// so an Ok status proves the syscall returned the exact stored data.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_success() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+    let content: &[u8] = b"read-subaccount-content-32-bytes";
+    assert_eq!(content.len(), 32);
+
+    let payload = subaccount_read_payload(true, false, 0, content.len() as u64, content);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert!(
+        status.is_ok(),
+        "read of full range must succeed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    // The subaccount was created, so the stored data must equal `content`.
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    let stored = bank
+        .get_account(&storage_addr)
+        .expect("subaccount must exist after a successful read tx");
+    assert_eq!(stored.data(), content);
+}
+
+/// Happy path with a non-zero offset: read a window from the middle of the
+/// stored data. The program verifies the returned bytes equal
+/// `content[offset..offset+length]`.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_success_offset() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+    let content: &[u8] = b"read-subaccount-content-32-bytes";
+
+    let instruction =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, content, vec![]);
+    let (status, _inner_instructions, log_messages) =
+        run_subaccount_tx(&bank, &mint_keypair, instruction);
+    assert!(
+        status.is_ok(),
+        "tx failed: {status:?}\nlogs:\n{}",
+        log_messages.join("\n"),
+    );
+
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    let stored = bank
+        .get_account(&storage_addr)
+        .expect("subaccount must exist after a successful read tx");
+    assert_eq!(stored.data(), content);
+
+    // Read 8 bytes starting at offset 10 — strictly inside the 32-byte buffer.
+    let payload = subaccount_read_payload(false, false, 10, 8, content);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert!(
+        status.is_ok(),
+        "in-range read at offset 10 must succeed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+}
+
+/// Happy path with a non-zero offset: read a window from the middle of the
+/// stored data. The program verifies the returned bytes equal
+/// `content[offset..offset+length]`.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_success_already_loaded() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+    let content: &[u8] = b"read-subaccount-content-32-bytes";
+
+    // Read 8 bytes starting at offset 10 — strictly inside the 32-byte buffer.
+    let payload = subaccount_read_payload(true, true, 10, 8, content);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert!(
+        status.is_ok(),
+        "in-range read at offset 10 must succeed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+}
+
+/// Edge case — no subaccount: reading bytes from a subaccount that was never
+/// created sees empty data, so any positive-length read is out of range and
+/// the syscall fails with `InvalidArgument`.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_missing_subaccount() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    // do_create = false ⇒ the subaccount does not exist; read 8 bytes.
+    let payload = subaccount_read_payload(false, false, 0, 8, &[]);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::InvalidArgument
+        )),
+        "read of a missing subaccount must fail with InvalidArgument\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    // The subaccount wasn't created, so the stored data must be empty.
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    assert!(
+        bank.get_account(&storage_addr).is_none(),
+        "failed tx must not persist any subaccount state",
+    );
+}
+
+/// Edge case — no subaccount: reading zero bytes from a subaccount that was never
+/// created sees empty data, so the syscall succeeds.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_zero_length_missing_subaccount() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    // do_create = false ⇒ the subaccount does not exist; read 0 bytes.
+    let payload = subaccount_read_payload(false, false, 0, 0, &[]);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert!(
+        status.is_ok(),
+        "zero-length read of a missing subaccount must succeed\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    // The subaccount wasn't created, so the stored data must be empty.
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    assert!(
+        bank.get_account(&storage_addr).is_none(),
+        "failed tx must not persist any subaccount state",
+    );
+}
+
+/// Edge case — fully out of range: the read window starts at `offset == len`,
+/// so none of the requested bytes exist. The syscall fails with
+/// `InvalidArgument`.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_out_of_range_full() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+    let content: &[u8] = b"read-subaccount-content-32-bytes";
+
+    // offset == content.len() ⇒ the entire [offset, offset+8) range is past
+    // the end of the data.
+    let payload = subaccount_read_payload(true, false, content.len() as u64, 8, content);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::InvalidArgument
+        )),
+        "fully out-of-range read must fail with InvalidArgument\nlogs:\n{}",
+        logs.join("\n"),
+    );
+}
+
+/// Edge case — partially out of range: the read window starts inside the data
+/// but extends past the end. The syscall must reject the whole read with
+/// `InvalidArgument` (no partial copy).
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_out_of_range_partial() {
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+    let content: &[u8] = b"read-subaccount-content-32-bytes";
+
+    // offset 28 + length 8 = 36 > 32 ⇒ starts inside the data but runs past
+    // the end.
+    let payload = subaccount_read_payload(true, false, 28, 8, content);
+    let ix =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix);
+    assert_eq!(
+        status,
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::InvalidArgument
+        )),
+        "partially out-of-range read must fail with InvalidArgument\nlogs:\n{}",
+        logs.join("\n"),
+    );
+}
+
+/// Contrasts the two persistence paths through the dirty filter in
+/// `TransactionAccounts::deconstruct_into_keyed_account_shared_data`, which only
+/// drains *touched* subaccounts:
+///
+///   * `read_sub` is only read (`sol_read_subaccount`) in Tx2. An immutable
+///     read never sets the touched flag, so the account is NOT re-stored — its
+///     modified-slot stays at Tx1's slot.
+///   * `mod_sub` is loaded writable and overwritten in Tx2. A writable load
+///     marks the subaccount touched, so it IS re-stored — its modified-slot
+///     advances to Tx2's slot.
+///
+/// Both subaccounts are created in the same Tx1 slot, so comparing their
+/// modified-slots after Tx2 pins the per-subaccount granularity of the filter.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_only_does_not_restore() {
+    let (bank, mut bank_client, bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let read_base = Pubkey::new_unique();
+    let mod_base = Pubkey::new_unique();
+    let content: &[u8] = b"read-subaccount-content-32-bytes";
+    let content_v2: &[u8] = b"OVERWRITTEN-subaccount-32-bytes!";
+    assert_eq!(content.len(), 32);
+    assert_eq!(content_v2.len(), content.len());
+
+    // Tx1 — create both subaccounts (two transactions in the same slot).
+    let ix1a =
+        subaccount_create_instruction(program_id, read_base, payer_pubkey, 0, content, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix1a);
+    assert!(
+        status.is_ok(),
+        "Tx1 create (read_sub) failed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+    let ix1b =
+        subaccount_create_instruction(program_id, mod_base, payer_pubkey, 0, content, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix1b);
+    assert!(
+        status.is_ok(),
+        "Tx1 create (mod_sub) failed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    let read_storage = subaccount_storage_addr_for(&read_base, &program_id);
+    let mod_storage = subaccount_storage_addr_for(&mod_base, &program_id);
+    let (_read_acc, read_created_slot) = bank
+        .get_account_modified_slot(&read_storage)
+        .expect("read_sub must exist after create");
+    let (_mod_acc, mod_created_slot) = bank
+        .get_account_modified_slot(&mod_storage)
+        .expect("mod_sub must exist after create");
+
+    // Advance into a new slot so a re-store in Tx2 is observable as a changed
+    // modified-slot.
+    let bank = bank_client
+        .advance_slot(1, bank_forks.as_ref(), &Pubkey::default())
+        .expect("advance slot for Tx2");
+    let tx2_slot = bank.slot();
+    assert_ne!(
+        tx2_slot, read_created_slot,
+        "Tx2 must run in a different slot than the create tx",
+    );
+
+    // Tx2a — read-only `sol_read_subaccount` of read_sub (no create, no load).
+    let payload = subaccount_read_payload(false, false, 0, content.len() as u64, content);
+    let ix2a =
+        subaccount_create_instruction(program_id, read_base, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix2a);
+    assert!(
+        status.is_ok(),
+        "Tx2 read failed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    // Tx2b — writable load + same-length overwrite of mod_sub (disc=1).
+    let ix2b = subaccount_instruction(program_id, mod_base, true, 1, content_v2, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix2b);
+    assert!(
+        status.is_ok(),
+        "Tx2 modify failed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    // read_sub: unchanged data, modified-slot still at Tx1's slot.
+    let (read_stored, read_modified_slot) = bank
+        .get_account_modified_slot(&read_storage)
+        .expect("read_sub must still exist after a read-only tx");
+    assert_eq!(
+        read_stored.data(),
+        content,
+        "a read must not change the stored subaccount data",
+    );
+    assert_eq!(
+        read_modified_slot, read_created_slot,
+        "a read-only sol_read_subaccount must not re-store the subaccount \
+         (modified-slot advanced {read_created_slot} -> {read_modified_slot})",
+    );
+
+    // mod_sub: overwritten data, modified-slot advanced to Tx2's slot.
+    let (mod_stored, mod_modified_slot) = bank
+        .get_account_modified_slot(&mod_storage)
+        .expect("mod_sub must still exist after the modifying tx");
+    assert_eq!(
+        mod_stored.data(),
+        content_v2,
+        "the writable overwrite must be on-chain",
+    );
+    assert_ne!(
+        mod_modified_slot, mod_created_slot,
+        "a modified subaccount must be re-stored (modified-slot must advance \
+         from the create slot {mod_created_slot})",
+    );
+    assert_eq!(
+        mod_modified_slot, tx2_slot,
+        "a modified subaccount must be re-stored at the modifying tx's slot \
+         (expected {tx2_slot}, got {mod_modified_slot})",
+    );
+}
