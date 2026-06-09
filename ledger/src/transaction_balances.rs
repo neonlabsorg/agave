@@ -16,10 +16,21 @@ pub fn compile_collected_balances(
 ) -> (
     TransactionBalancesSet,
     TransactionTokenBalancesSet,
+    // Owner-facing keys of *changed* subaccounts, aligned with the tail of the
+    // native pre/post balances.
+    Vec<Vec<Pubkey>>,
+    // F10/PRS-155: owner-facing keys of *unchanged* subaccounts (read-only),
+    // reported by address only — no pre/post balances.
     Vec<Vec<Pubkey>>,
 ) {
-    let (native_pre, native_post, token_pre, token_post, subaccount_keys) =
-        balance_collector.into_vecs();
+    let (
+        native_pre,
+        native_post,
+        token_pre,
+        token_post,
+        subaccount_keys,
+        unchanged_subaccount_keys,
+    ) = balance_collector.into_vecs();
 
     let native_balances = TransactionBalancesSet::new(native_pre, native_post);
     let token_balances = TransactionTokenBalancesSet::new(
@@ -27,7 +38,12 @@ pub fn compile_collected_balances(
         collected_token_infos_to_token_balances(token_post),
     );
 
-    (native_balances, token_balances, subaccount_keys)
+    (
+        native_balances,
+        token_balances,
+        subaccount_keys,
+        unchanged_subaccount_keys,
+    )
 }
 
 fn collected_token_infos_to_token_balances(
@@ -149,9 +165,10 @@ mod tests {
             token_pre,
             token_post,
             subaccount_keys: vec![vec![], vec![]],
+            unchanged_subaccount_keys: vec![vec![], vec![]],
         };
 
-        let (actual_native, actual_token, actual_subaccount_keys) =
+        let (actual_native, actual_token, actual_subaccount_keys, actual_unchanged_subaccount_keys) =
             compile_collected_balances(balance_collector);
 
         assert_eq!(expected_native.pre_balances, actual_native.pre_balances);
@@ -167,6 +184,10 @@ mod tests {
         );
         assert_eq!(
             actual_subaccount_keys,
+            vec![Vec::<Pubkey>::new(), Vec::<Pubkey>::new()]
+        );
+        assert_eq!(
+            actual_unchanged_subaccount_keys,
             vec![Vec::<Pubkey>::new(), Vec::<Pubkey>::new()]
         );
     }

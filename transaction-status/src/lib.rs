@@ -204,6 +204,16 @@ fn build_simple_ui_transaction_status_meta(
                     .collect(),
             )
         },
+        unchanged_subaccount_addresses: if meta.unchanged_subaccount_addresses.is_empty() {
+            OptionSerializer::Skip
+        } else {
+            OptionSerializer::Some(
+                meta.unchanged_subaccount_addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            )
+        },
     }
 }
 
@@ -248,6 +258,16 @@ fn parse_ui_transaction_status_meta(
         } else {
             OptionSerializer::Some(
                 meta.subaccount_addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            )
+        },
+        unchanged_subaccount_addresses: if meta.unchanged_subaccount_addresses.is_empty() {
+            OptionSerializer::Skip
+        } else {
+            OptionSerializer::Some(
+                meta.unchanged_subaccount_addresses
                     .iter()
                     .map(ToString::to_string)
                     .collect(),
@@ -930,6 +950,7 @@ mod test {
             compute_units_consumed: None,
             cost_units: None,
             subaccount_addresses: vec![],
+            unchanged_subaccount_addresses: vec![],
         };
         #[rustfmt::skip]
         let expected_json_output_value: serde_json::Value = serde_json::from_str(

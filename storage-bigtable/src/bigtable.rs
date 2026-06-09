@@ -1027,6 +1027,7 @@ mod tests {
                 compute_units_consumed: Some(1234),
                 cost_units: Some(5678),
                 subaccount_addresses: vec![],
+                unchanged_subaccount_addresses: vec![],
             },
         });
         let expected_block = ConfirmedBlock {

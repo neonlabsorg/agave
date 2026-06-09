@@ -50,6 +50,7 @@ pub(crate) trait BalanceCollectionRoutines {
         account_loader: &mut AccountLoader<CB>,
         transaction: &impl SVMTransaction,
         subaccount_lane: &[KeyedAccountSharedData],
+        unchanged_subaccount_addresses: &[Pubkey],
     );
 }
 
@@ -62,6 +63,7 @@ pub(crate) trait BalanceCollectionRoutines {
         token_pre(pub),
         token_post(pub),
         subaccount_keys(pub),
+        unchanged_subaccount_keys(pub),
     )
 )]
 pub struct BalanceCollector {
@@ -69,11 +71,15 @@ pub struct BalanceCollector {
     native_post: BatchNativeBalances,
     token_pre: BatchTokenBalances,
     token_post: BatchTokenBalances,
-    // F10/PRS-314: per-transaction owner-facing pubkeys of subaccounts touched
+    // F10/PRS-314: per-transaction owner-facing pubkeys of subaccounts *changed*
     // during execution, in the same order as the tail of `native_pre` /
     // `native_post` (positions [account_keys.len()..)). Empty for txs that
-    // didn't use subaccounts.
+    // didn't change any subaccount.
     subaccount_keys: BatchSubaccountKeys,
+    // F10/PRS-155: per-transaction owner-facing pubkeys of subaccounts that
+    // were accessed but left *unchanged* (read-only reads/loads). These carry
+    // no pre/post balances — the receipt lists them by owner address only.
+    unchanged_subaccount_keys: BatchSubaccountKeys,
 }
 
 impl BalanceCollector {
@@ -85,6 +91,7 @@ impl BalanceCollector {
             token_pre: Vec::with_capacity(transaction_count),
             token_post: Vec::with_capacity(transaction_count),
             subaccount_keys: Vec::with_capacity(transaction_count),
+            unchanged_subaccount_keys: Vec::with_capacity(transaction_count),
         }
     }
 
@@ -98,6 +105,7 @@ impl BalanceCollector {
         BatchTokenBalances,
         BatchTokenBalances,
         BatchSubaccountKeys,
+        BatchSubaccountKeys,
     ) {
         (
             self.native_pre,
@@ -105,6 +113,7 @@ impl BalanceCollector {
             self.token_pre,
             self.token_post,
             self.subaccount_keys,
+            self.unchanged_subaccount_keys,
         )
     }
 
@@ -150,6 +159,7 @@ impl BalanceCollector {
             && self.token_pre.len() == expected_len
             && self.token_post.len() == expected_len
             && self.subaccount_keys.len() == expected_len
+            && self.unchanged_subaccount_keys.len() == expected_len
     }
 }
 
@@ -168,6 +178,9 @@ impl BalanceCollectionRoutines for BalanceCollector {
         // are appended in `collect_subaccount_pre_balances` /
         // `collect_post_balances` below.
         self.subaccount_keys.push(Vec::new());
+        // Unchanged subaccounts are recorded in `collect_post_balances` (owner
+        // keys only); seed the per-tx slot here to keep batch lengths aligned.
+        self.unchanged_subaccount_keys.push(Vec::new());
     }
 
     fn collect_subaccount_pre_balances<CB: TransactionProcessingCallback>(
@@ -210,6 +223,7 @@ impl BalanceCollectionRoutines for BalanceCollector {
         account_loader: &mut AccountLoader<CB>,
         transaction: &impl SVMTransaction,
         subaccount_lane: &[KeyedAccountSharedData],
+        unchanged_subaccount_addresses: &[Pubkey],
     ) {
         let (mut native_balances, token_balances) =
             self.collect_balances(account_loader, transaction);
@@ -226,6 +240,15 @@ impl BalanceCollectionRoutines for BalanceCollector {
 
         self.native_post.push(native_balances);
         self.token_post.push(token_balances);
+
+        // F10/PRS-155: record the read-only (unchanged) subaccounts by owner
+        // key only — no balance is appended to native_pre/native_post for
+        // them. The per-tx slot was seeded in `collect_pre_balances`.
+        if !unchanged_subaccount_addresses.is_empty() {
+            if let Some(tail) = self.unchanged_subaccount_keys.last_mut() {
+                tail.extend_from_slice(unchanged_subaccount_addresses);
+            }
+        }
     }
 }
 
@@ -255,9 +278,15 @@ impl BalanceCollectionRoutines for Option<BalanceCollector> {
         account_loader: &mut AccountLoader<CB>,
         transaction: &impl SVMTransaction,
         subaccount_lane: &[KeyedAccountSharedData],
+        unchanged_subaccount_addresses: &[Pubkey],
     ) {
         if let Some(inner) = self {
-            inner.collect_post_balances(account_loader, transaction, subaccount_lane)
+            inner.collect_post_balances(
+                account_loader,
+                transaction,
+                subaccount_lane,
+                unchanged_subaccount_addresses,
+            )
         }
     }
 }

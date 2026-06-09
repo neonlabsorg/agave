@@ -235,8 +235,15 @@ impl WritableAccount for TransactionAccountViewMut<'_> {
 
 /// An account key and the matching account
 pub type KeyedAccountSharedData = (Pubkey, AccountSharedData);
-pub(crate) type DeconstructedTransactionAccounts =
-    (Vec<KeyedAccountSharedData>, Box<[Cell<bool>]>, Cell<i64>);
+pub(crate) type DeconstructedTransactionAccounts = (
+    Vec<KeyedAccountSharedData>,
+    // F10/PRS-155: owner-facing keys of subaccounts that were accessed but
+    // not modified this transaction (drained out of the persisted lane by the
+    // dirty filter). The receipt lists them by owner address only.
+    Vec<Pubkey>,
+    Box<[Cell<bool>]>,
+    Cell<i64>,
+);
 
 #[derive(Debug)]
 pub struct TransactionAccounts {
@@ -686,7 +693,14 @@ impl TransactionAccounts {
         self.lamports_delta.get()
     }
 
-    fn deconstruct_into_keyed_account_shared_data(&mut self) -> Vec<KeyedAccountSharedData> {
+    /// Returns the persisted accounts (main lane + the *changed* subaccount
+    /// lane, keyed by owner pubkey) together with the owner-facing keys of
+    /// subaccounts that were accessed but left unchanged this transaction.
+    /// The latter are reported in the receipt by owner address only — they are
+    /// deliberately excluded from the persisted accounts by the dirty filter.
+    fn deconstruct_into_keyed_account_shared_data(
+        &mut self,
+    ) -> (Vec<KeyedAccountSharedData>, Vec<Pubkey>) {
         let mut shared_account_fields = std::mem::take(&mut self.shared_account_fields);
         let mut private_account_fields = std::mem::take(&mut self.private_account_fields);
         let mut accounts: Vec<_> = shared_account_fields
@@ -720,9 +734,11 @@ impl TransactionAccounts {
         let sub_shared = std::mem::take(&mut *self.subaccount_shared_fields.borrow_mut());
         let sub_private = std::mem::take(&mut *self.subaccount_private_fields.borrow_mut());
         let sub_touched = std::mem::take(&mut *self.touched_subaccounts.borrow_mut());
+        let mut unchanged_subaccounts: Vec<Pubkey> = Vec::new();
         for (idx, (shared_box, private_box)) in
             sub_shared.into_iter().zip(sub_private.into_iter()).enumerate()
         {
+            let shared = (*shared_box).into_inner();
             // F10: only persist subaccounts that were actually modified this
             // transaction. `touched_subaccounts[idx]` is set by `touch()`
             // whenever a subaccount is created, funded, written, or loaded
@@ -732,10 +748,14 @@ impl TransactionAccounts {
             // identical payload (write amplification plus a write-version/slot
             // bump from a logically read-only op) and, for a subaccount that
             // never existed on-chain, resurrect an all-default tombstone.
+            //
+            // The unchanged subaccount is still surfaced to the receipt — by
+            // owner-facing key only (no balances) — so RPC consumers can see
+            // which subaccounts the transaction touched read-only.
             if !sub_touched.get(idx).copied().unwrap_or(false) {
+                unchanged_subaccounts.push(shared.key);
                 continue;
             }
-            let shared = (*shared_box).into_inner();
             let private = (*private_box).into_inner();
             accounts.push((
                 shared.key,
@@ -748,7 +768,7 @@ impl TransactionAccounts {
                 ),
             ));
         }
-        accounts
+        (accounts, unchanged_subaccounts)
     }
 
     pub(crate) fn deconstruct_into_account_shared_data(&mut self) -> Vec<AccountSharedData> {
@@ -799,8 +819,14 @@ impl TransactionAccounts {
     }
 
     pub(crate) fn take(mut self) -> DeconstructedTransactionAccounts {
-        let shared_data = self.deconstruct_into_keyed_account_shared_data();
-        (shared_data, self.touched_flags, self.resize_delta)
+        let (shared_data, unchanged_subaccounts) =
+            self.deconstruct_into_keyed_account_shared_data();
+        (
+            shared_data,
+            unchanged_subaccounts,
+            self.touched_flags,
+            self.resize_delta,
+        )
     }
 
     pub fn resize_delta(&self) -> i64 {
@@ -1260,7 +1286,7 @@ mod tests {
             "dynamic_accounts_lamports_sum must reflect added subaccount lamports",
         );
 
-        let (accounts, _touched, _resize) = tx_accounts.take();
+        let (accounts, _unchanged, _touched, _resize) = tx_accounts.take();
         assert_eq!(
             accounts.len(),
             2,
@@ -1304,20 +1330,26 @@ mod tests {
             .touch(touched_index | crate::SUBACCOUNT_MARKER)
             .unwrap();
 
-        let derived_storage = Pubkey::new_from_array(
-            solana_sha256_hasher::hashv(&[&[1u8], touched_pda.as_ref()]).to_bytes(),
-        );
-
-        let (accounts, _touched, _resize) = tx_accounts.take();
+        let (accounts, unchanged, _touched, _resize) = tx_accounts.take();
         assert_eq!(
             accounts.len(),
             2,
             "exactly the main account and the one touched subaccount must persist",
         );
         assert_eq!(accounts.first().unwrap().0, main_pubkey);
+        // PRS-155: the persisted lane carries the owner-facing pubkey;
+        // `subaccount_storage_address` is applied later at the accounts-db
+        // boundary.
         let (sub_key, sub_account) = accounts.get(1).unwrap();
-        assert_eq!(*sub_key, derived_storage, "touched subaccount persisted");
+        assert_eq!(*sub_key, touched_pda, "touched subaccount persisted by owner key");
         assert_eq!(sub_account.lamports(), 1_000);
+        // The untouched sibling is not persisted, but is reported to the
+        // receipt as an unchanged subaccount (owner key only).
+        assert_eq!(
+            unchanged,
+            vec![untouched_pda],
+            "untouched subaccount must be reported in the unchanged list, not persisted",
+        );
     }
 
     /// `get_dynamic_accounts_lamports_sum` feeds the runtime balance check

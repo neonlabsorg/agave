@@ -210,6 +210,10 @@ pub struct StoredTransactionStatusMeta {
     // old bincode blobs deserialize this as an empty Vec.
     #[serde(default, deserialize_with = "default_on_eof")]
     pub subaccount_addresses: Vec<Pubkey>,
+    // F10/PRS-155: unchanged (read-only) subaccount owner keys. Also appended
+    // backward-compatibly — old blobs deserialize this as an empty Vec.
+    #[serde(default, deserialize_with = "default_on_eof")]
+    pub unchanged_subaccount_addresses: Vec<Pubkey>,
 }
 
 impl From<StoredTransactionStatusMeta> for TransactionStatusMeta {
@@ -228,6 +232,7 @@ impl From<StoredTransactionStatusMeta> for TransactionStatusMeta {
             compute_units_consumed,
             cost_units,
             subaccount_addresses,
+            unchanged_subaccount_addresses,
         } = value;
         Self {
             status,
@@ -247,6 +252,7 @@ impl From<StoredTransactionStatusMeta> for TransactionStatusMeta {
             compute_units_consumed,
             cost_units,
             subaccount_addresses,
+            unchanged_subaccount_addresses,
         }
     }
 }
@@ -269,6 +275,7 @@ impl TryFrom<TransactionStatusMeta> for StoredTransactionStatusMeta {
             compute_units_consumed,
             cost_units,
             subaccount_addresses,
+            unchanged_subaccount_addresses,
         } = value;
 
         if !loaded_addresses.is_empty() {
@@ -296,6 +303,7 @@ impl TryFrom<TransactionStatusMeta> for StoredTransactionStatusMeta {
             compute_units_consumed,
             cost_units,
             subaccount_addresses,
+            unchanged_subaccount_addresses,
         })
     }
 }
@@ -408,7 +416,10 @@ mod tests {
     // contract: new blobs round-trip the addresses, and old blobs written
     // before the field existed (i.e. the byte stream ends right after
     // `cost_units`) still deserialize, defaulting the field to an empty Vec.
-    fn stored_meta_with(subaccount_addresses: Vec<solana_pubkey::Pubkey>) -> StoredTransactionStatusMeta {
+    fn stored_meta_with(
+        subaccount_addresses: Vec<solana_pubkey::Pubkey>,
+        unchanged_subaccount_addresses: Vec<solana_pubkey::Pubkey>,
+    ) -> StoredTransactionStatusMeta {
         StoredTransactionStatusMeta {
             status: Ok(()),
             fee: 42,
@@ -423,6 +434,7 @@ mod tests {
             compute_units_consumed: Some(1234),
             cost_units: Some(5678),
             subaccount_addresses,
+            unchanged_subaccount_addresses,
         }
     }
 
@@ -434,29 +446,42 @@ mod tests {
             Pubkey::new_from_array([7u8; 32]),
             Pubkey::new_from_array([9u8; 32]),
         ];
-        let bytes = bincode::serialize(&stored_meta_with(subaccount_addresses.clone())).unwrap();
+        let unchanged_subaccount_addresses = vec![Pubkey::new_from_array([11u8; 32])];
+        let bytes = bincode::serialize(&stored_meta_with(
+            subaccount_addresses.clone(),
+            unchanged_subaccount_addresses.clone(),
+        ))
+        .unwrap();
         let decoded: StoredTransactionStatusMeta = bincode::deserialize(&bytes).unwrap();
         assert_eq!(decoded.subaccount_addresses, subaccount_addresses);
+        assert_eq!(
+            decoded.unchanged_subaccount_addresses,
+            unchanged_subaccount_addresses
+        );
     }
 
     #[test]
     fn test_stored_transaction_status_meta_old_blob_defaults_subaccount_addresses() {
-        // An empty trailing Vec encodes as an 8-byte length prefix of 0. Since
-        // `subaccount_addresses` is the final field, stripping those 8 bytes
-        // reproduces the exact byte stream an old node (without the field)
-        // would have written.
-        let bytes = bincode::serialize(&stored_meta_with(vec![])).unwrap();
-        let (old_blob, length_prefix) = bytes.split_at(bytes.len() - 8);
+        // Each empty trailing Vec encodes as an 8-byte length prefix of 0.
+        // `subaccount_addresses` and `unchanged_subaccount_addresses` are the
+        // last two fields, so stripping those 16 bytes reproduces the exact
+        // byte stream an old node (without either field) would have written.
+        let bytes = bincode::serialize(&stored_meta_with(vec![], vec![])).unwrap();
+        let (old_blob, length_prefixes) = bytes.split_at(bytes.len() - 16);
         assert_eq!(
-            length_prefix,
-            &[0u8; 8],
-            "an empty subaccount_addresses Vec must encode as a zero u64 length prefix",
+            length_prefixes,
+            &[0u8; 16],
+            "two empty trailing Vecs must encode as two zero u64 length prefixes",
         );
 
         let decoded: StoredTransactionStatusMeta = bincode::deserialize(old_blob).unwrap();
         assert!(
             decoded.subaccount_addresses.is_empty(),
             "old blobs must deserialize with an empty subaccount_addresses Vec",
+        );
+        assert!(
+            decoded.unchanged_subaccount_addresses.is_empty(),
+            "old blobs must deserialize with an empty unchanged_subaccount_addresses Vec",
         );
         // The rest of the meta must survive the truncated decode intact.
         assert_eq!(decoded.fee, 42);
@@ -471,7 +496,16 @@ mod tests {
         use {solana_pubkey::Pubkey, solana_transaction_status::TransactionStatusMeta};
 
         let subaccount_addresses = vec![Pubkey::new_from_array([3u8; 32])];
-        let meta: TransactionStatusMeta = stored_meta_with(subaccount_addresses.clone()).into();
+        let unchanged_subaccount_addresses = vec![Pubkey::new_from_array([4u8; 32])];
+        let meta: TransactionStatusMeta = stored_meta_with(
+            subaccount_addresses.clone(),
+            unchanged_subaccount_addresses.clone(),
+        )
+        .into();
         assert_eq!(meta.subaccount_addresses, subaccount_addresses);
+        assert_eq!(
+            meta.unchanged_subaccount_addresses,
+            unchanged_subaccount_addresses
+        );
     }
 }

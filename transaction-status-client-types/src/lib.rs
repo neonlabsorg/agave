@@ -386,6 +386,11 @@ pub struct UiTransactionStatusMeta {
         skip_serializing_if = "OptionSerializer::should_skip"
     )]
     pub subaccount_addresses: OptionSerializer<Vec<String>>,
+    #[serde(
+        default = "OptionSerializer::skip",
+        skip_serializing_if = "OptionSerializer::should_skip"
+    )]
+    pub unchanged_subaccount_addresses: OptionSerializer<Vec<String>>,
 }
 
 impl From<TransactionStatusMeta> for UiTransactionStatusMeta {
@@ -395,6 +400,16 @@ impl From<TransactionStatusMeta> for UiTransactionStatusMeta {
         } else {
             OptionSerializer::Some(
                 meta.subaccount_addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            )
+        };
+        let unchanged_subaccount_addresses = if meta.unchanged_subaccount_addresses.is_empty() {
+            OptionSerializer::Skip
+        } else {
+            OptionSerializer::Some(
+                meta.unchanged_subaccount_addresses
                     .iter()
                     .map(ToString::to_string)
                     .collect(),
@@ -427,6 +442,7 @@ impl From<TransactionStatusMeta> for UiTransactionStatusMeta {
             compute_units_consumed: OptionSerializer::or_skip(meta.compute_units_consumed),
             cost_units: OptionSerializer::or_skip(meta.cost_units),
             subaccount_addresses,
+            unchanged_subaccount_addresses,
         }
     }
 }
@@ -671,11 +687,15 @@ pub struct TransactionStatusMeta {
     pub return_data: Option<TransactionReturnData>,
     pub compute_units_consumed: Option<u64>,
     pub cost_units: Option<u64>,
-    /// F10/PRS-314: owner-facing pubkeys of subaccounts touched by this
+    /// F10/PRS-314: owner-facing pubkeys of subaccounts *changed* by this
     /// transaction, in the order they appear in the tail of
     /// `pre_balances`/`post_balances` (positions `[account_keys.len()..)`).
-    /// Empty for transactions that don't use subaccounts.
+    /// Empty for transactions that don't change any subaccount.
     pub subaccount_addresses: Vec<Pubkey>,
+    /// F10/PRS-155: owner-facing pubkeys of subaccounts accessed but left
+    /// *unchanged* (read-only reads/loads). Reported by address only — these
+    /// carry no entries in `pre_balances`/`post_balances`.
+    pub unchanged_subaccount_addresses: Vec<Pubkey>,
 }
 
 impl Default for TransactionStatusMeta {
@@ -695,6 +715,7 @@ impl Default for TransactionStatusMeta {
             compute_units_consumed: None,
             cost_units: None,
             subaccount_addresses: vec![],
+            unchanged_subaccount_addresses: vec![],
         }
     }
 }

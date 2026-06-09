@@ -363,10 +363,8 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
             .iter()
             .skip(message.account_keys().len())
         {
-            self.loaded_accounts.insert(
-                subaccount_storage_address(owner_address),
-                account.clone(),
-            );
+            self.loaded_accounts
+                .insert(subaccount_storage_address(owner_address), account.clone());
         }
     }
 }

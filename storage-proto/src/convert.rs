@@ -423,6 +423,7 @@ impl From<TransactionStatusMeta> for generated::TransactionStatusMeta {
             compute_units_consumed,
             cost_units,
             subaccount_addresses,
+            unchanged_subaccount_addresses,
         } = value;
         let err = match status {
             Ok(()) => None,
@@ -469,6 +470,10 @@ impl From<TransactionStatusMeta> for generated::TransactionStatusMeta {
             .into_iter()
             .map(|key| <Pubkey as AsRef<[u8]>>::as_ref(&key).into())
             .collect();
+        let unchanged_subaccount_addresses = unchanged_subaccount_addresses
+            .into_iter()
+            .map(|key| <Pubkey as AsRef<[u8]>>::as_ref(&key).into())
+            .collect();
 
         Self {
             err,
@@ -489,6 +494,7 @@ impl From<TransactionStatusMeta> for generated::TransactionStatusMeta {
             compute_units_consumed,
             cost_units,
             subaccount_addresses,
+            unchanged_subaccount_addresses,
         }
     }
 }
@@ -523,6 +529,7 @@ impl TryFrom<generated::TransactionStatusMeta> for TransactionStatusMeta {
             compute_units_consumed,
             cost_units,
             subaccount_addresses,
+            unchanged_subaccount_addresses,
         } = value;
         let status = match &err {
             None => Ok(()),
@@ -587,6 +594,14 @@ impl TryFrom<generated::TransactionStatusMeta> for TransactionStatusMeta {
                 let err = format!("Invalid subaccount address: {err:?}");
                 Self::Error::new(bincode::ErrorKind::Custom(err))
             })?;
+        let unchanged_subaccount_addresses = unchanged_subaccount_addresses
+            .into_iter()
+            .map(Pubkey::try_from)
+            .collect::<Result<_, _>>()
+            .map_err(|err| {
+                let err = format!("Invalid unchanged subaccount address: {err:?}");
+                Self::Error::new(bincode::ErrorKind::Custom(err))
+            })?;
         Ok(Self {
             status,
             fee,
@@ -602,6 +617,7 @@ impl TryFrom<generated::TransactionStatusMeta> for TransactionStatusMeta {
             compute_units_consumed,
             cost_units,
             subaccount_addresses,
+            unchanged_subaccount_addresses,
         })
     }
 }

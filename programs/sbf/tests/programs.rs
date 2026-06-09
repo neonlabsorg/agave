@@ -6882,7 +6882,7 @@ fn test_program_sbf_subaccount_addresses_in_status_meta() {
 
     let balance_collector =
         balance_collector.expect("balance recording was enabled, collector must exist");
-    let (balances, _token_balances, subaccount_keys) =
+    let (balances, _token_balances, subaccount_keys, _unchanged_subaccount_keys) =
         compile_collected_balances(balance_collector);
 
     // Single-transaction batch ⇒ index 0.
@@ -6951,5 +6951,120 @@ fn test_program_sbf_subaccount_addresses_in_status_meta() {
             );
         }
         other => panic!("expected Ui subaccount_addresses to be Some, got {other:?}"),
+    }
+}
+
+/// PRS-155: a read-only `sol_read_subaccount` of an existing subaccount must
+/// surface that subaccount in the receipt's *unchanged* lane
+/// (`unchanged_subaccount_addresses`, owner key only) and NOT in the *changed*
+/// lane (`subaccount_addresses` + the pre/post balance tails). Complements
+/// `test_program_sbf_subaccount_addresses_in_status_meta`, which covers the
+/// changed lane.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_unchanged_addresses_in_status_meta() {
+    use {
+        solana_ledger::transaction_balances::compile_collected_balances,
+        solana_transaction_context::create_subaccount_address,
+    };
+
+    let (bank, _bank_client, _bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let base_pubkey = Pubkey::new_unique();
+    let payer_pubkey = mint_keypair.pubkey();
+    let content: &[u8] = b"read-subaccount-content-32-bytes";
+
+    // Tx1 — create + write the subaccount so it exists on-chain for Tx2 to read.
+    let ix1 =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, content, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix1);
+    assert!(
+        status.is_ok(),
+        "Tx1 create failed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    // Tx2 — read-only `sol_read_subaccount` (do_create = false, do_load = false),
+    // with transaction balance recording enabled.
+    let payload = subaccount_read_payload(false, false, 0, content.len() as u64, content);
+    let ix2 =
+        subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 9, &payload, vec![]);
+    let tx2 = Transaction::new_signed_with_payer(
+        &[ix2],
+        Some(&payer_pubkey),
+        &[&mint_keypair],
+        bank.last_blockhash(),
+    );
+    let account_keys_len = tx2.message.account_keys.len();
+
+    let tx_batch = bank.prepare_batch_for_tests(vec![tx2]);
+    let (mut commit_results, balance_collector) = bank.load_execute_and_commit_transactions(
+        &tx_batch,
+        MAX_PROCESSING_AGE,
+        ExecutionRecordingConfig {
+            enable_cpi_recording: false,
+            enable_log_recording: true,
+            enable_return_data_recording: false,
+            enable_transaction_balance_recording: true,
+        },
+        &mut ExecuteTimings::default(),
+        None,
+    );
+
+    let committed = commit_results.pop().unwrap().expect("read tx must commit");
+    assert!(
+        committed.status.is_ok(),
+        "Tx2 read failed: {:?}\nlogs:\n{}",
+        committed.status,
+        committed.log_messages.clone().unwrap_or_default().join("\n"),
+    );
+
+    let balance_collector =
+        balance_collector.expect("balance recording was enabled, collector must exist");
+    let (balances, _token_balances, subaccount_keys, unchanged_subaccount_keys) =
+        compile_collected_balances(balance_collector);
+
+    let expected_owner =
+        create_subaccount_address(&[base_pubkey.as_ref(), SUBACCOUNT_SEED_TAG], &program_id)
+            .expect("derive owner-facing subaccount pubkey");
+
+    // The read-only subaccount belongs to the unchanged lane, by owner key only.
+    assert!(
+        subaccount_keys[0].is_empty(),
+        "a read-only tx must not record any changed subaccount, got {:?}",
+        subaccount_keys[0],
+    );
+    assert_eq!(
+        &unchanged_subaccount_keys[0],
+        &vec![expected_owner],
+        "the read-only subaccount must be reported in the unchanged lane by owner key",
+    );
+
+    // Unchanged subaccounts carry no balance tail — pre/post stay sized to the
+    // transaction's account keys only.
+    assert_eq!(
+        balances.pre_balances[0].len(),
+        account_keys_len,
+        "unchanged subaccounts must not extend the pre_balances tail",
+    );
+    assert_eq!(
+        balances.post_balances[0].len(),
+        account_keys_len,
+        "unchanged subaccounts must not extend the post_balances tail",
+    );
+
+    // And it survives into the receipt meta's unchanged lane.
+    let meta = solana_transaction_status::TransactionStatusMeta {
+        status: committed.status.clone(),
+        unchanged_subaccount_addresses: unchanged_subaccount_keys[0].clone(),
+        ..solana_transaction_status::TransactionStatusMeta::default()
+    };
+    let ui_meta: solana_transaction_status::UiTransactionStatusMeta = meta.into();
+    match ui_meta.unchanged_subaccount_addresses {
+        solana_transaction_status::option_serializer::OptionSerializer::Some(ref addrs) => {
+            assert_eq!(addrs, &vec![expected_owner.to_string()]);
+        }
+        other => panic!("expected Ui unchanged_subaccount_addresses Some, got {other:?}"),
     }
 }

@@ -1187,6 +1187,12 @@ pub struct ExecutionRecord {
     /// **owner-facing** pubkey. `subaccount_storage_address` is applied
     /// only at the accounts-db / loader-cache boundary.
     pub accounts: Vec<KeyedAccountSharedData>,
+    /// F10/PRS-155: owner-facing keys of subaccounts that were accessed but
+    /// left **unchanged** this transaction (a pure `sol_read_subaccount` or a
+    /// read-only `sol_load_subaccount`). They are deliberately absent from
+    /// `accounts` — the dirty filter does not persist them — but the receipt
+    /// reports them by owner address only (no balances).
+    pub unchanged_subaccount_addresses: Vec<Pubkey>,
     pub return_data: TransactionReturnData,
     pub touched_account_count: u64,
     pub accounts_resize_delta: i64,
@@ -1196,9 +1202,10 @@ pub struct ExecutionRecord {
 #[cfg(not(target_os = "solana"))]
 impl From<TransactionContext<'_>> for ExecutionRecord {
     fn from(context: TransactionContext) -> Self {
-        let (accounts, touched_flags, resize_delta) = Rc::try_unwrap(context.accounts)
-            .expect("transaction_context.accounts has unexpected outstanding refs")
-            .take();
+        let (accounts, unchanged_subaccount_addresses, touched_flags, resize_delta) =
+            Rc::try_unwrap(context.accounts)
+                .expect("transaction_context.accounts has unexpected outstanding refs")
+                .take();
         let touched_account_count = touched_flags
             .iter()
             .fold(0usize, |accumulator, was_touched| {
@@ -1206,6 +1213,7 @@ impl From<TransactionContext<'_>> for ExecutionRecord {
             }) as u64;
         Self {
             accounts,
+            unchanged_subaccount_addresses,
             return_data: context.return_data,
             touched_account_count,
             accounts_resize_delta: Cell::into_inner(resize_delta),

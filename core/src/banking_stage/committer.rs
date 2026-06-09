@@ -173,7 +173,7 @@ impl Committer {
             // Therefore this should always be true.
             debug_assert!(balance_collector.is_some());
 
-            let (balances, token_balances, subaccount_keys) =
+            let (balances, token_balances, subaccount_keys, unchanged_subaccount_keys) =
                 compile_collected_balances(balance_collector.unwrap_or_default());
 
             transaction_status_sender.send_transaction_status_batch(
@@ -185,6 +185,7 @@ impl Committer {
                 tx_costs,
                 batch_transaction_indexes,
                 subaccount_keys,
+                unchanged_subaccount_keys,
             );
         }
     }

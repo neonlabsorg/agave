@@ -3600,6 +3600,7 @@ mod balance_collector {
                 pre_token_vecs,
                 post_token_vecs,
                 _subaccount_keys,
+                _unchanged_subaccount_keys,
             ) = batch_output.balance_collector.unwrap().into_vecs();
 
             // first test the fee-payer balances
