@@ -448,6 +448,24 @@ fn install_subaccount_data_region(
     memory_mapping
         .replace_region(region_index, new_region)
         .map_err(|_| InstructionError::InvalidArgument)?;
+
+    // F10: mapping a subaccount's data region writable is the point at which
+    // the program gains the ability to mutate it in place via direct mapping.
+    // In-bounds direct-mapped stores hit `vm_to_host` directly and never run
+    // the `access_violation_handler`, so they can't flip the touched flag on
+    // their own (only realloc/CoW accesses route through the handler, which
+    // does call `touch`). Mark the subaccount touched here so an in-place
+    // overwrite of an existing subaccount (e.g. a writable `sol_load_subaccount`
+    // followed by a same-length write) is still persisted at tx commit. A
+    // read-only load takes the `new_readonly` branch above and is intentionally
+    // left untouched so it is not re-stored. Mirrors the "writable ⇒ persist"
+    // contract the runtime applies to main accounts.
+    if is_writable {
+        invoke_context
+            .transaction_context
+            .accounts()
+            .touch(subaccount_index | SUBACCOUNT_MARKER)?;
+    }
     Ok(())
 }
 

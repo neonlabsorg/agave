@@ -6693,3 +6693,124 @@ fn test_program_sbf_subaccount_read_out_of_range_partial() {
         logs.join("\n"),
     );
 }
+
+/// Contrasts the two persistence paths through the dirty filter in
+/// `TransactionAccounts::deconstruct_into_keyed_account_shared_data`, which only
+/// drains *touched* subaccounts:
+///
+///   * `read_sub` is only read (`sol_read_subaccount`) in Tx2. An immutable
+///     read never sets the touched flag, so the account is NOT re-stored — its
+///     modified-slot stays at Tx1's slot.
+///   * `mod_sub` is loaded writable and overwritten in Tx2. A writable load
+///     marks the subaccount touched, so it IS re-stored — its modified-slot
+///     advances to Tx2's slot.
+///
+/// Both subaccounts are created in the same Tx1 slot, so comparing their
+/// modified-slots after Tx2 pins the per-subaccount granularity of the filter.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_read_only_does_not_restore() {
+    let (bank, mut bank_client, bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let payer_pubkey = mint_keypair.pubkey();
+    let read_base = Pubkey::new_unique();
+    let mod_base = Pubkey::new_unique();
+    let content: &[u8] = b"read-subaccount-content-32-bytes";
+    let content_v2: &[u8] = b"OVERWRITTEN-subaccount-32-bytes!";
+    assert_eq!(content.len(), 32);
+    assert_eq!(content_v2.len(), content.len());
+
+    // Tx1 — create both subaccounts (two transactions in the same slot).
+    let ix1a =
+        subaccount_create_instruction(program_id, read_base, payer_pubkey, 0, content, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix1a);
+    assert!(
+        status.is_ok(),
+        "Tx1 create (read_sub) failed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+    let ix1b =
+        subaccount_create_instruction(program_id, mod_base, payer_pubkey, 0, content, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix1b);
+    assert!(
+        status.is_ok(),
+        "Tx1 create (mod_sub) failed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    let read_storage = subaccount_storage_addr_for(&read_base, &program_id);
+    let mod_storage = subaccount_storage_addr_for(&mod_base, &program_id);
+    let (_read_acc, read_created_slot) = bank
+        .get_account_modified_slot(&read_storage)
+        .expect("read_sub must exist after create");
+    let (_mod_acc, mod_created_slot) = bank
+        .get_account_modified_slot(&mod_storage)
+        .expect("mod_sub must exist after create");
+
+    // Advance into a new slot so a re-store in Tx2 is observable as a changed
+    // modified-slot.
+    let bank = bank_client
+        .advance_slot(1, bank_forks.as_ref(), &Pubkey::default())
+        .expect("advance slot for Tx2");
+    let tx2_slot = bank.slot();
+    assert_ne!(
+        tx2_slot, read_created_slot,
+        "Tx2 must run in a different slot than the create tx",
+    );
+
+    // Tx2a — read-only `sol_read_subaccount` of read_sub (no create, no load).
+    let payload = subaccount_read_payload(false, false, 0, content.len() as u64, content);
+    let ix2a =
+        subaccount_create_instruction(program_id, read_base, payer_pubkey, 9, &payload, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix2a);
+    assert!(
+        status.is_ok(),
+        "Tx2 read failed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    // Tx2b — writable load + same-length overwrite of mod_sub (disc=1).
+    let ix2b = subaccount_instruction(program_id, mod_base, true, 1, content_v2, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix2b);
+    assert!(
+        status.is_ok(),
+        "Tx2 modify failed: {status:?}\nlogs:\n{}",
+        logs.join("\n"),
+    );
+
+    // read_sub: unchanged data, modified-slot still at Tx1's slot.
+    let (read_stored, read_modified_slot) = bank
+        .get_account_modified_slot(&read_storage)
+        .expect("read_sub must still exist after a read-only tx");
+    assert_eq!(
+        read_stored.data(),
+        content,
+        "a read must not change the stored subaccount data",
+    );
+    assert_eq!(
+        read_modified_slot, read_created_slot,
+        "a read-only sol_read_subaccount must not re-store the subaccount \
+         (modified-slot advanced {read_created_slot} -> {read_modified_slot})",
+    );
+
+    // mod_sub: overwritten data, modified-slot advanced to Tx2's slot.
+    let (mod_stored, mod_modified_slot) = bank
+        .get_account_modified_slot(&mod_storage)
+        .expect("mod_sub must still exist after the modifying tx");
+    assert_eq!(
+        mod_stored.data(),
+        content_v2,
+        "the writable overwrite must be on-chain",
+    );
+    assert_ne!(
+        mod_modified_slot, mod_created_slot,
+        "a modified subaccount must be re-stored (modified-slot must advance \
+         from the create slot {mod_created_slot})",
+    );
+    assert_eq!(
+        mod_modified_slot, tx2_slot,
+        "a modified subaccount must be re-stored at the modifying tx's slot \
+         (expected {tx2_slot}, got {mod_modified_slot})",
+    );
+}
