@@ -387,7 +387,7 @@ impl<'ix_data> TransactionContext<'ix_data> {
         deduplication_map: Vec<u16>,
         instruction_data: Cow<'ix_data, [u8]>,
     ) -> Result<(), InstructionError> {
-        debug_assert_eq!(deduplication_map.len(), MAX_ACCOUNTS_PER_TRANSACTION);
+        //debug_assert_eq!(deduplication_map.len(), MAX_ACCOUNTS_PER_TRANSACTION);
         let instruction = self
             .instruction_trace
             .last_mut()

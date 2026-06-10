@@ -20,15 +20,15 @@ type LockCount = u32;
 pub struct ThreadSet(u64);
 
 #[derive(Debug)]
-struct AccountWriteLocks {
-    thread_id: ThreadId,
-    lock_count: LockCount,
+pub struct AccountWriteLocks {
+    pub thread_id: ThreadId,
+    pub lock_count: LockCount,
 }
 
 #[derive(Debug)]
-struct AccountReadLocks {
-    thread_set: ThreadSet,
-    lock_counts: [LockCount; MAX_THREADS],
+pub struct AccountReadLocks {
+    pub thread_set: ThreadSet,
+    pub lock_counts: [LockCount; MAX_THREADS],
 }
 
 /// Account locks.
@@ -37,7 +37,7 @@ struct AccountReadLocks {
 /// Read Locks - multiple threads can hold a read lock at a time.
 ///     Contains thread-set for easily checking which threads are scheduled.
 #[derive(Debug, Default)]
-struct AccountLocks {
+pub struct AccountLocks {
     pub write_locks: Option<AccountWriteLocks>,
     pub read_locks: Option<AccountReadLocks>,
 }
@@ -77,6 +77,10 @@ impl ThreadAwareAccountLocks {
             num_threads,
             locks: AHashMap::new(),
         }
+    }
+
+    pub fn acc_locks<'a>(&'a self, addr: &Pubkey) -> Option<&'a AccountLocks> {
+        self.locks.get(addr)
     }
 
     /// Returns the `ThreadId` if the accounts are able to be locked
