@@ -205,7 +205,7 @@ impl SVMTransactionExecutionCost {
             cpi_bytes_per_unit: 250, // ~50MB at 200,000 units
             sysvar_base_cost: 100,
             secp256k1_recover_cost: 25_000,
-            syscall_base_cost: 100,
+            syscall_base_cost: 10,
             curve25519_edwards_validate_point_cost: 159,
             curve25519_edwards_add_cost: 473,
             curve25519_edwards_subtract_cost: 475,
