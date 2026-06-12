@@ -274,6 +274,11 @@ impl<'ix_data> TransactionContext<'ix_data> {
 
     /// F10: register a new subaccount under the given key.
     /// Returns the subaccount index (without the `SUBACCOUNT_MARKER` high-bit).
+    ///
+    /// The entry is left **untouched**, so the end-of-tx dirty filter does not
+    /// persist it unless a caller touches it. The read-only load path relies on
+    /// this; the `sol_create_subaccount` syscall touches the entry right after
+    /// adding it so a created subaccount always persists.
     #[cfg(not(target_os = "solana"))]
     pub fn add_subaccount(
         &self,

@@ -1352,6 +1352,52 @@ mod tests {
         );
     }
 
+    /// PRS-155: a created subaccount must persist by construction. The
+    /// `sol_create_subaccount` syscall adds the subaccount and immediately
+    /// touches it (`idx | SUBACCOUNT_MARKER`); this test exercises that lane
+    /// contract with the worst case — zero lamports, zero data, which no later
+    /// setter would touch (`set_data_length(0)` is a no-op and there is no
+    /// funding transfer) — and asserts the entry still reaches the drained
+    /// account list. Contrast with an *untouched* `add_subaccount` entry, which
+    /// the dirty filter skips (see
+    /// `test_deconstruct_persists_only_touched_subaccount`).
+    #[test]
+    fn test_touched_create_persists_zero_lamport_subaccount() {
+        let main_pubkey = Pubkey::new_from_array([1u8; 32]);
+        let main_account = AccountSharedData::new(100, 4, &Pubkey::new_unique());
+        let tx_accounts = TransactionAccounts::new(vec![(main_pubkey, main_account)]);
+
+        // Zero lamports, zero data — nothing a later setter would touch.
+        let created_pda = Pubkey::new_from_array([9u8; 32]);
+        let owner = Pubkey::new_from_array([42u8; 32]);
+        let created_index =
+            tx_accounts.add_subaccount(created_pda, AccountSharedData::new(0, 0, &owner));
+        // Mirror the create syscall: touch right after add.
+        tx_accounts
+            .touch(created_index | crate::SUBACCOUNT_MARKER)
+            .unwrap();
+
+        let (accounts, unchanged, _touched, _resize) = tx_accounts.take();
+        assert_eq!(
+            accounts.len(),
+            2,
+            "the main account and the created zero-lamport subaccount must both persist",
+        );
+        assert_eq!(accounts.first().unwrap().0, main_pubkey);
+        let (sub_key, sub_account) = accounts.get(1).unwrap();
+        assert_eq!(
+            *sub_key, created_pda,
+            "created subaccount persisted by owner key",
+        );
+        assert_eq!(sub_account.lamports(), 0);
+        assert_eq!(sub_account.data().len(), 0);
+        assert_eq!(sub_account.owner(), &owner);
+        assert!(
+            unchanged.is_empty(),
+            "a created subaccount is persisted, not reported as unchanged",
+        );
+    }
+
     /// `get_dynamic_accounts_lamports_sum` feeds the runtime balance check
     /// (`lamports_before + sum == lamports_after`). Since only touched
     /// subaccounts are persisted, the sum must exclude the lamports of an

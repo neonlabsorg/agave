@@ -129,6 +129,18 @@ declare_builtin_function!(
         invoke_context.timings.compute_subaccounts_us += compute_subaccounts_time.as_us();
 
         let subaccount_index = find_or_add_subaccount(invoke_context, subaccount_pubkey)?;
+        // F10/PRS-314: a created subaccount must always be persisted by the
+        // end-of-tx dirty filter, even a zero-lamport/zero-space allocation
+        // that no later setter mutates (`set_data_length(0)` is a no-op and
+        // with no funding transfer there is no lamport change to touch on).
+        // Touch it here so persistence is correct by construction rather than
+        // relying on a setter to remember. The load path leaves an unmodified
+        // subaccount untouched; a writable load touches it once mutated (see
+        // `commit_subaccount_slot`).
+        invoke_context
+            .transaction_context
+            .accounts()
+            .touch(subaccount_index | SUBACCOUNT_MARKER)?;
         let system_program_index = invoke_context
             .transaction_context
             .find_index_of_account(&system_program::id())
