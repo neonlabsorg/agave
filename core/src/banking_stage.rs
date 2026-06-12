@@ -511,7 +511,9 @@ impl BankingStage {
                 Builder::new()
                     .name(format!("solCoWorker{id:02}"))
                     .spawn(move || {
-                        let _ = consume_worker.run();
+                        if consume_worker.run().is_err() {
+                            std::process::abort();
+                        }
                     })
                     .unwrap(),
             )
@@ -745,7 +747,9 @@ mod external {
                     Builder::new()
                         .name(format!("solECoWorker{id:02}"))
                         .spawn(move || {
-                            let _ = consume_worker.run();
+                            if consume_worker.run().is_err() {
+                                std::process::abort();
+                            }
                         })
                         .unwrap(),
                 )
