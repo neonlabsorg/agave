@@ -8,7 +8,6 @@ use slotmap::SlotMap;
 use solana_transaction::Address;
 use ahash::AHashMap;
 
-
 #[derive(Parser)]
 struct Args {
     #[arg(long)]
@@ -49,6 +48,7 @@ struct Config {
     pub slot_deadline: u64,
     #[serde(with = "humantime_serde")]
     pub report_delay: Option<Duration>,
+    max_queue_size: usize,
 }
 
 slotmap::new_key_type! {
@@ -75,17 +75,21 @@ struct TxMeta {
     shared_key: TransactionKey,
     affinity_requirements: Vec<usize>,
     affinity_requirements_count: usize,
-    state: TxState
+    state: TxState,
+    score: usize,
+    expire_slot: u64,
 }
 
 impl TxMeta {
-    fn new(shared_key: TransactionKey) -> Self {
+    fn new(shared_key: TransactionKey, score: usize, slot: u64) -> Self {
         Self {
             shared_key,
             waiting_queue: 0,
             affinity_requirements: Vec::new(),
             affinity_requirements_count: 0,
             state: TxState::default(),
+            score,
+            expire_slot: slot
         }
     }
 
@@ -232,6 +236,16 @@ impl<T: Copy> TxDataProvider for agave_scheduling_utils::bridge::SchedulerBindin
     }
 }
 
+trait MutableTxProvider: TxDataProvider {
+    fn remove_tx(&mut self, key: TransactionKey);
+}
+
+impl<T: Copy> MutableTxProvider for agave_scheduling_utils::bridge::SchedulerBindingsBridge<T> {
+    fn remove_tx(&mut self, key: TransactionKey) {
+        self.drop_transaction(key);
+    }
+}
+
 enum Event {
     AddressUnblocked(Address),
     AffinityRequirementDropped(SchedulerTxKey),
@@ -253,7 +267,10 @@ struct LockingQueue {
 
     backlogs: Vec<usize>,
 
-    passed_txs: usize,
+    seen_txs: usize,
+
+    slot: u64,
+    expires: usize
 }
 
 fn make_vector<T>(size: usize, f: impl FnMut() -> T) -> Vec<T> {
@@ -277,8 +294,14 @@ impl LockingQueue {
             backlogs: make_vector(num_threads, || 0),
             affinity_waiters: AHashMap::new(),
             events_to_dispatch: VecDeque::new(),
-            passed_txs: 0
+            seen_txs: 0,
+            slot: 0,
+            expires: 0
         }
+    }
+
+    fn size(&self) -> usize {
+        self.metas.len()
     }
 
     fn start_waiting_for_workers(&mut self, key: SchedulerTxKey, tx: &TransactionState) {
@@ -318,7 +341,7 @@ impl LockingQueue {
 
         tx_meta.set_affinity_requirements(requirements);
         if tx_meta.affinity_requirements_count <= 1 {
-            self.try_pick_tx(key, tx, true, None);
+            self.try_pick_tx(key, tx, true);
             assert!({
                 let tx_meta = self.metas.get(key).unwrap();
                 tx_meta.state == TxState::Picked || tx_meta.state == TxState::Backpressured
@@ -326,9 +349,9 @@ impl LockingQueue {
         }
     }
 
-    fn new_tx(&mut self, shared_key: TransactionKey, tx: &TransactionState) {
-        self.passed_txs += 1;
-        let key = self.metas.insert(TxMeta::new(shared_key));
+    fn new_tx(&mut self, meta: TxMeta, tx: &TransactionState) {
+        self.seen_txs += 1;
+        let key = self.metas.insert(meta);
         let meta = self.metas.get_mut(key).unwrap();
         for (lock, is_write) in tx.locks() {
             if self.resources.entry(*lock).or_default().push(key, is_write) {
@@ -340,7 +363,7 @@ impl LockingQueue {
         }
     }
 
-    fn try_pick_tx(&mut self, key: SchedulerTxKey, txdata: &TransactionState, was_blocked: bool, score_hint: Option<usize>) -> bool {
+    fn try_pick_tx(&mut self, key: SchedulerTxKey, txdata: &TransactionState, was_blocked: bool) -> bool {
         let write_locks = txdata.write_locks().collect::<smallvec::SmallVec<[_; 64]>>();
         let read_locks = txdata.read_locks().collect::<smallvec::SmallVec<[_; 64]>>();
         let tx_meta = self.metas.get_mut(key).unwrap();
@@ -364,7 +387,7 @@ impl LockingQueue {
 
         match lock_result {
             Ok(thread) => {
-                let score = score_hint.unwrap_or(tx_score(txdata));
+                let score = tx_meta.score;
                 if self.backlogs[thread] >= self.max_worker_backlog {
                     tx_meta.state = TxState::Backpressured;
                     self.backpressured[thread].push(PickedTx(score, key));
@@ -406,17 +429,41 @@ impl LockingQueue {
 
     }
 
-    fn dispatch_event(&mut self, ev: Event, txdata: &impl TxDataProvider) {
+    // returns true if the key is already non-valid (expired)
+    fn maybe_expire(&mut self, key: SchedulerTxKey, txdata: &mut impl MutableTxProvider) -> bool {
+        let (shared_key, expire_slot) = {
+            let Some(meta) = self.metas.get(key) else {
+                return true;
+            };
+            (meta.shared_key, meta.expire_slot)
+        };
+        if expire_slot <= self.slot {
+            self.expires += 1;
+            txdata.remove_tx(shared_key);
+            self.metas.remove(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn dispatch_event(&mut self, ev: Event, txdata: &mut impl MutableTxProvider) {
         match ev {
             Event::AffinityRequirementDropped(key) => {
+                if self.maybe_expire(key, txdata) {
+                    return;
+                }
                 let Some(meta) = self.metas.get(key) else {
                     return;
                 };
                 let txdata = txdata.txdata(meta.shared_key);
-                self.try_pick_tx(key, txdata, true, None);
+                self.try_pick_tx(key, txdata, true);
             }
             Event::AddressUnblocked(address) => {
                 while let Some(key) = self.resources.get_mut(&address).and_then(|q| q.drain()) {
+                    if self.maybe_expire(key, txdata) {
+                        return;
+                    }
                     let (waiting_queue, txdata) = {
                         let meta = self.metas.get_mut(key).unwrap();
                         assert!(meta.waiting_queue > 0);
@@ -434,9 +481,9 @@ impl LockingQueue {
         }
     }
 
-    fn drain_backpressured(&mut self, thread: usize, txdata: &impl TxDataProvider) {
+    fn drain_backpressured(&mut self, thread: usize, txdata: &mut impl MutableTxProvider) {
         while self.backlogs[thread] < self.max_worker_backlog {
-            let Some(PickedTx(score, key)) = self.backpressured[thread].pop() else {
+            let Some(PickedTx(_, key)) = self.backpressured[thread].pop() else {
                 break;
             };
 
@@ -444,17 +491,21 @@ impl LockingQueue {
                 continue;
             }
 
+            if self.maybe_expire(key, txdata) {
+                continue;
+            }
+
             let txdata = txdata.txdata({
                 let meta = self.metas.get(key).unwrap();
                 assert!(meta.state == TxState::Backpressured);
-                meta
-            }.shared_key);
+                meta.shared_key
+            });
 
-            assert!(self.try_pick_tx(key, txdata, true, Some(score)));
+            assert!(self.try_pick_tx(key, txdata, true));
         }
     }
 
-    fn dispatch_events(&mut self, txdata: &impl TxDataProvider) {
+    fn dispatch_events(&mut self, txdata: &mut impl MutableTxProvider) {
         while let Some(ev) = self.events_to_dispatch.pop_front() {
             self.dispatch_event(ev, txdata);
         }
@@ -521,22 +572,33 @@ fn main() {
 
     let mut slot = 0;
     let mut last_report = std::time::Instant::now();
+    let mut reschedules = 0;
+    let mut drops = 0;
+
+    let mut sent_stats = make_vector(workers, || 0);
+    let mut receive_stats = make_vector(workers, || 0);
 
     loop {
         let mut to_spin = true;
         if let Some(item) = bridge.drain_progress() {
             slot = item.current_slot;
+            locking_queue.slot = slot;
         }
 
         bridge.drain_tpu(|bridge, tx_key| {
             to_spin = false;
             let data = bridge.transaction(tx_key);
+            if locking_queue.size() >= config.max_queue_size {
+                drops += 1;
+                return TxDecision::Drop;
+            }
             if config.check_max_inflight > 0 {
                 to_check.insert(tx_key);
             } else {
-                locking_queue.new_tx(tx_key, data);
+                locking_queue.new_tx(TxMeta::new(tx_key, tx_score(data), slot + config.slot_deadline), data);
             }
             TxDecision::Keep
+
         }, config.drain_tpu_granularity);
 
         if !to_check.is_empty() {
@@ -557,6 +619,10 @@ fn main() {
         bridge.drain_worker(check_worker, |bridge, worker_resp| {
             match worker_resp.response {
                 WorkerAction::Check(response, _pubkeys) => {
+                    if locking_queue.size() >= config.max_queue_size {
+                        drops += 1;
+                        return TxDecision::Drop;
+                    }
                     if response.parsing_and_sanitization_flags & parsing_and_sanitization_flags::FAILED != 0 {
                         TxDecision::Drop
                     } else if response.status_check_flags != status_check_flags::REQUESTED | status_check_flags::PERFORMED {
@@ -564,7 +630,12 @@ fn main() {
                     } else if response.resolve_flags & resolve_flags::FAILED != 0 {
                         TxDecision::Drop
                     } else {
-                        locking_queue.new_tx(worker_resp.key, bridge.transaction(worker_resp.key));
+                        locking_queue.new_tx(
+                            TxMeta::new(
+                                worker_resp.key,
+                                tx_score(bridge.transaction(worker_resp.key)),
+                                slot + config.slot_deadline),
+                            bridge.transaction(worker_resp.key));
                         TxDecision::Keep
                     }
                 },
@@ -577,6 +648,7 @@ fn main() {
 
         for worker in 0..workers {
             bridge.drain_worker(worker, |bridge, worker_resp| {
+                receive_stats[worker] += 1;
                 to_spin = false;
                 let shared_key = worker_resp.key;
                 let key = worker_resp.meta;
@@ -584,26 +656,25 @@ fn main() {
                     WorkerAction::Check(_, _) => panic!("unexpected worker response"),
                     WorkerAction::Execute(item) => {
                         assert!(item.not_included_reason != not_included_reasons::ACCOUNT_IN_USE);
-                        locking_queue.remove_completed(key, bridge.transaction(shared_key), worker);
+                        let score = locking_queue.metas.get(key).unwrap().score;
                         if item.not_included_reason == not_included_reasons::WOULD_EXCEED_MAX_ACCOUNT_COST_LIMIT ||
                             item.not_included_reason == not_included_reasons::WOULD_EXCEED_ACCOUNT_DATA_BLOCK_LIMIT ||
                             item.not_included_reason == not_included_reasons::PROGRAM_EXECUTION_TEMPORARILY_RESTRICTED
                         {
-                            locking_queue.new_tx(shared_key, bridge.transaction(shared_key));
+                            reschedules += 1;
+                            locking_queue.picked[worker].push(PickedTx(score, key));
                             TxDecision::Keep
                         } else {
+                            locking_queue.remove_completed(key, bridge.transaction(shared_key), worker);
                             TxDecision::Drop
                         }
                     },
-                    WorkerAction::Unprocessed => {
-                        locking_queue.new_tx(shared_key, bridge.transaction(shared_key));
-                        TxDecision::Keep
-                    }
+                    WorkerAction::Unprocessed => TxDecision::Drop // max_working_slot violation
                 }
             }, config.max_txs_per_worker);
         }
 
-        locking_queue.dispatch_events(&bridge);
+        locking_queue.dispatch_events(&mut bridge);
         if let Some(period) = config.report_delay {
             let now = std::time::Instant::now();
             if last_report + period < now {
@@ -650,14 +721,19 @@ fn main() {
                         assert!(v.blocked_reads > 0 || v.blocked_writes > 0);
                     }
                 }
-                println!("{}/{workers} saturated enqueued txs {} ({statuses:?}) passed txs {}",
-                    locking_queue.backlogs.iter().filter(|x| **x>0).count(), locking_queue.metas.len(), locking_queue.passed_txs);
+
+                let expires = locking_queue.expires;
+                let passed_txs = locking_queue.seen_txs;
+                let queue_len = locking_queue.metas.len();
+                let picked_queue_len = locking_queue.picked.iter().filter(|x| !x.is_empty()).count();
+                println!("{}/{workers} saturated backlogs {:?} (sent/receive stats {sent_stats:?}/{receive_stats:?}); enqueued txs {queue_len}/{statuses:?}/{picked_queue_len}; txs seen/expires/reschedules/drops {passed_txs}/{expires}/{reschedules}/{drops} slot {slot}",
+                    locking_queue.backlogs.iter().filter(|x| **x>0).count(), locking_queue.backlogs);
                 last_report = now;
             }
         }
 
         for worker in 0..workers {
-            locking_queue.drain_backpressured(worker, &bridge);
+            locking_queue.drain_backpressured(worker, &mut bridge);
             let mut batch = smallvec::SmallVec::<[_; MAX_TRANSACTIONS_PER_MESSAGE]>::new();
             macro_rules! send_batch {
                 () => {
@@ -668,6 +744,7 @@ fn main() {
                         max_working_slot: slot + config.slot_deadline,
                         flags: pack_message_flags::EXECUTE
                     }).unwrap();
+                    sent_stats[worker] += batch.len();
                     batch.clear();
                 };
             }
