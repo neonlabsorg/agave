@@ -75,28 +75,33 @@ impl Default for TxState {
 type TxLocksSubscriptionList = IntrusiveList<(SchedulerTxKey, /* is_write */ bool), 2, 0, true>;
 type LockWaitingTxsList = IntrusiveList<(SchedulerTxKey, /* is_write */ bool), 2, 1, true>;
 
+type AffinitySubscriptionList = IntrusiveList<SchedulerTxKey, 2, 0, true>;
+type AffinityWaitingTxsList = IntrusiveList<SchedulerTxKey, 2, 1, true>;
+
+type Score = (usize, usize);
+
 #[derive(Default)]
 struct TxMeta {
     shared_key: TransactionKey,
 
     resource_queue_subs: TxLocksSubscriptionList,
-    _affinity_subs: TxLocksSubscriptionList,
 
+    affinity_subs: AffinitySubscriptionList,
     affinity_requirements: Vec<usize>,
     affinity_requirements_count: usize,
     state: TxState,
-    score: usize,
+    score: Score,
     expire_slot: u64,
 }
 
 impl TxMeta {
-    fn new(shared_key: TransactionKey, score: usize, slot: u64) -> Self {
+    fn new(shared_key: TransactionKey, score: Score, slot: u64) -> Self {
         Self {
             shared_key,
             affinity_requirements: Vec::new(),
             affinity_requirements_count: 0,
             state: TxState::default(),
-            _affinity_subs: TxLocksSubscriptionList::new(),
+            affinity_subs: AffinitySubscriptionList::new(),
             resource_queue_subs: TxLocksSubscriptionList::new(),
             score,
             expire_slot: slot
@@ -196,7 +201,7 @@ impl ResourceLockingQueue {
 }
 
 #[derive(Eq, Ord)]
-struct PickedTx(usize, SchedulerTxKey);
+struct PickedTx(Score, SchedulerTxKey);
 
 impl PartialEq for PickedTx {
     fn eq(&self, other: &PickedTx) -> bool {
@@ -212,29 +217,26 @@ impl PartialOrd for PickedTx {
 
 #[derive(Default)]
 struct AccWaiters {
-    readers: Vec<SchedulerTxKey>,
-    writers: Vec<SchedulerTxKey>,
-    deregisters: usize
+    readers: AffinityWaitingTxsList,
+    writers: AffinityWaitingTxsList,
 }
 
 impl AccWaiters {
-    fn drain(&mut self, ro: bool) -> Vec<SchedulerTxKey> {
-        let mut result = std::mem::take(&mut self.readers);
-        if !ro {
-            result.append(&mut self.writers);
+    fn drain(&mut self, ro: bool) -> Option<SchedulerTxKey> {
+        if !self.readers.is_empty() {
+            if let Some(item) = self.readers.pop_front() {
+                return Some(*item.contained());
+            }
+        } else if !ro {
+            if let Some(item) = self.writers.pop_front() {
+                return Some(*item.contained());
+            }
         }
-        result
+        None
     }
 
-    fn mark_deregister(&mut self) -> bool {
-        self.deregisters += 1;
-        self.deregisters * 2 >= self.readers.len() + self.writers.len()
-    }
-
-    fn retain(&mut self, predicate: &impl Fn(&SchedulerTxKey) -> bool)  {
-        self.readers.retain(predicate);
-        self.writers.retain(predicate);
-        self.deregisters = 0;
+    fn empty(&self) -> bool {
+        self.readers.is_empty() && self.writers.is_empty()
     }
 }
 
@@ -327,11 +329,14 @@ impl LockingQueue {
             if requirements.is_empty() {
                 requirements.resize(self.num_threads, 0);
             }
+            let mut sub = ItemHolder::new(key).into();
+            tx_meta.affinity_subs.push_front(&mut sub);
+            let mut sub = sub.switch();
             let waiters = self.affinity_waiters.entry(addr).or_default();
             if is_write {
-                waiters.writers.push(key);
+                waiters.writers.push_front(&mut sub);
             } else {
-                waiters.readers.push(key);
+                waiters.readers.push_front(&mut sub);
             }
             requirements[thread] += 1;
         };
@@ -523,30 +528,34 @@ impl LockingQueue {
         self.picked_locks.unlock_accounts(tx.write_locks(), tx.read_locks(), worker);
         self.backlogs[worker] -= 1;
         for (lock, _) in tx.locks() {
+            let mut to_delete = false;
             if let Some(waiters) = self.affinity_waiters.get_mut(lock) {
                 let acc_locks = self.picked_locks.acc_locks(lock);
                 if acc_locks.map(|a| a.write_locks.is_some()) == Some(true) {
                     continue;
                 }
 
-                for waiter in waiters.drain(acc_locks.map_or(false, |acc| acc.read_locks.is_some())).into_iter() {
+                while let Some(waiter) = waiters.drain(acc_locks.map_or(false, |acc| acc.read_locks.is_some())) {
                     if let Some(tx_meta) = self.metas.get_mut(waiter) {
                         if tx_meta.remove_affinity_requirement(worker) && tx_meta.affinity_requirements_count <= 1 {
                             self.events_to_dispatch.push_back(Event::AffinityRequirementDropped(waiter));
                         }
                     }
                 }
-                if waiters.mark_deregister() {
-                    waiters.retain(&|key| self.metas.get(*key).is_some());
-                }
+                to_delete = waiters.empty();
+            }
+            if to_delete {
+                self.affinity_waiters.remove(lock);
             }
         }
         self.metas.remove(key);
     }
 }
 
-fn tx_score(_data: &TransactionState) -> usize {
-    0
+impl Config {
+    fn tx_score(&self, _data: &TransactionState) -> usize {
+        0
+    }
 }
 
 
@@ -603,7 +612,8 @@ fn main() {
             if config.check_max_inflight > 0 {
                 to_check.insert(tx_key);
             } else {
-                locking_queue.new_tx(TxMeta::new(tx_key, tx_score(data), slot + config.slot_deadline), data);
+                let ts_prio = usize::MAX - locking_queue.seen_txs;
+                locking_queue.new_tx(TxMeta::new(tx_key, (config.tx_score(data), ts_prio), slot + config.slot_deadline), data);
             }
             TxDecision::Keep
 
@@ -638,10 +648,11 @@ fn main() {
                     } else if response.resolve_flags & resolve_flags::FAILED != 0 {
                         TxDecision::Drop
                     } else {
+                        let ts_prio = usize::MAX - locking_queue.seen_txs;
                         locking_queue.new_tx(
                             TxMeta::new(
                                 worker_resp.key,
-                                tx_score(bridge.transaction(worker_resp.key)),
+                                (config.tx_score(bridge.transaction(worker_resp.key)), ts_prio),
                                 slot + config.slot_deadline),
                             bridge.transaction(worker_resp.key));
                         TxDecision::Keep
