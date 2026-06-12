@@ -48,6 +48,34 @@ const _: () = assert!(
 
 const _: () = assert!(SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE % BPF_ALIGN_OF_U128 == 0);
 
+/// F10: shared precondition for the entire subaccount syscall surface
+/// (create / load / read / unload). Subaccount slots rely on direct-mapped
+/// account data and the stricter ABI pointer checks, so every one of these
+/// syscalls must refuse to run unless both features are active.
+///
+/// This must be the first thing each syscall does, before it mutates the
+/// `TransactionContext`, issues a system `Transfer` CPI, or persists any
+/// state — otherwise those side effects would happen under an ABI the rest of
+/// the runtime does not expect. Returns `UnsupportedSysvar` when the
+/// preconditions are not met.
+fn check_subaccount_syscall_enabled(
+    invoke_context: &mut InvokeContext,
+    syscall_name: &str,
+) -> Result<(), Error> {
+    let feature_set = invoke_context.get_feature_set();
+    let stricter_abi_and_runtime_constraints = feature_set.stricter_abi_and_runtime_constraints;
+    let account_data_direct_mapping = feature_set.account_data_direct_mapping;
+    if !(stricter_abi_and_runtime_constraints && account_data_direct_mapping) {
+        ic_msg!(
+            invoke_context,
+            "{}: requires stricter ABI/runtime constraints && account data direct mapping features",
+            syscall_name,
+        );
+        return Err(InstructionError::UnsupportedSysvar.into());
+    }
+    Ok(())
+}
+
 fn find_or_add_subaccount(
     invoke_context: &mut InvokeContext,
     subaccount_pubkey: Pubkey,
@@ -99,6 +127,8 @@ declare_builtin_function!(
         lamports: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
+        check_subaccount_syscall_enabled(invoke_context, "sol_create_subaccount")?;
+
         let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
         consume_compute_meter(invoke_context, syscall_base_cost)?;
         let check_aligned = invoke_context.get_check_aligned();
@@ -800,17 +830,7 @@ fn load_subaccount_impl(
     memory_mapping: &mut MemoryMapping,
     kind: AccountViewKind,
 ) -> Result<u64, Error> {
-    let stricter_abi_and_runtime_constraints = invoke_context
-        .get_feature_set()
-        .stricter_abi_and_runtime_constraints;
-    let account_data_direct_mapping = invoke_context.get_feature_set().account_data_direct_mapping;
-    if !(stricter_abi_and_runtime_constraints && account_data_direct_mapping) {
-        ic_msg!(
-            invoke_context,
-            "sol_load_subaccount: requires stricter ABI/runtime constraints && account data direct mapping features"
-        );
-        return Err(InstructionError::UnsupportedSysvar.into());
-    }
+    check_subaccount_syscall_enabled(invoke_context, "sol_load_subaccount")?;
 
     let mut load_subaccount_time = Measure::start("load_subaccount");
     let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
@@ -1011,6 +1031,8 @@ declare_builtin_function!(
         length: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
+        check_subaccount_syscall_enabled(invoke_context, "sol_read_subaccount")?;
+
         // We use `load_subaccount` measure here to capture the time spent on loading subaccount
         // from the AccountsDB.
         let mut load_subaccount_time = Measure::start("load_subaccount");
@@ -1093,6 +1115,8 @@ declare_builtin_function!(
         _arg5: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
+        check_subaccount_syscall_enabled(invoke_context, "sol_unload_subaccount")?;
+
         let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
         consume_compute_meter(invoke_context, syscall_base_cost)?;
         let check_aligned = invoke_context.get_check_aligned();
