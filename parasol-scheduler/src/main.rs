@@ -3,10 +3,13 @@ use std::{collections::{BTreeSet, BinaryHeap, VecDeque}, time::Duration};
 use agave_scheduler_bindings::{pack_message_flags::{self, check_flags}, worker_message_types::{not_included_reasons, parsing_and_sanitization_flags, resolve_flags, status_check_flags}, MAX_TRANSACTIONS_PER_MESSAGE};
 use agave_scheduling_utils::{bridge::{KeyedTransactionMeta, ScheduleBatch, TransactionKey, TransactionState, TxDecision, WorkerAction}, handshake::ClientLogon, thread_aware_account_locks::{self, ThreadAwareAccountLocks, ThreadId, ThreadSet}};
 use clap::Parser;
+use intrusive_list::{IntrusiveList, ItemHolder};
 use serde::Deserialize;
 use slotmap::SlotMap;
 use solana_transaction::Address;
 use ahash::AHashMap;
+
+pub mod intrusive_list;
 
 #[derive(Parser)]
 struct Args {
@@ -69,10 +72,16 @@ impl Default for TxState {
     }
 }
 
-#[derive(Clone, Default)]
+type TxLocksSubscriptionList = IntrusiveList<(SchedulerTxKey, /* is_write */ bool), 2, 0, true>;
+type LockWaitingTxsList = IntrusiveList<(SchedulerTxKey, /* is_write */ bool), 2, 1, true>;
+
+#[derive(Default)]
 struct TxMeta {
-    waiting_queue: usize,
     shared_key: TransactionKey,
+
+    resource_queue_subs: TxLocksSubscriptionList,
+    _affinity_subs: TxLocksSubscriptionList,
+
     affinity_requirements: Vec<usize>,
     affinity_requirements_count: usize,
     state: TxState,
@@ -84,10 +93,11 @@ impl TxMeta {
     fn new(shared_key: TransactionKey, score: usize, slot: u64) -> Self {
         Self {
             shared_key,
-            waiting_queue: 0,
             affinity_requirements: Vec::new(),
             affinity_requirements_count: 0,
             state: TxState::default(),
+            _affinity_subs: TxLocksSubscriptionList::new(),
+            resource_queue_subs: TxLocksSubscriptionList::new(),
             score,
             expire_slot: slot
         }
@@ -119,7 +129,7 @@ impl TxMeta {
 
 #[derive(Default)]
 struct ResourceLockingQueue {
-    acquire_queue: VecDeque<(SchedulerTxKey, /*is_write*/ bool)>,
+    acquire_queue: LockWaitingTxsList,
     blocked_reads: usize,
     blocked_writes: usize,
 }
@@ -129,7 +139,7 @@ impl ResourceLockingQueue {
         self.acquire_queue.is_empty() && self.blocked_reads == 0 && self.blocked_writes == 0
     }
 
-    fn push(&mut self, key: SchedulerTxKey, is_write: bool) -> bool {
+    fn push(&mut self, key: SchedulerTxKey, txmeta: &mut TxMeta, is_write: bool) {
         if self.acquire_queue.is_empty() && self.blocked_writes == 0 {
             if self.blocked_reads == 0 {
                 if is_write {
@@ -137,14 +147,15 @@ impl ResourceLockingQueue {
                 } else {
                     self.blocked_reads += 1;
                 }
-                return false;
+                return;
             } else if !is_write {
                 self.blocked_reads += 1;
-                return false;
+                return;
             }
         }
-        self.acquire_queue.push_back((key, is_write));
-        true
+        let item = ItemHolder::new((key, is_write));
+        self.acquire_queue.push_back(&mut item.clone().into());
+        txmeta.resource_queue_subs.push_front(&mut item.into());
     }
 
     fn unblock(&mut self, is_write: bool) {
@@ -163,20 +174,21 @@ impl ResourceLockingQueue {
         }
 
         if self.blocked_reads > 0 {
-            if let Some((_, is_write)) = self.acquire_queue.front() {
-                if *is_write {
+            if let Some(is_write) = self.acquire_queue.front().map(|x| x.contained().1) {
+                if is_write {
                     return None;
                 }
             }
         }
 
-        if let Some((key, is_write)) = self.acquire_queue.pop_front() {
-            if is_write {
+        if let Some(item) = self.acquire_queue.pop_front() {
+            let (key, is_write) = item.contained();
+            if *is_write {
                 self.blocked_writes += 1;
             } else {
                 self.blocked_reads += 1;
             }
-            Some(key)
+            Some(*key)
         } else {
             None
         }
@@ -306,7 +318,7 @@ impl LockingQueue {
 
     fn start_waiting_for_workers(&mut self, key: SchedulerTxKey, tx: &TransactionState) {
         let tx_meta = self.metas.get_mut(key).unwrap();
-        assert!(tx_meta.waiting_queue == 0);
+        assert!(tx_meta.resource_queue_subs.is_empty());
         tx_meta.state = TxState::Active;
         let mut requirements = Vec::new();
         let mut requirements_count = 0;
@@ -354,11 +366,9 @@ impl LockingQueue {
         let key = self.metas.insert(meta);
         let meta = self.metas.get_mut(key).unwrap();
         for (lock, is_write) in tx.locks() {
-            if self.resources.entry(*lock).or_default().push(key, is_write) {
-                meta.waiting_queue += 1;
-            }
+            self.resources.entry(*lock).or_default().push(key, meta, is_write);
         }
-        if meta.waiting_queue == 0 {
+        if meta.resource_queue_subs.is_empty() {
             self.start_waiting_for_workers(key, tx);
         }
     }
@@ -372,7 +382,7 @@ impl LockingQueue {
             return false;
         }
         assert!(tx_meta.state != TxState::Enqueued);
-        assert!(tx_meta.waiting_queue == 0);
+        assert!(tx_meta.resource_queue_subs.is_empty());
 
         let lock_result = self.picked_locks.try_lock_accounts(
             write_locks.as_slice().iter().cloned(),
@@ -464,13 +474,11 @@ impl LockingQueue {
                     if self.maybe_expire(key, txdata) {
                         return;
                     }
-                    let (waiting_queue, txdata) = {
+                    let (no_subs, txdata) = {
                         let meta = self.metas.get_mut(key).unwrap();
-                        assert!(meta.waiting_queue > 0);
-                        meta.waiting_queue -= 1;
-                        (meta.waiting_queue, txdata.txdata(meta.shared_key))
+                        (meta.resource_queue_subs.is_empty(), txdata.txdata(meta.shared_key))
                     };
-                    if waiting_queue == 0 {
+                    if no_subs {
                         self.start_waiting_for_workers(key, txdata);
                     }
                 }
@@ -679,39 +687,25 @@ fn main() {
             let now = std::time::Instant::now();
             if last_report + period < now {
                 let mut statuses = vec![0; 4];
-                for (k, v) in locking_queue.metas.iter() {
+                for (_k, v) in locking_queue.metas.iter() {
                     match v.state {
                         TxState::Enqueued => {
-                            assert!(v.waiting_queue > 0);
+                            assert!(!v.resource_queue_subs.is_empty());
                             assert!(v.affinity_requirements_count == 0);
                             statuses[0] += 1;
-                            let txdata = bridge.transaction(v.shared_key);
-                            let mut blocked = 0;
-                            for (lock, is_write) in txdata.locks() {
-                                let Some(q) = locking_queue.resources.get(lock) else {
-                                    continue;
-                                };
-                                for (tx, enq_is_write) in q.acquire_queue.iter() {
-                                    if k == *tx {
-                                        blocked += 1;
-                                        assert!(is_write == *enq_is_write);
-                                    }
-                                }
-                            }
-                            assert!(blocked == v.waiting_queue);
                         }
                         TxState::Active => {
                             statuses[1] += 1;
-                            assert!(v.waiting_queue == 0);
+                            assert!(v.resource_queue_subs.is_empty());
                             assert!(v.affinity_requirements_count > 0);
                         }
                         TxState::Backpressured => {
                             statuses[2] += 1;
-                            assert!(v.waiting_queue == 0);
+                            assert!(v.resource_queue_subs.is_empty());
                         }
                         TxState::Picked => {
                             statuses[3] += 1;
-                            assert!(v.waiting_queue == 0);
+                            assert!(v.resource_queue_subs.is_empty());
                             assert!(v.affinity_requirements_count <= 1);
                         }
                     }

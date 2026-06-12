@@ -32,7 +32,7 @@ impl<T, const N: usize> ListNode<T, N> {
     }
 }
 
-/// `DELETE_ALL` selects how items leave the list when it is dropped:
+/// `DELETE_ALL` selects how items leave the list when it is dropped or items are popped:
 /// `false` unlinks each item only from this list's index `I`, leaving it in any
 /// other lists it belongs to; `true` unlinks each item from *every* index, so
 /// dropping this list evicts its items from all lists at once.
@@ -128,11 +128,22 @@ impl<T, const N: usize, const I: usize, const DELETE_ALL: bool>
         self.private_head().prev_item().unwrap().insert_after(cur);
     }
 
+    pub fn is_empty(&self) -> bool {
+        let ptr = self.hub.as_ref().get_ref() as *const ListNode<T, N>;
+        self.hub.as_ref().next[I] == NonNull::new(ptr.cast_mut())
+    }
+
     pub fn pop_front(&mut self) -> Option<Cursor<T, N, I>> {
-        match self.begin() {
+        match self.front() {
             Some(mut begin) => {
-                begin.unlink();
-                Some(begin)
+                if DELETE_ALL {
+                    let mut begin = ItemHolder::from(begin);
+                    begin.unlink();
+                    Some(begin.into())
+                } else {
+                    begin.unlink();
+                    Some(begin)
+                }
             }
             None => None
         }
@@ -141,14 +152,20 @@ impl<T, const N: usize, const I: usize, const DELETE_ALL: bool>
     pub fn pop_back(&mut self) -> Option<Cursor<T, N, I>> {
         match self.tail() {
             Some(mut tail) => {
-                tail.unlink();
-                Some(tail)
+                if DELETE_ALL {
+                    let mut tail = ItemHolder::from(tail);
+                    tail.unlink();
+                    Some(tail.into())
+                } else {
+                    tail.unlink();
+                    Some(tail)
+                }
             }
             None => None
         }
     }
 
-    pub fn begin(&self) -> Option<Cursor<T, N, I>> {
+    pub fn front(&self) -> Option<Cursor<T, N, I>> {
         self.private_head().next()
     }
 
@@ -330,7 +347,7 @@ mod tests {
     /// Collect the ids of a single-index list by walking `begin()` -> `next()`.
     fn ids(list: &IntrusiveList<Probe, 1, 0, false>) -> Vec<i32> {
         let mut out = Vec::new();
-        let mut cur = list.begin();
+        let mut cur = list.front();
         while let Some(c) = cur {
             out.push(c.contained().id);
             cur = c.next();
@@ -341,7 +358,7 @@ mod tests {
     #[test]
     fn empty_list_has_no_begin_or_tail() {
         let list = IntrusiveList::<Probe, 1, 0, false>::new();
-        assert!(list.begin().is_none());
+        assert!(list.front().is_none());
         assert!(list.tail().is_none());
         assert_eq!(ids(&list), Vec::<i32>::new());
     }
@@ -352,10 +369,10 @@ mod tests {
         let mut list = IntrusiveList::<Probe, 1, 0, false>::new();
         push_probe(&mut list, 42, &drops);
 
-        assert_eq!(list.begin().unwrap().contained().id, 42);
+        assert_eq!(list.front().unwrap().contained().id, 42);
         assert_eq!(list.tail().unwrap().contained().id, 42);
         // single element: its `next` walks back to the hub -> None
-        assert!(list.begin().unwrap().next().is_none());
+        assert!(list.front().unwrap().next().is_none());
     }
 
     #[test]
@@ -394,7 +411,7 @@ mod tests {
         push_probe(&mut list, 2, &drops);
         push_probe(&mut list, 3, &drops); // front
 
-        let mut first = list.begin().unwrap();
+        let mut first = list.front().unwrap();
         assert_eq!(first.contained().id, 3);
         first.unlink();
         drop(first); // last handle gone + unlinked => freed
@@ -412,7 +429,7 @@ mod tests {
         push_probe(&mut list, 3, &drops); // order: 3, 2, 1
 
         // walk to the middle element (id == 2)
-        let mut mid = list.begin().unwrap().next().unwrap();
+        let mut mid = list.front().unwrap().next().unwrap();
         assert_eq!(mid.contained().id, 2);
         mid.unlink();
         drop(mid);
@@ -428,10 +445,10 @@ mod tests {
         for i in 0..5 {
             push_probe(&mut list, i, &drops);
         }
-        while let Some(mut c) = list.begin() {
+        while let Some(mut c) = list.front() {
             c.unlink();
         }
-        assert!(list.begin().is_none());
+        assert!(list.front().is_none());
         assert!(list.tail().is_none());
         assert_eq!(drops.get(), 5, "every unlinked node should be freed");
     }
@@ -457,7 +474,7 @@ mod tests {
             let mut list = IntrusiveList::<Probe, 1, 0, false>::new();
             push_probe(&mut list, 99, &drops);
             // keep an outside handle to the only node
-            held = list.begin();
+            held = list.front();
         }
         // list is gone, but our cursor still holds the node
         assert_eq!(drops.get(), 0, "node still referenced by a live cursor");
@@ -472,7 +489,7 @@ mod tests {
         let mut list = IntrusiveList::<Probe, 1, 0, false>::new();
         push_probe(&mut list, 5, &drops);
 
-        let a = list.begin().unwrap();
+        let a = list.front().unwrap();
         let b = a.clone();
         assert_eq!(a.contained().id, b.contained().id);
         drop(a);
@@ -498,8 +515,8 @@ mod tests {
             drop(c1);
 
             // visible from both lists
-            assert_eq!(l0.begin().unwrap().contained().id, 7);
-            assert_eq!(l1.begin().unwrap().contained().id, 7);
+            assert_eq!(l0.front().unwrap().contained().id, 7);
+            assert_eq!(l1.front().unwrap().contained().id, 7);
             assert_eq!(drops.get(), 0);
         }
         assert_eq!(drops.get(), 1, "node shared by two lists must be freed exactly once");
@@ -574,7 +591,7 @@ mod tests {
     #[test]
     fn default_constructs_empty_list() {
         let list: IntrusiveList<Probe, 1, 0, false> = IntrusiveList::default();
-        assert!(list.begin().is_none());
+        assert!(list.front().is_none());
         assert!(list.tail().is_none());
     }
 
@@ -585,7 +602,7 @@ mod tests {
         push_probe(&mut list, 1, &drops);
         push_probe(&mut list, 2, &drops); // order: 2, 1
 
-        let mut anchor = list.begin().unwrap(); // id 2
+        let mut anchor = list.front().unwrap(); // id 2
         let mut newc: Cursor<Probe, 1, 0> =
             ItemHolder::new(Probe::new(99, &drops)).into();
         anchor.insert_after(&mut newc);
@@ -604,12 +621,12 @@ mod tests {
         let mut c: Cursor<Probe, 1, 0> = ItemHolder::new(Probe::new(1, &drops)).into();
         l0.push_front(&mut c);
         assert_eq!(ids(&l0), vec![1]);
-        assert!(l1.begin().is_none());
+        assert!(l1.front().is_none());
 
         // pushing the same cursor again must unlink it from l0 first
         // (exercises unlink's (Some, Some) relink arm)
         l1.push_front(&mut c);
-        assert!(l0.begin().is_none(), "node moved out of l0");
+        assert!(l0.front().is_none(), "node moved out of l0");
         assert_eq!(ids(&l1), vec![1]);
 
         drop(c);
@@ -621,7 +638,7 @@ mod tests {
         list: &IntrusiveList<Probe, N, I, D>,
     ) -> Vec<i32> {
         let mut out = Vec::new();
-        let mut cur = list.begin();
+        let mut cur = list.front();
         while let Some(c) = cur {
             out.push(c.contained().id);
             cur = c.next();
@@ -649,9 +666,9 @@ mod tests {
             drop(c2);
 
             // the single node is reachable from all three lists
-            assert_eq!(l0.begin().unwrap().contained().id, 5);
-            assert_eq!(l1.begin().unwrap().contained().id, 5);
-            assert_eq!(l2.begin().unwrap().contained().id, 5);
+            assert_eq!(l0.front().unwrap().contained().id, 5);
+            assert_eq!(l1.front().unwrap().contained().id, 5);
+            assert_eq!(l2.front().unwrap().contained().id, 5);
             assert_eq!(drops.get(), 0);
         }
         // l2, then l1, then l0 drop: each unlinks its own index, the last frees
@@ -672,14 +689,14 @@ mod tests {
             drop(c0);
             drop(c1);
 
-            assert_eq!(l0.begin().unwrap().contained().id, 7);
-            assert_eq!(l1.begin().unwrap().contained().id, 7);
+            assert_eq!(l0.front().unwrap().contained().id, 7);
+            assert_eq!(l1.front().unwrap().contained().id, 7);
             // l0 is dropped here, at the end of the block
         }
 
         // l0's Drop unlinked the node from index 0 only; it lives on in l1
         assert_eq!(drops.get(), 0, "dropping l0 must not free a node still in l1");
-        assert_eq!(l1.begin().unwrap().contained().id, 7);
+        assert_eq!(l1.front().unwrap().contained().id, 7);
 
         // removing it from the last remaining list frees it
         drop(l1);
@@ -726,13 +743,13 @@ mod tests {
         drop(c1);
 
         // node lives in both lists, kept alive by `holder`
-        assert_eq!(l0.begin().unwrap().contained().id, 3);
-        assert_eq!(l1.begin().unwrap().contained().id, 3);
+        assert_eq!(l0.front().unwrap().contained().id, 3);
+        assert_eq!(l1.front().unwrap().contained().id, 3);
 
         // unlink-all removes it from every list at once
         holder.unlink();
-        assert!(l0.begin().is_none(), "removed from l0");
-        assert!(l1.begin().is_none(), "removed from l1");
+        assert!(l0.front().is_none(), "removed from l0");
+        assert!(l1.front().is_none(), "removed from l1");
         assert_eq!(drops.get(), 0, "holder still owns the (now unlinked) node");
 
         // excluded from all lists + last handle dropped => freed
@@ -750,11 +767,11 @@ mod tests {
         let mut c0: Cursor<Probe, 2, 0> = holder.clone().into();
         l0.push_front(&mut c0);
         drop(c0);
-        assert_eq!(l0.begin().unwrap().contained().id, 4);
+        assert_eq!(l0.front().unwrap().contained().id, 4);
 
         // unlink-all must skip the never-linked index 1 gracefully (no-op there)
         holder.unlink();
-        assert!(l0.begin().is_none());
+        assert!(l0.front().is_none());
         assert_eq!(drops.get(), 0);
 
         drop(holder);
@@ -774,7 +791,7 @@ mod tests {
         holder.unlink();
         // calling it again on a fully-unlinked node hits only (None, None) arms
         holder.unlink();
-        assert!(l0.begin().is_none());
+        assert!(l0.front().is_none());
         assert_eq!(drops.get(), 0);
 
         drop(holder);
@@ -804,7 +821,7 @@ mod tests {
         }
 
         // delete-all evicted the node from l1 too, and (no cursors left) freed it
-        assert!(l1.begin().is_none(), "delete-all must evict the node from l1");
+        assert!(l1.front().is_none(), "delete-all must evict the node from l1");
         assert_eq!(drops.get(), 1, "node freed once it left every list");
     }
 
@@ -827,7 +844,7 @@ mod tests {
 
         // contrast with delete-all: the node survives in l1
         assert_eq!(drops.get(), 0, "delete-one must leave the node alive in l1");
-        assert_eq!(l1.begin().unwrap().contained().id, 7);
+        assert_eq!(l1.front().unwrap().contained().id, 7);
         drop(l1);
         assert_eq!(drops.get(), 1);
     }
@@ -849,7 +866,7 @@ mod tests {
             // l0 dropped here
         }
 
-        assert!(l1.begin().is_none(), "every item evicted from l1");
+        assert!(l1.front().is_none(), "every item evicted from l1");
         assert_eq!(drops.get(), 3, "all three freed");
     }
 
@@ -867,13 +884,13 @@ mod tests {
             l1.push_front(&mut c1);
             drop(c0);
             // keep an independent live handle to the node
-            held = l1.begin().unwrap();
+            held = l1.front().unwrap();
             drop(c1);
             // l0 dropped here
         }
 
         // delete-all unlinked the node from l1, but a live cursor still pins it
-        assert!(l1.begin().is_none(), "node removed from l1 by delete-all");
+        assert!(l1.front().is_none(), "node removed from l1 by delete-all");
         assert_eq!(drops.get(), 0, "must not free while a cursor still holds it");
         assert_eq!(held.contained().id, 9);
 
@@ -908,7 +925,7 @@ mod tests {
 
         // push_back keeps insertion order front-to-back
         assert_eq!(ids(&list), vec![1, 2, 3]);
-        assert_eq!(list.begin().unwrap().contained().id, 1);
+        assert_eq!(list.front().unwrap().contained().id, 1);
         assert_eq!(list.tail().unwrap().contained().id, 3);
     }
 
@@ -919,7 +936,7 @@ mod tests {
         push_back_probe(&mut list, 42, &drops);
 
         assert_eq!(ids(&list), vec![42]);
-        assert_eq!(list.begin().unwrap().contained().id, 42);
+        assert_eq!(list.front().unwrap().contained().id, 42);
         assert_eq!(list.tail().unwrap().contained().id, 42);
     }
 
@@ -990,7 +1007,7 @@ mod tests {
         assert_eq!(list.pop_back().unwrap().contained().id, 3);
 
         assert!(list.pop_front().is_none(), "list is now empty");
-        assert!(list.begin().is_none());
+        assert!(list.front().is_none());
         assert!(list.tail().is_none());
         // each popped cursor was dropped at the end of its statement
         assert_eq!(drops.get(), 4, "every drained node freed exactly once");
