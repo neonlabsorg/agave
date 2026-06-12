@@ -97,6 +97,7 @@ pub struct TvuConfig {
     // Validators which should be given priority when serving repairs
     pub repair_whitelist: Arc<RwLock<HashSet<Pubkey>>>,
     pub wait_for_vote_to_start_leader: bool,
+    pub single_validator: bool,
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
     pub shred_sigverify_threads: NonZeroUsize,
@@ -111,6 +112,7 @@ impl Default for TvuConfig {
             repair_validators: None,
             repair_whitelist: Arc::new(RwLock::new(HashSet::default())),
             wait_for_vote_to_start_leader: false,
+            single_validator: false,
             replay_forks_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             replay_transactions_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
@@ -332,6 +334,7 @@ impl Tvu {
             leader_schedule_cache: leader_schedule_cache.clone(),
             block_commitment_cache,
             wait_for_vote_to_start_leader: tvu_config.wait_for_vote_to_start_leader,
+            single_validator: tvu_config.single_validator,
             tower_storage: tower_storage.clone(),
             wait_to_vote_slot,
             replay_forks_threads: tvu_config.replay_forks_threads,

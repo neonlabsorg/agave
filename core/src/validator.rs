@@ -361,6 +361,11 @@ pub struct ValidatorConfig {
     pub validator_exit: Arc<RwLock<Exit>>,
     pub validator_exit_backpressure: HashMap<String, Arc<AtomicBool>>,
     pub no_wait_for_vote_to_start_leader: bool,
+    // Single-validator mode: this node is the only voter and always its own
+    // leader. Makes ReplayStage skip backward PoH resets that would orphan the
+    // in-progress leader block (see `single_validator_should_skip_backward_reset`).
+    // Does not change the dead-slot path. Unsafe in a multi-validator cluster.
+    pub single_validator: bool,
     pub wait_to_vote_slot: Option<Slot>,
     pub runtime_config: RuntimeConfig,
     pub banking_trace_dir_byte_limit: banking_trace::DirByteLimit,
@@ -440,6 +445,7 @@ impl ValidatorConfig {
             validator_exit: Arc::new(RwLock::new(Exit::default())),
             validator_exit_backpressure: HashMap::default(),
             no_wait_for_vote_to_start_leader: true,
+            single_validator: false,
             accounts_db_config: ACCOUNTS_DB_CONFIG_FOR_TESTING,
             wait_to_vote_slot: None,
             runtime_config: RuntimeConfig::default(),
@@ -1648,6 +1654,7 @@ impl Validator {
                 repair_validators: config.repair_validators.clone(),
                 repair_whitelist: config.repair_whitelist.clone(),
                 wait_for_vote_to_start_leader,
+                single_validator: config.single_validator,
                 replay_forks_threads: config.replay_forks_threads,
                 replay_transactions_threads: config.replay_transactions_threads,
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,

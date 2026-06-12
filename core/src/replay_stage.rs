@@ -273,6 +273,9 @@ pub struct ReplayStageConfig {
     pub leader_schedule_cache: Arc<LeaderScheduleCache>,
     pub block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
     pub wait_for_vote_to_start_leader: bool,
+    // Single-validator mode: makes the reset path skip backward PoH resets that
+    // would orphan the in-progress leader block. Does not change the dead-slot path.
+    pub single_validator: bool,
     pub tower_storage: Arc<dyn TowerStorage>,
     // Stops voting until this slot has been reached. Should be used to avoid
     // duplicate voting which can lead to slashing.
@@ -581,6 +584,7 @@ impl ReplayStage {
             leader_schedule_cache,
             block_commitment_cache,
             wait_for_vote_to_start_leader,
+            single_validator,
             tower_storage,
             wait_to_vote_slot,
             replay_forks_threads,
@@ -1136,7 +1140,35 @@ impl ReplayStage {
                                 warn!("Identity changed from {my_old_pubkey} to {my_pubkey}");
                             }
 
-                            if !poh_controller.has_pending_message() {
+                            // Single-validator safeguard (Family B): never reset
+                            // PoH backward onto an ancestor of the block we are
+                            // still producing. Doing so would orphan the
+                            // in-progress leader block, leaving it with too few
+                            // ticks (dead slot) and rolling back its already
+                            // `processed` transactions. With only one voter there
+                            // is no competing fork to switch to, so completing the
+                            // current block is always correct. Best-effort: relies on
+                            // the live `poh_recorder.bank()` against this iteration's
+                            // `ancestors` snapshot; on a single own-leader node the
+                            // reset target is the heaviest (forward) tip, so a backward
+                            // reset is effectively never selected anyway.
+                            let skip_backward_reset = single_validator
+                                && Self::single_validator_should_skip_backward_reset(
+                                    poh_recorder.read().unwrap().bank().map(|b| b.slot()),
+                                    reset_bank.slot(),
+                                    &ancestors,
+                                );
+                            if skip_backward_reset {
+                                info!(
+                                    "single-validator: keeping in-progress slot, skipping \
+                                     backward PoH reset to {}",
+                                    reset_bank.slot()
+                                );
+                                datapoint_info!(
+                                    "replay_stage-single_validator_skip_backward_reset",
+                                    ("reset_slot", reset_bank.slot(), i64),
+                                );
+                            } else if !poh_controller.has_pending_message() {
                                 Self::reset_poh_recorder(
                                     &my_pubkey,
                                     &blockstore,
@@ -2950,6 +2982,26 @@ impl ReplayStage {
         info!(
             "{my_pubkey} reset PoH to tick {tick_height} (within slot {slot}). {next_leader_msg}",
         );
+    }
+
+    /// Single-validator safeguard (Family B). Decide whether a PoH reset to
+    /// `reset_slot` would orphan an in-progress leader block we are still
+    /// producing. Returns `true` only when there is a working bank strictly
+    /// newer than the reset target that descends from it — resetting in that
+    /// case abandons our work and yields a `TooFewTicks` dead slot. Forward
+    /// resets (target == or newer than the working bank), an absent working
+    /// bank, or a non-descendant target return `false` (reset proceeds).
+    fn single_validator_should_skip_backward_reset(
+        poh_working_slot: Option<Slot>,
+        reset_slot: Slot,
+        ancestors: &HashMap<Slot, HashSet<Slot>>,
+    ) -> bool {
+        match poh_working_slot {
+            Some(working_slot) if working_slot > reset_slot => ancestors
+                .get(&working_slot)
+                .is_some_and(|a| a.contains(&reset_slot)),
+            _ => false,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9408,6 +9460,42 @@ pub(crate) mod tests {
         assert!(!fork_choice
             .is_candidate(&(5, bank_forks.bank_hash(5).unwrap()))
             .unwrap());
+    }
+
+    #[test]
+    fn test_single_validator_should_skip_backward_reset() {
+        // working slot 5 descends from reset target 3 -> skip (would orphan work)
+        let mut ancestors = HashMap::new();
+        ancestors.insert(5u64, HashSet::from([4u64, 3, 2, 1, 0]));
+        assert!(ReplayStage::single_validator_should_skip_backward_reset(
+            Some(5),
+            3,
+            &ancestors
+        ));
+        // reset target == working slot -> forward/no-op -> do not skip
+        assert!(!ReplayStage::single_validator_should_skip_backward_reset(
+            Some(5),
+            5,
+            &ancestors
+        ));
+        // reset target newer than working slot -> forward -> do not skip
+        assert!(!ReplayStage::single_validator_should_skip_backward_reset(
+            Some(3),
+            5,
+            &ancestors
+        ));
+        // no working bank -> nothing to orphan -> do not skip
+        assert!(!ReplayStage::single_validator_should_skip_backward_reset(
+            None, 3, &ancestors
+        ));
+        // working slot is newer but NOT a descendant of the reset target -> do not skip
+        let mut non_descendant = HashMap::new();
+        non_descendant.insert(5u64, HashSet::from([4u64]));
+        assert!(!ReplayStage::single_validator_should_skip_backward_reset(
+            Some(5),
+            3,
+            &non_descendant
+        ));
     }
 
     #[test]
