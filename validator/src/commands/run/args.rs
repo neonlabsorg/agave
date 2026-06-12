@@ -678,9 +678,11 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                  leader. ReplayStage never resets PoH backward onto an ancestor of the block it \
                  is still producing, so an in-progress leader slot is not orphaned into a dead \
                  slot (which would roll back its already-`processed` transactions). This lets \
-                 clients rely on `processed`. Note: it does NOT alter the dead-slot path for \
-                 genuine replay errors or for a partial block left by a crash/restart. Unsafe in \
-                 any multi-validator cluster.",
+                 clients rely on `processed`. On graceful shutdown it also finishes the \
+                 in-progress leader block before exiting, so a restart loses nothing; only a \
+                 hard crash can still leave a partial slot (use `confirmed` or client retry). It \
+                 does NOT alter the dead-slot path for genuine replay errors. Unsafe in any \
+                 multi-validator cluster.",
             ),
     )
     .arg(

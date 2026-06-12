@@ -638,6 +638,10 @@ pub struct Validator {
     completed_data_sets_service: Option<CompletedDataSetsService>,
     snapshot_packager_service: Option<SnapshotPackagerService>,
     poh_recorder: Arc<RwLock<PohRecorder>>,
+    // Single-validator graceful-shutdown drain: on exit, finish the in-progress
+    // leader block before tearing down so its `processed` transactions survive.
+    single_validator: bool,
+    leader_drain: Arc<AtomicBool>,
     poh_service: PohService,
     tpu: Tpu,
     tvu: Tvu,
@@ -1439,6 +1443,10 @@ impl Validator {
         let wait_for_vote_to_start_leader =
             !waited_for_supermajority && !config.no_wait_for_vote_to_start_leader;
 
+        // Shared with ReplayStage; set on graceful shutdown to drain the
+        // in-progress leader block in single-validator mode (see `exit`).
+        let leader_drain = Arc::new(AtomicBool::new(false));
+
         let poh_service = PohService::new(
             poh_recorder.clone(),
             &genesis_config.poh_config,
@@ -1655,6 +1663,7 @@ impl Validator {
                 repair_whitelist: config.repair_whitelist.clone(),
                 wait_for_vote_to_start_leader,
                 single_validator: config.single_validator,
+                leader_drain: leader_drain.clone(),
                 replay_forks_threads: config.replay_forks_threads,
                 replay_transactions_threads: config.replay_transactions_threads,
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,
@@ -1826,6 +1835,8 @@ impl Validator {
             tvu,
             poh_service,
             poh_recorder,
+            single_validator: config.single_validator,
+            leader_drain,
             ip_echo_server,
             validator_exit: config.validator_exit.clone(),
             cluster_info,
@@ -1847,6 +1858,31 @@ impl Validator {
 
     // Used for notifying many nodes in parallel to exit
     pub fn exit(&mut self) {
+        // Single-validator graceful drain: stop starting new leader slots (via
+        // `leader_drain`, observed by ReplayStage) and wait for the in-progress
+        // leader block to be fully persisted in blockstore, so its already
+        // `processed` transactions survive the restart instead of being dropped
+        // as a partial slot. Best-effort with a bounded timeout; a hard crash
+        // cannot be helped because the block is genuinely incomplete.
+        if self.single_validator {
+            self.leader_drain.store(true, Ordering::Relaxed);
+            let in_flight_slot = self.poh_recorder.read().unwrap().bank().map(|b| b.slot());
+            if let Some(slot) = in_flight_slot {
+                let deadline = Instant::now() + Duration::from_millis(2000);
+                while !self.blockstore.is_full(slot) {
+                    if Instant::now() >= deadline {
+                        warn!(
+                            "single-validator drain: in-progress leader slot {slot} not \
+                             persisted before timeout; exiting anyway"
+                        );
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                info!("single-validator drain finished for in-progress leader slot {slot}");
+            }
+        }
+
         self.validator_exit.write().unwrap().exit();
 
         // drop all signals in blockstore

@@ -98,6 +98,9 @@ pub struct TvuConfig {
     pub repair_whitelist: Arc<RwLock<HashSet<Pubkey>>>,
     pub wait_for_vote_to_start_leader: bool,
     pub single_validator: bool,
+    // Set on graceful shutdown to stop starting new leader slots so the
+    // in-progress block can finish before exit (single-validator drain).
+    pub leader_drain: Arc<AtomicBool>,
     pub replay_forks_threads: NonZeroUsize,
     pub replay_transactions_threads: NonZeroUsize,
     pub shred_sigverify_threads: NonZeroUsize,
@@ -113,6 +116,7 @@ impl Default for TvuConfig {
             repair_whitelist: Arc::new(RwLock::new(HashSet::default())),
             wait_for_vote_to_start_leader: false,
             single_validator: false,
+            leader_drain: Arc::<AtomicBool>::default(),
             replay_forks_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             replay_transactions_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
@@ -335,6 +339,7 @@ impl Tvu {
             block_commitment_cache,
             wait_for_vote_to_start_leader: tvu_config.wait_for_vote_to_start_leader,
             single_validator: tvu_config.single_validator,
+            leader_drain: tvu_config.leader_drain,
             tower_storage: tower_storage.clone(),
             wait_to_vote_slot,
             replay_forks_threads: tvu_config.replay_forks_threads,

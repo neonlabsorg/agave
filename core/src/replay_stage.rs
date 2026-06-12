@@ -276,6 +276,9 @@ pub struct ReplayStageConfig {
     // Single-validator mode: makes the reset path skip backward PoH resets that
     // would orphan the in-progress leader block. Does not change the dead-slot path.
     pub single_validator: bool,
+    // Set on graceful shutdown (single-validator) to stop starting new leader
+    // slots so the in-progress block can finish and be persisted before exit.
+    pub leader_drain: Arc<AtomicBool>,
     pub tower_storage: Arc<dyn TowerStorage>,
     // Stops voting until this slot has been reached. Should be used to avoid
     // duplicate voting which can lead to slashing.
@@ -585,6 +588,7 @@ impl ReplayStage {
             block_commitment_cache,
             wait_for_vote_to_start_leader,
             single_validator,
+            leader_drain,
             tower_storage,
             wait_to_vote_slot,
             replay_forks_threads,
@@ -1240,7 +1244,11 @@ impl ReplayStage {
                     // may add a bank that will not included in either of these maps.
                     drop(ancestors);
                     drop(descendants);
-                    if !tpu_has_bank && !poh_controller.has_pending_message() {
+                    // Single-validator graceful drain: once shutdown requested, stop
+                    // starting new leader slots so the in-progress block can finish and
+                    // be persisted instead of leaving a fresh partial slot behind.
+                    let leader_draining = leader_drain.load(Ordering::Relaxed);
+                    if !tpu_has_bank && !poh_controller.has_pending_message() && !leader_draining {
                         if let Some(poh_slot) = Self::maybe_start_leader(
                             &my_pubkey,
                             &bank_forks,
