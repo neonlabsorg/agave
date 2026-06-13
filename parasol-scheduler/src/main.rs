@@ -72,8 +72,8 @@ impl Default for TxState {
     }
 }
 
-type TxLocksSubscriptionList = IntrusiveList<(SchedulerTxKey, /* is_write */ bool), 2, 0, true>;
-type LockWaitingTxsList = IntrusiveList<(SchedulerTxKey, /* is_write */ bool), 2, 1, true>;
+type TxLocksSubscriptionList = IntrusiveList<(SchedulerTxKey, /* is_write */ bool, Address), 2, 0, true>;
+type LockWaitingTxsList = IntrusiveList<(SchedulerTxKey, /* is_write */ bool, Address), 2, 1, true>;
 
 type AffinitySubscriptionList = IntrusiveList<SchedulerTxKey, 2, 0, true>;
 type AffinityWaitingTxsList = IntrusiveList<SchedulerTxKey, 2, 1, true>;
@@ -144,7 +144,7 @@ impl ResourceLockingQueue {
         self.acquire_queue.is_empty() && self.blocked_reads == 0 && self.blocked_writes == 0
     }
 
-    fn push(&mut self, key: SchedulerTxKey, txmeta: &mut TxMeta, is_write: bool) {
+    fn push(&mut self, key: SchedulerTxKey, txmeta: &mut TxMeta, is_write: bool, lock: &Address) {
         if self.acquire_queue.is_empty() && self.blocked_writes == 0 {
             if self.blocked_reads == 0 {
                 if is_write {
@@ -158,18 +158,28 @@ impl ResourceLockingQueue {
                 return;
             }
         }
-        let item = ItemHolder::new((key, is_write));
+        let item = ItemHolder::new((key, is_write, *lock));
         self.acquire_queue.push_back(&mut item.clone().into());
         txmeta.resource_queue_subs.push_front(&mut item.into());
     }
 
-    fn unblock(&mut self, is_write: bool) {
+    fn block(&mut self, is_write: bool) {
+        if is_write {
+            self.blocked_writes += 1;
+        } else {
+            self.blocked_reads += 1;
+        }
+    }
+
+    fn unblock(&mut self, is_write: bool) -> bool {
         if is_write {
             assert!(self.blocked_writes > 0);
             self.blocked_writes -= 1;
+            self.blocked_writes == 0
         } else {
             assert!(self.blocked_reads > 0);
             self.blocked_reads -= 1;
+            self.blocked_reads == 0
         }
     }
 
@@ -187,7 +197,7 @@ impl ResourceLockingQueue {
         }
 
         if let Some(item) = self.acquire_queue.pop_front() {
-            let (key, is_write) = item.contained();
+            let (key, is_write, _) = item.contained();
             if *is_write {
                 self.blocked_writes += 1;
             } else {
@@ -358,7 +368,7 @@ impl LockingQueue {
 
         tx_meta.set_affinity_requirements(requirements);
         if tx_meta.affinity_requirements_count <= 1 {
-            self.try_pick_tx(key, tx, true);
+            self.try_pick_tx(key, tx);
             assert!({
                 let tx_meta = self.metas.get(key).unwrap();
                 tx_meta.state == TxState::Picked || tx_meta.state == TxState::Backpressured
@@ -371,14 +381,14 @@ impl LockingQueue {
         let key = self.metas.insert(meta);
         let meta = self.metas.get_mut(key).unwrap();
         for (lock, is_write) in tx.locks() {
-            self.resources.entry(*lock).or_default().push(key, meta, is_write);
+            self.resources.entry(*lock).or_default().push(key, meta, is_write, lock);
         }
         if meta.resource_queue_subs.is_empty() {
             self.start_waiting_for_workers(key, tx);
         }
     }
 
-    fn try_pick_tx(&mut self, key: SchedulerTxKey, txdata: &TransactionState, was_blocked: bool) -> bool {
+    fn try_pick_tx(&mut self, key: SchedulerTxKey, txdata: &TransactionState) -> bool {
         let write_locks = txdata.write_locks().collect::<smallvec::SmallVec<[_; 64]>>();
         let read_locks = txdata.read_locks().collect::<smallvec::SmallVec<[_; 64]>>();
         let tx_meta = self.metas.get_mut(key).unwrap();
@@ -416,20 +426,17 @@ impl LockingQueue {
                 self.backlogs[thread] += 1;
 
                 self.picked[thread].push(PickedTx(score, key));
-                tx_meta.state = TxState::Picked;
-                if was_blocked {
+                {
                     for (lock, is_write) in txdata.locks() {
                         if {
                             let locks = self.resources.get_mut(lock).unwrap();
-                            locks.unblock(is_write);
-                            locks.empty()
+                            locks.unblock(is_write)
                         } {
-                            self.resources.remove(lock);
-                        } else {
                             self.events_to_dispatch.push_back(Event::AddressUnblocked(*lock));
                         }
                     }
                 }
+                tx_meta.state = TxState::Picked;
 
                 true
             },
@@ -446,13 +453,30 @@ impl LockingQueue {
 
     // returns true if the key is already non-valid (expired)
     fn maybe_expire(&mut self, key: SchedulerTxKey, txdata: &mut impl MutableTxProvider) -> bool {
-        let (shared_key, expire_slot) = {
-            let Some(meta) = self.metas.get(key) else {
+let (shared_key, expired) = {
+            let Some(meta) = self.metas.get_mut(key) else {
                 return true;
             };
-            (meta.shared_key, meta.expire_slot)
+            let expired = meta.expire_slot <= self.slot;
+            if expired && meta.state != TxState::Picked {
+                // compensating unconditional unblocks below
+                while let Some(item) = meta.resource_queue_subs.pop_front() {
+                    let (_, is_write, lock) = item.contained();
+                    if let Some(queue) = self.resources.get_mut(lock) {
+                        queue.block(*is_write);
+                    }
+                }
+                for (lock, is_write) in txdata.txdata(meta.shared_key).locks() {
+                    if let Some(queue) = self.resources.get_mut(lock) {
+                        if queue.unblock(is_write) {
+                            self.events_to_dispatch.push_back(Event::AddressUnblocked(*lock));
+                        }
+                    }
+                }
+            }
+            (meta.shared_key, expired)
         };
-        if expire_slot <= self.slot {
+        if expired {
             self.expires += 1;
             txdata.remove_tx(shared_key);
             self.metas.remove(key);
@@ -472,7 +496,7 @@ impl LockingQueue {
                     return;
                 };
                 let txdata = txdata.txdata(meta.shared_key);
-                self.try_pick_tx(key, txdata, true);
+                self.try_pick_tx(key, txdata);
             }
             Event::AddressUnblocked(address) => {
                 while let Some(key) = self.resources.get_mut(&address).and_then(|q| q.drain()) {
@@ -514,7 +538,7 @@ impl LockingQueue {
                 meta.shared_key
             });
 
-            assert!(self.try_pick_tx(key, txdata, true));
+            assert!(self.try_pick_tx(key, txdata));
         }
     }
 
@@ -698,6 +722,7 @@ fn main() {
             let now = std::time::Instant::now();
             if last_report + period < now {
                 let mut statuses = vec![0; 4];
+                let mut locks_sum = 0_i64;
                 for (_k, v) in locking_queue.metas.iter() {
                     match v.state {
                         TxState::Enqueued => {
@@ -720,19 +745,31 @@ fn main() {
                             assert!(v.affinity_requirements_count <= 1);
                         }
                     }
+                    if v.state != TxState::Picked {
+                        let mut cur = v.resource_queue_subs.front();
+                        while cur.is_some() {
+                            locks_sum += 1;
+                            cur = cur.unwrap().next();
+                        }
+                        for _ in bridge.transaction(v.shared_key).locks() {
+                            locks_sum -= 1;
+                        }
+                    }
                 }
-                for (_, v) in locking_queue.resources.iter() {
+                for (_k, v) in locking_queue.resources.iter() {
                     if !v.acquire_queue.is_empty() {
                         assert!(v.blocked_reads > 0 || v.blocked_writes > 0);
                     }
+                    locks_sum += (v.blocked_reads + v.blocked_writes) as i64;
                 }
-
                 let expires = locking_queue.expires;
                 let passed_txs = locking_queue.seen_txs;
                 let queue_len = locking_queue.metas.len();
                 let picked_queue_len = locking_queue.picked.iter().filter(|x| !x.is_empty()).count();
-                println!("{}/{workers} saturated backlogs {:?} (sent/receive stats {sent_stats:?}/{receive_stats:?}); enqueued txs {queue_len}/{statuses:?}/{picked_queue_len}; txs seen/expires/reschedules/drops {passed_txs}/{expires}/{reschedules}/{drops} slot {slot}",
+                println!("{}/{workers} saturated({:?}) (sent/receive stats {sent_stats:?}/{receive_stats:?}); enqueued txs {queue_len}/{statuses:?}/{picked_queue_len}; txs seen/expires/reschedules/drops {passed_txs}/{expires}/{reschedules}/{drops} slot {slot}",
+
                     locking_queue.backlogs.iter().filter(|x| **x>0).count(), locking_queue.backlogs);
+                assert!(locks_sum == 0, "unbalanced locks {locks_sum} among {} txs", locking_queue.size());
                 last_report = now;
             }
         }
