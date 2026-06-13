@@ -37,19 +37,20 @@ impl<T, const N: usize> ListNode<T, N> {
 /// other lists it belongs to; `true` unlinks each item from *every* index, so
 /// dropping this list evicts its items from all lists at once.
 pub struct IntrusiveList<T, const N: usize, const I: usize, const DELETE_ALL: bool> {
-    hub: Pin<Box<ListNode<T, N>>>
+    hub: Option<Pin<Box<ListNode<T, N>>>>
 }
 
 impl<T, const N: usize, const I: usize, const DELETE_ALL: bool> Drop
     for IntrusiveList<T, N, I, DELETE_ALL>
 {
     fn drop(&mut self) {
-        let head = self.private_head();
-        while let Some(mut cur) = head.next() {
-            if DELETE_ALL {
-                ItemHolder::from(cur).unlink();
-            } else {
-                cur.unlink();
+        if let Some(head) = self.private_head() {
+            while let Some(mut cur) = head.next() {
+                if DELETE_ALL {
+                    ItemHolder::from(cur).unlink();
+                } else {
+                    cur.unlink();
+                }
             }
         }
     }
@@ -95,42 +96,53 @@ impl<T, const N: usize, const I: usize, const DELETE_ALL: bool> Default
     for IntrusiveList<T, N, I, DELETE_ALL>
 {
     fn default() -> Self {
-        Self::new()
+        Self { hub: None }
     }
 }
 
 impl<T, const N: usize, const I: usize, const DELETE_ALL: bool>
     IntrusiveList<T, N, I, DELETE_ALL>
 {
-    pub fn new() -> Self {
-        let result = Self {
-            hub: Box::pin(ListNode::new_empty())
-        };
-
-        let ptr = (result.hub.as_ref().get_ref() as *const ListNode<T, N>).cast_mut();
-        unsafe {
-            (*ptr).next[I] = NonNull::new(ptr);
-            (*ptr).prev[I] = NonNull::new(ptr);
-        }
-        result
+    pub const fn new() -> Self {
+        Self { hub: None }
     }
 
-    fn private_head(&self) -> Cursor<T, N, I> {
-        let ptr = self.hub.as_ref().get_ref() as *const ListNode<T, N>;
-        unsafe {Cursor::new(std::ptr::NonNull::new(ptr.cast_mut()).unwrap())}
+    fn init(&mut self) {
+        if self.hub.is_none() {
+            self.hub = Some(Box::pin(ListNode::new_empty()));
+            let ptr = (self.hub.as_ref().unwrap().as_ref().get_ref() as *const ListNode<T, N>).cast_mut();
+            unsafe {
+                (*ptr).next[I] = NonNull::new(ptr);
+                (*ptr).prev[I] = NonNull::new(ptr);
+            }
+        }
+    }
+
+    fn private_head(&self) -> Option<Cursor<T, N, I>> {
+        self.hub.as_ref().map(|hub| {
+            let ptr = hub.as_ref().get_ref() as *const ListNode<T, N>;
+            unsafe {Cursor::new(std::ptr::NonNull::new(ptr.cast_mut()).unwrap())}
+        })
     }
 
     pub fn push_front(&mut self, cur: &mut Cursor<T, N, I>) {
-        self.private_head().insert_after(cur);
+        self.init();
+        self.private_head().unwrap().insert_after(cur);
     }
 
     pub fn push_back(&mut self, cur: &mut Cursor<T, N, I>) {
-        self.private_head().prev_item().unwrap().insert_after(cur);
+        self.init();
+        self.private_head().unwrap().prev_item().unwrap().insert_after(cur);
     }
 
     pub fn is_empty(&self) -> bool {
-        let ptr = self.hub.as_ref().get_ref() as *const ListNode<T, N>;
-        self.hub.as_ref().next[I] == NonNull::new(ptr.cast_mut())
+        match self.hub.as_ref() {
+            Some(hub) => {
+                let ptr = hub.as_ref().get_ref() as *const ListNode<T, N>;
+                hub.as_ref().next[I] == NonNull::new(ptr.cast_mut())
+            },
+            None => true
+        }
     }
 
     pub fn pop_front(&mut self) -> Option<Cursor<T, N, I>> {
@@ -166,11 +178,11 @@ impl<T, const N: usize, const I: usize, const DELETE_ALL: bool>
     }
 
     pub fn front(&self) -> Option<Cursor<T, N, I>> {
-        self.private_head().next()
+        self.private_head().and_then(|x| x.next())
     }
 
     pub fn tail(&self) -> Option<Cursor<T, N, I>> {
-        self.private_head().prev()
+        self.private_head().and_then(|x| x.prev())
     }
 }
 
