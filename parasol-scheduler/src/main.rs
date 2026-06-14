@@ -1,4 +1,4 @@
-use std::{collections::{BTreeSet, BinaryHeap, VecDeque}, time::Duration};
+use std::{collections::{BTreeSet, BinaryHeap, VecDeque}, panic, time::Duration};
 
 use agave_scheduler_bindings::{pack_message_flags::{self, check_flags}, worker_message_types::{not_included_reasons, parsing_and_sanitization_flags, resolve_flags, status_check_flags}, MAX_TRANSACTIONS_PER_MESSAGE};
 use agave_scheduling_utils::{bridge::{KeyedTransactionMeta, ScheduleBatch, TransactionKey, TransactionState, TxDecision, WorkerAction}, handshake::ClientLogon, thread_aware_account_locks::{self, ThreadAwareAccountLocks, ThreadId, ThreadSet}};
@@ -52,6 +52,8 @@ struct Config {
     #[serde(with = "humantime_serde")]
     pub report_delay: Option<Duration>,
     max_queue_size: usize,
+    priority_rules: Vec<Vec<Vec<u8>>>,
+    default_priority: usize
 }
 
 slotmap::new_key_type! {
@@ -78,7 +80,43 @@ type LockWaitingTxsList = IntrusiveList<(SchedulerTxKey, /* is_write */ bool, Ad
 type AffinitySubscriptionList = IntrusiveList<SchedulerTxKey, 2, 0, true>;
 type AffinityWaitingTxsList = IntrusiveList<SchedulerTxKey, 2, 1, true>;
 
-type Score = (usize, usize);
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct Score(usize, usize);
+
+impl Ord for Score {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (other.0, other.1).cmp(&(self.0, self.1))
+    }
+}
+
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        (other.0, other.1).partial_cmp(&(self.0, self.1))
+    }
+}
+
+impl Score {
+    fn new(prio_level: usize, secondary: usize) -> Self {
+        Self(prio_level, secondary)
+    }
+
+    #[allow(unused)]
+    fn prio_level(&self) -> usize {
+        self.0
+    }
+}
+//
+//const fn parse_rules_max() -> usize {
+//    let rules_cnt = env!("RULES_MAX");
+//    match usize::from_str_radix(rules_cnt, 10) {
+//        Ok(v) => v,
+//        Err(_) => panic!("invalid value for rules_max bound")
+//    }
+//}
+//
+//#[allow(unused)]
+//const RULES_MAX: usize = parse_rules_max();
+
 
 #[derive(Default)]
 struct TxMeta {
@@ -453,7 +491,7 @@ impl LockingQueue {
 
     // returns true if the key is already non-valid (expired)
     fn maybe_expire(&mut self, key: SchedulerTxKey, txdata: &mut impl MutableTxProvider) -> bool {
-let (shared_key, expired) = {
+        let (shared_key, expired) = {
             let Some(meta) = self.metas.get_mut(key) else {
                 return true;
             };
@@ -577,8 +615,16 @@ let (shared_key, expired) = {
 }
 
 impl Config {
-    fn tx_score(&self, _data: &TransactionState) -> usize {
-        0
+    fn tx_score(&self, data: &TransactionState) -> usize {
+        let instruction_data = data.data.data();
+        for (priority, rule) in self.priority_rules.iter().enumerate() {
+            for prefix in rule.iter() {
+                if instruction_data.len() >= prefix.len() && &instruction_data[0..prefix.len()] == prefix {
+                    return priority;
+                }
+            }
+        }
+        self.default_priority
     }
 }
 
@@ -588,6 +634,9 @@ fn main() {
     env_logger::init();
 
     let config: Config = toml::from_slice(&std::fs::read(args.config_path).unwrap()).unwrap();
+    //assert!(RULES_MAX >= config.priority_rules.len());
+    //assert!(RULES_MAX > config.default_priority);
+    println!("config {config:?}");
     let logon = ClientLogon {
         allocator_size: config.tpu.allocator_size,
         pack_to_worker_capacity: config.tpu.pack_to_worker_capacity,
@@ -616,8 +665,8 @@ fn main() {
     let mut reschedules = 0;
     let mut drops = 0;
 
-    let mut sent_stats = make_vector(workers, || 0);
-    let mut receive_stats = make_vector(workers, || 0);
+    let mut send_stats = make_vector(workers, || 0);
+    let mut inflight = make_vector(workers, || 0);
 
     loop {
         let mut to_spin = true;
@@ -625,6 +674,8 @@ fn main() {
             slot = item.current_slot;
             locking_queue.slot = slot;
         }
+
+        let mut new_txs = Vec::new();
 
         bridge.drain_tpu(|bridge, tx_key| {
             to_spin = false;
@@ -636,8 +687,7 @@ fn main() {
             if config.check_max_inflight > 0 {
                 to_check.insert(tx_key);
             } else {
-                let ts_prio = usize::MAX - locking_queue.seen_txs;
-                locking_queue.new_tx(TxMeta::new(tx_key, (config.tx_score(data), ts_prio), slot + config.slot_deadline), data);
+                new_txs.push((config.tx_score(data), tx_key));
             }
             TxDecision::Keep
 
@@ -672,13 +722,8 @@ fn main() {
                     } else if response.resolve_flags & resolve_flags::FAILED != 0 {
                         TxDecision::Drop
                     } else {
-                        let ts_prio = usize::MAX - locking_queue.seen_txs;
-                        locking_queue.new_tx(
-                            TxMeta::new(
-                                worker_resp.key,
-                                (config.tx_score(bridge.transaction(worker_resp.key)), ts_prio),
-                                slot + config.slot_deadline),
-                            bridge.transaction(worker_resp.key));
+                        let key = worker_resp.key;
+                        new_txs.push((config.tx_score(bridge.transaction(key)), key));
                         TxDecision::Keep
                     }
                 },
@@ -689,9 +734,16 @@ fn main() {
             }
         }, config.check_max_inflight);
 
+        new_txs.sort();
+        let mut num = 0;
+        for (score, shared_key) in new_txs.into_iter() {
+            locking_queue.new_tx(TxMeta::new(shared_key, Score::new(score, num), slot + config.slot_deadline), bridge.transaction(shared_key));
+            num += 1;
+        }
+
         for worker in 0..workers {
             bridge.drain_worker(worker, |bridge, worker_resp| {
-                receive_stats[worker] += 1;
+                inflight[worker] -= 1;
                 to_spin = false;
                 let shared_key = worker_resp.key;
                 let key = worker_resp.meta;
@@ -721,55 +773,63 @@ fn main() {
         if let Some(period) = config.report_delay {
             let now = std::time::Instant::now();
             if last_report + period < now {
-                let mut statuses = vec![0; 4];
-                let mut locks_sum = 0_i64;
-                for (_k, v) in locking_queue.metas.iter() {
-                    match v.state {
-                        TxState::Enqueued => {
-                            assert!(!v.resource_queue_subs.is_empty());
-                            assert!(v.affinity_requirements_count == 0);
-                            statuses[0] += 1;
-                        }
-                        TxState::Active => {
-                            statuses[1] += 1;
-                            assert!(v.resource_queue_subs.is_empty());
-                            assert!(v.affinity_requirements_count > 0);
-                        }
-                        TxState::Backpressured => {
-                            statuses[2] += 1;
-                            assert!(v.resource_queue_subs.is_empty());
-                        }
-                        TxState::Picked => {
-                            statuses[3] += 1;
-                            assert!(v.resource_queue_subs.is_empty());
-                            assert!(v.affinity_requirements_count <= 1);
-                        }
-                    }
-                    if v.state != TxState::Picked {
-                        let mut cur = v.resource_queue_subs.front();
-                        while cur.is_some() {
-                            locks_sum += 1;
-                            cur = cur.unwrap().next();
-                        }
-                        for _ in bridge.transaction(v.shared_key).locks() {
-                            locks_sum -= 1;
-                        }
-                    }
-                }
-                for (_k, v) in locking_queue.resources.iter() {
-                    if !v.acquire_queue.is_empty() {
-                        assert!(v.blocked_reads > 0 || v.blocked_writes > 0);
-                    }
-                    locks_sum += (v.blocked_reads + v.blocked_writes) as i64;
-                }
                 let expires = locking_queue.expires;
                 let passed_txs = locking_queue.seen_txs;
                 let queue_len = locking_queue.metas.len();
-                let picked_queue_len = locking_queue.picked.iter().filter(|x| !x.is_empty()).count();
-                println!("{}/{workers} saturated({:?}) (sent/receive stats {sent_stats:?}/{receive_stats:?}); enqueued txs {queue_len}/{statuses:?}/{picked_queue_len}; txs seen/expires/reschedules/drops {passed_txs}/{expires}/{reschedules}/{drops} slot {slot}",
+                let picked_queue_len: usize = locking_queue.picked.iter().map(|x| x.len()).sum();
 
-                    locking_queue.backlogs.iter().filter(|x| **x>0).count(), locking_queue.backlogs);
-                assert!(locks_sum == 0, "unbalanced locks {locks_sum} among {} txs", locking_queue.size());
+                #[cfg(feature="runtime-checks")]
+                {
+                    let mut statuses = vec![0; 4];
+                    let mut locks_sum = 0_i64;
+                    for (_k, v) in locking_queue.metas.iter() {
+                        match v.state {
+                            TxState::Enqueued => {
+                                assert!(!v.resource_queue_subs.is_empty());
+                                assert!(v.affinity_requirements_count == 0);
+                                statuses[0] += 1;
+                            }
+                            TxState::Active => {
+                                statuses[1] += 1;
+                                assert!(v.resource_queue_subs.is_empty());
+                                assert!(v.affinity_requirements_count > 0);
+                            }
+                            TxState::Backpressured => {
+                                statuses[2] += 1;
+                                assert!(v.resource_queue_subs.is_empty());
+                            }
+                            TxState::Picked => {
+                                statuses[3] += 1;
+                                assert!(v.resource_queue_subs.is_empty());
+                                assert!(v.affinity_requirements_count <= 1);
+                            }
+                        }
+                        if v.state != TxState::Picked {
+                            let mut cur = v.resource_queue_subs.front();
+                            while cur.is_some() {
+                                locks_sum += 1;
+                                cur = cur.unwrap().next();
+                            }
+                            for _ in bridge.transaction(v.shared_key).locks() {
+                                locks_sum -= 1;
+                            }
+                        }
+                    }
+                    for (_k, v) in locking_queue.resources.iter() {
+                        if !v.acquire_queue.is_empty() {
+                            assert!(v.blocked_reads > 0 || v.blocked_writes > 0);
+                        }
+                        locks_sum += (v.blocked_reads + v.blocked_writes) as i64;
+                    }
+                    assert!(locks_sum == 0, "unbalanced locks {locks_sum} among {} txs", locking_queue.size());
+                    println!("enqueued {queue_len}/{statuses:?}/{picked_queue_len}");
+                }
+
+                println!("{}/{workers} saturated({:?}/{:?}) (sent {send_stats:?}); enqueued txs {queue_len}/{picked_queue_len}; txs seen/expires/reschedules/drops {passed_txs}/{expires}/{reschedules}/{drops} slot {slot}",
+
+                    locking_queue.backlogs.iter().filter(|x| **x>0).count(),
+                    locking_queue.backlogs, inflight);
+
                 last_report = now;
             }
         }
@@ -786,7 +846,8 @@ fn main() {
                         max_working_slot: slot + config.slot_deadline,
                         flags: pack_message_flags::EXECUTE
                     }).unwrap();
-                    sent_stats[worker] += batch.len();
+                    send_stats[worker] += batch.len();
+                    inflight[worker] += batch.len();
                     batch.clear();
                 };
             }

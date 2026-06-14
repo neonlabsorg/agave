@@ -26,3 +26,6 @@ toml.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+runtime-checks = []
