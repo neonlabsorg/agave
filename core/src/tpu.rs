@@ -363,7 +363,7 @@ impl Tpu {
                             let session = server.accept()?;
                             match banking_stage.write()?.as_mut() {
                                 Some(banking_stage) => {
-                                    banking_stage.spawn_external_threads(session).unwrap();
+                                    let _ = banking_stage.spawn_external_threads(session);
                                     Ok(true)
                                 }
                                 None => {
