@@ -93,8 +93,8 @@ impl Default for TxState {
 type TxLocksSubscriptionList = IntrusiveList<(SchedulerTxKey, /* is_write */ bool, Address), 2, 0, true>;
 type LockWaitingTxsList = IntrusiveList<(SchedulerTxKey, /* is_write */ bool, Address), 2, 1, true>;
 
-type AffinitySubscriptionList = IntrusiveList<SchedulerTxKey, 2, 0, true>;
-type AffinityWaitingTxsList = IntrusiveList<SchedulerTxKey, 2, 1, true>;
+type AffinitySubscriptionList = IntrusiveList<(SchedulerTxKey, usize), 2, 0, true>;
+type AffinityWaitingTxsList = IntrusiveList<(SchedulerTxKey, usize), 2, 1, true>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct Score(usize, usize);
@@ -286,7 +286,7 @@ struct AccWaiters {
 }
 
 impl AccWaiters {
-    fn drain(&mut self, ro: bool) -> Option<SchedulerTxKey> {
+    fn drain(&mut self, ro: bool) -> Option<(SchedulerTxKey, usize)> {
         if !self.readers.is_empty() {
             if let Some(item) = self.readers.pop_front() {
                 return Some(*item.contained());
@@ -393,7 +393,7 @@ impl LockingQueue {
             if requirements.is_empty() {
                 requirements.resize(self.num_threads, 0);
             }
-            let mut sub = ItemHolder::new(key).into();
+            let mut sub = ItemHolder::new((key, thread)).into();
             tx_meta.affinity_subs.push_front(&mut sub);
             let mut sub = sub.switch();
             let waiters = self.affinity_waiters.entry(addr).or_default();
@@ -621,9 +621,9 @@ impl LockingQueue {
                     continue;
                 }
 
-                while let Some(waiter) = waiters.drain(acc_locks.map_or(false, |acc| acc.read_locks.is_some())) {
+                while let Some((waiter, blocked_on)) = waiters.drain(acc_locks.map_or(false, |acc| acc.read_locks.is_some())) {
                     if let Some(tx_meta) = self.metas.get_mut(waiter) {
-                        if tx_meta.remove_affinity_requirement(worker) && tx_meta.affinity_requirements_count <= 1 {
+                        if tx_meta.remove_affinity_requirement(blocked_on) && tx_meta.affinity_requirements_count <= 1 {
                             self.events_to_dispatch.push_back(Event::AffinityRequirementDropped(waiter));
                         }
                     }
