@@ -1,10 +1,10 @@
-use std::{marker::PhantomPinned, pin::Pin, ptr::NonNull};
+use std::{cell::Cell, marker::PhantomPinned, pin::Pin, ptr::NonNull};
 
 type ListLink<T, const N: usize> = Option<NonNull<ListNode<T, N>>>;
 
 struct ListNode<T, const N: usize> {
     payload: Option<T>,
-    borrows: usize,
+    borrows: Cell<usize>,
     next: [ListLink<T, N>; N],
     prev: [ListLink<T, N>; N],
     _marker: PhantomPinned
@@ -14,7 +14,7 @@ impl<T, const N: usize> ListNode<T, N> {
     fn new(payload: T) -> Self {
         Self {
             payload: Some(payload),
-            borrows: 1,
+            borrows: Cell::new(1),
             next: [None; N],
             prev: [None; N],
             _marker: PhantomPinned
@@ -24,7 +24,7 @@ impl<T, const N: usize> ListNode<T, N> {
     fn new_empty() -> Self {
         Self {
             payload: None,
-            borrows: 1,
+            borrows: Cell::new(1),
             next: [None; N],
             prev: [None; N],
             _marker: PhantomPinned
@@ -44,13 +44,12 @@ impl<T, const N: usize, const I: usize, const DELETE_ALL: bool> Drop
     for IntrusiveList<T, N, I, DELETE_ALL>
 {
     fn drop(&mut self) {
-        if let Some(head) = self.private_head() {
-            while let Some(mut cur) = head.next() {
-                if DELETE_ALL {
-                    ItemHolder::from(cur).unlink();
-                } else {
-                    cur.unlink();
-                }
+        //not iterating to silence miri errors
+        while let Some(mut cur) = self.front() {
+            if DELETE_ALL {
+                ItemHolder::from(cur).unlink();
+            } else {
+                cur.unlink();
             }
         }
     }
@@ -110,7 +109,8 @@ impl<T, const N: usize, const I: usize, const DELETE_ALL: bool>
     fn init(&mut self) {
         if self.hub.is_none() {
             self.hub = Some(Box::pin(ListNode::new_empty()));
-            let ptr = (self.hub.as_ref().unwrap().as_ref().get_ref() as *const ListNode<T, N>).cast_mut();
+            let pin = self.hub.as_mut().unwrap().as_mut();
+            let ptr = unsafe { pin.get_unchecked_mut() as *mut ListNode<T, N> };
             unsafe {
                 (*ptr).next[I] = NonNull::new(ptr);
                 (*ptr).prev[I] = NonNull::new(ptr);
@@ -125,14 +125,21 @@ impl<T, const N: usize, const I: usize, const DELETE_ALL: bool>
         })
     }
 
+    fn private_head_mut(&mut self) -> Option<Cursor<T, N, I>> {
+        self.hub.as_mut().map(|hub| {
+            let ptr = unsafe { hub.as_mut().get_unchecked_mut() as *mut ListNode<T, N> };
+            unsafe { Cursor::new(NonNull::new(ptr).unwrap()) }
+        })
+    }
+
     pub fn push_front(&mut self, cur: &mut Cursor<T, N, I>) {
         self.init();
-        self.private_head().unwrap().insert_after(cur);
+        self.private_head_mut().unwrap().insert_after(cur);
     }
 
     pub fn push_back(&mut self, cur: &mut Cursor<T, N, I>) {
         self.init();
-        self.private_head().unwrap().prev_item().unwrap().insert_after(cur);
+        self.private_head_mut().unwrap().prev_item().unwrap().insert_after(cur);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -186,12 +193,14 @@ impl<T, const N: usize, const I: usize, const DELETE_ALL: bool>
     }
 }
 
-unsafe fn drop_impl<T, const N: usize>(mut ptr: NonNull<ListNode<T, N>>) {
-    if 0 == unsafe {
-        let borrows = &mut ptr.as_mut().borrows;
-        *borrows -= 1;
-        *borrows
-    } {
+unsafe fn drop_impl<T, const N: usize>(ptr: NonNull<ListNode<T, N>>) {
+    let remaining = {
+        let node = unsafe { ptr.as_ref() };
+        let remaining = node.borrows.get() - 1;
+        node.borrows.set(remaining);
+        remaining
+    };
+    if remaining == 0 {
         for i in 0..N {
             if unsafe {ptr.as_ref().next[i].is_some()} {
                 return;
@@ -215,8 +224,9 @@ impl<T, const N: usize> Drop for ItemHolder<T, N> {
 
 impl<T, const N: usize> Clone for ItemHolder<T, N> {
     fn clone(&self) -> Self {
-        let mut cur = self.cur.clone();
-        unsafe { cur.as_mut() }.borrows += 1;
+        let cur = self.cur;
+        let node = unsafe { cur.as_ref() };
+        node.borrows.set(node.borrows.get() + 1);
         Self { cur }
     }
 }
@@ -253,8 +263,9 @@ impl<T, const N: usize> ItemHolder<T, N> {
 }
 
 impl<T, const N: usize, const I: usize> Cursor<T, N, I> {
-    unsafe fn new(mut cur: NonNull<ListNode<T, N>>) -> Self {
-        cur.as_mut().borrows += 1;
+    unsafe fn new(cur: NonNull<ListNode<T, N>>) -> Self {
+        let node = unsafe { cur.as_ref() };
+        node.borrows.set(node.borrows.get() + 1);
         Self { cur }
     }
 
