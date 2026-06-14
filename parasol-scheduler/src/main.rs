@@ -64,8 +64,24 @@ slotmap::new_key_type! {
 enum TxState {
     Enqueued,
     Active,
-    Backpressured,
-    Picked
+    Backpressured(usize),
+    Picked(usize)
+}
+
+impl TxState {
+    fn is_picked(&self) -> bool {
+        match self {
+            Self::Picked(_) => true,
+            _ => false
+        }
+    }
+
+    fn is_backpressured(&self) -> bool {
+        match self {
+            Self::Backpressured(_) => true,
+            _ => false
+        }
+    }
 }
 
 impl Default for TxState {
@@ -319,7 +335,7 @@ struct LockingQueue {
     picked: Vec<BinaryHeap<PickedTx>>,
 
     affinity_waiters: AHashMap<Address, AccWaiters>,
-    backpressured: Vec<BinaryHeap<PickedTx>>,
+    backpressured: Vec<VecDeque<PickedTx>>,
     max_worker_backlog: usize,
 
     picked_locks: ThreadAwareAccountLocks,
@@ -350,7 +366,7 @@ impl LockingQueue {
             resources: AHashMap::new(),
             metas: SlotMap::with_key(),
             picked: make_vector(num_threads, || BinaryHeap::new()),
-            backpressured: make_vector(num_threads, || BinaryHeap::new()),
+            backpressured: make_vector(num_threads, || VecDeque::new()),
             picked_locks: ThreadAwareAccountLocks::new(num_threads),
             num_threads,
             backlogs: make_vector(num_threads, || 0),
@@ -406,10 +422,10 @@ impl LockingQueue {
 
         tx_meta.set_affinity_requirements(requirements);
         if tx_meta.affinity_requirements_count <= 1 {
-            self.try_pick_tx(key, tx);
+            self.try_pick_tx(key, tx, false);
             assert!({
                 let tx_meta = self.metas.get(key).unwrap();
-                tx_meta.state == TxState::Picked || tx_meta.state == TxState::Backpressured
+                tx_meta.state.is_picked() || tx_meta.state.is_backpressured()
             });
         }
     }
@@ -426,12 +442,12 @@ impl LockingQueue {
         }
     }
 
-    fn try_pick_tx(&mut self, key: SchedulerTxKey, txdata: &TransactionState) -> bool {
+    fn try_pick_tx(&mut self, key: SchedulerTxKey, txdata: &TransactionState, ignore_bp: bool) -> bool {
         let write_locks = txdata.write_locks().collect::<smallvec::SmallVec<[_; 64]>>();
         let read_locks = txdata.read_locks().collect::<smallvec::SmallVec<[_; 64]>>();
         let tx_meta = self.metas.get_mut(key).unwrap();
 
-        if tx_meta.state == TxState::Picked {
+        if tx_meta.state.is_picked() {
             return false;
         }
         assert!(tx_meta.state != TxState::Enqueued);
@@ -444,20 +460,22 @@ impl LockingQueue {
             |threads| {
                 threads.contained_threads_iter()
                     .min_by(|thread1, thread2|
-                        (self.backlogs[*thread1])
-                            .cmp(&(self.backlogs[*thread2]))).unwrap()
+                        (self.backlogs[*thread1] + self.backpressured[*thread1].len())
+                            .cmp(&(self.backlogs[*thread2] + self.backpressured[*thread2].len()))).unwrap()
             });
 
         match lock_result {
             Ok(thread) => {
                 let score = tx_meta.score;
-                if self.backlogs[thread] >= self.max_worker_backlog {
-                    tx_meta.state = TxState::Backpressured;
-                    self.backpressured[thread].push(PickedTx(score, key));
+                if self.picked[thread].len() >= self.max_worker_backlog || (!ignore_bp && !self.backpressured[thread].is_empty()) {
                     self.picked_locks.unlock_accounts(
                         write_locks.as_slice().iter().cloned(),
                         read_locks.as_slice().iter().cloned(),
                         thread);
+                    if tx_meta.state != TxState::Backpressured(thread) {
+                        self.backpressured[thread].push_back(PickedTx(score, key));
+                    }
+                    tx_meta.state = TxState::Backpressured(thread);
                     return false;
                 }
 
@@ -474,7 +492,7 @@ impl LockingQueue {
                         }
                     }
                 }
-                tx_meta.state = TxState::Picked;
+                tx_meta.state = TxState::Picked(thread);
 
                 true
             },
@@ -496,7 +514,12 @@ impl LockingQueue {
                 return true;
             };
             let expired = meta.expire_slot <= self.slot;
-            if expired && meta.state != TxState::Picked {
+            if expired {
+                if let TxState::Picked(worker) = meta.state {
+                    let tx = txdata.txdata(meta.shared_key);
+                    self.picked_locks.unlock_accounts(tx.write_locks(), tx.read_locks(), worker);
+                    self.backlogs[worker] -= 1;
+                }
                 // compensating unconditional unblocks below
                 while let Some(item) = meta.resource_queue_subs.pop_front() {
                     let (_, is_write, lock) = item.contained();
@@ -534,12 +557,12 @@ impl LockingQueue {
                     return;
                 };
                 let txdata = txdata.txdata(meta.shared_key);
-                self.try_pick_tx(key, txdata);
+                self.try_pick_tx(key, txdata, false);
             }
             Event::AddressUnblocked(address) => {
                 while let Some(key) = self.resources.get_mut(&address).and_then(|q| q.drain()) {
                     if self.maybe_expire(key, txdata) {
-                        return;
+                        continue;
                     }
                     let (no_subs, txdata) = {
                         let meta = self.metas.get_mut(key).unwrap();
@@ -557,12 +580,12 @@ impl LockingQueue {
     }
 
     fn drain_backpressured(&mut self, thread: usize, txdata: &mut impl MutableTxProvider) {
-        while self.backlogs[thread] < self.max_worker_backlog {
-            let Some(PickedTx(_, key)) = self.backpressured[thread].pop() else {
+        while self.picked[thread].len() < self.max_worker_backlog {
+            let Some(PickedTx(_, key)) = self.backpressured[thread].pop_front() else {
                 break;
             };
 
-            if self.metas.get(key).map(|meta| meta.state == TxState::Picked).unwrap_or(true) {
+            if self.metas.get(key).map(|meta| meta.state.is_picked()).unwrap_or(true) {
                 continue;
             }
 
@@ -572,12 +595,13 @@ impl LockingQueue {
 
             let txdata = txdata.txdata({
                 let meta = self.metas.get(key).unwrap();
-                assert!(meta.state == TxState::Backpressured);
+                assert!(meta.state.is_backpressured());
                 meta.shared_key
             });
 
-            assert!(self.try_pick_tx(key, txdata));
+            assert!(self.try_pick_tx(key, txdata, true));
         }
+        self.dispatch_events(txdata);
     }
 
     fn dispatch_events(&mut self, txdata: &mut impl MutableTxProvider) {
@@ -794,17 +818,17 @@ fn main() {
                                 assert!(v.resource_queue_subs.is_empty());
                                 assert!(v.affinity_requirements_count > 0);
                             }
-                            TxState::Backpressured => {
+                            TxState::Backpressured(_) => {
                                 statuses[2] += 1;
                                 assert!(v.resource_queue_subs.is_empty());
                             }
-                            TxState::Picked => {
+                            TxState::Picked(_) => {
                                 statuses[3] += 1;
                                 assert!(v.resource_queue_subs.is_empty());
                                 assert!(v.affinity_requirements_count <= 1);
                             }
                         }
-                        if v.state != TxState::Picked {
+                        if !v.state.is_picked() {
                             let mut cur = v.resource_queue_subs.front();
                             while cur.is_some() {
                                 locks_sum += 1;
@@ -822,10 +846,10 @@ fn main() {
                         locks_sum += (v.blocked_reads + v.blocked_writes) as i64;
                     }
                     assert!(locks_sum == 0, "unbalanced locks {locks_sum} among {} txs", locking_queue.size());
-                    println!("enqueued {queue_len}/{statuses:?}/{picked_queue_len}");
+                    println!("enqueued tx kinds {queue_len}/{statuses:?}/{picked_queue_len}");
                 }
 
-                println!("{}/{workers} saturated({:?}/{:?}) (sent {send_stats:?}); enqueued txs {queue_len}/{picked_queue_len}; txs seen/expires/reschedules/drops {passed_txs}/{expires}/{reschedules}/{drops} slot {slot}",
+                println!("{}/{workers} saturated({:?}/{:?}) (sent {send_stats:?}); enqueued {queue_len}/{picked_queue_len}; txs seen/expires/reschedules/drops {passed_txs}/{expires}/{reschedules}/{drops} slot {slot}",
 
                     locking_queue.backlogs.iter().filter(|x| **x>0).count(),
                     locking_queue.backlogs, inflight);
@@ -847,11 +871,14 @@ fn main() {
                         flags: pack_message_flags::EXECUTE
                     }).unwrap();
                     send_stats[worker] += batch.len();
-                    inflight[worker] += batch.len();
                     batch.clear();
                 };
             }
-            while let Some(PickedTx(_, key)) = locking_queue.picked[worker].pop() {
+            while inflight[worker] < config.max_txs_per_worker {
+                let Some(PickedTx(_, key)) = locking_queue.picked[worker].pop() else {
+                    break;
+                };
+                inflight[worker] += 1;
                 batch.push(KeyedTransactionMeta::<SchedulerTxKey>{
                     key: locking_queue.metas.get(key).unwrap().shared_key,
                     meta: key
