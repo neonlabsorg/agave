@@ -37,6 +37,7 @@ WORKDIR /opt
 RUN git clone --recursive "${AGAVE_REPO}" agave && \
     cd agave && \
     git checkout "${AGAVE_REF}" && \
+    git rev-parse HEAD && \
     git submodule update --init --recursive
 
 WORKDIR /opt/agave

@@ -497,6 +497,7 @@ solana-program-memory = "3.0.0"
 solana-program-option = "3.0.0"
 solana-program-pack = "3.0.0"
 solana-program-runtime = { path = "program-runtime", version = "=3.1.13", features = ["agave-unstable-api"] }
+solana-program-subaccount = "3.0.0"
 solana-program-test = { path = "program-test", version = "=3.1.13", features = ["agave-unstable-api"] }
 solana-pubkey = { version = "3.0.0", default-features = false }
 solana-pubsub-client = { path = "pubsub-client", version = "=3.1.13" }
@@ -785,6 +786,7 @@ solana-program-log-macro = { path = "parasol/solana-sdk/program-log-macro" }
 solana-program-memory = { path = "parasol/solana-sdk/program-memory" }
 solana-program-option = { path = "parasol/solana-sdk/program-option" }
 solana-program-pack = { path = "parasol/solana-sdk/program-pack" }
+solana-program-subaccount = { path = "parasol/solana-sdk/program-subaccount" }
 solana-pubkey = { path = "parasol/solana-sdk/pubkey" }
 solana-quic-definitions = { path = "parasol/solana-sdk/quic-definitions" }
 solana-rent = { path = "parasol/solana-sdk/rent" }
