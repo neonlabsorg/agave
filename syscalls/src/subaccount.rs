@@ -23,7 +23,7 @@ use {
     },
     solana_sdk_ids::system_program,
     solana_svm_log_collector::ic_msg,
-    solana_system_interface::{instruction::SystemInstruction, MAX_PERMITTED_DATA_LENGTH},
+    solana_system_interface::instruction::SystemInstruction,
     solana_transaction_context::{
         create_subaccount_address, subaccount_storage_address, vm_slice::VmSlice, IndexOfAccount,
         InstructionAccount, MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
@@ -217,16 +217,6 @@ declare_builtin_function!(
                     subaccount_pubkey,
                 );
                 return Err(InstructionError::AccountAlreadyInitialized.into());
-            }
-
-            if space > MAX_PERMITTED_DATA_LENGTH {
-                ic_msg!(
-                    invoke_context,
-                    "Allocate: requested {}, max allowed {}",
-                    space,
-                    MAX_PERMITTED_DATA_LENGTH
-                );
-                return Err(InstructionError::InvalidArgument.into());
             }
 
             subaccount.set_data_length(space as usize)?;

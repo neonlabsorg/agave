@@ -192,14 +192,18 @@ impl BalanceCollectionRoutines for BalanceCollector {
             return;
         }
 
-        let pre_tail = self
-            .native_pre
-            .last_mut()
-            .expect("collect_subaccount_pre_balances called without collect_pre_balances");
-        let subaccount_keys_tail = self
-            .subaccount_keys
-            .last_mut()
-            .expect("collect_subaccount_pre_balances called without collect_pre_balances");
+        let (Some(pre_tail), Some(subaccount_keys_tail)) =
+            (self.native_pre.last_mut(), self.subaccount_keys.last_mut())
+        else {
+            // `collect_pre_balances` seeds both tails for every tx, so a missing
+            // tail here means it was skipped — a caller bug. Assert loudly in
+            // debug builds, but don't panic the validator hot path in release.
+            debug_assert!(
+                false,
+                "collect_subaccount_pre_balances called without collect_pre_balances"
+            );
+            return;
+        };
         for (owner_pubkey, _) in subaccount_lane.iter() {
             // The lane is keyed by the owner-facing pubkey;
             // `subaccount_storage_address` is the accounts-db addressing of
