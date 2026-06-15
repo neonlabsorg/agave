@@ -2395,7 +2395,17 @@ mod tests {
         )
         .unwrap();
 
-        invoke_context.mock_set_remaining(400 - 1);
+        // Each `sol_log` costs max(syscall_base_cost, len). We need `ComputationalBudgetExceeded` on the last call,
+        // so set remaining compute units to 1 less than the total cost of the 4 calls below.
+        let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
+        let string_len = string.len() as u64;
+        invoke_context.mock_set_remaining(
+            syscall_base_cost.max(string_len)
+                + syscall_base_cost.max(string_len * 2)
+                + syscall_base_cost.max(string_len)
+                + syscall_base_cost.max(string_len)
+                - 1,
+        );
         let result = SyscallLog::rust(
             &mut invoke_context,
             0x100000001, // AccessViolation
