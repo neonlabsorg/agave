@@ -2,14 +2,15 @@
 use qualifier_attr::qualifiers;
 use {
     crate::{
-        vm_slice::VmSlice, IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION,
-        MAX_ACCOUNT_DATA_LEN, SUBACCOUNT_MARKER,
+        subaccount_storage_address, vm_slice::VmSlice, IndexOfAccount,
+        MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION, MAX_ACCOUNT_DATA_LEN, SUBACCOUNT_MARKER,
     },
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_instruction::error::InstructionError,
     solana_pubkey::Pubkey,
     std::{
         cell::{Cell, RefCell, UnsafeCell},
+        collections::HashMap,
         ops::{Deref, DerefMut},
         ptr,
         sync::Arc,
@@ -282,6 +283,8 @@ pub struct TransactionAccounts {
     subaccount_borrow_counters: RefCell<Vec<Box<BorrowCounter>>>,
     #[cfg(not(target_os = "solana"))]
     touched_subaccounts: RefCell<Vec<bool>>,
+    #[cfg(not(target_os = "solana"))]
+    subaccount_indexes: RefCell<HashMap<Pubkey, IndexOfAccount>>,
 }
 
 impl TransactionAccounts {
@@ -327,6 +330,7 @@ impl TransactionAccounts {
             subaccount_private_fields: RefCell::new(Vec::new()),
             subaccount_borrow_counters: RefCell::new(Vec::new()),
             touched_subaccounts: RefCell::new(Vec::new()),
+            subaccount_indexes: RefCell::new(HashMap::new()),
             dynamic_accounts_lamports_sum: Cell::new(0),
         }
     }
@@ -375,6 +379,7 @@ impl TransactionAccounts {
         let mut private = self.subaccount_private_fields.borrow_mut();
         let mut counters = self.subaccount_borrow_counters.borrow_mut();
         let mut touched = self.touched_subaccounts.borrow_mut();
+        let mut indexes = self.subaccount_indexes.borrow_mut();
         let index = shared.len() as IndexOfAccount;
         shared.push(Box::new(UnsafeCell::new(AccountSharedFields {
             key: pubkey,
@@ -396,6 +401,7 @@ impl TransactionAccounts {
                 .get()
                 .saturating_add(lamports as u128),
         );
+        indexes.insert(pubkey, index);
         index
     }
 
@@ -415,17 +421,8 @@ impl TransactionAccounts {
 
     #[cfg(not(target_os = "solana"))]
     pub fn find_index_of_subaccount(&self, pubkey: &Pubkey) -> Option<IndexOfAccount> {
-        let shared = self.subaccount_shared_fields.borrow();
-        shared
-            .iter()
-            .position(|boxed| {
-                // SAFETY: subaccount lane is append-only; no concurrent
-                // mutable borrow via AccountRefMut can be live while we read
-                // just the immutable `key` field — it is never mutated after
-                // construction.
-                unsafe { (*boxed.get()).key == *pubkey }
-            })
-            .map(|i| i as IndexOfAccount)
+        let indexes = self.subaccount_indexes.borrow();
+        indexes.get(pubkey).copied()
     }
 
     #[cfg(not(target_os = "solana"))]
@@ -701,9 +698,7 @@ impl TransactionAccounts {
         for (shared_box, private_box) in sub_shared.into_iter().zip(sub_private.into_iter()) {
             let shared = (*shared_box).into_inner();
             let private = (*private_box).into_inner();
-            let storage_address = Pubkey::new_from_array(
-                solana_sha256_hasher::hashv(&[&[1u8], shared.key.as_ref()]).to_bytes(),
-            );
+            let storage_address = subaccount_storage_address(&shared.key);
             accounts.push((
                 storage_address,
                 AccountSharedData::create_from_existing_shared_data(
