@@ -37,6 +37,12 @@ pub struct TransactionExecutionDetails {
     /// The change in accounts data len for this transaction.
     /// NOTE: This value is valid IFF `status` is `Ok`.
     pub accounts_data_len_delta: i64,
+    /// F10/PRS-155: owner-facing keys of subaccounts accessed but left
+    /// *unchanged* this transaction (a pure `sol_read_subaccount` or a
+    /// read-only `sol_load_subaccount`). Pure receipt metadata — these are
+    /// never committed, so they don't belong on `LoadedTransaction`. The
+    /// receipt reports them by owner address only (no balances).
+    pub unchanged_subaccount_addresses: Vec<Pubkey>,
 }
 
 impl TransactionExecutionDetails {

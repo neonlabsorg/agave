@@ -8086,6 +8086,8 @@ pub mod tests {
                     return_data: Some(TransactionReturnData::default()),
                     compute_units_consumed,
                     cost_units,
+                    subaccount_addresses: vec![],
+                    unchanged_subaccount_addresses: vec![],
                 }
                 .into();
                 blockstore
@@ -8106,6 +8108,8 @@ pub mod tests {
                     return_data: Some(TransactionReturnData::default()),
                     compute_units_consumed,
                     cost_units,
+                    subaccount_addresses: vec![],
+                    unchanged_subaccount_addresses: vec![],
                 }
                 .into();
                 blockstore
@@ -8126,6 +8130,8 @@ pub mod tests {
                     return_data: Some(TransactionReturnData::default()),
                     compute_units_consumed,
                     cost_units,
+                    subaccount_addresses: vec![],
+                    unchanged_subaccount_addresses: vec![],
                 }
                 .into();
                 blockstore
@@ -8148,6 +8154,8 @@ pub mod tests {
                         return_data: Some(TransactionReturnData::default()),
                         compute_units_consumed,
                         cost_units,
+                        subaccount_addresses: vec![],
+                        unchanged_subaccount_addresses: vec![],
                     },
                 }
             })
@@ -8298,6 +8306,8 @@ pub mod tests {
             return_data: Some(test_return_data.clone()),
             compute_units_consumed: compute_units_consumed_1,
             cost_units: cost_units_1,
+            subaccount_addresses: vec![],
+            unchanged_subaccount_addresses: vec![],
         }
         .into();
         assert!(transaction_status_cf
@@ -8319,6 +8329,8 @@ pub mod tests {
             return_data,
             compute_units_consumed,
             cost_units,
+            subaccount_addresses: _,
+            unchanged_subaccount_addresses: _,
         } = transaction_status_cf
             .get_protobuf((Signature::default(), 0))
             .unwrap()
@@ -8354,6 +8366,8 @@ pub mod tests {
             return_data: Some(test_return_data.clone()),
             compute_units_consumed: compute_units_consumed_2,
             cost_units: cost_units_2,
+            subaccount_addresses: vec![],
+            unchanged_subaccount_addresses: vec![],
         }
         .into();
         assert!(transaction_status_cf
@@ -8375,6 +8389,8 @@ pub mod tests {
             return_data,
             compute_units_consumed,
             cost_units,
+            subaccount_addresses: _,
+            unchanged_subaccount_addresses: _,
         } = transaction_status_cf
             .get_protobuf((Signature::from([2u8; 64]), 9))
             .unwrap()
@@ -8493,6 +8509,8 @@ pub mod tests {
             return_data: Some(TransactionReturnData::default()),
             compute_units_consumed: Some(42u64),
             cost_units: Some(1234),
+            subaccount_addresses: vec![],
+            unchanged_subaccount_addresses: vec![],
         }
         .into();
 
@@ -8670,6 +8688,8 @@ pub mod tests {
             return_data: Some(TransactionReturnData::default()),
             compute_units_consumed: Some(42u64),
             cost_units: Some(1234),
+            subaccount_addresses: vec![],
+            unchanged_subaccount_addresses: vec![],
         }
         .into();
 
@@ -8798,6 +8818,8 @@ pub mod tests {
             return_data: Some(TransactionReturnData::default()),
             compute_units_consumed: Some(42u64),
             cost_units: Some(1234),
+            subaccount_addresses: vec![],
+            unchanged_subaccount_addresses: vec![],
         }
         .into();
 
@@ -8967,6 +8989,8 @@ pub mod tests {
                     return_data: return_data.clone(),
                     compute_units_consumed: Some(42),
                     cost_units: Some(1234),
+                    subaccount_addresses: vec![],
+                    unchanged_subaccount_addresses: vec![],
                 }
                 .into();
                 blockstore
@@ -8989,6 +9013,8 @@ pub mod tests {
                         return_data,
                         compute_units_consumed: Some(42),
                         cost_units: Some(1234),
+                        subaccount_addresses: vec![],
+                        unchanged_subaccount_addresses: vec![],
                     },
                 }
             })
@@ -9090,6 +9116,8 @@ pub mod tests {
                     return_data: return_data.clone(),
                     compute_units_consumed: Some(42u64),
                     cost_units: Some(1234),
+                    subaccount_addresses: vec![],
+                    unchanged_subaccount_addresses: vec![],
                 }
                 .into();
                 blockstore
@@ -9112,6 +9140,8 @@ pub mod tests {
                         return_data,
                         compute_units_consumed: Some(42u64),
                         cost_units: Some(1234),
+                        subaccount_addresses: vec![],
+                        unchanged_subaccount_addresses: vec![],
                     },
                 }
             })
@@ -9787,6 +9817,8 @@ pub mod tests {
                 return_data: Some(TransactionReturnData::default()),
                 compute_units_consumed: None,
                 cost_units: None,
+                subaccount_addresses: vec![],
+                unchanged_subaccount_addresses: vec![],
             }
             .into();
             transaction_status_cf
@@ -10590,6 +10622,8 @@ pub mod tests {
             }),
             compute_units_consumed: Some(23456),
             cost_units: Some(5678),
+            subaccount_addresses: vec![],
+            unchanged_subaccount_addresses: vec![],
         };
         let deprecated_status: StoredTransactionStatusMeta = status.clone().try_into().unwrap();
         let protobuf_status: generated::TransactionStatusMeta = status.into();

@@ -194,6 +194,26 @@ fn build_simple_ui_transaction_status_meta(
         return_data: OptionSerializer::Skip,
         compute_units_consumed: OptionSerializer::Skip,
         cost_units: OptionSerializer::Skip,
+        subaccount_addresses: if meta.subaccount_addresses.is_empty() {
+            OptionSerializer::Skip
+        } else {
+            OptionSerializer::Some(
+                meta.subaccount_addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            )
+        },
+        unchanged_subaccount_addresses: if meta.unchanged_subaccount_addresses.is_empty() {
+            OptionSerializer::Skip
+        } else {
+            OptionSerializer::Some(
+                meta.unchanged_subaccount_addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            )
+        },
     }
 }
 
@@ -233,6 +253,26 @@ fn parse_ui_transaction_status_meta(
         ),
         compute_units_consumed: OptionSerializer::or_skip(meta.compute_units_consumed),
         cost_units: OptionSerializer::or_skip(meta.cost_units),
+        subaccount_addresses: if meta.subaccount_addresses.is_empty() {
+            OptionSerializer::Skip
+        } else {
+            OptionSerializer::Some(
+                meta.subaccount_addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            )
+        },
+        unchanged_subaccount_addresses: if meta.unchanged_subaccount_addresses.is_empty() {
+            OptionSerializer::Skip
+        } else {
+            OptionSerializer::Some(
+                meta.unchanged_subaccount_addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            )
+        },
     }
 }
 
@@ -909,6 +949,8 @@ mod test {
             return_data: None,
             compute_units_consumed: None,
             cost_units: None,
+            subaccount_addresses: vec![],
+            unchanged_subaccount_addresses: vec![],
         };
         #[rustfmt::skip]
         let expected_json_output_value: serde_json::Value = serde_json::from_str(
