@@ -891,6 +891,7 @@ fn main() {
                 send_batch!();
             }
 
+            locking_queue.drain_backpressured(worker, &mut bridge);
         }
 
         if to_spin {
