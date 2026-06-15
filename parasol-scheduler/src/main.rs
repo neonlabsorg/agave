@@ -453,6 +453,15 @@ impl LockingQueue {
         assert!(tx_meta.state != TxState::Enqueued);
         assert!(tx_meta.resource_queue_subs.is_empty());
 
+        macro_rules! can_place {
+            ($thread:expr) => {
+                {
+                    let thread = $thread;
+                    self.picked[thread].len() < self.max_worker_backlog && (ignore_bp || self.backpressured[thread].is_empty())
+                }
+            }
+        }
+
         let lock_result = self.picked_locks.try_lock_accounts(
             write_locks.as_slice().iter().cloned(),
             read_locks.as_slice().iter().cloned(),
@@ -460,14 +469,14 @@ impl LockingQueue {
             |threads| {
                 threads.contained_threads_iter()
                     .min_by(|thread1, thread2|
-                        (self.backlogs[*thread1] + self.backpressured[*thread1].len())
-                            .cmp(&(self.backlogs[*thread2] + self.backpressured[*thread2].len()))).unwrap()
+                        (!can_place!(*thread1), self.backlogs[*thread1] + self.backpressured[*thread1].len())
+                            .cmp(&(!can_place!(*thread2), self.backlogs[*thread2] + self.backpressured[*thread2].len()))).unwrap()
             });
 
         match lock_result {
             Ok(thread) => {
                 let score = tx_meta.score;
-                if self.picked[thread].len() >= self.max_worker_backlog || (!ignore_bp && !self.backpressured[thread].is_empty()) {
+                if !can_place!(thread) {
                     self.picked_locks.unlock_accounts(
                         write_locks.as_slice().iter().cloned(),
                         read_locks.as_slice().iter().cloned(),
