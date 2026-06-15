@@ -613,7 +613,7 @@ fn main() {
         genesis.hot_accounts(hot_accounts);
     }
 
-    if matches.is_present("single_validator") {
+    if agave_validator::single_validator_enabled(&matches) {
         genesis.single_validator(true);
     }
 

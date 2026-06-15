@@ -945,8 +945,9 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                     "Run in single-validator mode: this node is the only voter and always its \
                      own leader. ReplayStage never resets PoH backward off the block it is still \
                      producing, and graceful shutdown finishes the in-progress leader block, so \
-                     `processed` transactions are not rolled back. Unsafe in any multi-validator \
-                     cluster.",
+                     `processed` transactions are not rolled back. Also enabled by setting the \
+                     SINGLE_VALIDATOR environment variable (to any value other than \
+                     0/false/no/off). Unsafe in any multi-validator cluster.",
                 ),
         )
         .args(&pub_sub_config::args(/*test_validator:*/ true))

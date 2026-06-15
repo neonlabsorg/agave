@@ -24,6 +24,29 @@ pub mod hot_accounts;
 pub fn format_name_value(name: &str, value: &str) -> String {
     format!("{} {}", style(name).bold(), value)
 }
+
+/// Whether single-validator mode is enabled, honoring both the
+/// `--single-validator` CLI flag and the `SINGLE_VALIDATOR` environment
+/// variable. clap 2.x ignores `.env()` on no-value flags (its `add_env`
+/// resolves only opts/positionals), so the env var is resolved here. A set
+/// env var counts as enabled unless its trimmed value is empty, `0`, `false`,
+/// `no`, or `off` (case-insensitive).
+pub fn single_validator_enabled(matches: &clap::ArgMatches) -> bool {
+    if matches.is_present("single_validator") {
+        return true;
+    }
+    match std::env::var("SINGLE_VALIDATOR") {
+        Ok(value) => {
+            let value = value.trim();
+            !value.is_empty()
+                && !value.eq_ignore_ascii_case("0")
+                && !value.eq_ignore_ascii_case("false")
+                && !value.eq_ignore_ascii_case("no")
+                && !value.eq_ignore_ascii_case("off")
+        }
+        Err(_) => false,
+    }
+}
 /// Pretty print a "name value"
 pub fn println_name_value(name: &str, value: &str) {
     println!("{}", format_name_value(name, value));
