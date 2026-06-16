@@ -1,6 +1,59 @@
-use std::{cell::Cell, marker::PhantomPinned, pin::Pin, ptr::NonNull};
+use std::{cell::{Cell, UnsafeCell}, marker::PhantomPinned, pin::Pin, ptr::NonNull};
 
-type ListLink<T, const N: usize> = Option<NonNull<ListNode<T, N>>>;
+struct ListLink<T, const N: usize>(UnsafeCell<Option<NonNull<ListNode<T, N>>>>);
+
+impl<T, const N: usize> ListLink<T, N> {
+    fn link(&self) -> Option<NonNull<ListNode<T, N>>> {
+        unsafe {
+            *self.0.get()
+        }
+    }
+
+    fn link_mut(&mut self) -> Option<NonNull<ListNode<T, N>>> {
+        unsafe {
+            *self.0.get()
+        }
+    }
+
+    fn is_some(&self) -> bool {
+        self.link().is_some()
+    }
+}
+
+impl<T, const N: usize> From<Option<NonNull<ListNode<T, N>>>> for ListLink<T, N> {
+    fn from(value: Option<NonNull<ListNode<T, N>>>) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+}
+
+impl<T, const N: usize> From<*mut ListNode<T, N>> for ListLink<T, N> {
+    fn from(value: *mut ListNode<T, N>) -> Self {
+        NonNull::new(value).into()
+    }
+}
+
+impl<T, const N: usize> PartialEq for ListLink<T, N> {
+    fn eq(&self, rhs: &Self) -> bool {
+        unsafe {
+            *self.0.get() == *rhs.0.get()
+        }
+    }
+}
+
+impl<T, const N: usize> Eq for ListLink<T, N> {
+}
+
+impl<T, const N: usize> Clone for ListLink<T, N> {
+    fn clone(&self) -> Self {
+        Self(unsafe {*self.0.get()}.into())
+    }
+}
+
+impl<T, const N: usize> Default for ListLink<T, N> {
+    fn default() -> Self {
+        Self(UnsafeCell::new(None))
+    }
+}
 
 struct ListNode<T, const N: usize> {
     payload: Option<T>,
@@ -15,8 +68,8 @@ impl<T, const N: usize> ListNode<T, N> {
         Self {
             payload: Some(payload),
             borrows: Cell::new(1),
-            next: [None; N],
-            prev: [None; N],
+            next: std::array::from_fn(|_| ListLink::default()),
+            prev: std::array::from_fn(|_| ListLink::default()),
             _marker: PhantomPinned
         }
     }
@@ -25,8 +78,8 @@ impl<T, const N: usize> ListNode<T, N> {
         Self {
             payload: None,
             borrows: Cell::new(1),
-            next: [None; N],
-            prev: [None; N],
+            next: std::array::from_fn(|_| ListLink::default()),
+            prev: std::array::from_fn(|_| ListLink::default()),
             _marker: PhantomPinned
         }
     }
@@ -44,12 +97,13 @@ impl<T, const N: usize, const I: usize, const DELETE_ALL: bool> Drop
     for IntrusiveList<T, N, I, DELETE_ALL>
 {
     fn drop(&mut self) {
-        //not iterating to silence miri errors
-        while let Some(mut cur) = self.front() {
-            if DELETE_ALL {
-                ItemHolder::from(cur).unlink();
-            } else {
-                cur.unlink();
+        if let Some(head) = self.private_head_mut() {
+            while let Some(mut cur) = head.next() {
+                if DELETE_ALL {
+                    ItemHolder::from(cur).unlink();
+                } else {
+                    cur.unlink();
+                }
             }
         }
     }
@@ -112,8 +166,8 @@ impl<T, const N: usize, const I: usize, const DELETE_ALL: bool>
             let pin = self.hub.as_mut().unwrap().as_mut();
             let ptr = unsafe { pin.get_unchecked_mut() as *mut ListNode<T, N> };
             unsafe {
-                (*ptr).next[I] = NonNull::new(ptr);
-                (*ptr).prev[I] = NonNull::new(ptr);
+                (*ptr).next[I] = ptr.into();
+                (*ptr).prev[I] = ptr.into();
             }
         }
     }
@@ -146,7 +200,7 @@ impl<T, const N: usize, const I: usize, const DELETE_ALL: bool>
         match self.hub.as_ref() {
             Some(hub) => {
                 let ptr = hub.as_ref().get_ref() as *const ListNode<T, N>;
-                hub.as_ref().next[I] == NonNull::new(ptr.cast_mut())
+                hub.as_ref().next[I] == ptr.cast_mut().into()
             },
             None => true
         }
@@ -238,16 +292,16 @@ impl<T, const N: usize, const I: usize> Clone for Cursor<T, N, I> {
 }
 
 unsafe fn unlink_impl<T, const N: usize>(mut ptr: NonNull<ListNode<T, N>>, i: usize) {
-    let next = unsafe {ptr.as_mut().next[i]};
-    let prev = unsafe {ptr.as_mut().prev[i]};
+    let next = unsafe {ptr.as_mut().next[i].link_mut()};
+    let prev = unsafe {ptr.as_mut().prev[i].link_mut()};
 
     match (next, prev) {
         (Some(mut next), Some(mut prev)) => unsafe {
-            next.as_mut().prev[i] = Some(prev);
-            prev.as_mut().next[i] = Some(next);
+            next.as_mut().prev[i] = Some(prev).into();
+            prev.as_mut().next[i] = Some(next).into();
 
-            ptr.as_mut().next[i] = None;
-            ptr.as_mut().prev[i] = None;
+            ptr.as_mut().next[i] = None.into();
+            ptr.as_mut().prev[i] = None.into();
         }
         (None, None) => {}
         _ => panic!("broken list links")
@@ -288,13 +342,13 @@ impl<T, const N: usize, const I: usize> Cursor<T, N, I> {
     pub fn insert_after(&mut self, other: &mut Cursor<T, N, I>) {
         other.unlink();
         unsafe {
-            let next = self.cur.as_ref().next[I];
-            self.cur.as_mut().next[I] = Some(other.cur);
-            other.cur.as_mut().prev[I] = Some(self.cur);
+            let next = self.cur.as_mut().next[I].link_mut();
+            self.cur.as_mut().next[I] = Some(other.cur).into();
+            other.cur.as_mut().prev[I] = Some(self.cur).into();
 
-            other.cur.as_mut().next[I] = next;
+            other.cur.as_mut().next[I] = next.into();
             if let Some(mut next) = next {
-                next.as_mut().prev[I] = Some(other.cur);
+                next.as_mut().prev[I] = Some(other.cur).into();
             }
         }
     }
@@ -308,7 +362,7 @@ impl<T, const N: usize, const I: usize> Cursor<T, N, I> {
     }
 
     fn next_item(&self) -> Option<Cursor<T, N, I>> {
-        unsafe { self.cur.as_ref().next[I].map(|next| Self::new(next)) }
+        unsafe { self.cur.as_ref().next[I].link().map(|next| Self::new(next)) }
     }
 
     pub fn next(&self) -> Option<Cursor<T, N, I>> {
@@ -316,7 +370,7 @@ impl<T, const N: usize, const I: usize> Cursor<T, N, I> {
     }
 
     fn prev_item(&self) -> Option<Cursor<T, N, I>> {
-        unsafe { self.cur.as_ref().prev[I].map(|next| Self::new(next)) }
+        unsafe { self.cur.as_ref().prev[I].link().map(|next| Self::new(next)) }
     }
 
     fn prev(&self) -> Option<Cursor<T, N, I>> {
