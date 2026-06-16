@@ -141,8 +141,11 @@ dependencies = [
  "log",
  "solana-clock",
  "solana-hash 3.1.0",
+ "solana-message",
  "solana-signature",
  "solana-transaction",
+ "solana-transaction-context",
+ "solana-transaction-error",
  "solana-transaction-status",
  "thiserror 2.0.17",
 ]
