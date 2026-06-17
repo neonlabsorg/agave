@@ -69,7 +69,7 @@ enum TxState {
         holder: ActiveTxsListPlaceHolder,
         assigned_to: usize,
     },
-    Picked(usize)
+    Picked
 }
 
 impl Drop for TxState {
@@ -83,7 +83,7 @@ impl Drop for TxState {
 impl TxState {
     fn is_picked(&self) -> bool {
         match self {
-            Self::Picked(_) => true,
+            Self::Picked => true,
             _ => false
         }
     }
@@ -564,7 +564,7 @@ impl LockingQueue {
                     }
                 }
                 assert!(tx_meta.state.is_active());
-                tx_meta.state = TxState::Picked(thread);
+                tx_meta.state = TxState::Picked;
                 tx_meta.expire_queue_holder.as_mut().unwrap().unlink();
 
                 tx_meta.affinity_subs = AffinitySubscriptionList::new();
@@ -582,19 +582,20 @@ impl LockingQueue {
             let Some(meta) = self.metas.get_mut(key) else {
                 return true;
             };
+            assert!(!meta.state.is_picked());
             let expired = meta.expire_slot <= self.slot;
             if expired {
-                if let TxState::Picked(worker) = meta.state {
-                    let tx = txdata.txdata(meta.shared_key);
-                    self.picked_locks.unlock_accounts(tx.write_locks(), tx.read_locks(), worker);
-                    self.backlogs[worker] -= 1;
-                } else if let TxState::Active { assigned_to, .. } = meta.state {
+                if let TxState::Active { assigned_to, .. } = meta.state {
                     self.actives_assigned_weight[assigned_to] -= meta.active_balancing_weight;
                 }
                 // compensating unconditional unblocks below
                 while let Some(item) = meta.resource_queue_subs.pop_front() {
                     let (_, is_write, lock) = item.contained();
                     if let Some(queue) = self.resources.get_mut(lock) {
+                        // The tx leaves the acquire queue without being granted, so
+                        // mirror drain()'s bookkeeping: drop its waiter count and
+                        // block() to compensate the unconditional unblock() below.
+                        queue.blocked_txs -= 1;
                         queue.block(*is_write);
                     }
                 }
@@ -1016,7 +1017,7 @@ fn main() {
                                 assert!(v.resource_queue_subs.is_empty());
                                 assigned_to_stats[assigned_to] += v.active_balancing_weight;
                             }
-                            TxState::Picked(_) => {
+                            TxState::Picked => {
                                 statuses[3] += 1;
                                 assert!(v.resource_queue_subs.is_empty());
                                 assert!(v.affinity_requirements_count <= 1);
