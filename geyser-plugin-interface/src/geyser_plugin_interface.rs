@@ -160,6 +160,8 @@ pub struct TransactionStatusMetaLegacy {
     pub compute_units_consumed: Option<u64>,
     pub cost_units: Option<u64>,
 }
+const _: () = assert!(core::mem::size_of::<TransactionStatusMetaLegacy>() == 328);
+
 
 impl From<&TransactionStatusMeta> for TransactionStatusMetaLegacy {
     /// Builds the frozen legacy view, dropping any fields added after the

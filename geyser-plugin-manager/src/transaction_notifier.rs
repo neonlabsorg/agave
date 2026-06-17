@@ -36,6 +36,13 @@ impl TransactionNotifier for TransactionNotifierImpl {
         transaction: &VersionedTransaction,
     ) {
         let mut measure = Measure::start("geyser-plugin-notify_plugins_of_transaction_info");
+
+        let plugin_manager = self.plugin_manager.read().unwrap();
+        
+        if plugin_manager.plugins.is_empty() {
+            return;
+        }
+
         // Hand plugins the frozen, ABI-stable view of the metadata. Plugins are
         // compiled separately and read `TransactionStatusMeta` fields by offset;
         // exposing the evolving struct directly breaks binary compatibility.
@@ -48,12 +55,6 @@ impl TransactionNotifier for TransactionNotifierImpl {
             &transaction_status_meta,
             transaction,
         );
-
-        let plugin_manager = self.plugin_manager.read().unwrap();
-
-        if plugin_manager.plugins.is_empty() {
-            return;
-        }
 
         for plugin in plugin_manager.plugins.iter() {
             if !plugin.transaction_notifications_enabled() {

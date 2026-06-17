@@ -2287,8 +2287,8 @@ pub struct TransactionStatusSender {
     pub dependency_tracker: Option<Arc<DependencyTracker>>,
 }
 
-#[allow(clippy::too_many_arguments)]
 impl TransactionStatusSender {
+    #[allow(clippy::too_many_arguments)]
     pub fn send_transaction_status_batch(
         &self,
         slot: Slot,
