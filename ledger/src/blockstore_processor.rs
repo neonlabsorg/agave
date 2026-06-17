@@ -2288,6 +2288,7 @@ pub struct TransactionStatusSender {
 }
 
 impl TransactionStatusSender {
+    #[allow(clippy::too_many_arguments)]
     pub fn send_transaction_status_batch(
         &self,
         slot: Slot,
