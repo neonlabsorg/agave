@@ -1,7 +1,7 @@
 use std::{collections::{BTreeSet, BinaryHeap, VecDeque}, panic, time::Duration};
 
 use agave_scheduler_bindings::{pack_message_flags::{self, check_flags}, worker_message_types::{not_included_reasons, parsing_and_sanitization_flags, resolve_flags, status_check_flags}, MAX_TRANSACTIONS_PER_MESSAGE};
-use agave_scheduling_utils::{bridge::{KeyedTransactionMeta, ScheduleBatch, TransactionKey, TransactionState, TxDecision, WorkerAction}, handshake::ClientLogon, thread_aware_account_locks::{self, ThreadAwareAccountLocks, ThreadId, ThreadSet}};
+use agave_scheduling_utils::{bridge::{KeyedTransactionMeta, ScheduleBatch, TransactionKey, TransactionState, TxDecision, WorkerAction}, handshake::ClientLogon, thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet}};
 use clap::Parser;
 use intrusive_list::{IntrusiveList, ItemHolder};
 use serde::Deserialize;
@@ -25,8 +25,6 @@ struct TpuConfig {
     pub allocator_size: usize,
     pub tpu_to_pack_capacity: usize,
     pub progress_tracker_capacity: usize,
-    pub pack_to_worker_capacity: usize,
-    pub worker_to_pack_capacity: usize,
 }
 
 
@@ -60,12 +58,26 @@ slotmap::new_key_type! {
     struct SchedulerTxKey;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+type ActiveTxsWorkerList = IntrusiveList<SchedulerTxKey, 1, 0, true>;
+type ActiveTxsListPlaceHolder = ItemHolder<SchedulerTxKey, 1>;
+
+#[derive(Clone, Debug)]
 enum TxState {
     Enqueued,
-    Active,
-    Backpressured(usize),
+    Locked,
+    Active{
+        holder: ActiveTxsListPlaceHolder,
+        assigned_to: usize,
+    },
     Picked(usize)
+}
+
+impl Drop for TxState {
+    fn drop(&mut self) {
+        if let Self::Active{ref mut holder, ..} = self {
+            holder.unlink();
+        }
+    }
 }
 
 impl TxState {
@@ -76,9 +88,16 @@ impl TxState {
         }
     }
 
-    fn is_backpressured(&self) -> bool {
+    fn is_active(&self) -> bool {
         match self {
-            Self::Backpressured(_) => true,
+            Self::Active{..} => true,
+            _ => false
+        }
+    }
+
+    fn is_enqueued(&self) -> bool {
+        match self {
+            Self::Enqueued => true,
             _ => false
         }
     }
@@ -121,17 +140,6 @@ impl Score {
         self.0
     }
 }
-//
-//const fn parse_rules_max() -> usize {
-//    let rules_cnt = env!("RULES_MAX");
-//    match usize::from_str_radix(rules_cnt, 10) {
-//        Ok(v) => v,
-//        Err(_) => panic!("invalid value for rules_max bound")
-//    }
-//}
-//
-//#[allow(unused)]
-//const RULES_MAX: usize = parse_rules_max();
 
 
 #[derive(Default)]
@@ -146,9 +154,19 @@ struct TxMeta {
     state: TxState,
     score: Score,
     expire_slot: u64,
+    rebalance_locked: bool,
+
+    active_balancing_weight: usize,
 }
 
 impl TxMeta {
+    fn affine_to(&self) -> Option<usize> {
+        assert!(!self.state.is_enqueued());
+        assert!(self.affinity_requirements_count <= 1);
+        let front = self.affinity_subs.front();
+        front.map(|item| item.contained().1)
+    }
+
     fn new(shared_key: TransactionKey, score: Score, slot: u64) -> Self {
         Self {
             shared_key,
@@ -158,7 +176,9 @@ impl TxMeta {
             affinity_subs: AffinitySubscriptionList::new(),
             resource_queue_subs: TxLocksSubscriptionList::new(),
             score,
-            expire_slot: slot
+            expire_slot: slot,
+            rebalance_locked: false,
+            active_balancing_weight: 0
         }
     }
 
@@ -181,9 +201,10 @@ impl TxMeta {
 
 // tx lifecycle:
 // 1. Enqueued for all the resources
-// 2. Dequeued -> blocked state
+// 2. Dequeued -> Locked state
 //  .. here affinity constraints are calculated (max 1 for each locked account)
-// 3. (affinity constraints + backpressure passed) -> picked state
+// 3. (affinity constraints) -> Active state
+// 4. Actual pick in main
 // picked means that we already decided which tread it will be executed on
 
 #[derive(Default)]
@@ -191,6 +212,8 @@ struct ResourceLockingQueue {
     acquire_queue: LockWaitingTxsList,
     blocked_reads: usize,
     blocked_writes: usize,
+
+    blocked_txs: usize,
 }
 
 impl ResourceLockingQueue {
@@ -214,6 +237,7 @@ impl ResourceLockingQueue {
         }
         let item = ItemHolder::new((key, is_write, *lock));
         self.acquire_queue.push_back(&mut item.clone().into());
+        self.blocked_txs += 1;
         txmeta.resource_queue_subs.push_front(&mut item.into());
     }
 
@@ -251,6 +275,7 @@ impl ResourceLockingQueue {
         }
 
         if let Some(item) = self.acquire_queue.pop_front() {
+            self.blocked_txs -= 1;
             let (key, is_write, _) = item.contained();
             if *is_write {
                 self.blocked_writes += 1;
@@ -264,18 +289,28 @@ impl ResourceLockingQueue {
     }
 }
 
-#[derive(Eq, Ord)]
+#[derive(Eq)]
 struct PickedTx(Score, SchedulerTxKey);
 
+// Ordered by `Score` only; the key is just an identity and carries no meaningful
+// order. `Ord`/`PartialOrd`/`Eq`/`PartialEq` must all agree, so `Ord` ignores the
+// key too (a derived `Ord` would compare it and break the contract vs the
+// score-only `PartialEq`/`PartialOrd`).
 impl PartialEq for PickedTx {
     fn eq(&self, other: &PickedTx) -> bool {
         self.0.eq(&other.0)
     }
 }
 
+impl Ord for PickedTx {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
 impl PartialOrd for PickedTx {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
@@ -324,31 +359,29 @@ impl<T: Copy> MutableTxProvider for agave_scheduling_utils::bridge::SchedulerBin
     }
 }
 
-enum Event {
-    AddressUnblocked(Address),
-    AffinityRequirementDropped(SchedulerTxKey),
-}
-
 struct LockingQueue {
     resources: AHashMap<Address, ResourceLockingQueue>,
     metas: slotmap::SlotMap<SchedulerTxKey, TxMeta>,
-    picked: Vec<BinaryHeap<PickedTx>>,
-
     affinity_waiters: AHashMap<Address, AccWaiters>,
-    backpressured: Vec<VecDeque<PickedTx>>,
     max_worker_backlog: usize,
+
+    actives_assigned_weight: Vec<usize>,
+    actives_assigned: Vec<ActiveTxsWorkerList>,
+    actives_locked_on: Vec<ActiveTxsWorkerList>,
+    picked: Vec<BinaryHeap<PickedTx>>,
 
     picked_locks: ThreadAwareAccountLocks,
     num_threads: usize,
 
-    events_to_dispatch: VecDeque<Event>,
+    affinity_events: VecDeque<SchedulerTxKey>,
+    unblock_events: VecDeque<Address>,
 
     backlogs: Vec<usize>,
 
     seen_txs: usize,
 
     slot: u64,
-    expires: usize
+    expires: usize,
 }
 
 fn make_vector<T>(size: usize, f: impl FnMut() -> T) -> Vec<T> {
@@ -366,15 +399,18 @@ impl LockingQueue {
             resources: AHashMap::new(),
             metas: SlotMap::with_key(),
             picked: make_vector(num_threads, || BinaryHeap::new()),
-            backpressured: make_vector(num_threads, || VecDeque::new()),
             picked_locks: ThreadAwareAccountLocks::new(num_threads),
             num_threads,
             backlogs: make_vector(num_threads, || 0),
             affinity_waiters: AHashMap::new(),
-            events_to_dispatch: VecDeque::new(),
+            affinity_events: VecDeque::new(),
+            unblock_events: VecDeque::new(),
             seen_txs: 0,
             slot: 0,
-            expires: 0
+            expires: 0,
+            actives_assigned: make_vector(num_threads, || ActiveTxsWorkerList::new()),
+            actives_locked_on: make_vector(num_threads, || ActiveTxsWorkerList::new()),
+            actives_assigned_weight: make_vector(num_threads, || 0)
         }
     }
 
@@ -382,10 +418,10 @@ impl LockingQueue {
         self.metas.len()
     }
 
-    fn start_waiting_for_workers(&mut self, key: SchedulerTxKey, tx: &TransactionState) {
+    fn start_waiting_for_workers(&mut self, key: SchedulerTxKey, tx: &TransactionState, eager_pick: bool) {
         let tx_meta = self.metas.get_mut(key).unwrap();
         assert!(tx_meta.resource_queue_subs.is_empty());
-        tx_meta.state = TxState::Active;
+        tx_meta.state = TxState::Locked;
         let mut requirements = Vec::new();
         let mut requirements_count = 0;
         let mut register_affinity = |thread: usize, addr: Address, is_write: bool| {
@@ -405,7 +441,9 @@ impl LockingQueue {
             requirements[thread] += 1;
         };
 
+        let mut weight = 1;
         for (lock, is_write) in tx.locks() {
+            weight = std::cmp::max(weight, 1 + self.resources.get(lock).unwrap().blocked_txs);
             if let Some(acc_locks) = self.picked_locks.acc_locks(lock) {
                 if is_write {
                     if let Some(locks) = &acc_locks.read_locks {
@@ -419,13 +457,17 @@ impl LockingQueue {
                 }
             }
         }
-
+        tx_meta.active_balancing_weight = weight;
         tx_meta.set_affinity_requirements(requirements);
-        if tx_meta.affinity_requirements_count <= 1 {
-            self.try_pick_tx(key, tx, false);
+        let reqs_count = tx_meta.affinity_requirements_count;
+        if reqs_count <= 1 {
+            let thread = self.make_active(key).unwrap();
+            if eager_pick {
+                self.try_pick_tx(key, tx, thread);
+            }
             assert!({
                 let tx_meta = self.metas.get(key).unwrap();
-                tx_meta.state.is_picked() || tx_meta.state.is_backpressured()
+                tx_meta.state.is_picked() || tx_meta.state.is_active()
             });
         }
     }
@@ -438,11 +480,11 @@ impl LockingQueue {
             self.resources.entry(*lock).or_default().push(key, meta, is_write, lock);
         }
         if meta.resource_queue_subs.is_empty() {
-            self.start_waiting_for_workers(key, tx);
+            self.start_waiting_for_workers(key, tx, false);
         }
     }
 
-    fn try_pick_tx(&mut self, key: SchedulerTxKey, txdata: &TransactionState, ignore_bp: bool) -> bool {
+    fn try_pick_tx(&mut self, key: SchedulerTxKey, txdata: &TransactionState, thread: usize) -> bool {
         let write_locks = txdata.write_locks().collect::<smallvec::SmallVec<[_; 64]>>();
         let read_locks = txdata.read_locks().collect::<smallvec::SmallVec<[_; 64]>>();
         let tx_meta = self.metas.get_mut(key).unwrap();
@@ -450,14 +492,15 @@ impl LockingQueue {
         if tx_meta.state.is_picked() {
             return false;
         }
-        assert!(tx_meta.state != TxState::Enqueued);
+        let TxState::Active { assigned_to, .. } = tx_meta.state else { panic!("picking not active tx"); };
+        assert!(assigned_to == thread);
         assert!(tx_meta.resource_queue_subs.is_empty());
 
         macro_rules! can_place {
             ($thread:expr) => {
                 {
                     let thread = $thread;
-                    self.picked[thread].len() < self.max_worker_backlog && (ignore_bp || self.backpressured[thread].is_empty())
+                    self.picked[thread].len() < self.max_worker_backlog
                 }
             }
         }
@@ -465,12 +508,9 @@ impl LockingQueue {
         let lock_result = self.picked_locks.try_lock_accounts(
             write_locks.as_slice().iter().cloned(),
             read_locks.as_slice().iter().cloned(),
-            ThreadSet::any(self.num_threads),
+            ThreadSet::only(thread),
             |threads| {
-                threads.contained_threads_iter()
-                    .min_by(|thread1, thread2|
-                        (!can_place!(*thread1), self.backlogs[*thread1] + self.backpressured[*thread1].len())
-                            .cmp(&(!can_place!(*thread2), self.backlogs[*thread2] + self.backpressured[*thread2].len()))).unwrap()
+                threads.contained_threads_iter().next().unwrap()
             });
 
         match lock_result {
@@ -481,14 +521,12 @@ impl LockingQueue {
                         write_locks.as_slice().iter().cloned(),
                         read_locks.as_slice().iter().cloned(),
                         thread);
-                    if tx_meta.state != TxState::Backpressured(thread) {
-                        self.backpressured[thread].push_back(PickedTx(score, key));
-                    }
-                    tx_meta.state = TxState::Backpressured(thread);
+                    self.make_active(key);
                     return false;
                 }
 
                 self.backlogs[thread] += 1;
+                self.actives_assigned_weight[thread] -= tx_meta.active_balancing_weight;
 
                 self.picked[thread].push(PickedTx(score, key));
                 {
@@ -497,21 +535,18 @@ impl LockingQueue {
                             let locks = self.resources.get_mut(lock).unwrap();
                             locks.unblock(is_write)
                         } {
-                            self.events_to_dispatch.push_back(Event::AddressUnblocked(*lock));
+                            self.unblock_events.push_back(*lock);
                         }
                     }
                 }
+                assert!(tx_meta.state.is_active());
                 tx_meta.state = TxState::Picked(thread);
+
+                tx_meta.affinity_subs = AffinitySubscriptionList::new();
 
                 true
             },
-            Err(err) => {
-                assert!(tx_meta.affinity_requirements_count > 0);
-                match err {
-                    thread_aware_account_locks::TryLockError::MultipleConflicts => false,
-                    thread_aware_account_locks::TryLockError::ThreadNotAllowed => unreachable!("We are explicitly allowing all threads here")
-                }
-            }
+            Err(_err) => false
         }
 
     }
@@ -539,7 +574,7 @@ impl LockingQueue {
                 for (lock, is_write) in txdata.txdata(meta.shared_key).locks() {
                     if let Some(queue) = self.resources.get_mut(lock) {
                         if queue.unblock(is_write) {
-                            self.events_to_dispatch.push_back(Event::AddressUnblocked(*lock));
+                            self.unblock_events.push_back(*lock);
                         }
                     }
                 }
@@ -556,66 +591,144 @@ impl LockingQueue {
         }
     }
 
-    fn dispatch_event(&mut self, ev: Event, txdata: &mut impl MutableTxProvider) {
-        match ev {
-            Event::AffinityRequirementDropped(key) => {
-                if self.maybe_expire(key, txdata) {
-                    return;
-                }
-                let Some(meta) = self.metas.get(key) else {
-                    return;
-                };
-                let txdata = txdata.txdata(meta.shared_key);
-                self.try_pick_tx(key, txdata, false);
-            }
-            Event::AddressUnblocked(address) => {
-                while let Some(key) = self.resources.get_mut(&address).and_then(|q| q.drain()) {
-                    if self.maybe_expire(key, txdata) {
-                        continue;
-                    }
-                    let (no_subs, txdata) = {
-                        let meta = self.metas.get_mut(key).unwrap();
-                        (meta.resource_queue_subs.is_empty(), txdata.txdata(meta.shared_key))
-                    };
-                    if no_subs {
-                        self.start_waiting_for_workers(key, txdata);
-                    }
-                }
-                if self.resources.get(&address).map(|q| q.empty()) == Some(true) {
-                    self.resources.remove(&address);
-                }
-            }
+    fn make_active(&mut self, key: SchedulerTxKey) -> Option<usize> {
+        let Some(meta) = self.metas.get_mut(key) else {
+            return None;
+        };
+
+        if !meta.state.is_active() {
+            let holder = ActiveTxsListPlaceHolder::new(key);
+            let assigned_to = match meta.affine_to() {
+                Some(thread) => thread,
+                None => (0..self.num_threads).min_by(|x, y|
+                    (self.actives_assigned_weight[*x], self.backlogs[*x])
+                        .cmp(&(self.actives_assigned_weight[*y], self.backlogs[*y])))
+                    .expect("there should be at least one worker")
+            };
+            self.actives_assigned_weight[assigned_to] += meta.active_balancing_weight;
+            self.actives_assigned[assigned_to].push_back(&mut holder.clone().into());
+            meta.state = TxState::Active{holder, assigned_to};
+            Some(assigned_to)
+        } else {
+            let TxState::Active { assigned_to, .. } = meta.state else {
+                panic!("should be unreachable");
+            };
+            Some(assigned_to)
         }
     }
 
-    fn drain_backpressured(&mut self, thread: usize, txdata: &mut impl MutableTxProvider) {
-        while self.picked[thread].len() < self.max_worker_backlog {
-            let Some(PickedTx(_, key)) = self.backpressured[thread].pop_front() else {
+    fn rebalance_actives(&mut self) {
+        // ceil bound
+        let mut threadweights = (0..self.num_threads).map(|i| (self.actives_assigned_weight[i], i)).collect::<Vec<_>>();
+        threadweights.sort();
+        threadweights.reverse();
+
+        let mut maxweight = 0;
+        for (_, i) in threadweights {
+            if self.actives_assigned_weight[i] <= maxweight {
                 break;
-            };
-
-            if self.metas.get(key).map(|meta| meta.state.is_picked()).unwrap_or(true) {
-                continue;
             }
+            while !self.actives_locked_on[i].is_empty() || !self.actives_assigned[i].is_empty() {
+                let key = if !self.actives_locked_on[i].is_empty() {
+                    *self.actives_locked_on[i].front().unwrap().contained()
+                } else {
+                    assert!(!self.actives_assigned[i].is_empty());
+                    *self.actives_assigned[i].tail().unwrap().contained()
+                };
 
+                let (weight, affine) = {
+                    let meta = self.metas.get(key).unwrap();
+                    (meta.active_balancing_weight, meta.affine_to())
+                };
+                self.actives_assigned_weight[i] -= weight;
+
+                let thread = (0..self.num_threads).min_by(|x, y|
+                    (self.actives_assigned_weight[*x], Some(*x) != affine, self.backlogs[*x])
+                        .cmp(&(self.actives_assigned_weight[*y], Some(*y) != affine, self.backlogs[*y])))
+                    .expect("there should be at least one worker");
+
+                let newweight = self.actives_assigned_weight[thread] + weight;
+                let oldweight = self.actives_assigned_weight[i] + weight;
+
+                if i == thread {
+                    self.actives_assigned_weight[i] = oldweight;
+                    break;
+                }
+                let becomespickable = affine.map(|a| a == thread).unwrap_or(true);
+                if newweight + {if becomespickable {0} else {self.backlogs[i]}} >= oldweight {
+                    self.actives_assigned_weight[i] = oldweight;
+                    break;
+                }
+                maxweight = std::cmp::max(maxweight, newweight);
+
+                let meta = self.metas.get_mut(key).unwrap();
+                self.actives_assigned_weight[thread] += weight;
+                if becomespickable {
+                    meta.rebalance_locked = false;
+                    let TxState::Active { ref holder, ref mut assigned_to } = meta.state else {
+                        panic!("tx should be active here");
+                    };
+                    self.actives_assigned[thread].push_back(&mut holder.clone().into());
+                    *assigned_to = thread;
+                } else {
+                    let TxState::Active { ref holder, ref mut assigned_to } = meta.state else {
+                        panic!("tx should be active here");
+                    };
+                    meta.rebalance_locked = true;
+                    self.actives_locked_on[thread].push_back(&mut holder.clone().into());
+                    *assigned_to = thread;
+                }
+            }
+            maxweight = std::cmp::max(maxweight, self.actives_assigned_weight[i]);
+        }
+    }
+
+    fn dispatch_unblock_event(&mut self, ev: Address, txdata: &mut impl MutableTxProvider, pick: bool) {
+        while let Some(key) = self.resources.get_mut(&ev).and_then(|q| q.drain()) {
             if self.maybe_expire(key, txdata) {
                 continue;
             }
-
-            let txdata = txdata.txdata({
-                let meta = self.metas.get(key).unwrap();
-                assert!(meta.state.is_backpressured());
-                meta.shared_key
-            });
-
-            assert!(self.try_pick_tx(key, txdata, true));
+            let (no_subs, txdata) = {
+                let meta = self.metas.get_mut(key).unwrap();
+                (meta.resource_queue_subs.is_empty(), txdata.txdata(meta.shared_key))
+            };
+            if no_subs {
+                self.start_waiting_for_workers(key, txdata, pick);
+            }
         }
-        self.dispatch_events(txdata);
+        if self.resources.get(&ev).map(|q| q.empty()) == Some(true) {
+            self.resources.remove(&ev);
+        }
     }
 
-    fn dispatch_events(&mut self, txdata: &mut impl MutableTxProvider) {
-        while let Some(ev) = self.events_to_dispatch.pop_front() {
-            self.dispatch_event(ev, txdata);
+    fn dispatch_affinity_events(&mut self) {
+        while let Some(tx) = self.affinity_events.pop_front() {
+            self.make_active(tx);
+            let Some(meta) = self.metas.get_mut(tx) else {
+                continue;
+            };
+            if meta.rebalance_locked && meta.affine_to().is_none() {
+                meta.rebalance_locked = false;
+                let TxState::Active { ref mut holder, ref mut assigned_to } = meta.state else { panic!("rebalance locked for non-active tx")};
+                self.actives_assigned[*assigned_to].push_back(&mut holder.clone().into());
+            }
+        }
+    }
+
+    fn dispatch_unblock_events(&mut self, txdata: &mut impl MutableTxProvider, pick: bool) {
+        while let Some(ev) = self.unblock_events.pop_front() {
+            self.dispatch_unblock_event(ev, txdata, pick);
+        }
+    }
+
+    fn drain_actives(&mut self, worker: usize, txdata: &mut impl MutableTxProvider) {
+        while self.backlogs[worker] < self.max_worker_backlog {
+            let Some(tx) = self.actives_assigned[worker].front() else {
+                break;
+            };
+            let key = *tx.contained();
+            assert!(self.try_pick_tx(key, txdata.txdata(self.metas.get(key).unwrap().shared_key), worker));
+            self.dispatch_unblock_events(txdata, true);
         }
     }
 
@@ -633,7 +746,7 @@ impl LockingQueue {
                 while let Some((waiter, blocked_on)) = waiters.drain(acc_locks.map_or(false, |acc| acc.read_locks.is_some())) {
                     if let Some(tx_meta) = self.metas.get_mut(waiter) {
                         if tx_meta.remove_affinity_requirement(blocked_on) && tx_meta.affinity_requirements_count <= 1 {
-                            self.events_to_dispatch.push_back(Event::AffinityRequirementDropped(waiter));
+                            self.affinity_events.push_back(waiter);
                         }
                     }
                 }
@@ -670,14 +783,31 @@ fn main() {
     //assert!(RULES_MAX >= config.priority_rules.len());
     //assert!(RULES_MAX > config.default_priority);
     println!("config {config:?}");
+    // Both per-worker rings are bounded by the same backpressure limit, so derive
+    // their capacity instead of trusting hand-tuned config. The scheduler caps
+    // per-worker in-flight txs (`max_txs_per_worker` for execute workers,
+    // `check_max_inflight` for the check worker):
+    //  * pack_to_worker: each queued message holds >= 1 in-flight tx, so unconsumed
+    //    request messages <= the in-flight cap;
+    //  * worker_to_pack: one response message per in-flight batch, each batch holds
+    //    >= 1 in-flight tx, so undrained response messages <= the in-flight cap.
+    // Sizing each ring to cover that cap makes a full queue unreachable, so the
+    // `.unwrap()` on `schedule` is a guaranteed invariant rather than a panic
+    // surface. The SPSC ring rounds capacity up to a power of two anyway, so
+    // request the next power of two directly.
+    let worker_queue_capacity = config
+        .max_txs_per_worker
+        .max(config.check_max_inflight)
+        .next_power_of_two();
+
     let logon = ClientLogon {
         allocator_size: config.tpu.allocator_size,
-        pack_to_worker_capacity: config.tpu.pack_to_worker_capacity,
+        pack_to_worker_capacity: worker_queue_capacity,
         progress_tracker_capacity: config.tpu.progress_tracker_capacity,
         allocator_handles: 1,
         tpu_to_pack_capacity: config.tpu.tpu_to_pack_capacity,
         worker_count: config.tpu.worker_count + 1,
-        worker_to_pack_capacity: config.tpu.worker_to_pack_capacity,
+        worker_to_pack_capacity: worker_queue_capacity,
         flags: 0
     };
 
@@ -742,6 +872,7 @@ fn main() {
         }
 
         bridge.drain_worker(check_worker, |bridge, worker_resp| {
+            check_inflight -= 1;
             match worker_resp.response {
                 WorkerAction::Check(response, _pubkeys) => {
                     if locking_queue.size() >= config.max_queue_size {
@@ -797,12 +928,18 @@ fn main() {
                             TxDecision::Drop
                         }
                     },
-                    WorkerAction::Unprocessed => TxDecision::Drop // max_working_slot violation
+                    WorkerAction::Unprocessed => {
+                        locking_queue.remove_completed(key, bridge.transaction(shared_key), worker);
+                        TxDecision::Drop // max_working_slot violation
+                    }
                 }
             }, config.max_txs_per_worker);
         }
 
-        locking_queue.dispatch_events(&mut bridge);
+        locking_queue.dispatch_affinity_events();
+        locking_queue.dispatch_unblock_events(&mut bridge, false);
+        locking_queue.rebalance_actives();
+
         if let Some(period) = config.report_delay {
             let now = std::time::Instant::now();
             if last_report + period < now {
@@ -815,6 +952,7 @@ fn main() {
                 {
                     let mut statuses = vec![0; 4];
                     let mut locks_sum = 0_i64;
+                    let mut assigned_to_stats = make_vector(workers, || 0);
                     for (_k, v) in locking_queue.metas.iter() {
                         match v.state {
                             TxState::Enqueued => {
@@ -822,14 +960,15 @@ fn main() {
                                 assert!(v.affinity_requirements_count == 0);
                                 statuses[0] += 1;
                             }
-                            TxState::Active => {
+                            TxState::Locked => {
                                 statuses[1] += 1;
                                 assert!(v.resource_queue_subs.is_empty());
                                 assert!(v.affinity_requirements_count > 0);
                             }
-                            TxState::Backpressured(_) => {
+                            TxState::Active{assigned_to, ..} => {
                                 statuses[2] += 1;
                                 assert!(v.resource_queue_subs.is_empty());
+                                assigned_to_stats[assigned_to] += v.active_balancing_weight;
                             }
                             TxState::Picked(_) => {
                                 statuses[3] += 1;
@@ -856,23 +995,26 @@ fn main() {
                     }
                     assert!(locks_sum == 0, "unbalanced locks {locks_sum} among {} txs", locking_queue.size());
                     println!("enqueued tx kinds {queue_len}/{statuses:?}/{picked_queue_len}");
+                    println!("{:?} == {:?}", locking_queue.actives_assigned_weight, assigned_to_stats);
+                    assert!(locking_queue.actives_assigned_weight == assigned_to_stats);
                 }
 
-                println!("{}/{workers} saturated({:?}/{:?}) (sent {send_stats:?}); enqueued {queue_len}/{picked_queue_len}; txs seen/expires/reschedules/drops {passed_txs}/{expires}/{reschedules}/{drops} slot {slot}",
+                println!("{}/{workers} saturated(backlog/inflight {:?}/{:?}) (sent {send_stats:?}); enqueued {queue_len}/{picked_queue_len} actives {:?}; txs seen/expires/reschedules/drops {passed_txs}/{expires}/{reschedules}/{drops} slot {slot}",
 
                     locking_queue.backlogs.iter().filter(|x| **x>0).count(),
-                    locking_queue.backlogs, inflight);
+                    locking_queue.backlogs, inflight,
+                    locking_queue.actives_assigned_weight);
 
                 last_report = now;
             }
         }
 
         for worker in 0..workers {
-            locking_queue.drain_backpressured(worker, &mut bridge);
+            locking_queue.drain_actives(worker, &mut bridge);
             let mut batch = smallvec::SmallVec::<[_; MAX_TRANSACTIONS_PER_MESSAGE]>::new();
             macro_rules! send_batch {
                 () => {
-                    assert!(batch.len() < MAX_TRANSACTIONS_PER_MESSAGE);
+                    assert!(batch.len() <= MAX_TRANSACTIONS_PER_MESSAGE);
                     bridge.schedule(ScheduleBatch{
                         worker,
                         transactions: batch.as_slice(),
@@ -899,8 +1041,6 @@ fn main() {
             if !batch.is_empty() {
                 send_batch!();
             }
-
-            locking_queue.drain_backpressured(worker, &mut bridge);
         }
 
         if to_spin {
