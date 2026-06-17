@@ -436,7 +436,7 @@ impl LockingQueue {
         self.metas.len()
     }
 
-    fn start_waiting_for_workers(&mut self, key: SchedulerTxKey, tx: &TransactionState, eager_pick: bool) {
+    fn start_waiting_for_workers(&mut self, key: SchedulerTxKey, tx: &TransactionState) {
         let tx_meta = self.metas.get_mut(key).unwrap();
         assert!(tx_meta.resource_queue_subs.is_empty());
         tx_meta.state = TxState::Locked;
@@ -479,10 +479,7 @@ impl LockingQueue {
         tx_meta.set_affinity_requirements(requirements);
         let reqs_count = tx_meta.affinity_requirements_count;
         if reqs_count <= 1 {
-            let thread = self.make_active(key).unwrap();
-            if eager_pick {
-                self.try_pick_tx(key, tx, thread);
-            }
+            self.make_active(key).unwrap();
             assert!({
                 let tx_meta = self.metas.get(key).unwrap();
                 tx_meta.state.is_picked() || tx_meta.state.is_active()
@@ -504,7 +501,7 @@ impl LockingQueue {
             self.resources.entry(*lock).or_default().push(key, meta, is_write, lock);
         }
         if meta.resource_queue_subs.is_empty() {
-            self.start_waiting_for_workers(key, tx, false);
+            self.start_waiting_for_workers(key, tx);
         }
     }
 
@@ -687,6 +684,14 @@ impl LockingQueue {
                     self.actives_assigned_weight[i] = oldweight;
                     break;
                 }
+
+                #[cfg(feature="runtime-checks")]
+                {
+                    self.actives_assigned_weight[i] += weight;
+                    println!("rebalance {:?} [{i}] -> [{thread}] with [{weight}]", self.actives_assigned_weight);
+                    self.actives_assigned_weight[i] -= weight;
+                }
+
                 maxweight = std::cmp::max(maxweight, newweight);
                 self.rebalances += 1;
 
@@ -712,7 +717,7 @@ impl LockingQueue {
         }
     }
 
-    fn dispatch_unblock_event(&mut self, ev: Address, txdata: &mut impl MutableTxProvider, pick: bool) {
+    fn dispatch_unblock_event(&mut self, ev: Address, txdata: &mut impl MutableTxProvider) {
         while let Some(key) = self.resources.get_mut(&ev).and_then(|q| q.drain()) {
             if self.maybe_expire(key, txdata) {
                 continue;
@@ -722,7 +727,7 @@ impl LockingQueue {
                 (meta.resource_queue_subs.is_empty(), txdata.txdata(meta.shared_key))
             };
             if no_subs {
-                self.start_waiting_for_workers(key, txdata, pick);
+                self.start_waiting_for_workers(key, txdata);
             }
         }
         if self.resources.get(&ev).map(|q| q.empty()) == Some(true) {
@@ -744,20 +749,31 @@ impl LockingQueue {
         }
     }
 
-    fn dispatch_unblock_events(&mut self, txdata: &mut impl MutableTxProvider, pick: bool) {
+    fn dispatch_unblock_events(&mut self, txdata: &mut impl MutableTxProvider) {
         while let Some(ev) = self.unblock_events.pop_front() {
-            self.dispatch_unblock_event(ev, txdata, pick);
+            self.dispatch_unblock_event(ev, txdata);
         }
     }
 
     fn drain_actives(&mut self, worker: usize, txdata: &mut impl MutableTxProvider) {
+        let Some(guard) = self.actives_assigned[worker].tail().map(|x| *x.contained()) else {
+            return;
+        };
+
         while self.backlogs[worker] < self.max_worker_backlog {
+            // after draining a tx class, several new can be placed to the list
+            // in this case I rotate actives list and drain one of them
+            // I explicitly guard preexisting transactions from these rotations so that they will be drained in normal fifo order on successive iterations
+            let tail = self.actives_assigned[worker].tail();
+            if tail.as_ref().map(|x| *x.contained() != guard).unwrap_or(false) {
+                self.actives_assigned[worker].push_front(&mut tail.unwrap());
+            }
             let Some(tx) = self.actives_assigned[worker].front() else {
                 break;
             };
             let key = *tx.contained();
             assert!(self.try_pick_tx(key, txdata.txdata(self.metas.get(key).unwrap().shared_key), worker));
-            self.dispatch_unblock_events(txdata, true);
+            self.dispatch_unblock_events(txdata);
         }
     }
 
@@ -984,7 +1000,7 @@ fn main() {
         }
 
         locking_queue.dispatch_affinity_events();
-        locking_queue.dispatch_unblock_events(&mut bridge, false);
+        locking_queue.dispatch_unblock_events(&mut bridge);
         locking_queue.rebalance_actives();
 
         if let Some(period) = config.report_delay {
