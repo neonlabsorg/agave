@@ -141,6 +141,8 @@ impl Score {
     }
 }
 
+type TxExpireQueue = IntrusiveList<SchedulerTxKey, 1, 0, true>;
+type TxExpirePlaceHolder = ItemHolder<SchedulerTxKey, 1>;
 
 #[derive(Default)]
 struct TxMeta {
@@ -157,6 +159,16 @@ struct TxMeta {
     rebalance_locked: bool,
 
     active_balancing_weight: usize,
+
+    expire_queue_holder: Option<TxExpirePlaceHolder>,
+}
+
+impl Drop for TxMeta {
+    fn drop(&mut self) {
+        if let Some(holder) = self.expire_queue_holder.as_mut() {
+            holder.unlink();
+        }
+    }
 }
 
 impl TxMeta {
@@ -178,7 +190,8 @@ impl TxMeta {
             score,
             expire_slot: slot,
             rebalance_locked: false,
-            active_balancing_weight: 0
+            active_balancing_weight: 0,
+            expire_queue_holder: None,
         }
     }
 
@@ -370,6 +383,8 @@ struct LockingQueue {
     actives_locked_on: Vec<ActiveTxsWorkerList>,
     picked: Vec<BinaryHeap<PickedTx>>,
 
+    txs_in_arrival_order: TxExpireQueue,
+
     picked_locks: ThreadAwareAccountLocks,
     num_threads: usize,
 
@@ -382,6 +397,7 @@ struct LockingQueue {
 
     slot: u64,
     expires: usize,
+    rebalances: usize,
 }
 
 fn make_vector<T>(size: usize, f: impl FnMut() -> T) -> Vec<T> {
@@ -395,6 +411,7 @@ impl LockingQueue {
     fn new(num_threads: usize, max_worker_backlog: usize) -> Self {
         assert!(num_threads > 0);
         Self {
+            rebalances: 0,
             max_worker_backlog,
             resources: AHashMap::new(),
             metas: SlotMap::with_key(),
@@ -410,7 +427,8 @@ impl LockingQueue {
             expires: 0,
             actives_assigned: make_vector(num_threads, || ActiveTxsWorkerList::new()),
             actives_locked_on: make_vector(num_threads, || ActiveTxsWorkerList::new()),
-            actives_assigned_weight: make_vector(num_threads, || 0)
+            actives_assigned_weight: make_vector(num_threads, || 0),
+            txs_in_arrival_order: TxExpireQueue::new(),
         }
     }
 
@@ -475,6 +493,12 @@ impl LockingQueue {
     fn new_tx(&mut self, meta: TxMeta, tx: &TransactionState) {
         self.seen_txs += 1;
         let key = self.metas.insert(meta);
+        {
+            // Record arrival: front is newest, so the list tail is the oldest tx.
+            let holder = TxExpirePlaceHolder::new(key);
+            self.txs_in_arrival_order.push_front(&mut holder.clone().into());
+            self.metas.get_mut(key).unwrap().expire_queue_holder = Some(holder);
+        }
         let meta = self.metas.get_mut(key).unwrap();
         for (lock, is_write) in tx.locks() {
             self.resources.entry(*lock).or_default().push(key, meta, is_write, lock);
@@ -541,6 +565,7 @@ impl LockingQueue {
                 }
                 assert!(tx_meta.state.is_active());
                 tx_meta.state = TxState::Picked(thread);
+                tx_meta.expire_queue_holder.as_mut().unwrap().unlink();
 
                 tx_meta.affinity_subs = AffinitySubscriptionList::new();
 
@@ -563,6 +588,8 @@ impl LockingQueue {
                     let tx = txdata.txdata(meta.shared_key);
                     self.picked_locks.unlock_accounts(tx.write_locks(), tx.read_locks(), worker);
                     self.backlogs[worker] -= 1;
+                } else if let TxState::Active { assigned_to, .. } = meta.state {
+                    self.actives_assigned_weight[assigned_to] -= meta.active_balancing_weight;
                 }
                 // compensating unconditional unblocks below
                 while let Some(item) = meta.resource_queue_subs.pop_front() {
@@ -660,6 +687,7 @@ impl LockingQueue {
                     break;
                 }
                 maxweight = std::cmp::max(maxweight, newweight);
+                self.rebalances += 1;
 
                 let meta = self.metas.get_mut(key).unwrap();
                 self.actives_assigned_weight[thread] += weight;
@@ -838,6 +866,24 @@ fn main() {
             locking_queue.slot = slot;
         }
 
+        // Proactively expire the oldest transactions before pulling new work in.
+        // Arrival order matches expire-slot order (every tx is stamped with the
+        // current slot + a fixed deadline), so the tail is the closest to
+        // expiry: once it is still live, nothing older can be expired either.
+        // Bounded by the same granularity as TPU draining to keep each
+        // iteration's work balanced.
+        let mut expired_steps = 0;
+        while expired_steps < config.drain_tpu_granularity {
+            let Some(key) = locking_queue.txs_in_arrival_order.tail().map(|c| *c.contained()) else {
+                break;
+            };
+            assert!(!locking_queue.metas.get(key).map(|m| m.state.is_picked()).unwrap_or(false));
+            if !locking_queue.maybe_expire(key, &mut bridge) {
+                break;
+            }
+            expired_steps += 1;
+        }
+
         let mut new_txs = Vec::new();
 
         bridge.drain_tpu(|bridge, tx_key| {
@@ -999,7 +1045,8 @@ fn main() {
                     assert!(locking_queue.actives_assigned_weight == assigned_to_stats);
                 }
 
-                println!("{}/{workers} saturated(backlog/inflight {:?}/{:?}) (sent {send_stats:?}); enqueued {queue_len}/{picked_queue_len} actives {:?}; txs seen/expires/reschedules/drops {passed_txs}/{expires}/{reschedules}/{drops} slot {slot}",
+                let rebalances = locking_queue.rebalances;
+                println!("{}/{workers} saturated(backlog/inflight {:?}/{:?}) (sent {send_stats:?}); enqueued {queue_len}/{picked_queue_len} actives {:?}, rebalances {rebalances}; txs seen/expires/reschedules/drops {passed_txs}/{expires}/{reschedules}/{drops} slot {slot}",
 
                     locking_queue.backlogs.iter().filter(|x| **x>0).count(),
                     locking_queue.backlogs, inflight,

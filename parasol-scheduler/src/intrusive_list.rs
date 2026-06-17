@@ -1,4 +1,4 @@
-use std::{cell::{Cell, UnsafeCell}, marker::PhantomPinned, pin::Pin, ptr::NonNull};
+use std::{cell::{Cell, UnsafeCell}, fmt::Debug, marker::PhantomPinned, pin::Pin, ptr::NonNull};
 
 struct ListLink<T, const N: usize>(UnsafeCell<Option<NonNull<ListNode<T, N>>>>);
 
@@ -115,6 +115,18 @@ pub struct Cursor<T, const N: usize, const I: usize> {
 
 pub struct ItemHolder<T, const N: usize> {
     cur: NonNull<ListNode<T, N>>,
+}
+
+impl<T: Debug, const N: usize> ItemHolder<T, N> {
+    fn contained(&self) -> &T {
+        unsafe { &self.cur.as_ref().payload.as_ref().unwrap() }
+    }
+}
+
+impl<T: Debug, const N: usize> Debug for ItemHolder<T, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        T::fmt(self.contained(), f)
+    }
 }
 
 impl<T, const N: usize> ItemHolder<T, N> {
