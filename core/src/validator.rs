@@ -383,7 +383,7 @@ pub struct ValidatorConfig {
     pub use_tpu_client_next: bool,
     pub retransmit_xdp: Option<XdpConfig>,
     pub repair_handler_type: RepairHandlerType,
-    pub external_scheduler: Option<String>
+    pub external_scheduler: Option<String>,
 }
 
 impl ValidatorConfig {
