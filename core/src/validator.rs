@@ -388,6 +388,7 @@ pub struct ValidatorConfig {
     pub use_tpu_client_next: bool,
     pub retransmit_xdp: Option<XdpConfig>,
     pub repair_handler_type: RepairHandlerType,
+    pub external_scheduler: Option<String>,
 }
 
 impl ValidatorConfig {
@@ -471,6 +472,7 @@ impl ValidatorConfig {
             use_tpu_client_next: true,
             retransmit_xdp: None,
             repair_handler_type: RepairHandlerType::default(),
+            external_scheduler: None
         }
     }
 
@@ -1780,6 +1782,7 @@ impl Validator {
             config.generator_config.clone(),
             key_notifiers.clone(),
             cancel,
+            config.external_scheduler.clone()
         );
 
         datapoint_info!(

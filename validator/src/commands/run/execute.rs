@@ -539,6 +539,7 @@ pub fn execute(
     );
 
     let mut validator_config = ValidatorConfig {
+        external_scheduler: run_args.scheduler_bind,
         require_tower: matches.is_present("require_tower"),
         tower_storage,
         halt_at_slot: value_t!(matches, "dev_halt_at_slot", Slot).ok(),

@@ -149,6 +149,7 @@ pub struct TestValidatorGenesis {
     /// the hot-pinned block-production scheduler. Populated from
     /// `--hot-accounts <PATH>` on the test-validator binary.
     pub hot_accounts: Vec<HotAccount>,
+    pub scheduler_bind: Option<String>,
     admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
 }
 
@@ -157,6 +158,7 @@ impl Default for TestValidatorGenesis {
         // Default to Tower consensus to ensure proper converage pre-Alpenglow.
         let deactivate_feature_set = [alpenglow::id()].into_iter().collect();
         Self {
+            scheduler_bind: None,
             fee_rate_governor: FeeRateGovernor::default(),
             ledger_path: Option::<PathBuf>::default(),
             tower_storage: Option::<Arc<dyn TowerStorage>>::default(),
@@ -1118,6 +1120,7 @@ impl TestValidator {
         };
 
         let mut validator_config = ValidatorConfig {
+            external_scheduler: config.scheduler_bind.clone(),
             on_start_geyser_plugin_config_files: config.geyser_plugin_config_files.clone(),
             rpc_addrs: Some((
                 SocketAddr::new(
