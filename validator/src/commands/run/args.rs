@@ -681,9 +681,9 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                  clients rely on `processed`. On graceful shutdown it also finishes the \
                  in-progress leader block before exiting, so a restart loses nothing; only a \
                  hard crash can still leave a partial slot (use `confirmed` or client retry). It \
-                 does NOT alter the dead-slot path for genuine replay errors. Also enabled by \
-                 setting the SINGLE_VALIDATOR environment variable (to any value other than \
-                 0/false/no/off). Unsafe in any multi-validator cluster.",
+                 does NOT alter the dead-slot path for genuine replay errors. Enabled by \
+                 default; disable by setting the SINGLE_VALIDATOR environment variable to \
+                 0/false/no/off. Unsafe in any multi-validator cluster — disable it there.",
             ),
     )
     .arg(
