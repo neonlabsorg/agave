@@ -614,6 +614,10 @@ fn main() {
         genesis.hot_accounts(hot_accounts);
     }
 
+    if agave_validator::single_validator_enabled(&matches) {
+        genesis.single_validator(true);
+    }
+
     match genesis.start_with_mint_address_and_geyser_plugin_rpc(
         mint_address,
         socket_addr_space,

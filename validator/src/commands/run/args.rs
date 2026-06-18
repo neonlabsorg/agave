@@ -671,6 +671,22 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("single_validator")
+            .long("single-validator")
+            .help(
+                "Run in single-validator mode: this node is the only voter and always its own \
+                 leader. ReplayStage never resets PoH backward onto an ancestor of the block it \
+                 is still producing, so an in-progress leader slot is not orphaned into a dead \
+                 slot (which would roll back its already-`processed` transactions). This lets \
+                 clients rely on `processed`. On graceful shutdown it also finishes the \
+                 in-progress leader block before exiting, so a restart loses nothing; only a \
+                 hard crash can still leave a partial slot (use `confirmed` or client retry). It \
+                 does NOT alter the dead-slot path for genuine replay errors. Enabled by \
+                 default; disable by setting the SINGLE_VALIDATOR environment variable to \
+                 0/false/no/off. Unsafe in any multi-validator cluster — disable it there.",
+            ),
+    )
+    .arg(
         Arg::with_name("hard_forks")
             .long("hard-fork")
             .value_name("SLOT")

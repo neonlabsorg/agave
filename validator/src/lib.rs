@@ -24,6 +24,40 @@ pub mod hot_accounts;
 pub fn format_name_value(name: &str, value: &str) -> String {
     format!("{} {}", style(name).bold(), value)
 }
+
+/// Whether single-validator mode is enabled. Single-validator mode is the
+/// default for this fork: it is ON unless explicitly turned off. The
+/// `SINGLE_VALIDATOR` environment variable disables it when set to a falsy
+/// value (`0`, `false`, `no`, or `off`, case-insensitive); any other value (or
+/// leaving it unset) leaves the mode enabled. The `--single-validator` CLI
+/// flag forces it on regardless of the env var. clap 2.x ignores `.env()` on
+/// no-value flags (its `add_env` resolves only opts/positionals), so the env
+/// var is resolved here.
+pub fn single_validator_enabled(matches: &clap::ArgMatches) -> bool {
+    single_validator_resolve(
+        matches.is_present("single_validator"),
+        std::env::var("SINGLE_VALIDATOR").ok().as_deref(),
+    )
+}
+
+/// Pure resolver behind [`single_validator_enabled`], split out so the
+/// default-on / env-disable logic is unit-testable without touching the
+/// process environment.
+fn single_validator_resolve(flag_present: bool, env: Option<&str>) -> bool {
+    if flag_present {
+        return true;
+    }
+    match env {
+        Some(value) => {
+            let value = value.trim();
+            !(value.eq_ignore_ascii_case("0")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("no")
+                || value.eq_ignore_ascii_case("off"))
+        }
+        None => true,
+    }
+}
 /// Pretty print a "name value"
 pub fn println_name_value(name: &str, value: &str) {
     println!("{}", format_name_value(name, value));
@@ -96,4 +130,40 @@ pub fn lock_ledger<'lock>(
         );
         exit(1);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::single_validator_resolve;
+
+    #[test]
+    fn default_on_when_flag_and_env_absent() {
+        assert!(single_validator_resolve(false, None));
+    }
+
+    #[test]
+    fn flag_forces_on_even_when_env_disables() {
+        assert!(single_validator_resolve(true, Some("off")));
+        assert!(single_validator_resolve(true, None));
+    }
+
+    #[test]
+    fn env_falsy_disables() {
+        for v in ["0", "false", "FALSE", "no", "No", "off", "OFF", "  off  "] {
+            assert!(
+                !single_validator_resolve(false, Some(v)),
+                "{v:?} should disable single-validator mode"
+            );
+        }
+    }
+
+    #[test]
+    fn env_other_values_keep_enabled() {
+        for v in ["1", "true", "yes", "on", "", "enabled", "anything"] {
+            assert!(
+                single_validator_resolve(false, Some(v)),
+                "{v:?} should leave single-validator mode enabled"
+            );
+        }
+    }
 }

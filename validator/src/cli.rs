@@ -948,6 +948,18 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                      `central-scheduler-hot-pinned` block-production method.",
                 ),
         )
+        .arg(
+            Arg::with_name("single_validator")
+                .long("single-validator")
+                .help(
+                    "Run in single-validator mode: this node is the only voter and always its \
+                     own leader. ReplayStage never resets PoH backward off the block it is still \
+                     producing, and graceful shutdown finishes the in-progress leader block, so \
+                     `processed` transactions are not rolled back. Enabled by default; disable \
+                     by setting the SINGLE_VALIDATOR environment variable to 0/false/no/off. \
+                     Unsafe in any multi-validator cluster — disable it there.",
+                ),
+        )
         .args(&pub_sub_config::args(/*test_validator:*/ true))
 }
 
