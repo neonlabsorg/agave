@@ -507,11 +507,15 @@ impl BankingStage {
             );
 
             worker_metrics.push(consume_worker.metrics_handle());
+            let exit = exit.clone();
             non_vote_thread_hdls.push(
                 Builder::new()
                     .name(format!("solCoWorker{id:02}"))
                     .spawn(move || {
-                        if consume_worker.run().is_err() {
+                        // A disconnected channel is the expected shutdown signal
+                        // (the scheduler thread drops its channel ends on exit);
+                        // only abort if the worker errors while still running.
+                        if consume_worker.run().is_err() && !exit.load(Ordering::Relaxed) {
                             std::process::abort();
                         }
                     })
