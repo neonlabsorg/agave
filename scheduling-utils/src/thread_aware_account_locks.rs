@@ -22,7 +22,7 @@ pub struct ThreadSet(u64);
 #[derive(Debug)]
 pub struct AccountWriteLocks {
     pub thread_id: ThreadId,
-    lock_count: LockCount,
+    pub lock_count: LockCount,
 }
 
 #[derive(Debug)]
