@@ -17,6 +17,8 @@ struct Args {
     socket: String,
     #[arg(long)]
     config_path: String,
+    #[arg(long, default_value="false")]
+    debug: bool
 }
 
 #[derive(Deserialize, Debug)]
@@ -402,8 +404,8 @@ struct LockingQueue {
     expires: usize,
     rebalances: usize,
 
-    #[cfg(feature="debug-rebalances")]
     drain_round: usize,
+    debug: bool
 }
 
 fn make_vector<T>(size: usize, f: impl FnMut() -> T) -> Vec<T> {
@@ -414,10 +416,9 @@ fn make_vector<T>(size: usize, f: impl FnMut() -> T) -> Vec<T> {
 
 #[allow(dead_code)]
 impl LockingQueue {
-    fn new(num_threads: usize, max_worker_backlog: usize) -> Self {
+    fn new(num_threads: usize, max_worker_backlog: usize, debug: bool) -> Self {
         assert!(num_threads > 0);
         Self {
-            #[cfg(feature="debug-rebalances")]
             drain_round: 0,
             rebalances: 0,
             max_worker_backlog,
@@ -438,6 +439,7 @@ impl LockingQueue {
             rebalance_queue: make_vector(num_threads, || ActiveTxsRebalanceQueue::new()),
             actives_assigned_weight: make_vector(num_threads, || 0),
             txs_in_arrival_order: TxExpireQueue::new(),
+            debug,
         }
     }
 
@@ -493,6 +495,18 @@ impl LockingQueue {
                 let tx_meta = self.metas.get(key).unwrap();
                 tx_meta.state.is_picked() || tx_meta.state.is_active()
             });
+        } else if self.debug {
+            let mut sum_weight = 0;
+            for i in 0..self.num_threads {
+                if tx_meta.affinity_requirements[i] > 0 {
+                    sum_weight += self.backlogs[i];
+                }
+            }
+            if sum_weight > self.max_worker_backlog {
+                println!("tx {:?} serializes with workers {:?}",
+                    tx.data.signatures().first(),
+                    (0..self.num_threads).filter(|x| tx_meta.affinity_requirements[*x] > 0).collect::<Vec<_>>());
+            }
         }
     }
 
@@ -695,8 +709,7 @@ impl LockingQueue {
                     break;
                 }
 
-                #[cfg(feature="debug-rebalances")]
-                {
+                if self.debug {
                     self.actives_assigned_weight[i] += weight;
                     println!("round {} rebalance {:?} [{i}] -> [{thread}] with [{weight}] will be locked {}",
                         self.drain_round,
@@ -793,7 +806,7 @@ impl LockingQueue {
         // after draining a particular tx class, several new can be placed to the list
         // in this case we prefer only one most-locked with already picked load and its descendants
         // the overall scheme should looks like weighted depth-fist-search
-        let mut new_classes = Vec::<(usize, Cursor<SchedulerTxKey, 2, 0>)>::new();
+        let mut new_classes = smallvec::SmallVec::<[(usize, Cursor<SchedulerTxKey, 2, 0>); 64]>::new();
 
         while self.backlogs[worker] < self.max_worker_backlog {
             let Some(tx) = (
@@ -931,7 +944,7 @@ fn main() {
     let mut to_check = BTreeSet::new();
     let mut check_inflight = 0;
 
-    let mut locking_queue = LockingQueue::new(workers, config.max_txs_per_worker);
+    let mut locking_queue = LockingQueue::new(workers, config.max_txs_per_worker, args.debug);
 
     let mut slot = 0;
     let mut last_report = std::time::Instant::now();
@@ -940,6 +953,7 @@ fn main() {
 
     let mut send_stats = make_vector(workers, || 0);
     let mut inflight = make_vector(workers, || 0);
+    let mut tx_num = 0;
 
     loop {
         let mut to_spin = true;
@@ -1027,10 +1041,9 @@ fn main() {
         }, config.check_max_inflight);
 
         new_txs.sort();
-        let mut num = 0;
         for (score, shared_key) in new_txs.into_iter() {
-            locking_queue.new_tx(TxMeta::new(shared_key, Score::new(score, num), slot + config.slot_deadline), bridge.transaction(shared_key));
-            num += 1;
+            locking_queue.new_tx(TxMeta::new(shared_key, Score::new(score, tx_num), slot + config.slot_deadline), bridge.transaction(shared_key));
+            tx_num += 1;
         }
 
         for worker in 0..workers {
@@ -1138,10 +1151,7 @@ fn main() {
             }
         }
 
-        #[cfg(feature="debug-rebalances")]
-        {
-            locking_queue.drain_round += 1;
-        }
+        locking_queue.drain_round += 1;
 
         for worker in 0..workers {
             locking_queue.drain_actives(worker, &mut bridge);
