@@ -953,6 +953,7 @@ fn main() {
 
     let mut send_stats = make_vector(workers, || 0);
     let mut inflight = make_vector(workers, || 0);
+    let mut tx_num = 0;
 
     loop {
         let mut to_spin = true;
@@ -1040,10 +1041,9 @@ fn main() {
         }, config.check_max_inflight);
 
         new_txs.sort();
-        let mut num = 0;
         for (score, shared_key) in new_txs.into_iter() {
-            locking_queue.new_tx(TxMeta::new(shared_key, Score::new(score, num), slot + config.slot_deadline), bridge.transaction(shared_key));
-            num += 1;
+            locking_queue.new_tx(TxMeta::new(shared_key, Score::new(score, tx_num), slot + config.slot_deadline), bridge.transaction(shared_key));
+            tx_num += 1;
         }
 
         for worker in 0..workers {
