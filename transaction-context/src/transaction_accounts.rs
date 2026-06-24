@@ -292,6 +292,15 @@ pub struct TransactionAccounts {
     touched_subaccounts: RefCell<Vec<bool>>,
     #[cfg(not(target_os = "solana"))]
     subaccount_indexes: RefCell<HashMap<Pubkey, IndexOfAccount>>,
+
+    #[cfg(not(target_os = "solana"))]
+    #[allow(clippy::vec_box)]
+    snapshot_shared_fields: RefCell<Vec<Box<UnsafeCell<AccountSharedFields>>>>,
+    #[cfg(not(target_os = "solana"))]
+    #[allow(clippy::vec_box)]
+    snapshot_private_fields: RefCell<Vec<Box<UnsafeCell<AccountPrivateFields>>>>,
+    #[cfg(not(target_os = "solana"))]
+    snapshot_indexes: RefCell<HashMap<Pubkey, IndexOfAccount>>,
 }
 
 impl TransactionAccounts {
@@ -338,6 +347,11 @@ impl TransactionAccounts {
             subaccount_borrow_counters: RefCell::new(Vec::new()),
             touched_subaccounts: RefCell::new(Vec::new()),
             subaccount_indexes: RefCell::new(HashMap::new()),
+
+            snapshot_shared_fields: RefCell::new(Vec::new()),
+            snapshot_private_fields: RefCell::new(Vec::new()),
+            snapshot_indexes: RefCell::new(HashMap::new()),
+
             dynamic_accounts_lamports_sum: Cell::new(0),
         }
     }
@@ -412,6 +426,42 @@ impl TransactionAccounts {
         index
     }
 
+    /// F10: append a new subaccount snapshot into the split-storage lane. 
+    /// Populates the two parallel Vecs (shared fields, private fields) 
+    /// without borrow counters and touched flags. Caller is responsible 
+    /// for deduplication — `TransactionContext::add_subaccount_snapshot` does the
+    /// find-index check before this.
+    ///
+    /// The entry is left **untouched**, so the end-of-tx dirty filter never
+    /// persists it.
+    #[cfg(not(target_os = "solana"))]
+    #[allow(dead_code)] // wired in by the snapshot syscall
+    pub(crate) fn add_subaccount_snapshot(
+        &self,
+        pubkey: Pubkey,
+        account: AccountSharedData,
+    ) -> IndexOfAccount {
+        let lamports = account.lamports();
+        let mut shared = self.snapshot_shared_fields.borrow_mut();
+        let mut private = self.snapshot_private_fields.borrow_mut();
+        let mut indexes = self.snapshot_indexes.borrow_mut();
+        let index = shared.len() as IndexOfAccount;
+        shared.push(Box::new(UnsafeCell::new(AccountSharedFields {
+            key: pubkey,
+            owner: *account.owner(),
+            lamports,
+            payload: crate::vm_slice::VmSlice::new(0, account.data().len() as u64),
+        })));
+        private.push(Box::new(UnsafeCell::new(AccountPrivateFields {
+            rent_epoch: account.rent_epoch(),
+            executable: account.executable(),
+            payload: account.data_clone(),
+        })));
+        // Intentionally doesn't track lamports in `dynamic_accounts_lamports_sum` — the snapshot is read-only
+        indexes.insert(pubkey, index);
+        index
+    }
+
     /// F10 W10: lamports introduced by `add_subaccount` for accounts not
     /// present in the original tx account list. SVM/runtime callers add
     /// this to the expected post-tx lamport sum to avoid false
@@ -444,8 +494,11 @@ impl TransactionAccounts {
     }
 
     #[cfg(not(target_os = "solana"))]
-    pub fn number_of_subaccounts(&self) -> IndexOfAccount {
-        self.subaccount_shared_fields.borrow().len() as IndexOfAccount
+    pub fn number_of_subaccounts_with_snapshots(&self) -> IndexOfAccount {
+        (
+            self.subaccount_shared_fields.borrow().len()
+            + self.snapshot_shared_fields.borrow().len()
+        ) as IndexOfAccount
     }
 
     #[cfg(not(target_os = "solana"))]
@@ -453,6 +506,23 @@ impl TransactionAccounts {
         let indexes = self.subaccount_indexes.borrow();
         indexes.get(pubkey).copied()
     }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn find_index_of_snapshot(&self, pubkey: &Pubkey) -> Option<IndexOfAccount> {
+        let indexes = self.snapshot_indexes.borrow();
+        indexes.get(pubkey).copied()
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn snapshot_key(&self, index: IndexOfAccount) -> Option<Pubkey> {
+        let shared = self.snapshot_shared_fields.borrow();
+        // SAFETY: `key` is set at construction and never mutated; immutable
+        // read is safe regardless of outstanding AccountRef/AccountRefMut.
+        shared
+            .get(index as usize)
+            .map(|boxed| unsafe { (*boxed.get()).key })
+    }
+
 
     #[cfg(not(target_os = "solana"))]
     pub fn subaccount_key(&self, index: IndexOfAccount) -> Option<Pubkey> {
@@ -553,6 +623,57 @@ impl TransactionAccounts {
             &**private_box as *const _ as *mut _;
         let counter_ptr: *const BorrowCounter = &**counter_box;
         Ok((shared_ptr, private_ptr, counter_ptr))
+    }
+
+    /// Return subaccount snapshot view for the given index. This is used 
+    /// to access the state of a subaccount at a specific point in time, 
+    /// without allowing any modifications.
+    #[cfg(not(target_os = "solana"))]
+    pub fn get_subaccount_snapshot(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<TransactionAccountView<'_>, InstructionError> {
+        let (shared_ptr, private_ptr) = self.snapshot_raw_ptrs(index)?;
+
+        // SAFETY: pointers obtained from `Box<_>`-owned entries in append-only
+        // Vecs — heap addresses are stable for the life of `self`. The borrow
+        // counter below guarantees no live `AccountRefMut` exists for this
+        // slot.
+        let abi_account = unsafe { &*(*shared_ptr).get() };
+        let private_fields = unsafe { &*(*private_ptr).get() };
+        Ok(TransactionAccountView {
+            abi_account,
+            private_fields,
+        })
+    }
+
+    /// Extracts stable raw pointers to the two split-storage cells of the
+    /// subaccount snapshot at `index`. The RefCell borrows on the outer Vecs are
+    /// dropped before returning because the Box-owned heap addresses are
+    /// stable for the life of `self` (append-only invariant).
+    #[cfg(not(target_os = "solana"))]
+    fn snapshot_raw_ptrs(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<
+        (
+            *mut UnsafeCell<AccountSharedFields>,
+            *mut UnsafeCell<AccountPrivateFields>,
+        ),
+        InstructionError,
+    > {
+        let shared = self.subaccount_shared_fields.borrow();
+        let private = self.subaccount_private_fields.borrow();
+        let shared_box = shared
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        let private_box = private
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        let shared_ptr: *mut UnsafeCell<AccountSharedFields> = &**shared_box as *const _ as *mut _;
+        let private_ptr: *mut UnsafeCell<AccountPrivateFields> =
+            &**private_box as *const _ as *mut _;
+        Ok((shared_ptr, private_ptr))
     }
 
     pub(crate) fn update_accounts_resize_delta(
@@ -1112,7 +1233,7 @@ mod tests {
     #[test]
     fn test_add_subaccount_populates_split_storage() {
         let tx_accounts = make_tx_accounts();
-        assert_eq!(tx_accounts.number_of_subaccounts(), 0);
+        assert_eq!(tx_accounts.number_of_subaccounts_with_snapshots(), 0);
 
         let sub_key = Pubkey::new_unique();
         let sub_owner = Pubkey::new_unique();
@@ -1120,7 +1241,7 @@ mod tests {
         let index = tx_accounts.add_subaccount(sub_key, sub_account);
 
         assert_eq!(index, 0);
-        assert_eq!(tx_accounts.number_of_subaccounts(), 1);
+        assert_eq!(tx_accounts.number_of_subaccounts_with_snapshots(), 1);
         assert_eq!(tx_accounts.find_index_of_subaccount(&sub_key), Some(0));
         assert_eq!(tx_accounts.subaccount_key(0), Some(sub_key));
         assert_eq!(

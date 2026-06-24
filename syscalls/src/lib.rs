@@ -15,7 +15,8 @@ pub use self::{
     mem_ops::{SyscallMemcmp, SyscallMemcpy, SyscallMemmove, SyscallMemset},
     subaccount::{
         SyscallCreateSubaccount, SyscallLoadSubaccountC, SyscallLoadSubaccountRust,
-        SyscallReadSubaccount, SyscallUnloadSubaccount,
+        SyscallLoadSubaccountSnapshot, SyscallReadSubaccount,
+        SyscallUnloadSubaccount,
     },
     sysvar::{
         SyscallGetClockSysvar, SyscallGetEpochRewardsSysvar, SyscallGetEpochScheduleSysvar,
@@ -454,6 +455,8 @@ pub fn create_program_runtime_environment_v1<'a, 'ix_data>(
     result.register_function("sol_create_subaccount", SyscallCreateSubaccount::vm)?;
     result.register_function("sol_load_subaccount_rust", SyscallLoadSubaccountRust::vm)?;
     result.register_function("sol_load_subaccount_c", SyscallLoadSubaccountC::vm)?;
+    // F10: read-only, base-free, start-of-block (parent-slot) snapshot loads.
+    result.register_function("sol_load_subaccount_snapshot", SyscallLoadSubaccountSnapshot::vm)?;
     result.register_function("sol_read_subaccount", SyscallReadSubaccount::vm)?;
     result.register_function("sol_unload_subaccount", SyscallUnloadSubaccount::vm)?;
 

@@ -2,15 +2,15 @@
 
 use {
     crate::{
-        invoke_context::{InvokeContext, SerializedAccountMetadata},
+        invoke_context::{InvokeContext, OccupiedSubaccountIndex, SerializedAccountMetadata},
         memory::{translate_slice, translate_type, translate_type_mut_for_cpi, translate_vm_slice},
         serialization::{create_memory_region_of_account, modify_memory_region_of_account},
     },
     solana_account_info::AccountInfo,
-    solana_instruction::{error::InstructionError, AccountMeta, Instruction},
+    solana_instruction::{AccountMeta, Instruction, error::InstructionError},
     solana_loader_v3_interface::instruction as bpf_loader_upgradeable,
     solana_program_entrypoint::MAX_PERMITTED_DATA_INCREASE,
-    solana_pubkey::{Pubkey, PubkeyError, MAX_SEEDS},
+    solana_pubkey::{MAX_SEEDS, Pubkey, PubkeyError},
     solana_sbpf::{ebpf, memory_region::MemoryMapping},
     solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, native_loader},
     solana_stable_layout::stable_instruction::StableInstruction,
@@ -18,8 +18,7 @@ use {
     solana_svm_measure::measure::Measure,
     solana_svm_timings::ExecuteTimings,
     solana_transaction_context::{
-        vm_slice::VmSlice, BorrowedInstructionAccount, IndexOfAccount,
-        MAX_ACCOUNTS_PER_INSTRUCTION, MAX_INSTRUCTION_DATA_LEN, SUBACCOUNT_MARKER,
+        BorrowedInstructionAccount, IndexOfAccount, MAX_ACCOUNTS_PER_INSTRUCTION, MAX_INSTRUCTION_DATA_LEN, SUBACCOUNT_MARKER, vm_slice::VmSlice
     },
     std::mem,
     thiserror::Error,
@@ -1209,7 +1208,7 @@ pub fn translate_subaccount_slots<'a>(
                     s.caller_account_metadata.as_ref(),
                     s.account_view_kind,
                 ) {
-                    (Some(idx), Some(meta), Some(kind)) => Some((
+                    (OccupiedSubaccountIndex::Subaccount(idx), Some(meta), Some(kind)) => Some((
                         s.vm_account_view_addr,
                         meta.clone(),
                         idx,

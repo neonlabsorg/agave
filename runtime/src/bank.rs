@@ -5868,6 +5868,22 @@ impl TransactionProcessingCallback for Bank {
             .load_with_fixed_root(&self.ancestors, pubkey)
     }
 
+    fn get_account_shared_data_at_block_start(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<(AccountSharedData, Slot)> {
+        // Read with the current slot excluded so writes made by earlier
+        // transactions in this block are invisible — i.e. the account as of the
+        // block's parent slot. `proper_ancestors()` is fixed at bank
+        // construction and identical across leader and replay, so the result is
+        // deterministic across the cluster.
+        let ancestors = Ancestors::from(self.proper_ancestors().collect::<Vec<_>>());
+        self.rc
+            .accounts
+            .accounts_db
+            .load_with_fixed_root(&ancestors, pubkey)
+    }
+
     fn inspect_account(&self, address: &Pubkey, account_state: AccountState, is_writable: bool) {
         self.inspect_account_for_accounts_lt_hash(address, &account_state, is_writable);
     }
