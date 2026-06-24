@@ -47,13 +47,15 @@ struct Config {
     pub send_to_worker_granularity: usize,
     #[serde(default="default_check_txs")]
     pub check_max_inflight: usize,
+    #[serde(default)]
+    pub round_budget_per_worker: Option<usize>,
     pub max_txs_per_worker: usize,
     pub slot_deadline: u64,
     #[serde(with = "humantime_serde")]
     pub report_delay: Option<Duration>,
     max_queue_size: usize,
     priority_rules: Vec<Vec<Vec<u8>>>,
-    default_priority: usize
+    default_priority: usize,
 }
 
 slotmap::new_key_type! {
@@ -802,13 +804,17 @@ impl LockingQueue {
         result as usize
     }
 
-    fn drain_actives(&mut self, worker: usize, txdata: &mut impl MutableTxProvider) {
+    fn drain_actives(&mut self, worker: usize, txdata: &mut impl MutableTxProvider, mut budget: usize) {
         // after draining a particular tx class, several new can be placed to the list
         // in this case we prefer only one most-locked with already picked load and its descendants
         // the overall scheme should looks like weighted depth-fist-search
         let mut new_classes = smallvec::SmallVec::<[(usize, Cursor<SchedulerTxKey, 2, 0>); 64]>::new();
 
         while self.backlogs[worker] < self.max_worker_backlog {
+            if budget <= 0 {
+                break;
+            }
+            budget -= 1;
             let Some(tx) = (
                 if new_classes.is_empty() {
                     self.actives_assigned[worker].front()
@@ -1154,7 +1160,7 @@ fn main() {
         locking_queue.drain_round += 1;
 
         for worker in 0..workers {
-            locking_queue.drain_actives(worker, &mut bridge);
+            locking_queue.drain_actives(worker, &mut bridge, config.round_budget_per_worker.unwrap_or(config.max_txs_per_worker));
             let mut batch = smallvec::SmallVec::<[_; MAX_TRANSACTIONS_PER_MESSAGE]>::new();
             macro_rules! send_batch {
                 () => {
