@@ -546,7 +546,7 @@ impl LockingQueue {
             ($thread:expr) => {
                 {
                     let thread = $thread;
-                    self.picked[thread].len() < self.max_worker_backlog
+                    self.backlogs[thread] < self.max_worker_backlog
                 }
             }
         }
