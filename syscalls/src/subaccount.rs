@@ -27,6 +27,7 @@ use {
     solana_transaction_context::{
         create_subaccount_address, subaccount_storage_address, vm_slice::VmSlice, IndexOfAccount,
         InstructionAccount, MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
+        transaction_accounts::SnapshotKey,
     },
 };
 
@@ -109,17 +110,20 @@ fn find_or_add_subaccount(
     Ok(subaccount_index)
 }
 
-fn find_or_add_subaccount_snapshot(
+fn find_or_add_snapshot(
     invoke_context: &mut InvokeContext,
-    snapshot_pubkey: Pubkey,
+    snapshot_key: &SnapshotKey,
 ) -> Result<IndexOfAccount, Error> {
     let snapshot_index = if let Some(snapshot_index) = invoke_context
         .transaction_context
-        .find_index_of_snapshot(&snapshot_pubkey)
+        .find_index_of_snapshot(&snapshot_key)
     {
         snapshot_index
     } else {
-        let storage_address = subaccount_storage_address(&snapshot_pubkey);
+        let storage_address = match snapshot_key {
+            SnapshotKey::Account(pubkey) => pubkey,
+            SnapshotKey::Subaccount(pubkey) => &subaccount_storage_address(pubkey),
+        };
         let (snapshot, _slot) = invoke_context
             .get_account_shared_data_at_block_start(&storage_address)
             .unwrap_or_else(|| (AccountSharedData::default(), 0));
@@ -130,7 +134,7 @@ fn find_or_add_subaccount_snapshot(
 
         invoke_context
             .transaction_context
-            .add_subaccount_snapshot(snapshot_pubkey, snapshot)?
+            .add_snapshot(snapshot_key, snapshot)?
     };
 
     Ok(snapshot_index)
@@ -1067,8 +1071,8 @@ declare_builtin_function!(
     }
 );
 
-/// Shared body of the read-only `sol_load_subaccount_snapshot_{rust,c}`
-/// syscalls.
+/// Shared body of the read-only `sol_load_subaccount_snapshot` and
+/// `sol_load_account_snapshot` syscalls.
 ///
 /// Like [`load_subaccount_impl`], but:
 ///   - it does **not** require a base account in the transaction — the address
@@ -1078,17 +1082,15 @@ declare_builtin_function!(
 ///     region is mapped read-only and the entry is never touched/persisted; and
 ///   - the on-chain state is read **as of the beginning of the block**
 ///     (parent-slot state) via `get_account_shared_data_at_block_start`, then
-///     stored in a fresh, non-deduplicated lane entry
-///     ([`add_readonly_subaccount_snapshot`]) so the snapshot is independent of
-///     any mid-block load of the same subaccount.
+///     stored in a fresh, deduplicated lane entry ([`add_snapshot`]) so the 
+///     snapshot is independent of any mid-block load of the same subaccount.
 ///
 /// The slot is released by the same `sol_unload_subaccount`.
-fn load_subaccount_snapshot_impl(
+fn load_snapshot_impl(
     invoke_context: &mut InvokeContext,
-    seeds_addr: u64,
-    seeds_len: u64,
     out_header_addr: u64,
     memory_mapping: &mut MemoryMapping,
+    get_snapshot_key: impl FnOnce(&mut InvokeContext, &mut MemoryMapping) -> Result<SnapshotKey, Error>,
 ) -> Result<u64, Error> {
     check_subaccount_syscall_enabled(invoke_context, "sol_load_subaccount_snapshot")?;
 
@@ -1098,21 +1100,7 @@ fn load_subaccount_snapshot_impl(
     let check_aligned = invoke_context.get_check_aligned();
 
     let mut compute_subaccounts_time = Measure::start("compute_subaccounts");
-    // Translate seeds → derive PDA. Read-only snapshot loads never require a
-    // base account, so writability is unconditionally false.
-    let snapshot_pubkey = {
-        let instruction_context = invoke_context
-            .transaction_context
-            .get_current_instruction_context()?;
-        let program_id = *instruction_context.get_program_key()?;
-        translate_subaccount_seeds_no_base(
-            &program_id,
-            seeds_addr,
-            seeds_len,
-            memory_mapping,
-            check_aligned,
-        )?
-    };
+    let snapshot_key = get_snapshot_key(invoke_context, memory_mapping)?;
     compute_subaccounts_time.stop();
     invoke_context.timings.compute_subaccounts_us += compute_subaccounts_time.as_us();
     let is_writable = false;  // snapshot loads are always read-only
@@ -1121,11 +1109,11 @@ fn load_subaccount_snapshot_impl(
     // non-deduplicated lane entry so it is independent of any mid-block load of
     // the same subaccount. Snapshot a copy of the header fields for the slot.
     let (subaccount_index, data_len, lamports, owner_bytes) = {
-        let snapshot_index = find_or_add_subaccount_snapshot(invoke_context, snapshot_pubkey)?;
+        let snapshot_index = find_or_add_snapshot(invoke_context, &snapshot_key)?;
         let snapshot = invoke_context
             .transaction_context
             .accounts()
-            .get_subaccount_snapshot(snapshot_index)?;
+            .get_snapshot(snapshot_index)?;
         let data_len = snapshot.data().len();
         let lamports = snapshot.lamports();
         let owner_bytes = *snapshot.owner();
@@ -1145,8 +1133,8 @@ fn load_subaccount_snapshot_impl(
         {
             ic_msg!(
                 invoke_context,
-                "sol_load_subaccount_snapshot: subaccount snapshot {} is already loaded",
-                snapshot_pubkey,
+                "sol_load_subaccount_snapshot: snapshot {} is already loaded",
+                snapshot_key.as_pubkey(),
             );
             return Err(InstructionError::AccountAlreadyInitialized.into());
         }
@@ -1171,7 +1159,7 @@ fn load_subaccount_snapshot_impl(
         memory_mapping,
         check_aligned,
         vm_header_addr,
-        &snapshot_pubkey,
+        snapshot_key.as_pubkey(),
         &owner_bytes,
         lamports,
         data_len,
@@ -1215,8 +1203,7 @@ fn load_subaccount_snapshot_impl(
 
 declare_builtin_function!(
     /// F10: read-only, base-free, start-of-block load of a subaccount into a
-    /// pre-reserved VM slot. See
-    /// [`load_subaccount_snapshot_impl`] for the shared semantics.
+    /// pre-reserved VM slot. See [`load_subaccount_snapshot_impl`] for the shared semantics.
     SyscallLoadSubaccountSnapshot,
     fn rust(
         invoke_context: &mut InvokeContext,
@@ -1227,12 +1214,55 @@ declare_builtin_function!(
         _arg5: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
-        load_subaccount_snapshot_impl(
+        load_snapshot_impl(
             invoke_context,
-            seeds_addr,
-            seeds_len,
             out_header_addr,
             memory_mapping,
+            |invoke_context, memory_mapping| {
+                // Translate seeds → derive PDA. Read-only snapshot loads never require a
+                // base account, so writability is unconditionally false.
+                let instruction_context = invoke_context
+                    .transaction_context
+                    .get_current_instruction_context()?;
+                let program_id = *instruction_context.get_program_key()?;
+                let snapshot_pubkey = translate_subaccount_seeds_no_base(
+                    &program_id,
+                    seeds_addr,
+                    seeds_len,
+                    memory_mapping,
+                    invoke_context.get_check_aligned(),
+                )?;
+                Ok(SnapshotKey::Subaccount(snapshot_pubkey))
+            }
+        )
+    }
+);
+
+declare_builtin_function!(
+    /// F10: read-only, base-free, start-of-block load of a account into a
+    /// pre-reserved VM slot. See [`load_snapshot_impl`] for the shared semantics.
+    SyscallLoadAccountSnapshot,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        pubkey_addr: u64,
+        out_header_addr: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        load_snapshot_impl(
+            invoke_context,
+            out_header_addr,
+            memory_mapping,
+            |invoke_context, memory_mapping| {
+                let pubkey = *translate_type::<Pubkey>(
+                    memory_mapping,
+                    pubkey_addr,
+                    invoke_context.get_check_aligned(),
+                )?;
+                Ok(SnapshotKey::Account(pubkey))
+            }
         )
     }
 );

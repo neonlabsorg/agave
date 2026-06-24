@@ -245,6 +245,21 @@ pub(crate) type DeconstructedTransactionAccounts = (
     Cell<i64>,
 );
 
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+pub enum SnapshotKey {
+    Account(Pubkey),
+    Subaccount(Pubkey),
+}
+
+impl SnapshotKey {
+    pub fn as_pubkey(&self) -> &Pubkey {
+        match self {
+            SnapshotKey::Account(key) => key,
+            SnapshotKey::Subaccount(key) => key,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TransactionAccounts {
     shared_account_fields: Box<[UnsafeCell<AccountSharedFields>]>,
@@ -300,7 +315,7 @@ pub struct TransactionAccounts {
     #[allow(clippy::vec_box)]
     snapshot_private_fields: RefCell<Vec<Box<UnsafeCell<AccountPrivateFields>>>>,
     #[cfg(not(target_os = "solana"))]
-    snapshot_indexes: RefCell<HashMap<Pubkey, IndexOfAccount>>,
+    snapshot_indexes: RefCell<HashMap<SnapshotKey, IndexOfAccount>>,
 }
 
 impl TransactionAccounts {
@@ -436,9 +451,9 @@ impl TransactionAccounts {
     /// persists it.
     #[cfg(not(target_os = "solana"))]
     #[allow(dead_code)] // wired in by the snapshot syscall
-    pub(crate) fn add_subaccount_snapshot(
+    pub(crate) fn add_snapshot(
         &self,
-        pubkey: Pubkey,
+        snapshot_key: &SnapshotKey,
         account: AccountSharedData,
     ) -> IndexOfAccount {
         let lamports = account.lamports();
@@ -447,7 +462,7 @@ impl TransactionAccounts {
         let mut indexes = self.snapshot_indexes.borrow_mut();
         let index = shared.len() as IndexOfAccount;
         shared.push(Box::new(UnsafeCell::new(AccountSharedFields {
-            key: pubkey,
+            key: *snapshot_key.as_pubkey(),
             owner: *account.owner(),
             lamports,
             payload: crate::vm_slice::VmSlice::new(0, account.data().len() as u64),
@@ -458,7 +473,7 @@ impl TransactionAccounts {
             payload: account.data_clone(),
         })));
         // Intentionally doesn't track lamports in `dynamic_accounts_lamports_sum` — the snapshot is read-only
-        indexes.insert(pubkey, index);
+        indexes.insert(snapshot_key.clone(), index);
         index
     }
 
@@ -508,9 +523,9 @@ impl TransactionAccounts {
     }
 
     #[cfg(not(target_os = "solana"))]
-    pub fn find_index_of_snapshot(&self, pubkey: &Pubkey) -> Option<IndexOfAccount> {
+    pub fn find_index_of_snapshot(&self, snapshot_key: &SnapshotKey) -> Option<IndexOfAccount> {
         let indexes = self.snapshot_indexes.borrow();
-        indexes.get(pubkey).copied()
+        indexes.get(snapshot_key).copied()
     }
 
     #[cfg(not(target_os = "solana"))]
@@ -629,7 +644,7 @@ impl TransactionAccounts {
     /// to access the state of a subaccount at a specific point in time, 
     /// without allowing any modifications.
     #[cfg(not(target_os = "solana"))]
-    pub fn get_subaccount_snapshot(
+    pub fn get_snapshot(
         &self,
         index: IndexOfAccount,
     ) -> Result<TransactionAccountView<'_>, InstructionError> {

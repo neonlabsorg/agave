@@ -12,7 +12,7 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 use {
-    crate::transaction_accounts::{AccountRefMut, KeyedAccountSharedData, TransactionAccounts},
+    crate::transaction_accounts::{AccountRefMut, KeyedAccountSharedData, SnapshotKey, TransactionAccounts},
     solana_account::{AccountSharedData, ReadableAccount},
     solana_instruction::error::InstructionError,
     solana_instructions_sysvar as instructions,
@@ -273,8 +273,8 @@ impl<'ix_data> TransactionContext<'ix_data> {
     }
 
     #[cfg(not(target_os = "solana"))]
-    pub fn find_index_of_snapshot(&self, pubkey: &Pubkey) -> Option<IndexOfAccount> {
-        self.accounts.find_index_of_snapshot(pubkey)
+    pub fn find_index_of_snapshot(&self, snapshot_key: &SnapshotKey) -> Option<IndexOfAccount> {
+        self.accounts.find_index_of_snapshot(snapshot_key)
     }
 
     /// F10: register a new subaccount under the given key.
@@ -304,9 +304,9 @@ impl<'ix_data> TransactionContext<'ix_data> {
     /// Returns the subaccount index (without the `SUBACCOUNT_MARKER`
     /// high-bit). The entry is left untouched and is never persisted.
     #[cfg(not(target_os = "solana"))]
-    pub fn add_subaccount_snapshot(
+    pub fn add_snapshot(
         &self,
-        pubkey: Pubkey,
+        snapshot_key: &SnapshotKey,
         account: AccountSharedData,
     ) -> Result<IndexOfAccount, InstructionError> {
         if (self.accounts.number_of_subaccounts_with_snapshots() as usize) >= MAX_SUBACCOUNTS_PER_TRANSACTION {
@@ -314,7 +314,7 @@ impl<'ix_data> TransactionContext<'ix_data> {
         }
         Ok(self
             .accounts
-            .add_subaccount_snapshot(pubkey, account))
+            .add_snapshot(snapshot_key, account))
     }
 
     /// Gets the max length of the instruction trace
