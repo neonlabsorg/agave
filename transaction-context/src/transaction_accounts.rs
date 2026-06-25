@@ -510,10 +510,9 @@ impl TransactionAccounts {
 
     #[cfg(not(target_os = "solana"))]
     pub fn number_of_subaccounts_with_snapshots(&self) -> IndexOfAccount {
-        (
-            self.subaccount_shared_fields.borrow().len()
-            + self.snapshot_shared_fields.borrow().len()
-        ) as IndexOfAccount
+        let subaccount_len = self.subaccount_shared_fields.borrow().len();
+        let snapshot_len = self.snapshot_shared_fields.borrow().len();
+        subaccount_len.saturating_add(snapshot_len) as IndexOfAccount
     }
 
     #[cfg(not(target_os = "solana"))]

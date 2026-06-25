@@ -116,7 +116,7 @@ fn find_or_add_snapshot(
 ) -> Result<IndexOfAccount, Error> {
     let snapshot_index = if let Some(snapshot_index) = invoke_context
         .transaction_context
-        .find_index_of_snapshot(&snapshot_key)
+        .find_index_of_snapshot(snapshot_key)
     {
         snapshot_index
     } else {
@@ -125,7 +125,7 @@ fn find_or_add_snapshot(
             SnapshotKey::Subaccount(pubkey) => &subaccount_storage_address(pubkey),
         };
         let (snapshot, _slot) = invoke_context
-            .get_account_shared_data_at_block_start(&storage_address)
+            .get_account_shared_data_at_block_start(storage_address)
             .unwrap_or_else(|| (AccountSharedData::default(), 0));
         let data_len_cost = (snapshot.data().len() as u64)
             .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
@@ -556,7 +556,6 @@ fn install_snapshot_data_region(
         .accounts()
         .get_snapshot(snapshot_index)?;
     let new_region = MemoryRegion::new_readonly(snapshot.data(), vm_data_addr);
-    drop(snapshot);
     let (region_index, _) = memory_mapping
         .find_region(vm_data_addr)
         .ok_or(InstructionError::MissingAccount)?;
