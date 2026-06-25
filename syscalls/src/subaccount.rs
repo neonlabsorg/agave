@@ -533,6 +533,39 @@ fn install_subaccount_data_region(
     Ok(())
 }
 
+/// Replaces the slot's data region with a **read-only** one backed by a
+/// snapshot-lane entry's storage. Mirrors [`install_subaccount_data_region`]'s
+/// read-only branch, but reads from the snapshot lane
+/// ([`get_snapshot`](solana_transaction_context::transaction_accounts)) rather
+/// than the subaccount lane — the two lanes use independent index spaces, and a
+/// snapshot read never write-locks or persists, so it is always read-only and
+/// must never be `touch`ed.
+///
+/// SAFETY: the host pointer captured in the `MemoryRegion` must remain valid
+/// for the lifetime of the VM. The snapshot lane is append-only and its
+/// `AccountSharedData` storage is pinned to the transaction context for the
+/// whole instruction's duration, so the slice address is stable.
+fn install_snapshot_data_region(
+    invoke_context: &mut InvokeContext,
+    memory_mapping: &mut MemoryMapping,
+    snapshot_index: solana_transaction_context::IndexOfAccount,
+    vm_data_addr: u64,
+) -> Result<(), Error> {
+    let snapshot = invoke_context
+        .transaction_context
+        .accounts()
+        .get_snapshot(snapshot_index)?;
+    let new_region = MemoryRegion::new_readonly(snapshot.data(), vm_data_addr);
+    drop(snapshot);
+    let (region_index, _) = memory_mapping
+        .find_region(vm_data_addr)
+        .ok_or(InstructionError::MissingAccount)?;
+    memory_mapping
+        .replace_region(region_index, new_region)
+        .map_err(|_| InstructionError::InvalidArgument)?;
+    Ok(())
+}
+
 /// Restores the slot's data region to the empty readonly placeholder so the
 /// next `sol_load_subaccount` call can install a fresh region.
 fn restore_subaccount_data_placeholder(
@@ -1166,14 +1199,14 @@ fn load_snapshot_impl(
         is_writable,
     )?;
 
-    // Map the slot's data region read-only onto the snapshot storage. Because
-    // `is_writable == false`, the entry is left untouched and never persisted.
-    install_subaccount_data_region(
+    // Map the slot's data region read-only onto the snapshot-lane storage.
+    // Snapshot reads use the independent snapshot lane (not the subaccount
+    // lane), are always read-only, and are never touched/persisted.
+    install_snapshot_data_region(
         invoke_context,
         memory_mapping,
         subaccount_index,
         vm_data_addr,
-        is_writable,
     )?;
 
     let metadata = SerializedAccountMetadata {
@@ -1369,7 +1402,7 @@ declare_builtin_function!(
         consume_compute_meter(invoke_context, syscall_base_cost)?;
         let check_aligned = invoke_context.get_check_aligned();
 
-        let (slot_index, subaccount_index, is_writable) = {
+        let (slot_index, occupied, is_writable, vm_data_addr) = {
             let syscall_context = invoke_context.get_syscall_context()?;
             let entry = syscall_context
                 .subaccount_slots
@@ -1384,16 +1417,50 @@ declare_builtin_function!(
                 );
                 return Err(InstructionError::InvalidArgument.into());
             };
-            let OccupiedSubaccountIndex::Subaccount(idx) = slot.occupied_subaccount_index else {
+            if slot.occupied_subaccount_index.is_empty() {
                 ic_msg!(
                     invoke_context,
                     "sol_unload_subaccount: slot at {:#x} is not loaded",
                     vm_header_addr,
                 );
                 return Err(InstructionError::InvalidArgument.into());
-            };
-            (slot_index, idx, slot.is_writable)
+            }
+            (
+                slot_index,
+                slot.occupied_subaccount_index,
+                slot.is_writable,
+                slot.vm_data_addr,
+            )
         };
+
+        // Read-only snapshot slots never mutated any lane and were direct-mapped
+        // read-only, so there is nothing to reconcile back into storage. Just
+        // restore the data placeholder, zero the header, and free the slot.
+        if let OccupiedSubaccountIndex::Snapshot(_) = occupied {
+            restore_subaccount_data_placeholder(memory_mapping, vm_data_addr)?;
+            write_subaccount_slot_header(
+                memory_mapping,
+                check_aligned,
+                vm_header_addr,
+                &Pubkey::default(),
+                &Pubkey::default(),
+                0,
+                0,
+                false,
+            )?;
+            let syscall_context = invoke_context.get_syscall_context_mut()?;
+            if let Some(slot) = syscall_context.subaccount_slots.get_mut(slot_index) {
+                slot.occupied_subaccount_index = OccupiedSubaccountIndex::Empty;
+                slot.caller_account_metadata = None;
+                slot.account_view_kind = None;
+                slot.is_writable = false;
+            }
+            return Ok(SUCCESS);
+        }
+
+        let subaccount_index = occupied
+            .get_subaccount_index()
+            .ok_or(InstructionError::InvalidArgument)?;
 
         // Read header fields out of VM memory (lamports / owner / data_len).
         let owner_bytes: [u8; PUBKEY_BYTES] = {

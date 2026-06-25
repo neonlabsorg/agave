@@ -17,6 +17,10 @@
 //!       (on a successful in-range read) verify the bytes match. Exercises
 //!       the happy path plus the missing-subaccount and out-of-range
 //!       (full/partial) edge cases — see `read_subaccount`.
+//!  10 — load_subaccount_snapshot: read-only, base-free, start-of-block load.
+//!       Takes the base pubkey from the payload (NOT from the account list, to
+//!       prove the base account is not required) and verifies the snapshot data
+//!       equals the expected bytes — see `load_snapshot_verify`.
 //!
 //! Accounts:
 //!   [0] payer / base seed (signer, writable, system-program-owned)
@@ -70,6 +74,13 @@ extern "C" {
         out_header_addr: *mut u64,
         _arg5: u64,
     ) -> u64;
+    fn sol_load_subaccount_snapshot(
+        seeds_addr: *const u8,
+        seeds_len: u64,
+        out_header_addr: *mut u64,
+        _arg4: u64,
+        _arg5: u64,
+    ) -> u64;
     fn sol_unload_subaccount(vm_header_addr: u64) -> u64;
     fn sol_read_subaccount(
         seeds_addr: *const u8,
@@ -103,6 +114,7 @@ fn process_instruction(
         7 => transfer_lamports(accounts, payload),
         8 => create_load_twice(accounts, payload),
         9 => read_subaccount(accounts, payload),
+        10 => load_snapshot_verify(payload),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -303,6 +315,56 @@ fn read_subaccount(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
         return Err(ProgramError::Custom(0x92));
     }
 
+    Ok(())
+}
+
+/// Exercises `sol_load_subaccount_snapshot_rust` (disc=10).
+///
+/// Loads a read-only, start-of-block snapshot of the subaccount and verifies
+/// its data equals `expected`. The base pubkey is taken from the payload rather
+/// than from `accounts[..]`, so the caller can omit the base account from the
+/// transaction entirely — proving the snapshot load does not require it.
+///
+/// Payload layout:
+///   bytes 0..32 : base pubkey (the first seed)
+///   bytes 32..  : expected snapshot data (what the start-of-block read must
+///                 return)
+///
+/// Returns `Custom(0xA0)` on a data mismatch and `Custom(0xA1)` on a length
+/// mismatch; the slot is always released before returning.
+fn load_snapshot_verify(payload: &[u8]) -> ProgramResult {
+    let base_bytes = payload
+        .get(0..32)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let expected = payload
+        .get(32..)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let seeds: [&[u8]; 2] = [base_bytes, SEED_TAG];
+
+    let header_addr = load_snapshot(&seeds)?;
+
+    let data_len = unsafe {
+        core::ptr::read_unaligned((header_addr + SLOT_HEADER_OFFSET_DATA_LEN) as *const u64)
+    } as usize;
+    let result = if data_len != expected.len() {
+        Err(ProgramError::Custom(0xA1))
+    } else {
+        let data_ptr = (header_addr + SLOT_HEADER_SIZE) as *const u8;
+        let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
+        if data == expected {
+            Ok(())
+        } else {
+            Err(ProgramError::Custom(0xA0))
+        }
+    };
+
+    // Always release the slot before returning, surfacing the verification
+    // result over a successful-unload status.
+    let u = unsafe { sol_unload_subaccount(header_addr) };
+    result?;
+    if u != SUCCESS {
+        return Err(ProgramError::from(u));
+    }
     Ok(())
 }
 
@@ -525,6 +587,23 @@ fn load_c(seeds: &[&[u8]]) -> Result<(u64, u64), ProgramError> {
         return Err(ProgramError::from(result));
     }
     Ok((header_addr, view_addr))
+}
+
+fn load_snapshot(seeds: &[&[u8]]) -> Result<u64, ProgramError> {
+    let mut header_addr: u64 = 0;
+    let result = unsafe {
+        sol_load_subaccount_snapshot(
+            seeds.as_ptr() as *const u8,
+            seeds.len() as u64,
+            &mut header_addr as *mut u64,
+            0,
+            0,
+        )
+    };
+    if result != SUCCESS {
+        return Err(ProgramError::from(result));
+    }
+    Ok(header_addr)
 }
 
 fn unload(header_addr: u64) -> ProgramResult {

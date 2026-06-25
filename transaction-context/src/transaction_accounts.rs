@@ -677,8 +677,8 @@ impl TransactionAccounts {
         ),
         InstructionError,
     > {
-        let shared = self.subaccount_shared_fields.borrow();
-        let private = self.subaccount_private_fields.borrow();
+        let shared = self.snapshot_shared_fields.borrow();
+        let private = self.snapshot_private_fields.borrow();
         let shared_box = shared
             .get(index as usize)
             .ok_or(InstructionError::MissingAccount)?;

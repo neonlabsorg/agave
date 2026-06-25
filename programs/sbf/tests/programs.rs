@@ -6076,6 +6076,112 @@ fn test_program_sbf_subaccount_persists_across_transactions() {
     assert_eq!(stored.owner(), &program_id);
 }
 
+/// `sol_load_subaccount_snapshot_*` reads the start-of-block (parent-slot)
+/// state and does not require the base account to be present in the
+/// transaction. Here the subaccount is created in one block and snapshot-read
+/// in the next, with the base account deliberately omitted from the reading
+/// transaction (disc=10 takes the base pubkey from instruction data).
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_snapshot_reads_block_start_without_base() {
+    let (bank, mut bank_client, bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let v1: &[u8] = b"snapshot-marker-v1_____________"; // 31 bytes
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    // Block A — create the subaccount with V1.
+    let ix1 = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, v1, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix1);
+    assert!(
+        status.is_ok(),
+        "create failed: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+
+    // Advance to a child block so the V1 write lives in the parent slot.
+    let bank = bank_client
+        .advance_slot(1, bank_forks.as_ref(), &Pubkey::default())
+        .expect("advance slot for snapshot read");
+
+    // Snapshot-read with NO base account in the transaction (empty account
+    // metas). Payload = base pubkey ++ expected start-of-block bytes (V1).
+    let mut data = vec![10u8];
+    data.extend_from_slice(base_pubkey.as_ref());
+    data.extend_from_slice(v1);
+    let ix2 = Instruction::new_with_bytes(program_id, &data, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix2);
+    assert!(
+        status.is_ok(),
+        "base-free snapshot read failed: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+}
+
+/// A `sol_load_subaccount_snapshot_*` read sees the start-of-block state even
+/// when an earlier transaction in the same block has overwritten the
+/// subaccount: the snapshot must observe the parent-slot value, not the live
+/// mid-block one.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_snapshot_ignores_midblock_write() {
+    let (bank, mut bank_client, bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let v1: &[u8] = b"snapshot-block-start-value-v1__"; // 31 bytes
+    let v2: &[u8] = b"midblock-overwrite-value-v2____"; // 31 bytes, same len
+    assert_eq!(v1.len(), v2.len());
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    // Block A — create with V1.
+    let ix1 = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, v1, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix1);
+    assert!(
+        status.is_ok(),
+        "create failed: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+
+    // Advance to block N.
+    let bank = bank_client
+        .advance_slot(1, bank_forks.as_ref(), &Pubkey::default())
+        .expect("advance slot for block N");
+
+    // Tx1 in block N — overwrite the subaccount mid-block with V2.
+    let ix2 = subaccount_instruction(program_id, base_pubkey, true, 1, v2, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix2);
+    assert!(
+        status.is_ok(),
+        "mid-block overwrite failed: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+
+    // Sanity: the live mid-block state is now V2.
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    assert_eq!(
+        bank.get_account(&storage_addr)
+            .expect("subaccount exists")
+            .data(),
+        v2,
+        "mid-block overwrite should be the live state",
+    );
+
+    // Tx2 in the SAME block N — the snapshot read must still see V1 (the
+    // start-of-block / parent-slot value), not the mid-block V2.
+    let mut data = vec![10u8];
+    data.extend_from_slice(base_pubkey.as_ref());
+    data.extend_from_slice(v1);
+    let ix3 = Instruction::new_with_bytes(program_id, &data, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix3);
+    assert!(
+        status.is_ok(),
+        "snapshot must read start-of-block V1, not mid-block V2: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+}
+
 #[test]
 #[cfg(feature = "sbf_rust")]
 fn test_program_sbf_subaccount_cant_modify_readonly_data() {
