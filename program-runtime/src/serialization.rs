@@ -13,7 +13,8 @@ use {
     solana_sdk_ids::bpf_loader_deprecated,
     solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
     solana_transaction_context::{
-        BorrowedInstructionAccount, IndexOfAccount, InstructionContext, MAX_ACCOUNTS_PER_INSTRUCTION, TransactionContext
+        BorrowedInstructionAccount, IndexOfAccount, InstructionContext, TransactionContext,
+        MAX_ACCOUNTS_PER_INSTRUCTION,
     },
     std::mem::{self, size_of},
 };
@@ -368,7 +369,8 @@ pub fn flush_subaccount_slots(
     slots: &[SubaccountSlot],
 ) -> Result<(), InstructionError> {
     for slot in slots {
-        let OccupiedSubaccountIndex::Subaccount(subaccount_index) = slot.occupied_subaccount_index else {
+        let OccupiedSubaccountIndex::Subaccount(subaccount_index) = slot.occupied_subaccount_index
+        else {
             continue;
         };
         let header_offset = slot.buffer_position;

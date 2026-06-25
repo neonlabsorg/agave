@@ -25,9 +25,9 @@ use {
     solana_svm_log_collector::ic_msg,
     solana_system_interface::instruction::SystemInstruction,
     solana_transaction_context::{
-        create_subaccount_address, subaccount_storage_address, vm_slice::VmSlice, IndexOfAccount,
-        InstructionAccount, MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
-        transaction_accounts::SnapshotKey,
+        create_subaccount_address, subaccount_storage_address, transaction_accounts::SnapshotKey,
+        vm_slice::VmSlice, IndexOfAccount, InstructionAccount, MAX_ACCOUNTS_PER_TRANSACTION,
+        SUBACCOUNT_MARKER,
     },
 };
 
@@ -617,7 +617,10 @@ impl SubaccountDataGuard {
             syscall_context
                 .subaccount_slots
                 .iter()
-                .find(|s| s.occupied_subaccount_index == OccupiedSubaccountIndex::Subaccount(subaccount_index))
+                .find(|s| {
+                    s.occupied_subaccount_index
+                        == OccupiedSubaccountIndex::Subaccount(subaccount_index)
+                })
                 .map(|s| (s.vm_data_addr, s.is_writable))
         };
         let Some((vm_data_addr, is_writable)) = slot_info else {
@@ -707,7 +710,9 @@ fn sync_subaccount_slot_after_mutation(
         syscall_context
             .subaccount_slots
             .iter()
-            .find(|s| s.occupied_subaccount_index == OccupiedSubaccountIndex::Subaccount(subaccount_index))
+            .find(|s| {
+                s.occupied_subaccount_index == OccupiedSubaccountIndex::Subaccount(subaccount_index)
+            })
             .and_then(
                 |s| match (s.caller_account_metadata.as_ref(), s.account_view_kind) {
                     (Some(m), Some(kind)) => Some((s.vm_account_view_addr, kind, m.clone())),
@@ -819,8 +824,8 @@ fn translate_subaccount_seeds_no_base(
 ) -> Result<Pubkey, Error> {
     let seeds =
         translate_subaccount_seed_slices(seeds_addr, seeds_len, memory_mapping, check_aligned)?;
-    let subaccount_pubkey =
-        create_subaccount_address(&seeds, program_id).map_err(|_| InstructionError::InvalidSeeds)?;
+    let subaccount_pubkey = create_subaccount_address(&seeds, program_id)
+        .map_err(|_| InstructionError::InvalidSeeds)?;
     Ok(subaccount_pubkey)
 }
 
@@ -967,11 +972,9 @@ fn load_subaccount_impl(
     // pick a free slot.
     let (slot_index, vm_header_addr, vm_data_addr, vm_account_view_addr) = {
         let syscall_context = invoke_context.get_syscall_context_mut()?;
-        if syscall_context
-            .subaccount_slots
-            .iter()
-            .any(|s| s.occupied_subaccount_index == OccupiedSubaccountIndex::Subaccount(subaccount_index))
-        {
+        if syscall_context.subaccount_slots.iter().any(|s| {
+            s.occupied_subaccount_index == OccupiedSubaccountIndex::Subaccount(subaccount_index)
+        }) {
             ic_msg!(
                 invoke_context,
                 "sol_load_subaccount: subaccount {} is already loaded",
@@ -1114,7 +1117,7 @@ declare_builtin_function!(
 ///     region is mapped read-only and the entry is never touched/persisted; and
 ///   - the on-chain state is read **as of the beginning of the block**
 ///     (parent-slot state) via `get_account_shared_data_at_block_start`, then
-///     stored in a fresh, deduplicated lane entry ([`add_snapshot`]) so the 
+///     stored in a fresh, deduplicated lane entry ([`add_snapshot`]) so the
 ///     snapshot is independent of any mid-block load of the same subaccount.
 ///
 /// The slot is released by the same `sol_unload_subaccount`.
@@ -1135,7 +1138,7 @@ fn load_snapshot_impl(
     let snapshot_key = get_snapshot_key(invoke_context, memory_mapping)?;
     compute_subaccounts_time.stop();
     invoke_context.timings.compute_subaccounts_us += compute_subaccounts_time.as_us();
-    let is_writable = false;  // snapshot loads are always read-only
+    let is_writable = false; // snapshot loads are always read-only
 
     // Load the start-of-block on-chain state into the (deduplicated) snapshot
     // lane and snapshot a copy of the header fields for the slot. The snapshot
@@ -1158,11 +1161,9 @@ fn load_snapshot_impl(
     // snapshot index — refuse if a slot already holds it. Then pick a free slot.
     let (slot_index, vm_header_addr, vm_data_addr) = {
         let syscall_context = invoke_context.get_syscall_context_mut()?;
-        if syscall_context
-            .subaccount_slots
-            .iter()
-            .any(|s| s.occupied_subaccount_index == OccupiedSubaccountIndex::Snapshot(snapshot_index))
-        {
+        if syscall_context.subaccount_slots.iter().any(|s| {
+            s.occupied_subaccount_index == OccupiedSubaccountIndex::Snapshot(snapshot_index)
+        }) {
             ic_msg!(
                 invoke_context,
                 "sol_load_subaccount_snapshot: snapshot {} is already loaded",
@@ -1176,14 +1177,13 @@ fn load_snapshot_impl(
             .enumerate()
             .find(|(_, slot)| slot.occupied_subaccount_index.is_empty())
         else {
-            ic_msg!(invoke_context, "sol_load_subaccount_snapshot: all slots in use");
+            ic_msg!(
+                invoke_context,
+                "sol_load_subaccount_snapshot: all slots in use"
+            );
             return Err(InstructionError::MaxAccountsExceeded.into());
         };
-        (
-            slot_index,
-            slot.vm_header_addr,
-            slot.vm_data_addr,
-        )
+        (slot_index, slot.vm_header_addr, slot.vm_data_addr)
     };
 
     // Stamp the slot header with the loaded subaccount's metadata.
@@ -1201,12 +1201,7 @@ fn load_snapshot_impl(
     // Map the slot's data region read-only onto the snapshot-lane storage.
     // Snapshot reads use the independent snapshot lane (not the subaccount
     // lane), are always read-only, and are never touched/persisted.
-    install_snapshot_data_region(
-        invoke_context,
-        memory_mapping,
-        snapshot_index,
-        vm_data_addr,
-    )?;
+    install_snapshot_data_region(invoke_context, memory_mapping, snapshot_index, vm_data_addr)?;
 
     let metadata = SerializedAccountMetadata {
         original_data_len: data_len,

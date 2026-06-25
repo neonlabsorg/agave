@@ -2078,8 +2078,7 @@ impl Bank {
         // of this function. With offset==0 (production default) this is a
         // no-op.
         let last_offset = crate::parasol_clock_offset::last_applied();
-        let mut unix_timestamp =
-            self.clock().unix_timestamp.saturating_sub(last_offset);
+        let mut unix_timestamp = self.clock().unix_timestamp.saturating_sub(last_offset);
         // set epoch_start_timestamp to None to warp timestamp
         let epoch_start_timestamp = {
             let epoch = if let Some(epoch) = parent_epoch {
@@ -2095,8 +2094,7 @@ impl Bank {
             slow: MAX_ALLOWABLE_DRIFT_PERCENTAGE_SLOW_V2,
         };
 
-        let ancestor_timestamp =
-            self.clock().unix_timestamp.saturating_sub(last_offset);
+        let ancestor_timestamp = self.clock().unix_timestamp.saturating_sub(last_offset);
         if let Some(timestamp_estimate) =
             self.get_timestamp_estimate(max_allowable_drift, epoch_start_timestamp)
         {

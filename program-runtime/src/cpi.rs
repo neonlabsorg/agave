@@ -7,10 +7,10 @@ use {
         serialization::{create_memory_region_of_account, modify_memory_region_of_account},
     },
     solana_account_info::AccountInfo,
-    solana_instruction::{AccountMeta, Instruction, error::InstructionError},
+    solana_instruction::{error::InstructionError, AccountMeta, Instruction},
     solana_loader_v3_interface::instruction as bpf_loader_upgradeable,
     solana_program_entrypoint::MAX_PERMITTED_DATA_INCREASE,
-    solana_pubkey::{MAX_SEEDS, Pubkey, PubkeyError},
+    solana_pubkey::{Pubkey, PubkeyError, MAX_SEEDS},
     solana_sbpf::{ebpf, memory_region::MemoryMapping},
     solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, native_loader},
     solana_stable_layout::stable_instruction::StableInstruction,
@@ -18,7 +18,8 @@ use {
     solana_svm_measure::measure::Measure,
     solana_svm_timings::ExecuteTimings,
     solana_transaction_context::{
-        BorrowedInstructionAccount, IndexOfAccount, MAX_ACCOUNTS_PER_INSTRUCTION, MAX_INSTRUCTION_DATA_LEN, SUBACCOUNT_MARKER, vm_slice::VmSlice
+        vm_slice::VmSlice, BorrowedInstructionAccount, IndexOfAccount,
+        MAX_ACCOUNTS_PER_INSTRUCTION, MAX_INSTRUCTION_DATA_LEN, SUBACCOUNT_MARKER,
     },
     std::mem,
     thiserror::Error,

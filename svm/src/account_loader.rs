@@ -371,7 +371,8 @@ impl<CB: TransactionProcessingCallback> TransactionProcessingCallback for Accoun
         // `update_accounts_for_executed_tx` populates with this block's writes)
         // and delegate straight to the underlying callback (the bank), whose
         // implementation reads the account as of the block's parent slot.
-        self.callbacks.get_account_shared_data_at_block_start(pubkey)
+        self.callbacks
+            .get_account_shared_data_at_block_start(pubkey)
     }
 }
 

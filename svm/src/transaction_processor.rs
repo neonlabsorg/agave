@@ -537,7 +537,6 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                         config,
                     );
 
-
                     match (
                         &executed_tx.execution_details.status,
                         config.drop_on_failure,

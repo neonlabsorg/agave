@@ -627,8 +627,8 @@ impl TransactionAccounts {
         Ok((shared_ptr, private_ptr, counter_ptr))
     }
 
-    /// Return subaccount snapshot view for the given index. This is used 
-    /// to access the state of a subaccount at a specific point in time, 
+    /// Return subaccount snapshot view for the given index. This is used
+    /// to access the state of a subaccount at a specific point in time,
     /// without allowing any modifications.
     #[cfg(not(target_os = "solana"))]
     pub fn get_snapshot(
@@ -858,8 +858,10 @@ impl TransactionAccounts {
         let sub_private = std::mem::take(&mut *self.subaccount_private_fields.borrow_mut());
         let sub_touched = std::mem::take(&mut *self.touched_subaccounts.borrow_mut());
         let mut unchanged_subaccounts: Vec<Pubkey> = Vec::new();
-        for (idx, (shared_box, private_box)) in
-            sub_shared.into_iter().zip(sub_private.into_iter()).enumerate()
+        for (idx, (shared_box, private_box)) in sub_shared
+            .into_iter()
+            .zip(sub_private.into_iter())
+            .enumerate()
         {
             let shared = (*shared_box).into_inner();
             // F10: only persist subaccounts that were actually modified this
@@ -918,8 +920,10 @@ impl TransactionAccounts {
         let sub_shared = std::mem::take(&mut *self.subaccount_shared_fields.borrow_mut());
         let sub_private = std::mem::take(&mut *self.subaccount_private_fields.borrow_mut());
         let sub_touched = std::mem::take(&mut *self.touched_subaccounts.borrow_mut());
-        for (idx, (shared_box, private_box)) in
-            sub_shared.into_iter().zip(sub_private.into_iter()).enumerate()
+        for (idx, (shared_box, private_box)) in sub_shared
+            .into_iter()
+            .zip(sub_private.into_iter())
+            .enumerate()
         {
             // F10: skip subaccounts that were never modified — see the keyed
             // variant `deconstruct_into_keyed_account_shared_data` for the
@@ -1464,7 +1468,10 @@ mod tests {
         // `subaccount_storage_address` is applied later at the accounts-db
         // boundary.
         let (sub_key, sub_account) = accounts.get(1).unwrap();
-        assert_eq!(*sub_key, touched_pda, "touched subaccount persisted by owner key");
+        assert_eq!(
+            *sub_key, touched_pda,
+            "touched subaccount persisted by owner key"
+        );
         assert_eq!(sub_account.lamports(), 1_000);
         // The untouched sibling is not persisted, but is reported to the
         // receipt as an unchanged subaccount (owner key only).
