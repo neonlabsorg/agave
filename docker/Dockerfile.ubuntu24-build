@@ -53,6 +53,7 @@ COPY --from=builder /opt/agave/target/release/cargo-* /out/
 COPY --from=builder /opt/agave/target/release/rbpf-* /out/
 COPY --from=builder /opt/agave/target/release/solana /out/
 COPY --from=builder /opt/agave/target/release/solana-* /out/
+COPY --from=builder /opt/agave/target/release/parasol-* /out/
 
 
 # Minimal runtime image with the compiled binaries
@@ -74,6 +75,7 @@ COPY --from=builder /opt/agave/target/release/cargo-* /out/
 COPY --from=builder /opt/agave/target/release/rbpf-* /out/
 COPY --from=builder /opt/agave/target/release/solana /out/
 COPY --from=builder /opt/agave/target/release/solana-* /out/
+COPY --from=builder /opt/agave/target/release/parasol-* /out/
 
 # Default to showing available binaries; override entrypoint/command as needed
 CMD ["solana-validator", "--version"]

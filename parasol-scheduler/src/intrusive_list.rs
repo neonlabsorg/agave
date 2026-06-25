@@ -199,11 +199,13 @@ impl<T, const N: usize, const I: usize, const DELETE_ALL: bool>
     }
 
     pub fn push_front(&mut self, cur: &mut Cursor<T, N, I>) {
+        cur.unlink();
         self.init();
         self.private_head_mut().unwrap().insert_after(cur);
     }
 
     pub fn push_back(&mut self, cur: &mut Cursor<T, N, I>) {
+        cur.unlink();
         self.init();
         self.private_head_mut().unwrap().prev_item().unwrap().insert_after(cur);
     }
@@ -361,6 +363,8 @@ impl<T, const N: usize, const I: usize> Cursor<T, N, I> {
             other.cur.as_mut().next[I] = next.into();
             if let Some(mut next) = next {
                 next.as_mut().prev[I] = Some(other.cur).into();
+            } else {
+                panic!("we don not allow building cursor list outside of List struct yet");
             }
         }
     }

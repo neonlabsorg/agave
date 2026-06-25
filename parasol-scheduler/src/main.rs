@@ -3,7 +3,7 @@ use std::{collections::{BTreeSet, BinaryHeap, VecDeque}, panic, time::Duration};
 use agave_scheduler_bindings::{pack_message_flags::{self, check_flags}, worker_message_types::{not_included_reasons, parsing_and_sanitization_flags, resolve_flags, status_check_flags}, MAX_TRANSACTIONS_PER_MESSAGE};
 use agave_scheduling_utils::{bridge::{KeyedTransactionMeta, ScheduleBatch, TransactionKey, TransactionState, TxDecision, WorkerAction}, handshake::ClientLogon, thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet}};
 use clap::Parser;
-use intrusive_list::{IntrusiveList, ItemHolder};
+use intrusive_list::{Cursor, IntrusiveList, ItemHolder};
 use serde::Deserialize;
 use slotmap::SlotMap;
 use solana_transaction::Address;
@@ -17,6 +17,8 @@ struct Args {
     socket: String,
     #[arg(long)]
     config_path: String,
+    #[arg(long, default_value="false")]
+    debug: bool
 }
 
 #[derive(Deserialize, Debug)]
@@ -45,21 +47,24 @@ struct Config {
     pub send_to_worker_granularity: usize,
     #[serde(default="default_check_txs")]
     pub check_max_inflight: usize,
+    #[serde(default)]
+    pub round_budget_per_worker: Option<usize>,
     pub max_txs_per_worker: usize,
     pub slot_deadline: u64,
     #[serde(with = "humantime_serde")]
     pub report_delay: Option<Duration>,
     max_queue_size: usize,
     priority_rules: Vec<Vec<Vec<u8>>>,
-    default_priority: usize
+    default_priority: usize,
 }
 
 slotmap::new_key_type! {
     struct SchedulerTxKey;
 }
 
-type ActiveTxsWorkerList = IntrusiveList<SchedulerTxKey, 1, 0, true>;
-type ActiveTxsListPlaceHolder = ItemHolder<SchedulerTxKey, 1>;
+type ActiveTxsWorkerList = IntrusiveList<SchedulerTxKey, 2, 0, true>;
+type ActiveTxsRebalanceQueue = IntrusiveList<SchedulerTxKey, 2, 1, true>;
+type ActiveTxsListPlaceHolder = ItemHolder<SchedulerTxKey, 2>;
 
 #[derive(Clone, Debug)]
 enum TxState {
@@ -381,6 +386,8 @@ struct LockingQueue {
     actives_assigned_weight: Vec<usize>,
     actives_assigned: Vec<ActiveTxsWorkerList>,
     actives_locked_on: Vec<ActiveTxsWorkerList>,
+    rebalance_queue: Vec<ActiveTxsRebalanceQueue>,
+
     picked: Vec<BinaryHeap<PickedTx>>,
 
     txs_in_arrival_order: TxExpireQueue,
@@ -398,6 +405,9 @@ struct LockingQueue {
     slot: u64,
     expires: usize,
     rebalances: usize,
+
+    drain_round: usize,
+    debug: bool
 }
 
 fn make_vector<T>(size: usize, f: impl FnMut() -> T) -> Vec<T> {
@@ -408,9 +418,10 @@ fn make_vector<T>(size: usize, f: impl FnMut() -> T) -> Vec<T> {
 
 #[allow(dead_code)]
 impl LockingQueue {
-    fn new(num_threads: usize, max_worker_backlog: usize) -> Self {
+    fn new(num_threads: usize, max_worker_backlog: usize, debug: bool) -> Self {
         assert!(num_threads > 0);
         Self {
+            drain_round: 0,
             rebalances: 0,
             max_worker_backlog,
             resources: AHashMap::new(),
@@ -427,8 +438,10 @@ impl LockingQueue {
             expires: 0,
             actives_assigned: make_vector(num_threads, || ActiveTxsWorkerList::new()),
             actives_locked_on: make_vector(num_threads, || ActiveTxsWorkerList::new()),
+            rebalance_queue: make_vector(num_threads, || ActiveTxsRebalanceQueue::new()),
             actives_assigned_weight: make_vector(num_threads, || 0),
             txs_in_arrival_order: TxExpireQueue::new(),
+            debug,
         }
     }
 
@@ -484,6 +497,18 @@ impl LockingQueue {
                 let tx_meta = self.metas.get(key).unwrap();
                 tx_meta.state.is_picked() || tx_meta.state.is_active()
             });
+        } else if self.debug {
+            let mut sum_weight = 0;
+            for i in 0..self.num_threads {
+                if tx_meta.affinity_requirements[i] > 0 {
+                    sum_weight += self.backlogs[i];
+                }
+            }
+            if sum_weight > self.max_worker_backlog {
+                println!("tx {:?} serializes with workers {:?}",
+                    tx.data.signatures().first(),
+                    (0..self.num_threads).filter(|x| tx_meta.affinity_requirements[*x] > 0).collect::<Vec<_>>());
+            }
         }
     }
 
@@ -521,7 +546,7 @@ impl LockingQueue {
             ($thread:expr) => {
                 {
                     let thread = $thread;
-                    self.picked[thread].len() < self.max_worker_backlog
+                    self.backlogs[thread] < self.max_worker_backlog
                 }
             }
         }
@@ -632,6 +657,7 @@ impl LockingQueue {
             };
             self.actives_assigned_weight[assigned_to] += meta.active_balancing_weight;
             self.actives_assigned[assigned_to].push_back(&mut holder.clone().into());
+            self.rebalance_queue[assigned_to].push_back(&mut holder.clone().into());
             meta.state = TxState::Active{holder, assigned_to};
             Some(assigned_to)
         } else {
@@ -658,7 +684,7 @@ impl LockingQueue {
                     *self.actives_locked_on[i].front().unwrap().contained()
                 } else {
                     assert!(!self.actives_assigned[i].is_empty());
-                    *self.actives_assigned[i].tail().unwrap().contained()
+                    *self.rebalance_queue[i].front().unwrap().contained()
                 };
 
                 let (weight, affine) = {
@@ -685,10 +711,12 @@ impl LockingQueue {
                     break;
                 }
 
-                #[cfg(feature="runtime-checks")]
-                {
+                if self.debug {
                     self.actives_assigned_weight[i] += weight;
-                    println!("rebalance {:?} [{i}] -> [{thread}] with [{weight}]", self.actives_assigned_weight);
+                    println!("round {} rebalance {:?} [{i}] -> [{thread}] with [{weight}] will be locked {}",
+                        self.drain_round,
+                        self.actives_assigned_weight,
+                        becomespickable);
                     self.actives_assigned_weight[i] -= weight;
                 }
 
@@ -703,6 +731,7 @@ impl LockingQueue {
                         panic!("tx should be active here");
                     };
                     self.actives_assigned[thread].push_back(&mut holder.clone().into());
+                    self.rebalance_queue[thread].push_back(&mut holder.clone().into());
                     *assigned_to = thread;
                 } else {
                     let TxState::Active { ref holder, ref mut assigned_to } = meta.state else {
@@ -710,6 +739,7 @@ impl LockingQueue {
                     };
                     meta.rebalance_locked = true;
                     self.actives_locked_on[thread].push_back(&mut holder.clone().into());
+                    self.rebalance_queue[thread].push_back(&mut holder.clone().into());
                     *assigned_to = thread;
                 }
             }
@@ -755,25 +785,79 @@ impl LockingQueue {
         }
     }
 
-    fn drain_actives(&mut self, worker: usize, txdata: &mut impl MutableTxProvider) {
-        let Some(guard) = self.actives_assigned[worker].tail().map(|x| *x.contained()) else {
-            return;
-        };
+    fn affinity_weight(&self, worker: usize, tx: &TransactionState) -> usize {
+        let mut result = 0;
+        for (lock, is_write) in tx.locks() {
+            if let Some(locks) = self.picked_locks.acc_locks(lock) {
+                if is_write {
+                    if let Some(ref read_locks) = locks.read_locks {
+                        if read_locks.thread_set.contains(worker) {
+                            result = std::cmp::max(result, read_locks.lock_counts[worker]);
+                        }
+                    }
+                }
+                if let Some(ref write_locks) = locks.write_locks {
+                    result = std::cmp::max(result, write_locks.lock_count);
+                }
+            }
+        }
+        result as usize
+    }
+
+    fn drain_actives(&mut self, worker: usize, txdata: &mut impl MutableTxProvider, mut budget: usize) {
+        // after draining a particular tx class, several new can be placed to the list
+        // in this case we prefer only one most-locked with already picked load and its descendants
+        // the overall scheme should looks like weighted depth-fist-search
+        let mut new_classes = smallvec::SmallVec::<[(usize, Cursor<SchedulerTxKey, 2, 0>); 64]>::new();
 
         while self.backlogs[worker] < self.max_worker_backlog {
-            // after draining a tx class, several new can be placed to the list
-            // in this case I rotate actives list and drain one of them
-            // I explicitly guard preexisting transactions from these rotations so that they will be drained in normal fifo order on successive iterations
-            let tail = self.actives_assigned[worker].tail();
-            if tail.as_ref().map(|x| *x.contained() != guard).unwrap_or(false) {
-                self.actives_assigned[worker].push_front(&mut tail.unwrap());
+            if budget <= 0 {
+                break;
             }
-            let Some(tx) = self.actives_assigned[worker].front() else {
+            budget -= 1;
+            let Some(tx) = (
+                if new_classes.is_empty() {
+                    self.actives_assigned[worker].front()
+                } else {
+                    new_classes.pop().map(|x| x.1)
+                }
+            ) else {
                 break;
             };
+
             let key = *tx.contained();
             assert!(self.try_pick_tx(key, txdata.txdata(self.metas.get(key).unwrap().shared_key), worker));
+
+            let tail = self.actives_assigned[worker].tail();
             self.dispatch_unblock_events(txdata);
+
+            let mut start = match tail {
+                None => self.actives_assigned[worker].front(),
+                Some(tail) => tail.next()
+            };
+
+            let sort_bound = new_classes.len();
+            loop {
+                let next = start.clone().and_then(|x| x.next());
+                match start {
+                    Some(start) => {
+                        let tx = txdata.txdata(self.metas.get(*start.contained()).unwrap().shared_key);
+                        let weight = self.affinity_weight(worker, tx);
+                        new_classes.push((weight, start));
+                    },
+                    None => break
+                }
+                start = next;
+            }
+            (&mut new_classes[sort_bound..]).sort_by(|(w1, _), (w2, _)| w1.cmp(w2));
+        }
+
+        for (_, cls) in new_classes.iter() {
+            self.actives_assigned[worker].push_back(&mut cls.clone());
+        }
+        for (_, cls) in new_classes.iter().rev() {
+            //pessimize rebalances for fresh classes
+            self.rebalance_queue[worker].push_back(&mut cls.clone().switch());
         }
     }
 
@@ -866,7 +950,7 @@ fn main() {
     let mut to_check = BTreeSet::new();
     let mut check_inflight = 0;
 
-    let mut locking_queue = LockingQueue::new(workers, config.max_txs_per_worker);
+    let mut locking_queue = LockingQueue::new(workers, config.max_txs_per_worker, args.debug);
 
     let mut slot = 0;
     let mut last_report = std::time::Instant::now();
@@ -875,6 +959,7 @@ fn main() {
 
     let mut send_stats = make_vector(workers, || 0);
     let mut inflight = make_vector(workers, || 0);
+    let mut tx_num = 0;
 
     loop {
         let mut to_spin = true;
@@ -962,10 +1047,9 @@ fn main() {
         }, config.check_max_inflight);
 
         new_txs.sort();
-        let mut num = 0;
         for (score, shared_key) in new_txs.into_iter() {
-            locking_queue.new_tx(TxMeta::new(shared_key, Score::new(score, num), slot + config.slot_deadline), bridge.transaction(shared_key));
-            num += 1;
+            locking_queue.new_tx(TxMeta::new(shared_key, Score::new(score, tx_num), slot + config.slot_deadline), bridge.transaction(shared_key));
+            tx_num += 1;
         }
 
         for worker in 0..workers {
@@ -1073,8 +1157,10 @@ fn main() {
             }
         }
 
+        locking_queue.drain_round += 1;
+
         for worker in 0..workers {
-            locking_queue.drain_actives(worker, &mut bridge);
+            locking_queue.drain_actives(worker, &mut bridge, config.round_budget_per_worker.unwrap_or(config.max_txs_per_worker));
             let mut batch = smallvec::SmallVec::<[_; MAX_TRANSACTIONS_PER_MESSAGE]>::new();
             macro_rules! send_batch {
                 () => {
