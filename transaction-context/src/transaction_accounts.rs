@@ -441,16 +441,15 @@ impl TransactionAccounts {
         index
     }
 
-    /// F10: append a new subaccount snapshot into the split-storage lane. 
-    /// Populates the two parallel Vecs (shared fields, private fields) 
-    /// without borrow counters and touched flags. Caller is responsible 
-    /// for deduplication — `TransactionContext::add_subaccount_snapshot` does the
+    /// F10: append a new subaccount snapshot into the split-storage lane.
+    /// Populates the two parallel Vecs (shared fields, private fields)
+    /// without borrow counters and touched flags. Caller is responsible
+    /// for deduplication — `TransactionContext::add_snapshot` does the
     /// find-index check before this.
     ///
     /// The entry is left **untouched**, so the end-of-tx dirty filter never
     /// persists it.
     #[cfg(not(target_os = "solana"))]
-    #[allow(dead_code)] // wired in by the snapshot syscall
     pub(crate) fn add_snapshot(
         &self,
         snapshot_key: &SnapshotKey,
@@ -526,17 +525,6 @@ impl TransactionAccounts {
         let indexes = self.snapshot_indexes.borrow();
         indexes.get(snapshot_key).copied()
     }
-
-    #[cfg(not(target_os = "solana"))]
-    pub fn snapshot_key(&self, index: IndexOfAccount) -> Option<Pubkey> {
-        let shared = self.snapshot_shared_fields.borrow();
-        // SAFETY: `key` is set at construction and never mutated; immutable
-        // read is safe regardless of outstanding AccountRef/AccountRefMut.
-        shared
-            .get(index as usize)
-            .map(|boxed| unsafe { (*boxed.get()).key })
-    }
-
 
     #[cfg(not(target_os = "solana"))]
     pub fn subaccount_key(&self, index: IndexOfAccount) -> Option<Pubkey> {

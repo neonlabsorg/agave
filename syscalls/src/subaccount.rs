@@ -1137,10 +1137,11 @@ fn load_snapshot_impl(
     invoke_context.timings.compute_subaccounts_us += compute_subaccounts_time.as_us();
     let is_writable = false;  // snapshot loads are always read-only
 
-    // Load the start-of-block on-chain state and register it in a fresh
-    // non-deduplicated lane entry so it is independent of any mid-block load of
-    // the same subaccount. Snapshot a copy of the header fields for the slot.
-    let (subaccount_index, data_len, lamports, owner_bytes) = {
+    // Load the start-of-block on-chain state into the (deduplicated) snapshot
+    // lane and snapshot a copy of the header fields for the slot. The snapshot
+    // lane is independent of the live subaccount lane, so this is unaffected by
+    // any mid-block load of the same subaccount.
+    let (snapshot_index, data_len, lamports, owner_bytes) = {
         let snapshot_index = find_or_add_snapshot(invoke_context, &snapshot_key)?;
         let snapshot = invoke_context
             .transaction_context
@@ -1152,16 +1153,15 @@ fn load_snapshot_impl(
         (snapshot_index, data_len, lamports, owner_bytes)
     };
 
-    // Pick a free slot. The index-based "already loaded" guard from
-    // `load_subaccount_impl` is intentionally omitted: each snapshot uses a
-    // fresh index and is read-only, so there is no writable-alias hazard from
-    // loading the same subaccount twice.
+    // Reject loading the same snapshot twice in one instruction:
+    // `find_or_add_snapshot` dedups by key, so a repeat load returns the same
+    // snapshot index — refuse if a slot already holds it. Then pick a free slot.
     let (slot_index, vm_header_addr, vm_data_addr) = {
         let syscall_context = invoke_context.get_syscall_context_mut()?;
         if syscall_context
             .subaccount_slots
             .iter()
-            .any(|s| s.occupied_subaccount_index == OccupiedSubaccountIndex::Snapshot(subaccount_index))
+            .any(|s| s.occupied_subaccount_index == OccupiedSubaccountIndex::Snapshot(snapshot_index))
         {
             ic_msg!(
                 invoke_context,
@@ -1204,7 +1204,7 @@ fn load_snapshot_impl(
     install_snapshot_data_region(
         invoke_context,
         memory_mapping,
-        subaccount_index,
+        snapshot_index,
         vm_data_addr,
     )?;
 
@@ -1220,7 +1220,7 @@ fn load_snapshot_impl(
     let header_out = translate_type_mut::<u64>(memory_mapping, out_header_addr, check_aligned)?;
 
     if let Some(slot) = syscall_context.subaccount_slots.get_mut(slot_index) {
-        slot.occupied_subaccount_index = OccupiedSubaccountIndex::Snapshot(subaccount_index);
+        slot.occupied_subaccount_index = OccupiedSubaccountIndex::Snapshot(snapshot_index);
         slot.caller_account_metadata = Some(metadata);
         slot.account_view_kind = None; // snapshot loads don't have a program-written view because subaccounts are not changed
         slot.is_writable = false;
@@ -1235,7 +1235,7 @@ fn load_snapshot_impl(
 
 declare_builtin_function!(
     /// F10: read-only, base-free, start-of-block load of a subaccount into a
-    /// pre-reserved VM slot. See [`load_subaccount_snapshot_impl`] for the shared semantics.
+    /// pre-reserved VM slot. See [`load_snapshot_impl`] for the shared semantics.
     SyscallLoadSubaccountSnapshot,
     fn rust(
         invoke_context: &mut InvokeContext,
@@ -1271,7 +1271,7 @@ declare_builtin_function!(
 );
 
 declare_builtin_function!(
-    /// F10: read-only, base-free, start-of-block load of a account into a
+    /// F10: read-only, base-free, start-of-block load of an account into a
     /// pre-reserved VM slot. See [`load_snapshot_impl`] for the shared semantics.
     SyscallLoadAccountSnapshot,
     fn rust(
