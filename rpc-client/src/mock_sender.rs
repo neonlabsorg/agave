@@ -372,6 +372,7 @@ impl RpcSender for MockSender {
                 json!(RpcVersionInfo {
                     solana_core: version.to_string(),
                     feature_set: Some(version.feature_set),
+                    git_commit: solana_version::git_commit_hash().map(String::from),
                 })
             }
             "getLatestBlockhash" => serde_json::to_value(Response {

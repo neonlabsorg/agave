@@ -63,6 +63,15 @@ fn compute_commit(sha1: Option<&'static str>) -> Option<u32> {
     u32::from_str_radix(sha1?.get(..8)?, /*radix:*/ 16).ok()
 }
 
+/// Returns the full git commit hash that this binary was built from, if it was
+/// captured at build time (see `build.rs`). `None` when building outside of a
+/// git checkout.
+pub fn git_commit_hash() -> Option<&'static str> {
+    option_env!("CI_COMMIT")
+        .or(option_env!("AGAVE_GIT_COMMIT_HASH"))
+        .filter(|hash| !hash.is_empty())
+}
+
 impl Default for Version {
     fn default() -> Self {
         let feature_set =
