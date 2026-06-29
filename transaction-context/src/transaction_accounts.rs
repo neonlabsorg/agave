@@ -638,9 +638,9 @@ impl TransactionAccounts {
         let (shared_ptr, private_ptr) = self.snapshot_raw_ptrs(index)?;
 
         // SAFETY: pointers obtained from `Box<_>`-owned entries in append-only
-        // Vecs — heap addresses are stable for the life of `self`. The borrow
-        // counter below guarantees no live `AccountRefMut` exists for this
-        // slot.
+        // Vecs — heap addresses are stable for the life of `self`. Snapshots are
+         // only exposed through shared views, so safe code cannot obtain `&mut`
+         // access to these cells.
         let abi_account = unsafe { &*(*shared_ptr).get() };
         let private_fields = unsafe { &*(*private_ptr).get() };
         Ok(TransactionAccountView {

@@ -313,6 +313,9 @@ impl<'ix_data> TransactionContext<'ix_data> {
         snapshot_key: &SnapshotKey,
         account: AccountSharedData,
     ) -> Result<IndexOfAccount, InstructionError> {
+        if self.find_index_of_snapshot(snapshot_key).is_some() {
+            return Err(InstructionError::DuplicateAccountIndex);
+        }
         if (self.accounts.number_of_subaccounts_with_snapshots() as usize)
             >= MAX_SUBACCOUNTS_PER_TRANSACTION
         {

@@ -454,7 +454,7 @@ fn load_subaccount_snapshot_verify(payload: &[u8]) -> ProgramResult {
         if data != expected_data {
             return Err(ProgramError::Custom(0xC0));
         }
-        if snapshot_owner(header_addr) != expected_owner {
+        if snapshot_owner(header_addr).as_ref() != expected_owner {
             return Err(ProgramError::Custom(0xC2));
         }
         if snapshot_lamports(header_addr) != expected_lamports {
@@ -647,9 +647,12 @@ fn snapshot_lamports(header_addr: u64) -> u64 {
     unsafe { core::ptr::read_unaligned((header_addr + SLOT_HEADER_OFFSET_LAMPORTS) as *const u64) }
 }
 
-/// Borrows the 32-byte `owner` field out of a slot header.
-fn snapshot_owner(header_addr: u64) -> &'static [u8] {
-    unsafe { core::slice::from_raw_parts((header_addr + SLOT_HEADER_OFFSET_OWNER) as *const u8, 32) }
+/// Reads the 32-byte `owner` field out of a slot header.
+fn snapshot_owner(header_addr: u64) -> Pubkey {
+    let bytes = unsafe {
+        core::ptr::read_unaligned((header_addr + SLOT_HEADER_OFFSET_OWNER) as *const [u8; 32])
+    };
+    Pubkey::new_from_array(bytes)
 }
 
 /// Verifies the snapshot's `data_len` and data bytes equal `expected`.
@@ -701,7 +704,7 @@ fn load_account_snapshot_verify(payload: &[u8]) -> ProgramResult {
         if data != expected_data {
             return Err(ProgramError::Custom(0xB0));
         }
-        if snapshot_owner(header_addr) != expected_owner {
+        if snapshot_owner(header_addr).as_ref() != expected_owner {
             return Err(ProgramError::Custom(0xB2));
         }
         if snapshot_lamports(header_addr) != expected_lamports {

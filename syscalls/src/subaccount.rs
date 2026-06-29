@@ -121,11 +121,11 @@ fn find_or_add_snapshot(
         snapshot_index
     } else {
         let storage_address = match snapshot_key {
-            SnapshotKey::Account(pubkey) => pubkey,
-            SnapshotKey::Subaccount(pubkey) => &subaccount_storage_address(pubkey),
+            SnapshotKey::Account(pubkey) => *pubkey,
+            SnapshotKey::Subaccount(pubkey) => subaccount_storage_address(pubkey),
         };
         let (snapshot, _slot) = invoke_context
-            .get_account_shared_data_at_block_start(storage_address)
+            .get_account_shared_data_at_block_start(&storage_address)
             .unwrap_or_else(|| (AccountSharedData::default(), 0));
         let data_len_cost = (snapshot.data().len() as u64)
             .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
@@ -1119,6 +1119,8 @@ declare_builtin_function!(
 ///     (parent-slot state) via `get_account_shared_data_at_block_start`, then
 ///     stored in a fresh, deduplicated lane entry ([`add_snapshot`]) so the
 ///     snapshot is independent of any mid-block load of the same subaccount.
+///   - doesn't use account-locking model because the snapshot is read-only and 
+///     never persisted, so it doesn't need to be locked for reading or writing.
 ///
 /// The slot is released by the same `sol_unload_subaccount`.
 fn load_snapshot_impl(
@@ -1127,8 +1129,6 @@ fn load_snapshot_impl(
     memory_mapping: &mut MemoryMapping,
     get_snapshot_key: impl FnOnce(&mut InvokeContext, &mut MemoryMapping) -> Result<SnapshotKey, Error>,
 ) -> Result<u64, Error> {
-    check_subaccount_syscall_enabled(invoke_context, "sol_load_subaccount_snapshot")?;
-
     let mut load_subaccount_time = Measure::start("load_subaccount");
     let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
     consume_compute_meter(invoke_context, syscall_base_cost)?;
@@ -1241,6 +1241,7 @@ declare_builtin_function!(
         _arg5: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
+        check_subaccount_syscall_enabled(invoke_context, "sol_load_subaccount_snapshot")?;
         load_snapshot_impl(
             invoke_context,
             out_header_addr,
@@ -1278,6 +1279,7 @@ declare_builtin_function!(
         _arg5: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, Error> {
+        check_subaccount_syscall_enabled(invoke_context, "sol_load_account_snapshot")?;
         load_snapshot_impl(
             invoke_context,
             out_header_addr,

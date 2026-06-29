@@ -264,7 +264,8 @@ pub struct SubaccountSlot {
     /// [`crate::cpi::CallerAccount::from_account_info`] and
     /// [`crate::cpi::CallerAccount::from_sol_account_info`].
     pub account_view_kind: Option<AccountViewKind>,
-    /// Specify object that is mirrored by the slot, either a subaccount or a snapshot of a subaccount.
+    /// Specify object that is mirrored by the slot, either a subaccount or 
+    /// a snapshot entry (for account or subaccount).
     pub occupied_subaccount_index: OccupiedSubaccountIndex,
     /// Writability bit recorded at `sol_load_subaccount` time. Re-install of
     /// the data region (after `sol_create_subaccount` resizes the underlying

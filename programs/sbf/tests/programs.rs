@@ -6559,6 +6559,115 @@ fn test_program_sbf_subaccount_snapshot_tracks_parent_not_origin() {
     );
 }
 
+/// (9) HIGH-1 determinism core, subaccount lane: the full
+/// write-in-tx-A / snapshot-in-a-later-tx-of-the-same-block / next-block
+/// scenario, asserting owner + lamports + data in one test.
+///
+/// The snapshot syscalls read the *parent slot* via
+/// `get_account_shared_data_at_block_start` →
+/// `Bank::proper_ancestors()` (the current slot excluded). That read must be
+/// byte-identical on the leader and on every replaying validator, so a snapshot
+/// taken in block N must observe X exactly as of the block boundary regardless
+/// of what earlier transactions in block N did to it.
+///
+/// Timeline:
+///   * Block A     — create subaccount X with V1 (owner = program_id,
+///                   lamports = funding). This is X's pre-block (parent-slot)
+///                   state for block N.
+///   * Block N tx A — a real transaction overwrites X's data to V2.
+///   * Block N tx B — `load_subaccount_snapshot(X)` must report owner/lamports
+///                   == X's pre-block values and data == V1 (NOT A's V2).
+///   * Block N+1    — `load_subaccount_snapshot(X)` must now report data == V2,
+///                   because block N (with A's write committed) is its parent.
+///
+/// Discriminating power: had the snapshot delegated to plain
+/// `get_account_shared_data` (which includes the current slot's writes), tx B
+/// would observe A's V2 and the disc=11 verifier would fail with `Custom(0xC0)`
+/// (data mismatch). It passes only because the parent-slot read excludes block
+/// N. The block-N+1 read then proves the parent read is not merely a frozen
+/// creation-time value — it tracks the committed parent slot.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_subaccount_snapshot_isolation_full() {
+    let (bank, mut bank_client, bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let v1: &[u8] = b"high1-subaccount-pre-block-val1"; // 31 bytes
+    let v2: &[u8] = b"high1-subaccount-txA-overwrite2"; // 31 bytes, same len
+    assert_eq!(v1.len(), v2.len());
+    let payer_pubkey = mint_keypair.pubkey();
+    let base_pubkey = Pubkey::new_unique();
+
+    // Block A — create X with V1 (owner = program_id, lamports = funding).
+    let ix1 = subaccount_create_instruction(program_id, base_pubkey, payer_pubkey, 0, v1, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix1);
+    assert!(
+        status.is_ok(),
+        "create failed: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+
+    // Advance to block N so the V1 write lives in the parent slot.
+    let bank = bank_client
+        .advance_slot(1, bank_forks.as_ref(), &Pubkey::default())
+        .expect("advance slot for block N");
+
+    // Block N, tx A — a real transaction overwrites X's data to V2.
+    let ix_tx_a = subaccount_instruction(program_id, base_pubkey, true, 1, v2, vec![]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix_tx_a);
+    assert!(
+        status.is_ok(),
+        "tx A overwrite failed: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+
+    // Sanity: the live mid-block state is now V2.
+    let storage_addr = subaccount_storage_addr_for(&base_pubkey, &program_id);
+    assert_eq!(
+        bank.get_account(&storage_addr)
+            .expect("subaccount exists")
+            .data(),
+        v2,
+        "tx A's overwrite should be the live state",
+    );
+
+    // Block N, tx B — the snapshot must report X's pre-block owner / lamports /
+    // data (V1), NOT A's mid-block V2. Fails with Custom(0xC0) if the read
+    // leaked A's write (i.e. if it used get_account_shared_data).
+    let ix_tx_b = subaccount_snapshot_verify_instruction(
+        program_id,
+        &base_pubkey,
+        &program_id,
+        SUBACCOUNT_FUNDING_LAMPORTS,
+        v1,
+    );
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix_tx_b);
+    assert!(
+        status.is_ok(),
+        "same-block snapshot must read pre-block V1, not tx A's V2: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+
+    // Advance to block N+1 — block N (with A's write) is now the parent, so the
+    // snapshot must observe A's committed V2.
+    let bank = bank_client
+        .advance_slot(1, bank_forks.as_ref(), &Pubkey::default())
+        .expect("advance slot for block N+1");
+    let ix_tx_c = subaccount_snapshot_verify_instruction(
+        program_id,
+        &base_pubkey,
+        &program_id,
+        SUBACCOUNT_FUNDING_LAMPORTS,
+        v2,
+    );
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix_tx_c);
+    assert!(
+        status.is_ok(),
+        "next-block snapshot must read tx A's committed V2: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+}
+
 // ============================================================================
 // `sol_load_account_snapshot` — read-only, base-free, start-of-block load of an
 // arbitrary account *by pubkey* (not subaccount seeds). Mirrors the subaccount
@@ -6661,6 +6770,88 @@ fn test_program_sbf_account_snapshot_ignores_midblock_write() {
     assert!(
         status.is_ok(),
         "snapshot must read start-of-block V1, not mid-block V2: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+}
+
+/// HIGH-1 determinism core, account lane: the full
+/// write-in-tx-A / snapshot-in-a-later-tx-of-the-same-block / next-block
+/// scenario, asserting owner + lamports + data in one test. Mirrors
+/// `test_program_sbf_subaccount_snapshot_isolation_full` but drives the
+/// `SnapshotKey::Account` lane, and uses a genuine `system_program::Transfer`
+/// transaction (not a direct `store_account`) as the in-block writer tx A.
+///
+/// Timeline:
+///   * Block A      — store X (system-owned, lamports = L1). X's pre-block state.
+///   * Block N tx A — a real system Transfer credits X to L1 + DELTA = L2.
+///   * Block N tx B — `load_account_snapshot(X)` must report lamports == L1 and
+///                    owner/data == X's pre-block values (NOT L2).
+///   * Block N+1    — `load_account_snapshot(X)` must now report lamports == L2.
+///
+/// Discriminating power: a plain `get_account_shared_data` read (current slot
+/// included) would see tx A's L2 in block N and the disc=17 verifier would fail
+/// with `Custom(0xB3)` (lamports mismatch). It passes only because the
+/// parent-slot read excludes block N; the block-N+1 read then proves the read
+/// tracks the committed parent slot rather than a frozen value.
+#[test]
+#[cfg(feature = "sbf_rust")]
+fn test_program_sbf_account_snapshot_isolation_full() {
+    use solana_system_interface::instruction as system_instruction;
+
+    let (bank, mut bank_client, bank_forks, mint_keypair, program_id) =
+        deploy_subaccount_program(1_000_000_000);
+
+    let account_pk = Pubkey::new_unique();
+    let owner = system_program::id(); // system-owned so a Transfer can credit it
+    let l1: u64 = 5_000_000; // pre-block balance (rent-exempt for 0-byte data)
+    let delta: u64 = 1_500_000;
+    let l2: u64 = l1 + delta;
+
+    // Block A — store X (system-owned, empty data, lamports = L1).
+    bank.store_account(&account_pk, &make_account(l1, &owner, &[]));
+
+    // Advance to block N so the L1 write lives in the parent slot.
+    let bank = bank_client
+        .advance_slot(1, bank_forks.as_ref(), &Pubkey::default())
+        .expect("advance slot for block N");
+
+    // Block N, tx A — a real Transfer credits X from the mint, raising it to L2.
+    let transfer_ix = system_instruction::transfer(&mint_keypair.pubkey(), &account_pk, delta);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, transfer_ix);
+    assert!(
+        status.is_ok(),
+        "tx A transfer failed: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+
+    // Sanity: the live mid-block balance is now L2.
+    assert_eq!(
+        bank.get_account(&account_pk).expect("account exists").lamports(),
+        l2,
+        "tx A's transfer should be the live state",
+    );
+
+    // Block N, tx B — the snapshot must report X's pre-block lamports (L1),
+    // owner and (empty) data, NOT tx A's mid-block L2. Fails with Custom(0xB3)
+    // if the read leaked A's write.
+    let ix_tx_b = account_snapshot_verify_instruction(program_id, &account_pk, &owner, l1, &[]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix_tx_b);
+    assert!(
+        status.is_ok(),
+        "same-block snapshot must read pre-block L1, not tx A's L2: {status:?}\nlogs:\n{}",
+        logs.join("\n")
+    );
+
+    // Advance to block N+1 — block N (with A's transfer committed) is now the
+    // parent, so the snapshot must observe L2.
+    let bank = bank_client
+        .advance_slot(1, bank_forks.as_ref(), &Pubkey::default())
+        .expect("advance slot for block N+1");
+    let ix_tx_c = account_snapshot_verify_instruction(program_id, &account_pk, &owner, l2, &[]);
+    let (status, _, logs) = run_subaccount_tx(&bank, &mint_keypair, ix_tx_c);
+    assert!(
+        status.is_ok(),
+        "next-block snapshot must read tx A's committed L2: {status:?}\nlogs:\n{}",
         logs.join("\n")
     );
 }
