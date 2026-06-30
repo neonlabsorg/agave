@@ -2,7 +2,7 @@
 
 use {
     crate::{
-        invoke_context::{InvokeContext, SerializedAccountMetadata},
+        invoke_context::{InvokeContext, OccupiedSubaccountIndex, SerializedAccountMetadata},
         memory::{translate_slice, translate_type, translate_type_mut_for_cpi, translate_vm_slice},
         serialization::{create_memory_region_of_account, modify_memory_region_of_account},
     },
@@ -1209,7 +1209,7 @@ pub fn translate_subaccount_slots<'a>(
                     s.caller_account_metadata.as_ref(),
                     s.account_view_kind,
                 ) {
-                    (Some(idx), Some(meta), Some(kind)) => Some((
+                    (OccupiedSubaccountIndex::Subaccount(idx), Some(meta), Some(kind)) => Some((
                         s.vm_account_view_addr,
                         meta.clone(),
                         idx,

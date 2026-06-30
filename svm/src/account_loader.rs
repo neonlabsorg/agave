@@ -362,6 +362,18 @@ impl<CB: TransactionProcessingCallback> TransactionProcessingCallback for Accoun
         // but will later be used in IndexImplementation::V2 of the global program cache.
         self.do_load(pubkey).0.map(|account| (account, 0))
     }
+
+    fn get_account_shared_data_at_block_start(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<(AccountSharedData, Slot)> {
+        // Deliberately bypass `self.loaded_accounts` (the mid-block cache that
+        // `update_accounts_for_executed_tx` populates with this block's writes)
+        // and delegate straight to the underlying callback (the bank), whose
+        // implementation reads the account as of the block's parent slot.
+        self.callbacks
+            .get_account_shared_data_at_block_start(pubkey)
+    }
 }
 
 // NOTE this is a required subtrait of TransactionProcessingCallback.

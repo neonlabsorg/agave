@@ -179,7 +179,7 @@ use {
                 AtomicBool, AtomicI64, AtomicU64,
                 Ordering::{self, AcqRel, Acquire, Relaxed},
             },
-            Arc, LockResult, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+            Arc, LockResult, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
         },
         time::{Duration, Instant},
     },
@@ -515,6 +515,7 @@ impl PartialEq for Bank {
             status_cache: _,
             blockhash_queue,
             ancestors,
+            parent_ancestors: _,
             hash,
             parent_hash,
             parent_slot,
@@ -740,6 +741,14 @@ pub struct Bank {
 
     /// The set of parents including this bank
     pub ancestors: Ancestors,
+
+    /// Lazily-memoized parent ancestor set: `ancestors` with `self.slot`
+    /// removed. `ancestors` is fixed at bank construction, so this is constant
+    /// for the bank's lifetime. The snapshot read path
+    /// (`get_account_shared_data_at_block_start`) builds it once and reuses it
+    /// across every distinct snapshot account, instead of cloning `ancestors`
+    /// and removing `self.slot` on each call.
+    parent_ancestors: OnceLock<Ancestors>,
 
     /// Hash of this Bank's state. Only meaningful after freezing.
     hash: RwLock<Hash>,
@@ -1071,6 +1080,7 @@ impl Bank {
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
             blockhash_queue: RwLock::<BlockhashQueue>::default(),
             ancestors: Ancestors::default(),
+            parent_ancestors: OnceLock::new(),
             hash: RwLock::<Hash>::default(),
             parent_hash: Hash::default(),
             parent_slot: Slot::default(),
@@ -1340,6 +1350,7 @@ impl Bank {
             collector_id: *collector_id,
             collector_fees: AtomicU64::new(0),
             ancestors: Ancestors::default(),
+            parent_ancestors: OnceLock::new(),
             hash: RwLock::new(Hash::default()),
             is_delta: AtomicBool::new(false),
             tick_height: AtomicU64::new(parent.tick_height.load(Relaxed)),
@@ -1811,6 +1822,7 @@ impl Bank {
             status_cache: Arc::<RwLock<BankStatusCache>>::default(),
             blockhash_queue: RwLock::new(fields.blockhash_queue),
             ancestors,
+            parent_ancestors: OnceLock::new(),
             hash: RwLock::new(fields.hash),
             parent_hash: fields.parent_hash,
             parent_slot: fields.parent_slot,
@@ -2078,8 +2090,7 @@ impl Bank {
         // of this function. With offset==0 (production default) this is a
         // no-op.
         let last_offset = crate::parasol_clock_offset::last_applied();
-        let mut unix_timestamp =
-            self.clock().unix_timestamp.saturating_sub(last_offset);
+        let mut unix_timestamp = self.clock().unix_timestamp.saturating_sub(last_offset);
         // set epoch_start_timestamp to None to warp timestamp
         let epoch_start_timestamp = {
             let epoch = if let Some(epoch) = parent_epoch {
@@ -2095,8 +2106,7 @@ impl Bank {
             slow: MAX_ALLOWABLE_DRIFT_PERCENTAGE_SLOW_V2,
         };
 
-        let ancestor_timestamp =
-            self.clock().unix_timestamp.saturating_sub(last_offset);
+        let ancestor_timestamp = self.clock().unix_timestamp.saturating_sub(last_offset);
         if let Some(timestamp_estimate) =
             self.get_timestamp_estimate(max_allowable_drift, epoch_start_timestamp)
         {
@@ -5866,6 +5876,28 @@ impl TransactionProcessingCallback for Bank {
             .accounts
             .accounts_db
             .load_with_fixed_root(&self.ancestors, pubkey)
+    }
+
+    fn get_account_shared_data_at_block_start(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<(AccountSharedData, Slot)> {
+        // Read with the current slot excluded so writes made by earlier
+        // transactions in this block are invisible — i.e. the account as of the
+        // block's parent slot. The parent ancestor set is fixed at bank
+        // construction and identical across leader and replay, so the result is
+        // deterministic across the cluster. It is memoized on first use
+        // (`parent_ancestors`) and reused across every snapshot load in the
+        // transaction rather than cloned per distinct account.
+        let parent_ancestors = self.parent_ancestors.get_or_init(|| {
+            let mut ancestors = self.ancestors.clone();
+            ancestors.remove(&self.slot);
+            ancestors
+        });
+        self.rc
+            .accounts
+            .accounts_db
+            .load_with_fixed_root(parent_ancestors, pubkey)
     }
 
     fn inspect_account(&self, address: &Pubkey, account_state: AccountState, is_writable: bool) {

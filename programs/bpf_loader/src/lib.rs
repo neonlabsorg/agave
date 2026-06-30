@@ -1642,7 +1642,7 @@ fn execute<'a, 'b: 'a>(
                                     .subaccount_slots
                                     .iter()
                                     .find_map(|slot| {
-                                        let subaccount_index = slot.occupied_subaccount_index?;
+                                        let subaccount_index = slot.occupied_subaccount_index.get_subaccount_index()?;
                                         let metadata = slot.caller_account_metadata.as_ref()?;
                                         let vm_end = slot
                                             .vm_data_addr
