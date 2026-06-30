@@ -67,6 +67,18 @@ message TransactionStatusMeta {
     optional uint64 compute_units_consumed = 16;
     // Total transaction cost
     optional uint64 cost_units = 17;
+
+    // F10/PRS-314: owner-facing pubkeys of subaccounts *changed* by this
+    // transaction, in the same order as the tail of `pre_balances`/
+    // `post_balances` (positions [account_keys.len()..)). Empty for
+    // transactions that don't change a subaccount. Always-empty for txs
+    // committed by older nodes (proto3 default).
+    repeated bytes subaccount_addresses = 200;
+
+    // F10/PRS-155: owner-facing pubkeys of subaccounts accessed but left
+    // *unchanged* (read-only). Reported by address only — no associated
+    // pre/post balances. Always-empty for txs committed by older nodes.
+    repeated bytes unchanged_subaccount_addresses = 201;
 }
 
 message TransactionError {

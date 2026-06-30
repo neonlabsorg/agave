@@ -197,6 +197,28 @@ pub enum AccountViewKind {
     C,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OccupiedSubaccountIndex {
+    Empty,
+    Subaccount(IndexOfAccount),
+    Snapshot(IndexOfAccount),
+}
+
+impl OccupiedSubaccountIndex {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    #[inline]
+    pub fn get_subaccount_index(&self) -> Option<IndexOfAccount> {
+        match self {
+            Self::Subaccount(idx) => Some(*idx),
+            _ => None,
+        }
+    }
+}
+
 /// Per-slot bookkeeping for a `sol_load_subaccount` reservation.
 ///
 /// At VM creation `serialize_parameters_aligned` reserves
@@ -242,9 +264,9 @@ pub struct SubaccountSlot {
     /// [`crate::cpi::CallerAccount::from_account_info`] and
     /// [`crate::cpi::CallerAccount::from_sol_account_info`].
     pub account_view_kind: Option<AccountViewKind>,
-    /// `Some(index)` once the slot is occupied, naming the subaccount index
-    /// inside `TransactionAccounts` whose state the slot mirrors.
-    pub occupied_subaccount_index: Option<IndexOfAccount>,
+    /// Specify object that is mirrored by the slot, either a subaccount or 
+    /// a snapshot entry (for account or subaccount).
+    pub occupied_subaccount_index: OccupiedSubaccountIndex,
     /// Writability bit recorded at `sol_load_subaccount` time. Re-install of
     /// the data region (after `sol_create_subaccount` resizes the underlying
     /// `AccountSharedData`) preserves this bit.
@@ -769,6 +791,18 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         self.environment_config
             .transaction_processing_callback
             .get_account_shared_data(pubkey)
+    }
+
+    /// Load an account as of the beginning of the current block (parent-slot
+    /// state), before any transaction in this block modified it. Used by the
+    /// read-only `sol_load_subaccount_snapshot_*` syscalls.
+    pub fn get_account_shared_data_at_block_start(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<(AccountSharedData, Slot)> {
+        self.environment_config
+            .transaction_processing_callback
+            .get_account_shared_data_at_block_start(pubkey)
     }
 
     // Should alignment be enforced during user pointer translation

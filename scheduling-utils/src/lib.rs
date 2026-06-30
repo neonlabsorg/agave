@@ -7,12 +7,13 @@
                 acknowledge use of an interface that may break without warning."
     )
 )]
-pub mod thread_aware_account_locks;
 
 pub mod error;
+pub mod thread_aware_account_locks;
+
 #[cfg(unix)]
+pub mod bridge;
 pub mod handshake;
-#[cfg(unix)]
+pub mod pubkeys_ptr;
 pub mod responses_region;
-#[cfg(unix)]
 pub mod transaction_ptr;

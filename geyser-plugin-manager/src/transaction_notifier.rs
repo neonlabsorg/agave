@@ -2,7 +2,7 @@
 use {
     crate::geyser_plugin_manager::GeyserPluginManager,
     agave_geyser_plugin_interface::geyser_plugin_interface::{
-        ReplicaTransactionInfoV3, ReplicaTransactionInfoVersions,
+        ReplicaTransactionInfoV3, ReplicaTransactionInfoVersions, TransactionStatusMetaLegacy,
     },
     log::*,
     solana_clock::Slot,
@@ -36,20 +36,25 @@ impl TransactionNotifier for TransactionNotifierImpl {
         transaction: &VersionedTransaction,
     ) {
         let mut measure = Measure::start("geyser-plugin-notify_plugins_of_transaction_info");
+
+        let plugin_manager = self.plugin_manager.read().unwrap();
+        
+        if plugin_manager.plugins.is_empty() {
+            return;
+        }
+
+        // Hand plugins the frozen, ABI-stable view of the metadata. Plugins are
+        // compiled separately and read `TransactionStatusMeta` fields by offset;
+        // exposing the evolving struct directly breaks binary compatibility.
+        let transaction_status_meta = TransactionStatusMetaLegacy::from(transaction_status_meta);
         let transaction_log_info = Self::build_replica_transaction_info(
             index,
             signature,
             message_hash,
             is_vote,
-            transaction_status_meta,
+            &transaction_status_meta,
             transaction,
         );
-
-        let plugin_manager = self.plugin_manager.read().unwrap();
-
-        if plugin_manager.plugins.is_empty() {
-            return;
-        }
 
         for plugin in plugin_manager.plugins.iter() {
             if !plugin.transaction_notifications_enabled() {
@@ -94,7 +99,7 @@ impl TransactionNotifierImpl {
         signature: &'a Signature,
         message_hash: &'a Hash,
         is_vote: bool,
-        transaction_status_meta: &'a TransactionStatusMeta,
+        transaction_status_meta: &'a TransactionStatusMetaLegacy,
         transaction: &'a VersionedTransaction,
     ) -> ReplicaTransactionInfoV3<'a> {
         ReplicaTransactionInfoV3 {

@@ -507,11 +507,17 @@ impl BankingStage {
             );
 
             worker_metrics.push(consume_worker.metrics_handle());
+            let exit = exit.clone();
             non_vote_thread_hdls.push(
                 Builder::new()
                     .name(format!("solCoWorker{id:02}"))
                     .spawn(move || {
-                        let _ = consume_worker.run();
+                        // A disconnected channel is the expected shutdown signal
+                        // (the scheduler thread drops its channel ends on exit);
+                        // only abort if the worker errors while still running.
+                        if consume_worker.run().is_err() && !exit.load(Ordering::Relaxed) {
+                            std::process::abort();
+                        }
                     })
                     .unwrap(),
             )
@@ -644,7 +650,7 @@ mod external {
     use {
         super::*,
         crate::banking_stage::consume_worker::external::ExternalWorker,
-        agave_scheduling_utils::handshake::server::{AgaveSession, AgaveWorkerSession},
+        agave_scheduling_utils::handshake::{AgaveSession, AgaveWorkerSession},
         tpu_to_pack::BankingPacketReceivers,
     };
 
@@ -653,6 +659,7 @@ mod external {
         pub fn spawn_external_threads(
             &mut self,
             AgaveSession {
+                flags: _,
                 tpu_to_pack,
                 progress_tracker,
                 workers,
@@ -744,7 +751,9 @@ mod external {
                     Builder::new()
                         .name(format!("solECoWorker{id:02}"))
                         .spawn(move || {
-                            let _ = consume_worker.run();
+                            if consume_worker.run().is_err() {
+                                std::process::abort();
+                            }
                         })
                         .unwrap(),
                 )

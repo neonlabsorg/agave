@@ -44,6 +44,23 @@ pub trait InvokeContextCallback {
 pub trait TransactionProcessingCallback: InvokeContextCallback {
     fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)>;
 
+    /// Load `pubkey` as of the beginning of the current block (parent-slot
+    /// state), before any transaction in this block modified it. Used by the
+    /// read-only `sol_load_subaccount_snapshot_*` syscalls to expose a
+    /// deterministic start-of-block snapshot independent of intra-block
+    /// ordering.
+    ///
+    /// The default implementation falls back to the live mid-block read so
+    /// non-bank contexts (tests / svm-internal harnesses, which generally run
+    /// a single slot) keep working unchanged. `Bank` overrides this to read
+    /// with the current slot excluded.
+    fn get_account_shared_data_at_block_start(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<(AccountSharedData, Slot)> {
+        self.get_account_shared_data(pubkey)
+    }
+
     fn inspect_account(&self, _address: &Pubkey, _account_state: AccountState, _is_writable: bool) {
     }
 }

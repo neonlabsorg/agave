@@ -8,7 +8,6 @@ use {
         },
         rollback_accounts::RollbackAccounts,
         transaction_error_metrics::TransactionErrorMetrics,
-        transaction_execution_result::ExecutedTransaction,
     },
     ahash::{AHashMap, AHashSet},
     solana_account::{
@@ -35,7 +34,9 @@ use {
     solana_svm_callback::{AccountState, TransactionProcessingCallback},
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_transaction::svm_message::SVMMessage,
-    solana_transaction_context::{transaction_accounts::KeyedAccountSharedData, IndexOfAccount},
+    solana_transaction_context::{
+        subaccount_storage_address, transaction_accounts::KeyedAccountSharedData, IndexOfAccount,
+    },
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::num::{NonZeroU32, Saturating},
 };
@@ -153,6 +154,13 @@ pub(crate) struct LoadedTransactionAccount {
     field_qualifiers(program_indices(pub), compute_budget(pub))
 )]
 pub struct LoadedTransaction {
+    /// Account values for the transaction. Indices
+    /// `[0..message.account_keys().len())` correspond to the message account
+    /// keys; the tail `[message.account_keys().len()..)` is the subaccount
+    /// lane, keyed by the **owner-facing** pubkey. The accounts-db storage
+    /// address (`subaccount_storage_address(owner)`) is applied at the
+    /// commit boundary by `account_saver::collect_accounts_to_store` and
+    /// matched on lookup by `AccountLoader::update_accounts_for_successful_tx`.
     pub accounts: Vec<KeyedAccountSharedData>,
     pub(crate) program_indices: Vec<IndexOfAccount>,
     pub fee_details: FeeDetails,
@@ -300,23 +308,6 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
         }
     }
 
-    pub(crate) fn update_accounts_for_executed_tx(
-        &mut self,
-        message: &impl SVMMessage,
-        executed_transaction: &ExecutedTransaction,
-    ) {
-        if executed_transaction.was_successful() {
-            self.update_accounts_for_successful_tx(
-                message,
-                &executed_transaction.loaded_transaction.accounts,
-            );
-        } else {
-            self.update_accounts_for_failed_tx(
-                &executed_transaction.loaded_transaction.rollback_accounts,
-            );
-        }
-    }
-
     pub(crate) fn update_accounts_for_failed_tx(&mut self, rollback_accounts: &RollbackAccounts) {
         for (account_address, account) in rollback_accounts {
             self.loaded_accounts
@@ -324,7 +315,7 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
         }
     }
 
-    fn update_accounts_for_successful_tx(
+    pub(crate) fn update_accounts_for_successful_tx(
         &mut self,
         message: &impl SVMMessage,
         transaction_accounts: &[KeyedAccountSharedData],
@@ -344,14 +335,20 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
 
             self.loaded_accounts.insert(*address, account.clone());
         }
-        for (address, account) in transaction_accounts
+        // F10/PRS-314: subaccount tail is keyed by the owner-facing pubkey;
+        // accounts-db addresses subaccounts by
+        // `subaccount_storage_address(owner)`, so apply the transform here at
+        // the cache-write boundary so subsequent
+        // `load_account(&storage_address(owner))` calls hit post-execution
+        // state.
+        for (owner_address, account) in transaction_accounts
             .iter()
             .skip(message.account_keys().len())
         {
-            self.loaded_accounts.insert(*address, account.clone());
+            self.loaded_accounts
+                .insert(subaccount_storage_address(owner_address), account.clone());
         }
     }
-
 }
 
 // Program loaders and parsers require a type that impls TransactionProcessingCallback,
@@ -364,6 +361,18 @@ impl<CB: TransactionProcessingCallback> TransactionProcessingCallback for Accoun
         // The returned last-modification-slot is a dummy value for now,
         // but will later be used in IndexImplementation::V2 of the global program cache.
         self.do_load(pubkey).0.map(|account| (account, 0))
+    }
+
+    fn get_account_shared_data_at_block_start(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<(AccountSharedData, Slot)> {
+        // Deliberately bypass `self.loaded_accounts` (the mid-block cache that
+        // `update_accounts_for_executed_tx` populates with this block's writes)
+        // and delegate straight to the underlying callback (the bank), whose
+        // implementation reads the account as of the block's parent slot.
+        self.callbacks
+            .get_account_shared_data_at_block_start(pubkey)
     }
 }
 

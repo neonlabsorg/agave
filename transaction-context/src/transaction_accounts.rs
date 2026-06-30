@@ -2,8 +2,8 @@
 use qualifier_attr::qualifiers;
 use {
     crate::{
-        subaccount_storage_address, vm_slice::VmSlice, IndexOfAccount,
-        MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION, MAX_ACCOUNT_DATA_LEN, SUBACCOUNT_MARKER,
+        vm_slice::VmSlice, IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION,
+        MAX_ACCOUNT_DATA_LEN, SUBACCOUNT_MARKER,
     },
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
     solana_instruction::error::InstructionError,
@@ -235,8 +235,30 @@ impl WritableAccount for TransactionAccountViewMut<'_> {
 
 /// An account key and the matching account
 pub type KeyedAccountSharedData = (Pubkey, AccountSharedData);
-pub(crate) type DeconstructedTransactionAccounts =
-    (Vec<KeyedAccountSharedData>, Box<[Cell<bool>]>, Cell<i64>);
+pub(crate) type DeconstructedTransactionAccounts = (
+    Vec<KeyedAccountSharedData>,
+    // F10/PRS-155: owner-facing keys of subaccounts that were accessed but
+    // not modified this transaction (drained out of the persisted lane by the
+    // dirty filter). The receipt lists them by owner address only.
+    Vec<Pubkey>,
+    Box<[Cell<bool>]>,
+    Cell<i64>,
+);
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+pub enum SnapshotKey {
+    Account(Pubkey),
+    Subaccount(Pubkey),
+}
+
+impl SnapshotKey {
+    pub fn as_pubkey(&self) -> &Pubkey {
+        match self {
+            SnapshotKey::Account(key) => key,
+            SnapshotKey::Subaccount(key) => key,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct TransactionAccounts {
@@ -285,6 +307,15 @@ pub struct TransactionAccounts {
     touched_subaccounts: RefCell<Vec<bool>>,
     #[cfg(not(target_os = "solana"))]
     subaccount_indexes: RefCell<HashMap<Pubkey, IndexOfAccount>>,
+
+    #[cfg(not(target_os = "solana"))]
+    #[allow(clippy::vec_box)]
+    snapshot_shared_fields: RefCell<Vec<Box<UnsafeCell<AccountSharedFields>>>>,
+    #[cfg(not(target_os = "solana"))]
+    #[allow(clippy::vec_box)]
+    snapshot_private_fields: RefCell<Vec<Box<UnsafeCell<AccountPrivateFields>>>>,
+    #[cfg(not(target_os = "solana"))]
+    snapshot_indexes: RefCell<HashMap<SnapshotKey, IndexOfAccount>>,
 }
 
 impl TransactionAccounts {
@@ -331,6 +362,11 @@ impl TransactionAccounts {
             subaccount_borrow_counters: RefCell::new(Vec::new()),
             touched_subaccounts: RefCell::new(Vec::new()),
             subaccount_indexes: RefCell::new(HashMap::new()),
+
+            snapshot_shared_fields: RefCell::new(Vec::new()),
+            snapshot_private_fields: RefCell::new(Vec::new()),
+            snapshot_indexes: RefCell::new(HashMap::new()),
+
             dynamic_accounts_lamports_sum: Cell::new(0),
         }
     }
@@ -405,6 +441,41 @@ impl TransactionAccounts {
         index
     }
 
+    /// F10: append a new subaccount snapshot into the split-storage lane.
+    /// Populates the two parallel Vecs (shared fields, private fields)
+    /// without borrow counters and touched flags. Caller is responsible
+    /// for deduplication — `TransactionContext::add_snapshot` does the
+    /// find-index check before this.
+    ///
+    /// The entry is left **untouched**, so the end-of-tx dirty filter never
+    /// persists it.
+    #[cfg(not(target_os = "solana"))]
+    pub(crate) fn add_snapshot(
+        &self,
+        snapshot_key: &SnapshotKey,
+        account: AccountSharedData,
+    ) -> IndexOfAccount {
+        let lamports = account.lamports();
+        let mut shared = self.snapshot_shared_fields.borrow_mut();
+        let mut private = self.snapshot_private_fields.borrow_mut();
+        let mut indexes = self.snapshot_indexes.borrow_mut();
+        let index = shared.len() as IndexOfAccount;
+        shared.push(Box::new(UnsafeCell::new(AccountSharedFields {
+            key: *snapshot_key.as_pubkey(),
+            owner: *account.owner(),
+            lamports,
+            payload: crate::vm_slice::VmSlice::new(0, account.data().len() as u64),
+        })));
+        private.push(Box::new(UnsafeCell::new(AccountPrivateFields {
+            rent_epoch: account.rent_epoch(),
+            executable: account.executable(),
+            payload: account.data_clone(),
+        })));
+        // Intentionally doesn't track lamports in `dynamic_accounts_lamports_sum` — the snapshot is read-only
+        indexes.insert(snapshot_key.clone(), index);
+        index
+    }
+
     /// F10 W10: lamports introduced by `add_subaccount` for accounts not
     /// present in the original tx account list. SVM/runtime callers add
     /// this to the expected post-tx lamport sum to avoid false
@@ -437,14 +508,22 @@ impl TransactionAccounts {
     }
 
     #[cfg(not(target_os = "solana"))]
-    pub fn number_of_subaccounts(&self) -> IndexOfAccount {
-        self.subaccount_shared_fields.borrow().len() as IndexOfAccount
+    pub fn number_of_subaccounts_with_snapshots(&self) -> IndexOfAccount {
+        let subaccount_len = self.subaccount_shared_fields.borrow().len();
+        let snapshot_len = self.snapshot_shared_fields.borrow().len();
+        subaccount_len.saturating_add(snapshot_len) as IndexOfAccount
     }
 
     #[cfg(not(target_os = "solana"))]
     pub fn find_index_of_subaccount(&self, pubkey: &Pubkey) -> Option<IndexOfAccount> {
         let indexes = self.subaccount_indexes.borrow();
         indexes.get(pubkey).copied()
+    }
+
+    #[cfg(not(target_os = "solana"))]
+    pub fn find_index_of_snapshot(&self, snapshot_key: &SnapshotKey) -> Option<IndexOfAccount> {
+        let indexes = self.snapshot_indexes.borrow();
+        indexes.get(snapshot_key).copied()
     }
 
     #[cfg(not(target_os = "solana"))]
@@ -546,6 +625,57 @@ impl TransactionAccounts {
             &**private_box as *const _ as *mut _;
         let counter_ptr: *const BorrowCounter = &**counter_box;
         Ok((shared_ptr, private_ptr, counter_ptr))
+    }
+
+    /// Return subaccount snapshot view for the given index. This is used
+    /// to access the state of a subaccount at a specific point in time,
+    /// without allowing any modifications.
+    #[cfg(not(target_os = "solana"))]
+    pub fn get_snapshot(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<TransactionAccountView<'_>, InstructionError> {
+        let (shared_ptr, private_ptr) = self.snapshot_raw_ptrs(index)?;
+
+        // SAFETY: pointers obtained from `Box<_>`-owned entries in append-only
+        // Vecs — heap addresses are stable for the life of `self`. Snapshots are
+         // only exposed through shared views, so safe code cannot obtain `&mut`
+         // access to these cells.
+        let abi_account = unsafe { &*(*shared_ptr).get() };
+        let private_fields = unsafe { &*(*private_ptr).get() };
+        Ok(TransactionAccountView {
+            abi_account,
+            private_fields,
+        })
+    }
+
+    /// Extracts stable raw pointers to the two split-storage cells of the
+    /// subaccount snapshot at `index`. The RefCell borrows on the outer Vecs are
+    /// dropped before returning because the Box-owned heap addresses are
+    /// stable for the life of `self` (append-only invariant).
+    #[cfg(not(target_os = "solana"))]
+    fn snapshot_raw_ptrs(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<
+        (
+            *mut UnsafeCell<AccountSharedFields>,
+            *mut UnsafeCell<AccountPrivateFields>,
+        ),
+        InstructionError,
+    > {
+        let shared = self.snapshot_shared_fields.borrow();
+        let private = self.snapshot_private_fields.borrow();
+        let shared_box = shared
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        let private_box = private
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        let shared_ptr: *mut UnsafeCell<AccountSharedFields> = &**shared_box as *const _ as *mut _;
+        let private_ptr: *mut UnsafeCell<AccountPrivateFields> =
+            &**private_box as *const _ as *mut _;
+        Ok((shared_ptr, private_ptr))
     }
 
     pub(crate) fn update_accounts_resize_delta(
@@ -686,7 +816,14 @@ impl TransactionAccounts {
         self.lamports_delta.get()
     }
 
-    fn deconstruct_into_keyed_account_shared_data(&mut self) -> Vec<KeyedAccountSharedData> {
+    /// Returns the persisted accounts (main lane + the *changed* subaccount
+    /// lane, keyed by owner pubkey) together with the owner-facing keys of
+    /// subaccounts that were accessed but left unchanged this transaction.
+    /// The latter are reported in the receipt by owner address only — they are
+    /// deliberately excluded from the persisted accounts by the dirty filter.
+    fn deconstruct_into_keyed_account_shared_data(
+        &mut self,
+    ) -> (Vec<KeyedAccountSharedData>, Vec<Pubkey>) {
         let mut shared_account_fields = std::mem::take(&mut self.shared_account_fields);
         let mut private_account_fields = std::mem::take(&mut self.private_account_fields);
         let mut accounts: Vec<_> = shared_account_fields
@@ -707,20 +844,26 @@ impl TransactionAccounts {
                 )
             })
             .collect();
-        // F10 W10: drain the subaccount lane and append entries to the main
-        // accounts vec under the *storage* address (`hashv(&[&[1u8], pda])`).
-        // Without this, subaccount data created by `sol_create_subaccount`
-        // is silently dropped at tx commit and accounts-db never receives
-        // any state — the next transaction's `get_account_shared_data` then
-        // returns `None` and downstream programs see empty payloads.
-        // Mirrors the parasol-dev `From<TransactionContext> for ExecutionRecord`
-        // contract.
+        // F10 W10 / PRS-314: drain the subaccount lane and append entries to
+        // the main accounts vec keyed by the **owner-facing** pubkey (i.e.
+        // the address `sol_create_subaccount` / `sol_load_subaccount` returns
+        // to the program). Consumers that need accounts-db addressing —
+        // `account_saver::collect_accounts_to_store` and
+        // `AccountLoader::update_accounts_for_successful_tx` — apply
+        // `subaccount_storage_address` at the boundary themselves. Keeping
+        // owner pubkeys in the lane lets the balance collector report them
+        // verbatim in the transaction recipe without a parallel owner-keys
+        // channel.
         let sub_shared = std::mem::take(&mut *self.subaccount_shared_fields.borrow_mut());
         let sub_private = std::mem::take(&mut *self.subaccount_private_fields.borrow_mut());
         let sub_touched = std::mem::take(&mut *self.touched_subaccounts.borrow_mut());
-        for (idx, (shared_box, private_box)) in
-            sub_shared.into_iter().zip(sub_private.into_iter()).enumerate()
+        let mut unchanged_subaccounts: Vec<Pubkey> = Vec::new();
+        for (idx, (shared_box, private_box)) in sub_shared
+            .into_iter()
+            .zip(sub_private.into_iter())
+            .enumerate()
         {
+            let shared = (*shared_box).into_inner();
             // F10: only persist subaccounts that were actually modified this
             // transaction. `touched_subaccounts[idx]` is set by `touch()`
             // whenever a subaccount is created, funded, written, or loaded
@@ -730,14 +873,17 @@ impl TransactionAccounts {
             // identical payload (write amplification plus a write-version/slot
             // bump from a logically read-only op) and, for a subaccount that
             // never existed on-chain, resurrect an all-default tombstone.
+            //
+            // The unchanged subaccount is still surfaced to the receipt — by
+            // owner-facing key only (no balances) — so RPC consumers can see
+            // which subaccounts the transaction touched read-only.
             if !sub_touched.get(idx).copied().unwrap_or(false) {
+                unchanged_subaccounts.push(shared.key);
                 continue;
             }
-            let shared = (*shared_box).into_inner();
             let private = (*private_box).into_inner();
-            let storage_address = subaccount_storage_address(&shared.key);
             accounts.push((
-                storage_address,
+                shared.key,
                 AccountSharedData::create_from_existing_shared_data(
                     shared.lamports,
                     private.payload,
@@ -747,7 +893,7 @@ impl TransactionAccounts {
                 ),
             ));
         }
-        accounts
+        (accounts, unchanged_subaccounts)
     }
 
     pub(crate) fn deconstruct_into_account_shared_data(&mut self) -> Vec<AccountSharedData> {
@@ -774,8 +920,10 @@ impl TransactionAccounts {
         let sub_shared = std::mem::take(&mut *self.subaccount_shared_fields.borrow_mut());
         let sub_private = std::mem::take(&mut *self.subaccount_private_fields.borrow_mut());
         let sub_touched = std::mem::take(&mut *self.touched_subaccounts.borrow_mut());
-        for (idx, (shared_box, private_box)) in
-            sub_shared.into_iter().zip(sub_private.into_iter()).enumerate()
+        for (idx, (shared_box, private_box)) in sub_shared
+            .into_iter()
+            .zip(sub_private.into_iter())
+            .enumerate()
         {
             // F10: skip subaccounts that were never modified — see the keyed
             // variant `deconstruct_into_keyed_account_shared_data` for the
@@ -798,8 +946,14 @@ impl TransactionAccounts {
     }
 
     pub(crate) fn take(mut self) -> DeconstructedTransactionAccounts {
-        let shared_data = self.deconstruct_into_keyed_account_shared_data();
-        (shared_data, self.touched_flags, self.resize_delta)
+        let (shared_data, unchanged_subaccounts) =
+            self.deconstruct_into_keyed_account_shared_data();
+        (
+            shared_data,
+            unchanged_subaccounts,
+            self.touched_flags,
+            self.resize_delta,
+        )
     }
 
     pub fn resize_delta(&self) -> i64 {
@@ -1085,7 +1239,7 @@ mod tests {
     #[test]
     fn test_add_subaccount_populates_split_storage() {
         let tx_accounts = make_tx_accounts();
-        assert_eq!(tx_accounts.number_of_subaccounts(), 0);
+        assert_eq!(tx_accounts.number_of_subaccounts_with_snapshots(), 0);
 
         let sub_key = Pubkey::new_unique();
         let sub_owner = Pubkey::new_unique();
@@ -1093,7 +1247,7 @@ mod tests {
         let index = tx_accounts.add_subaccount(sub_key, sub_account);
 
         assert_eq!(index, 0);
-        assert_eq!(tx_accounts.number_of_subaccounts(), 1);
+        assert_eq!(tx_accounts.number_of_subaccounts_with_snapshots(), 1);
         assert_eq!(tx_accounts.find_index_of_subaccount(&sub_key), Some(0));
         assert_eq!(tx_accounts.subaccount_key(0), Some(sub_key));
         assert_eq!(
@@ -1259,11 +1413,7 @@ mod tests {
             "dynamic_accounts_lamports_sum must reflect added subaccount lamports",
         );
 
-        let derived_storage = Pubkey::new_from_array(
-            solana_sha256_hasher::hashv(&[&[1u8], subaccount_pda.as_ref()]).to_bytes(),
-        );
-
-        let (accounts, _touched, _resize) = tx_accounts.take();
+        let (accounts, _unchanged, _touched, _resize) = tx_accounts.take();
         assert_eq!(
             accounts.len(),
             2,
@@ -1272,10 +1422,10 @@ mod tests {
         let (main_key, _) = accounts.first().unwrap();
         assert_eq!(*main_key, main_pubkey, "main account preserved");
         let (sub_key, sub_account) = accounts.get(1).unwrap();
-        assert_eq!(
-            *sub_key, derived_storage,
-            "subaccount mapped to storage address"
-        );
+        // PRS-314: the subaccount lane carries the owner-facing pubkey;
+        // `subaccount_storage_address` is applied later at the accounts-db
+        // / loader-cache boundary.
+        assert_eq!(*sub_key, subaccount_pda, "subaccount keyed by owner pubkey");
         assert_eq!(sub_account.lamports(), 1_000);
         assert_eq!(sub_account.data(), subaccount.data());
         assert_eq!(sub_account.owner(), &owner);
@@ -1307,20 +1457,75 @@ mod tests {
             .touch(touched_index | crate::SUBACCOUNT_MARKER)
             .unwrap();
 
-        let derived_storage = Pubkey::new_from_array(
-            solana_sha256_hasher::hashv(&[&[1u8], touched_pda.as_ref()]).to_bytes(),
-        );
-
-        let (accounts, _touched, _resize) = tx_accounts.take();
+        let (accounts, unchanged, _touched, _resize) = tx_accounts.take();
         assert_eq!(
             accounts.len(),
             2,
             "exactly the main account and the one touched subaccount must persist",
         );
         assert_eq!(accounts.first().unwrap().0, main_pubkey);
+        // PRS-155: the persisted lane carries the owner-facing pubkey;
+        // `subaccount_storage_address` is applied later at the accounts-db
+        // boundary.
         let (sub_key, sub_account) = accounts.get(1).unwrap();
-        assert_eq!(*sub_key, derived_storage, "touched subaccount persisted");
+        assert_eq!(
+            *sub_key, touched_pda,
+            "touched subaccount persisted by owner key"
+        );
         assert_eq!(sub_account.lamports(), 1_000);
+        // The untouched sibling is not persisted, but is reported to the
+        // receipt as an unchanged subaccount (owner key only).
+        assert_eq!(
+            unchanged,
+            vec![untouched_pda],
+            "untouched subaccount must be reported in the unchanged list, not persisted",
+        );
+    }
+
+    /// PRS-155: a created subaccount must persist by construction. The
+    /// `sol_create_subaccount` syscall adds the subaccount and immediately
+    /// touches it (`idx | SUBACCOUNT_MARKER`); this test exercises that lane
+    /// contract with the worst case — zero lamports, zero data, which no later
+    /// setter would touch (`set_data_length(0)` is a no-op and there is no
+    /// funding transfer) — and asserts the entry still reaches the drained
+    /// account list. Contrast with an *untouched* `add_subaccount` entry, which
+    /// the dirty filter skips (see
+    /// `test_deconstruct_persists_only_touched_subaccount`).
+    #[test]
+    fn test_touched_create_persists_zero_lamport_subaccount() {
+        let main_pubkey = Pubkey::new_from_array([1u8; 32]);
+        let main_account = AccountSharedData::new(100, 4, &Pubkey::new_unique());
+        let tx_accounts = TransactionAccounts::new(vec![(main_pubkey, main_account)]);
+
+        // Zero lamports, zero data — nothing a later setter would touch.
+        let created_pda = Pubkey::new_from_array([9u8; 32]);
+        let owner = Pubkey::new_from_array([42u8; 32]);
+        let created_index =
+            tx_accounts.add_subaccount(created_pda, AccountSharedData::new(0, 0, &owner));
+        // Mirror the create syscall: touch right after add.
+        tx_accounts
+            .touch(created_index | crate::SUBACCOUNT_MARKER)
+            .unwrap();
+
+        let (accounts, unchanged, _touched, _resize) = tx_accounts.take();
+        assert_eq!(
+            accounts.len(),
+            2,
+            "the main account and the created zero-lamport subaccount must both persist",
+        );
+        assert_eq!(accounts.first().unwrap().0, main_pubkey);
+        let (sub_key, sub_account) = accounts.get(1).unwrap();
+        assert_eq!(
+            *sub_key, created_pda,
+            "created subaccount persisted by owner key",
+        );
+        assert_eq!(sub_account.lamports(), 0);
+        assert_eq!(sub_account.data().len(), 0);
+        assert_eq!(sub_account.owner(), &owner);
+        assert!(
+            unchanged.is_empty(),
+            "a created subaccount is persisted, not reported as unchanged",
+        );
     }
 
     /// `get_dynamic_accounts_lamports_sum` feeds the runtime balance check

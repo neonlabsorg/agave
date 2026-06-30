@@ -76,6 +76,7 @@ pub struct RunArgs {
     pub json_rpc_config: JsonRpcConfig,
     pub pub_sub_config: PubSubConfig,
     pub send_transaction_service_config: SendTransactionServiceConfig,
+    pub scheduler_bind: Option<String>,
 }
 
 impl FromClapArgMatches for RunArgs {
@@ -135,6 +136,7 @@ impl FromClapArgMatches for RunArgs {
 
         let socket_addr_space = SocketAddrSpace::new(matches.is_present("allow_private_addr"));
 
+        let scheduler_bind = matches.value_of("scheduler_bind").map(str::to_string);
         Ok(RunArgs {
             identity_keypair,
             ledger_path,
@@ -149,6 +151,7 @@ impl FromClapArgMatches for RunArgs {
             send_transaction_service_config: SendTransactionServiceConfig::from_clap_arg_match(
                 matches,
             )?,
+            scheduler_bind
         })
     }
 }
@@ -366,6 +369,13 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "TPU Vortexor Receiver address to which verified transaction packet will be \
                  forwarded.",
             ),
+    )
+    .arg(
+        Arg::with_name("scheduler_bind")
+            .long("scheduler-bind")
+            .value_name("PATH")
+            .takes_value(true)
+            .help("path to unix socket to listen on")
     )
     .arg(
         Arg::with_name("public_rpc_addr")
@@ -668,6 +678,22 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "If the validator starts up with no ledger, it will wait to start block \
                  production until it sees a vote land in a rooted slot. This prevents double \
                  signing. Turn off to risk double signing a block.",
+            ),
+    )
+    .arg(
+        Arg::with_name("single_validator")
+            .long("single-validator")
+            .help(
+                "Run in single-validator mode: this node is the only voter and always its own \
+                 leader. ReplayStage never resets PoH backward onto an ancestor of the block it \
+                 is still producing, so an in-progress leader slot is not orphaned into a dead \
+                 slot (which would roll back its already-`processed` transactions). This lets \
+                 clients rely on `processed`. On graceful shutdown it also finishes the \
+                 in-progress leader block before exiting, so a restart loses nothing; only a \
+                 hard crash can still leave a partial slot (use `confirmed` or client retry). It \
+                 does NOT alter the dead-slot path for genuine replay errors. Enabled by \
+                 default; disable by setting the SINGLE_VALIDATOR environment variable to \
+                 0/false/no/off. Unsafe in any multi-validator cluster — disable it there.",
             ),
     )
     .arg(

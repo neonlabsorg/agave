@@ -17,6 +17,42 @@
 //!       (on a successful in-range read) verify the bytes match. Exercises
 //!       the happy path plus the missing-subaccount and out-of-range
 //!       (full/partial) edge cases — see `read_subaccount`.
+//!  10 — load_subaccount_snapshot: read-only, base-free, start-of-block load.
+//!       Takes the base pubkey from the payload (NOT from the account list, to
+//!       prove the base account is not required) and verifies the snapshot data
+//!       equals the expected bytes — see `load_snapshot_verify`.
+//!  11 — load_subaccount_snapshot + verify owner / lamports / data_len / data
+//!       against expected values from the payload — see
+//!       `load_subaccount_snapshot_verify`.
+//!  12 — load_subaccount_snapshot + attempt to write into the read-only data
+//!       region (must fault) — see `load_subaccount_snapshot_cannot_modify`.
+//!  13 — load_subaccount_snapshot twice for the same subaccount in one
+//!       instruction; the second load must fail — see
+//!       `load_subaccount_snapshot_twice`.
+//!  14 — load_subaccount_snapshot + unload + reload + unload, proving a freed
+//!       snapshot slot can be reused — see `load_subaccount_snapshot_unload_reload`.
+//!  15 — load two distinct subaccount snapshots into two slots concurrently and
+//!       verify each — see `load_two_subaccount_snapshots`.
+//!  16 — writable load + overwrite, then load a snapshot of the SAME subaccount
+//!       and verify it still reads the start-of-block value, proving the
+//!       snapshot lane is independent of the live subaccount lane within a
+//!       single instruction — see `subaccount_snapshot_independent_from_writable_load`.
+//!  17 — load_account_snapshot: read-only, base-free, start-of-block load of an
+//!       arbitrary account *by pubkey* (not seeds). Verifies the snapshot's
+//!       owner / lamports / data_len / data against expected values from the
+//!       payload — see `load_account_snapshot_verify`.
+//!  18 — load_account_snapshot + attempt to write into the read-only data
+//!       region (must fault) — see `load_account_snapshot_cannot_modify`.
+//!  19 — load_account_snapshot twice for the same pubkey in one instruction;
+//!       the second load must fail — see `load_account_snapshot_twice`.
+//!  20 — load_account_snapshot + unload + reload + unload, proving a freed
+//!       snapshot slot can be reused — see `load_account_snapshot_unload_reload`.
+//!  21 — load two distinct account snapshots into two slots concurrently and
+//!       verify each — see `load_two_account_snapshots`.
+//!  22 — load a subaccount snapshot (by seeds) AND an account snapshot (by
+//!       pubkey) in one instruction, proving the `Account` and `Subaccount`
+//!       snapshot-key variants never collide — see
+//!       `account_and_subaccount_snapshot_distinct`.
 //!
 //! Accounts:
 //!   [0] payer / base seed (signer, writable, system-program-owned)
@@ -70,6 +106,20 @@ extern "C" {
         out_header_addr: *mut u64,
         _arg5: u64,
     ) -> u64;
+    fn sol_load_subaccount_snapshot(
+        seeds_addr: *const u8,
+        seeds_len: u64,
+        out_header_addr: *mut u64,
+        _arg4: u64,
+        _arg5: u64,
+    ) -> u64;
+    fn sol_load_account_snapshot(
+        pubkey_addr: *const u8,
+        out_header_addr: *mut u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+    ) -> u64;
     fn sol_unload_subaccount(vm_header_addr: u64) -> u64;
     fn sol_read_subaccount(
         seeds_addr: *const u8,
@@ -103,6 +153,19 @@ fn process_instruction(
         7 => transfer_lamports(accounts, payload),
         8 => create_load_twice(accounts, payload),
         9 => read_subaccount(accounts, payload),
+        10 => load_snapshot_verify(payload),
+        11 => load_subaccount_snapshot_verify(payload),
+        12 => load_subaccount_snapshot_cannot_modify(payload),
+        13 => load_subaccount_snapshot_twice(payload),
+        14 => load_subaccount_snapshot_unload_reload(payload),
+        15 => load_two_subaccount_snapshots(payload),
+        16 => subaccount_snapshot_independent_from_writable_load(accounts, payload),
+        17 => load_account_snapshot_verify(payload),
+        18 => load_account_snapshot_cannot_modify(payload),
+        19 => load_account_snapshot_twice(payload),
+        20 => load_account_snapshot_unload_reload(payload),
+        21 => load_two_account_snapshots(payload),
+        22 => account_and_subaccount_snapshot_distinct(payload),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -303,6 +366,506 @@ fn read_subaccount(accounts: &[AccountInfo], payload: &[u8]) -> ProgramResult {
         return Err(ProgramError::Custom(0x92));
     }
 
+    Ok(())
+}
+
+/// Exercises `sol_load_subaccount_snapshot_rust` (disc=10).
+///
+/// Loads a read-only, start-of-block snapshot of the subaccount and verifies
+/// its data equals `expected`. The base pubkey is taken from the payload rather
+/// than from `accounts[..]`, so the caller can omit the base account from the
+/// transaction entirely — proving the snapshot load does not require it.
+///
+/// Payload layout:
+///   bytes 0..32 : base pubkey (the first seed)
+///   bytes 32..  : expected snapshot data (what the start-of-block read must
+///                 return)
+///
+/// Returns `Custom(0xA0)` on a data mismatch and `Custom(0xA1)` on a length
+/// mismatch; the slot is always released before returning.
+fn load_snapshot_verify(payload: &[u8]) -> ProgramResult {
+    let base_bytes = payload
+        .get(0..32)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let expected = payload
+        .get(32..)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let seeds: [&[u8]; 2] = [base_bytes, SEED_TAG];
+
+    let header_addr = load_snapshot(&seeds)?;
+
+    let data_len = unsafe {
+        core::ptr::read_unaligned((header_addr + SLOT_HEADER_OFFSET_DATA_LEN) as *const u64)
+    } as usize;
+    let result = if data_len != expected.len() {
+        Err(ProgramError::Custom(0xA1))
+    } else {
+        let data_ptr = (header_addr + SLOT_HEADER_SIZE) as *const u8;
+        let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
+        if data == expected {
+            Ok(())
+        } else {
+            Err(ProgramError::Custom(0xA0))
+        }
+    };
+
+    // Always release the slot before returning, surfacing the verification
+    // result over a successful-unload status.
+    let u = unsafe { sol_unload_subaccount(header_addr) };
+    result?;
+    if u != SUCCESS {
+        return Err(ProgramError::from(u));
+    }
+    Ok(())
+}
+
+/// Exercises `sol_load_subaccount_snapshot` with full metadata verification
+/// (disc=11). Base pubkey is taken from the payload (base-free).
+///
+/// Payload layout:
+///   bytes  0..32 : base pubkey (first seed)
+///   bytes 32..64 : expected owner
+///   bytes 64..72 : expected lamports (u64 LE)
+///   bytes 72..   : expected snapshot data
+///
+/// Custom codes: 0xC0 data mismatch, 0xC1 data_len mismatch, 0xC2 owner
+/// mismatch, 0xC3 lamports mismatch.
+fn load_subaccount_snapshot_verify(payload: &[u8]) -> ProgramResult {
+    let base = payload.get(0..32).ok_or(ProgramError::InvalidInstructionData)?;
+    let expected_owner = payload.get(32..64).ok_or(ProgramError::InvalidInstructionData)?;
+    let expected_lamports = u64::from_le_bytes(
+        payload
+            .get(64..72)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(ProgramError::InvalidInstructionData)?,
+    );
+    let expected_data = payload.get(72..).ok_or(ProgramError::InvalidInstructionData)?;
+    let seeds: [&[u8]; 2] = [base, SEED_TAG];
+
+    let header_addr = load_snapshot(&seeds)?;
+
+    let result: ProgramResult = (|| {
+        let data_len = snapshot_data_len(header_addr);
+        if data_len != expected_data.len() {
+            return Err(ProgramError::Custom(0xC1));
+        }
+        let data =
+            unsafe { core::slice::from_raw_parts((header_addr + SLOT_HEADER_SIZE) as *const u8, data_len) };
+        if data != expected_data {
+            return Err(ProgramError::Custom(0xC0));
+        }
+        if snapshot_owner(header_addr).as_ref() != expected_owner {
+            return Err(ProgramError::Custom(0xC2));
+        }
+        if snapshot_lamports(header_addr) != expected_lamports {
+            return Err(ProgramError::Custom(0xC3));
+        }
+        Ok(())
+    })();
+
+    let u = unsafe { sol_unload_subaccount(header_addr) };
+    result?;
+    if u != SUCCESS {
+        return Err(ProgramError::from(u));
+    }
+    Ok(())
+}
+
+/// Read-only enforcement for a subaccount snapshot (disc=12). Loads the
+/// snapshot then stores into its data region; the region is read-only so the
+/// store must fault and abort the instruction. `Custom(0xC5)` is returned only
+/// if the write was wrongly accepted.
+fn load_subaccount_snapshot_cannot_modify(payload: &[u8]) -> ProgramResult {
+    let base = payload.get(0..32).ok_or(ProgramError::InvalidInstructionData)?;
+    let seeds: [&[u8]; 2] = [base, SEED_TAG];
+    let header_addr = load_snapshot(&seeds)?;
+    let data_ptr = (header_addr + SLOT_HEADER_SIZE) as *mut u8;
+    unsafe { core::ptr::write_unaligned(data_ptr, 0xFF) };
+    let _ = unsafe { sol_unload_subaccount(header_addr) };
+    Err(ProgramError::Custom(0xC5))
+}
+
+/// Loading the same subaccount snapshot twice in one instruction must fail
+/// (disc=13). Returns `Custom(0xC6)` if the second load unexpectedly succeeds;
+/// otherwise propagates the syscall error.
+fn load_subaccount_snapshot_twice(payload: &[u8]) -> ProgramResult {
+    let base = payload.get(0..32).ok_or(ProgramError::InvalidInstructionData)?;
+    let seeds: [&[u8]; 2] = [base, SEED_TAG];
+    let _h1 = load_snapshot(&seeds)?;
+    let mut header2: u64 = 0;
+    let r2 = unsafe {
+        sol_load_subaccount_snapshot(
+            seeds.as_ptr() as *const u8,
+            seeds.len() as u64,
+            &mut header2 as *mut u64,
+            0,
+            0,
+        )
+    };
+    if r2 == SUCCESS {
+        return Err(ProgramError::Custom(0xC6));
+    }
+    Err(ProgramError::from(r2))
+}
+
+/// Load a subaccount snapshot, verify + unload, then reload the SAME subaccount
+/// into a freed slot and verify again (disc=14). Proves slot reuse.
+///
+/// Payload layout: base(32) ++ expected data.
+fn load_subaccount_snapshot_unload_reload(payload: &[u8]) -> ProgramResult {
+    let base = payload.get(0..32).ok_or(ProgramError::InvalidInstructionData)?;
+    let expected = payload.get(32..).ok_or(ProgramError::InvalidInstructionData)?;
+    let seeds: [&[u8]; 2] = [base, SEED_TAG];
+
+    let h1 = load_snapshot(&seeds)?;
+    verify_snapshot_data(h1, expected)?;
+    unload(h1)?;
+
+    let h2 = load_snapshot(&seeds)?;
+    verify_snapshot_data(h2, expected)?;
+    unload(h2)
+}
+
+/// Load two distinct subaccount snapshots into two slots at once and verify
+/// each (disc=15). Both slots are released before returning.
+///
+/// Payload layout:
+///   bytes  0..32 : base #1
+///   bytes 32..64 : base #2
+///   bytes 64..66 : data #1 length (u16 LE)
+///   bytes 66..66+len1        : expected data #1
+///   bytes 66+len1..          : expected data #2
+fn load_two_subaccount_snapshots(payload: &[u8]) -> ProgramResult {
+    let base1 = payload.get(0..32).ok_or(ProgramError::InvalidInstructionData)?;
+    let base2 = payload.get(32..64).ok_or(ProgramError::InvalidInstructionData)?;
+    let len1 = u16::from_le_bytes(
+        payload
+            .get(64..66)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(ProgramError::InvalidInstructionData)?,
+    ) as usize;
+    let data1 = payload
+        .get(66..66 + len1)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let data2 = payload
+        .get(66 + len1..)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+
+    let seeds1: [&[u8]; 2] = [base1, SEED_TAG];
+    let seeds2: [&[u8]; 2] = [base2, SEED_TAG];
+    let h1 = load_snapshot(&seeds1)?;
+    let h2 = load_snapshot(&seeds2)?;
+
+    let result: ProgramResult = (|| {
+        verify_snapshot_data(h1, data1)?;
+        verify_snapshot_data(h2, data2)?;
+        Ok(())
+    })();
+
+    let u2 = unsafe { sol_unload_subaccount(h2) };
+    let u1 = unsafe { sol_unload_subaccount(h1) };
+    result?;
+    if u1 != SUCCESS {
+        return Err(ProgramError::from(u1));
+    }
+    if u2 != SUCCESS {
+        return Err(ProgramError::from(u2));
+    }
+    Ok(())
+}
+
+/// Proves the snapshot lane is independent of the live subaccount lane within a
+/// single instruction (disc=16). `accounts[0]` is the base (writable). Loads
+/// the subaccount writable, overwrites its data with V2, then loads a snapshot
+/// of the SAME subaccount and asserts it still reads the start-of-block value
+/// V1. Finally commits V2 (unload of the writable slot).
+///
+/// Payload layout:
+///   bytes 0..2 : V1 length (u16 LE)
+///   bytes 2..2+len : expected start-of-block data V1
+///   bytes 2+len..  : V2 to overwrite the live subaccount with
+fn subaccount_snapshot_independent_from_writable_load(
+    accounts: &[AccountInfo],
+    payload: &[u8],
+) -> ProgramResult {
+    let base = accounts.get(0).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let len1 = u16::from_le_bytes(
+        payload
+            .get(0..2)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(ProgramError::InvalidInstructionData)?,
+    ) as usize;
+    let v1 = payload
+        .get(2..2 + len1)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let v2 = payload
+        .get(2 + len1..)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let seeds = seeds_from_payer(base.key);
+
+    // Writable load + overwrite the live subaccount with V2 (subaccount lane).
+    let (header_w, _view) = load_rust(&seeds)?;
+    write_data(header_w, v2);
+
+    // Snapshot load — must still observe the start-of-block value V1.
+    let header_s = load_snapshot(&seeds)?;
+    let result = verify_snapshot_data(header_s, v1);
+    let us = unsafe { sol_unload_subaccount(header_s) };
+
+    // Commit the writable overwrite.
+    let uw = unload(header_w);
+
+    result?;
+    if us != SUCCESS {
+        return Err(ProgramError::from(us));
+    }
+    uw
+}
+
+/// Loads a read-only, start-of-block snapshot of an arbitrary account by its
+/// pubkey via `sol_load_account_snapshot` and returns the slot header address.
+fn load_account_snapshot(pubkey: &[u8]) -> Result<u64, ProgramError> {
+    let mut header_addr: u64 = 0;
+    let result = unsafe {
+        sol_load_account_snapshot(pubkey.as_ptr(), &mut header_addr as *mut u64, 0, 0, 0)
+    };
+    if result != SUCCESS {
+        return Err(ProgramError::from(result));
+    }
+    Ok(header_addr)
+}
+
+/// Reads the `data_len` field out of a slot header.
+fn snapshot_data_len(header_addr: u64) -> usize {
+    let len =
+        unsafe { core::ptr::read_unaligned((header_addr + SLOT_HEADER_OFFSET_DATA_LEN) as *const u64) };
+    len as usize
+}
+
+/// Reads the `lamports` field out of a slot header.
+fn snapshot_lamports(header_addr: u64) -> u64 {
+    unsafe { core::ptr::read_unaligned((header_addr + SLOT_HEADER_OFFSET_LAMPORTS) as *const u64) }
+}
+
+/// Reads the 32-byte `owner` field out of a slot header.
+fn snapshot_owner(header_addr: u64) -> Pubkey {
+    let bytes = unsafe {
+        core::ptr::read_unaligned((header_addr + SLOT_HEADER_OFFSET_OWNER) as *const [u8; 32])
+    };
+    Pubkey::new_from_array(bytes)
+}
+
+/// Verifies the snapshot's `data_len` and data bytes equal `expected`.
+/// Returns `Custom(0xA1)` on a length mismatch and `Custom(0xA0)` on a byte
+/// mismatch (same codes `load_snapshot_verify` uses).
+fn verify_snapshot_data(header_addr: u64, expected: &[u8]) -> ProgramResult {
+    let data_len = snapshot_data_len(header_addr);
+    if data_len != expected.len() {
+        return Err(ProgramError::Custom(0xA1));
+    }
+    let data = unsafe { core::slice::from_raw_parts((header_addr + SLOT_HEADER_SIZE) as *const u8, data_len) };
+    if data != expected {
+        return Err(ProgramError::Custom(0xA0));
+    }
+    Ok(())
+}
+
+/// Exercises `sol_load_account_snapshot` (disc=11).
+///
+/// Payload layout:
+///   bytes  0..32 : account pubkey
+///   bytes 32..64 : expected owner
+///   bytes 64..72 : expected lamports (u64 LE)
+///   bytes 72..   : expected snapshot data
+///
+/// Verifies the start-of-block owner / lamports / data_len / data, then
+/// releases the slot. Custom codes: 0xB0 data mismatch, 0xB1 data_len
+/// mismatch, 0xB2 owner mismatch, 0xB3 lamports mismatch.
+fn load_account_snapshot_verify(payload: &[u8]) -> ProgramResult {
+    let pubkey = payload.get(0..32).ok_or(ProgramError::InvalidInstructionData)?;
+    let expected_owner = payload.get(32..64).ok_or(ProgramError::InvalidInstructionData)?;
+    let expected_lamports = u64::from_le_bytes(
+        payload
+            .get(64..72)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(ProgramError::InvalidInstructionData)?,
+    );
+    let expected_data = payload.get(72..).ok_or(ProgramError::InvalidInstructionData)?;
+
+    let header_addr = load_account_snapshot(pubkey)?;
+
+    let result: ProgramResult = (|| {
+        let data_len = snapshot_data_len(header_addr);
+        if data_len != expected_data.len() {
+            return Err(ProgramError::Custom(0xB1));
+        }
+        let data =
+            unsafe { core::slice::from_raw_parts((header_addr + SLOT_HEADER_SIZE) as *const u8, data_len) };
+        if data != expected_data {
+            return Err(ProgramError::Custom(0xB0));
+        }
+        if snapshot_owner(header_addr).as_ref() != expected_owner {
+            return Err(ProgramError::Custom(0xB2));
+        }
+        if snapshot_lamports(header_addr) != expected_lamports {
+            return Err(ProgramError::Custom(0xB3));
+        }
+        Ok(())
+    })();
+
+    // Always release the slot before surfacing the verification result.
+    let u = unsafe { sol_unload_subaccount(header_addr) };
+    result?;
+    if u != SUCCESS {
+        return Err(ProgramError::from(u));
+    }
+    Ok(())
+}
+
+/// Exercises read-only enforcement of an account snapshot (disc=12).
+///
+/// Loads the snapshot then attempts to store into its data region. The region
+/// is mapped read-only, so the store must fault and abort the instruction in
+/// the VM — control never returns. If it somehow returns, the write was
+/// wrongly accepted: release the slot and report `Custom(0xB5)`.
+fn load_account_snapshot_cannot_modify(payload: &[u8]) -> ProgramResult {
+    let pubkey = payload.get(0..32).ok_or(ProgramError::InvalidInstructionData)?;
+    let header_addr = load_account_snapshot(pubkey)?;
+    let data_ptr = (header_addr + SLOT_HEADER_SIZE) as *mut u8;
+    unsafe { core::ptr::write_unaligned(data_ptr, 0xFF) };
+    // Unreachable on a correctly read-only mapping.
+    let _ = unsafe { sol_unload_subaccount(header_addr) };
+    Err(ProgramError::Custom(0xB5))
+}
+
+/// Loading the same account snapshot twice in one instruction must fail
+/// (disc=13). Returns `Custom(0xB6)` if the second load unexpectedly succeeds;
+/// otherwise propagates the syscall error so the test can assert on it.
+fn load_account_snapshot_twice(payload: &[u8]) -> ProgramResult {
+    let pubkey = payload.get(0..32).ok_or(ProgramError::InvalidInstructionData)?;
+    let _h1 = load_account_snapshot(pubkey)?;
+    let mut header2: u64 = 0;
+    let r2 = unsafe {
+        sol_load_account_snapshot(pubkey.as_ptr(), &mut header2 as *mut u64, 0, 0, 0)
+    };
+    if r2 == SUCCESS {
+        return Err(ProgramError::Custom(0xB6));
+    }
+    Err(ProgramError::from(r2))
+}
+
+/// Loads an account snapshot, verifies + unloads it, then reloads the SAME
+/// account into a (now-freed) slot and verifies again (disc=14). Proves a
+/// released snapshot slot can be reused.
+///
+/// Payload layout: pubkey(32) ++ expected data.
+fn load_account_snapshot_unload_reload(payload: &[u8]) -> ProgramResult {
+    let pubkey = payload.get(0..32).ok_or(ProgramError::InvalidInstructionData)?;
+    let expected = payload.get(32..).ok_or(ProgramError::InvalidInstructionData)?;
+
+    let h1 = load_account_snapshot(pubkey)?;
+    verify_snapshot_data(h1, expected)?;
+    unload(h1)?;
+
+    let h2 = load_account_snapshot(pubkey)?;
+    verify_snapshot_data(h2, expected)?;
+    unload(h2)
+}
+
+/// Loads two distinct account snapshots into two slots at once and verifies
+/// each (disc=15). Both slots are released before returning.
+///
+/// Payload layout:
+///   bytes  0..32 : pubkey #1
+///   bytes 32..64 : pubkey #2
+///   bytes 64..66 : data #1 length (u16 LE)
+///   bytes 66..66+len1        : expected data #1
+///   bytes 66+len1..          : expected data #2
+fn load_two_account_snapshots(payload: &[u8]) -> ProgramResult {
+    let pk1 = payload.get(0..32).ok_or(ProgramError::InvalidInstructionData)?;
+    let pk2 = payload.get(32..64).ok_or(ProgramError::InvalidInstructionData)?;
+    let len1 = u16::from_le_bytes(
+        payload
+            .get(64..66)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(ProgramError::InvalidInstructionData)?,
+    ) as usize;
+    let data1 = payload
+        .get(66..66 + len1)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let data2 = payload
+        .get(66 + len1..)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+
+    let h1 = load_account_snapshot(pk1)?;
+    let h2 = load_account_snapshot(pk2)?;
+
+    let result: ProgramResult = (|| {
+        verify_snapshot_data(h1, data1)?;
+        verify_snapshot_data(h2, data2)?;
+        Ok(())
+    })();
+
+    // Release both slots regardless of the verification outcome.
+    let u2 = unsafe { sol_unload_subaccount(h2) };
+    let u1 = unsafe { sol_unload_subaccount(h1) };
+    result?;
+    if u1 != SUCCESS {
+        return Err(ProgramError::from(u1));
+    }
+    if u2 != SUCCESS {
+        return Err(ProgramError::from(u2));
+    }
+    Ok(())
+}
+
+/// Loads a subaccount snapshot (by seeds) and an account snapshot (by pubkey)
+/// in one instruction (disc=16). The two use distinct `SnapshotKey` variants —
+/// `Subaccount(derived)` vs `Account(pubkey)` — so even when the test points
+/// the account snapshot at the subaccount's *derived* address they must resolve
+/// to independent lane entries with their own data.
+///
+/// Payload layout:
+///   bytes  0..32 : base pubkey (first subaccount seed)
+///   bytes 32..64 : account pubkey for the account snapshot
+///   bytes 64..66 : account data length (u16 LE)
+///   bytes 66..66+len : expected account-snapshot data
+///   bytes 66+len..   : expected subaccount-snapshot data
+fn account_and_subaccount_snapshot_distinct(payload: &[u8]) -> ProgramResult {
+    let base = payload.get(0..32).ok_or(ProgramError::InvalidInstructionData)?;
+    let account_pk = payload.get(32..64).ok_or(ProgramError::InvalidInstructionData)?;
+    let acct_len = u16::from_le_bytes(
+        payload
+            .get(64..66)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(ProgramError::InvalidInstructionData)?,
+    ) as usize;
+    let account_data = payload
+        .get(66..66 + acct_len)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let subaccount_data = payload
+        .get(66 + acct_len..)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+
+    let seeds: [&[u8]; 2] = [base, SEED_TAG];
+    let h_sub = load_snapshot(&seeds)?;
+    let h_acct = load_account_snapshot(account_pk)?;
+
+    let result: ProgramResult = (|| {
+        verify_snapshot_data(h_sub, subaccount_data)?;
+        verify_snapshot_data(h_acct, account_data)?;
+        Ok(())
+    })();
+
+    let ua = unsafe { sol_unload_subaccount(h_acct) };
+    let us = unsafe { sol_unload_subaccount(h_sub) };
+    result?;
+    if us != SUCCESS {
+        return Err(ProgramError::from(us));
+    }
+    if ua != SUCCESS {
+        return Err(ProgramError::from(ua));
+    }
     Ok(())
 }
 
@@ -525,6 +1088,23 @@ fn load_c(seeds: &[&[u8]]) -> Result<(u64, u64), ProgramError> {
         return Err(ProgramError::from(result));
     }
     Ok((header_addr, view_addr))
+}
+
+fn load_snapshot(seeds: &[&[u8]]) -> Result<u64, ProgramError> {
+    let mut header_addr: u64 = 0;
+    let result = unsafe {
+        sol_load_subaccount_snapshot(
+            seeds.as_ptr() as *const u8,
+            seeds.len() as u64,
+            &mut header_addr as *mut u64,
+            0,
+            0,
+        )
+    };
+    if result != SUCCESS {
+        return Err(ProgramError::from(result));
+    }
+    Ok(header_addr)
 }
 
 fn unload(header_addr: u64) -> ProgramResult {

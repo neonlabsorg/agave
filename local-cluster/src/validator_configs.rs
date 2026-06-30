@@ -58,6 +58,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         poh_hashes_per_batch: config.poh_hashes_per_batch,
         process_ledger_before_services: config.process_ledger_before_services,
         no_wait_for_vote_to_start_leader: config.no_wait_for_vote_to_start_leader,
+        single_validator: config.single_validator,
         accounts_db_config: config.accounts_db_config.clone(),
         wait_to_vote_slot: config.wait_to_vote_slot,
         runtime_config: config.runtime_config.clone(),
@@ -81,6 +82,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         use_tpu_client_next: config.use_tpu_client_next,
         retransmit_xdp: config.retransmit_xdp.clone(),
         repair_handler_type: config.repair_handler_type.clone(),
+        external_scheduler: config.external_scheduler.clone()
     }
 }
 

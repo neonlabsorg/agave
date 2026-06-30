@@ -56,6 +56,7 @@ fn main() {
     let version = solana_version::version!();
     let matches = cli::test_app(version, &default_args).get_matches();
 
+
     let output = if matches.is_present("quiet") {
         Output::None
     } else if matches.is_present("log") {
@@ -409,6 +410,9 @@ fn main() {
     }
 
     let mut genesis = TestValidatorGenesis::default();
+
+    let scheduler_bind = matches.value_of("scheduler_bind").map(str::to_string);
+    genesis.scheduler_bind = scheduler_bind;
     genesis.max_ledger_shreds = value_of(&matches, "limit_ledger_size");
     genesis.max_genesis_archive_unpacked_size = Some(u64::MAX);
     genesis.log_messages_bytes_limit = value_t!(matches, "log_messages_bytes_limit", usize).ok();
@@ -612,6 +616,10 @@ fn main() {
 
     if !hot_accounts.is_empty() {
         genesis.hot_accounts(hot_accounts);
+    }
+
+    if agave_validator::single_validator_enabled(&matches) {
+        genesis.single_validator(true);
     }
 
     match genesis.start_with_mint_address_and_geyser_plugin_rpc(

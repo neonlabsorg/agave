@@ -2923,6 +2923,7 @@ pub mod rpc_minimal {
             Ok(RpcVersionInfo {
                 solana_core: version.to_string(),
                 feature_set: Some(version.feature_set),
+                git_commit: solana_version::git_commit_hash().map(String::from),
             })
         }
 

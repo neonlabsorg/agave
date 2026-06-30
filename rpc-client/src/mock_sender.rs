@@ -247,6 +247,8 @@ impl RpcSender for MockSender {
                             return_data: OptionSerializer::Skip,
                             compute_units_consumed: OptionSerializer::Skip,
                             cost_units: OptionSerializer::Skip,
+                            subaccount_addresses: OptionSerializer::Skip,
+                            unchanged_subaccount_addresses: OptionSerializer::Skip,
                         }),
                 },
                 block_time: Some(1628633791),
@@ -370,6 +372,7 @@ impl RpcSender for MockSender {
                 json!(RpcVersionInfo {
                     solana_core: version.to_string(),
                     feature_set: Some(version.feature_set),
+                    git_commit: solana_version::git_commit_hash().map(String::from),
                 })
             }
             "getLatestBlockhash" => serde_json::to_value(Response {

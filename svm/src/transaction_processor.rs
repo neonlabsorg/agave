@@ -127,6 +127,18 @@ pub struct TransactionProcessingConfig<'a> {
     pub limit_to_load_programs: bool,
     /// Recording capabilities for transaction execution.
     pub recording_config: ExecutionRecordingConfig,
+    /// Should failing transactions within the batch be dropped (no fee charged
+    /// & not committed).
+    pub drop_on_failure: bool,
+    /// If any transaction in the batch is not committed then the entire batch
+    /// should not be committed.
+    ///
+    /// # Note
+    ///
+    /// Without `drop_on_failure` this flag will still allow processed but
+    /// failing transactions to be committed. If both flags are set then any
+    /// failing transaction will cause all transactions to be aborted.
+    pub all_or_nothing: bool,
 }
 
 /// Runtime environment for transaction batch processing.
@@ -462,12 +474,16 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
             let (processing_result, single_execution_us) = measure_us!(match load_result {
                 TransactionLoadResult::NotLoaded(err) => Err(err),
-                TransactionLoadResult::FeesOnly(fees_only_tx) => {
-                    // Update loaded accounts cache with nonce and fee-payer
-                    account_loader.update_accounts_for_failed_tx(&fees_only_tx.rollback_accounts);
+                TransactionLoadResult::FeesOnly(fees_only_tx) => match config.drop_on_failure {
+                    true => Err(fees_only_tx.load_error),
+                    false => {
+                        // Update loaded accounts cache with nonce and fee-payer
+                        account_loader
+                            .update_accounts_for_failed_tx(&fees_only_tx.rollback_accounts);
 
-                    Ok(ProcessedTransaction::FeesOnly(Box::new(fees_only_tx)))
-                }
+                        Ok(ProcessedTransaction::FeesOnly(Box::new(fees_only_tx)))
+                    }
+                },
                 TransactionLoadResult::Loaded(loaded_transaction) => {
                     let (program_accounts_set, filter_executable_us) = measure_us!(self
                         .filter_executable_program_accounts(
@@ -521,24 +537,118 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                         config,
                     );
 
-                    // Update loaded accounts cache with account states which might have changed.
-                    // Also update local program cache with modifications made by the transaction,
-                    // if it executed successfully.
-                    account_loader.update_accounts_for_executed_tx(tx, &executed_tx);
+                    match (
+                        &executed_tx.execution_details.status,
+                        config.drop_on_failure,
+                    ) {
+                        // Successful transactions need to update the account loader cache as future
+                        // transactions in the batch may depend on them.
+                        (Ok(_), _) => {
+                            // F10/PRS-314: capture subaccount pre-balances **before**
+                            // `update_accounts_for_executed_tx` populates the loader
+                            // cache with post-execution state. The lane lives at
+                            // `loaded_transaction.accounts[account_keys.len()..]` and
+                            // is keyed by the owner-facing pubkey;
+                            // `subaccount_storage_address` is applied inside the
+                            // balance collector when reading pre-state from the
+                            // loader cache. Failed executions roll back subaccount
+                            // changes, so we skip the capture there.
+                            let head = tx.account_keys().len();
+                            let lane = executed_tx
+                                .loaded_transaction
+                                .accounts
+                                .get(head..)
+                                .unwrap_or(&[]);
+                            balance_collector
+                                .collect_subaccount_pre_balances(&mut account_loader, lane);
 
-                    if executed_tx.was_successful() {
-                        program_cache_for_tx_batch.merge(&executed_tx.programs_modified_by_tx);
+                            account_loader.update_accounts_for_successful_tx(
+                                tx,
+                                &executed_tx.loaded_transaction.accounts,
+                            );
+                            // Also update local program cache with modifications made by the
+                            // transaction, if it executed successfully.
+                            program_cache_for_tx_batch.merge(&executed_tx.programs_modified_by_tx);
+
+                            Ok(ProcessedTransaction::Executed(Box::new(executed_tx)))
+                        }
+                        // If the transaction failed & drop on failure is set then we don't want to
+                        // update the accounts as this transaction will be dropped from the batch.
+                        (Err(err), true) => Err(err.clone()),
+                        // Unsuccessful transactions will still update rollback accounts (fee payer,
+                        // nonce, etc).
+                        (Err(_), false) => {
+                            account_loader.update_accounts_for_failed_tx(
+                                &executed_tx.loaded_transaction.rollback_accounts,
+                            );
+
+                            Ok(ProcessedTransaction::Executed(Box::new(executed_tx)))
+                        }
                     }
-
-                    Ok(ProcessedTransaction::Executed(Box::new(executed_tx)))
                 }
             });
             execution_us = execution_us.saturating_add(single_execution_us);
 
-            let ((), collect_balances_us) =
-                measure_us!(balance_collector.collect_post_balances(&mut account_loader, tx));
+            // F10/PRS-314: the subaccount lane lives in
+            // `loaded_transaction.accounts[account_keys.len()..]` after a
+            // successful execution; we expose that slice to the balance
+            // collector so it can extend pre/post-balance vectors with the
+            // subaccounts the program actually touched. For
+            // failed/non-executed transactions, subaccount changes are rolled
+            // back, so we pass an empty slice.
+            // F10/PRS-155: also expose the read-only (unchanged) subaccounts —
+            // owner keys only, no balances — so the receipt can list them in a
+            // separate lane. Rolled back on failed/non-executed txs, so empty
+            // there.
+            let (subaccount_lane, unchanged_subaccounts): (&[_], &[_]) = match &processing_result {
+                Ok(ProcessedTransaction::Executed(executed_tx)) if executed_tx.was_successful() => {
+                    let head = tx.account_keys().len();
+                    (
+                        executed_tx
+                            .loaded_transaction
+                            .accounts
+                            .get(head..)
+                            .unwrap_or(&[]),
+                        &executed_tx.execution_details.unchanged_subaccount_addresses,
+                    )
+                }
+                _ => (&[], &[]),
+            };
+            let ((), collect_balances_us) = measure_us!(balance_collector.collect_post_balances(
+                &mut account_loader,
+                tx,
+                subaccount_lane,
+                unchanged_subaccounts,
+            ));
             execute_timings
                 .saturating_add_in_place(ExecuteTimingType::CollectBalancesUs, collect_balances_us);
+
+            // If this is an all or nothing batch and we failed to process this transaction then we
+            // must abort all prior/remaining transactions.
+            if config.all_or_nothing && processing_result.is_err() {
+                // Abort prior transactions.
+                for res in processing_results.iter_mut() {
+                    *res = Err(TransactionError::CommitCancelled);
+                }
+
+                // Preserve the failure that triggered the batch to abort.
+                processing_results.push(processing_result);
+
+                // Abort remaining transactions.
+                processing_results.extend(
+                    (0..sanitized_txs.len() - processing_results.len())
+                        .map(|_| Err(TransactionError::CommitCancelled)),
+                );
+
+                return LoadAndExecuteSanitizedTransactionsOutput {
+                    error_metrics,
+                    execute_timings,
+                    processing_results,
+                    // If we abort the batch and balance recording is enabled, no balances should be
+                    // collected. If this is a leader thread, no batch will be committed.
+                    balance_collector: None,
+                };
+            }
 
             processing_results.push(processing_result);
         }
@@ -1003,6 +1113,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
         let ExecutionRecord {
             accounts,
+            unchanged_subaccount_addresses,
             return_data,
             touched_account_count,
             accounts_resize_delta: accounts_data_len_delta,
@@ -1040,6 +1151,10 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 return_data,
                 executed_units,
                 accounts_data_len_delta,
+                // F10/PRS-155: read-only subaccounts (owner keys only) carried
+                // as receipt metadata so the balance collector can list them in
+                // the receipt's unchanged lane. Never committed.
+                unchanged_subaccount_addresses,
             },
             loaded_transaction,
             programs_modified_by_tx: program_cache_for_tx_batch.drain_modified_entries(),

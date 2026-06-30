@@ -1,7 +1,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use {
-    crate::invoke_context::{SerializedAccountMetadata, SubaccountSlot},
+    crate::invoke_context::{OccupiedSubaccountIndex, SerializedAccountMetadata, SubaccountSlot},
     solana_instruction::error::InstructionError,
     solana_program_entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER},
     solana_pubkey::Pubkey,
@@ -369,7 +369,8 @@ pub fn flush_subaccount_slots(
     slots: &[SubaccountSlot],
 ) -> Result<(), InstructionError> {
     for slot in slots {
-        let Some(subaccount_index) = slot.occupied_subaccount_index else {
+        let OccupiedSubaccountIndex::Subaccount(subaccount_index) = slot.occupied_subaccount_index
+        else {
             continue;
         };
         let header_offset = slot.buffer_position;
@@ -766,7 +767,7 @@ fn serialize_parameters_aligned(
             vm_data_addr,
             caller_account_metadata: None,
             account_view_kind: None,
-            occupied_subaccount_index: None,
+            occupied_subaccount_index: OccupiedSubaccountIndex::Empty,
             is_writable: false,
         });
     }

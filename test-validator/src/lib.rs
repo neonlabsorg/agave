@@ -141,11 +141,15 @@ pub struct TestValidatorGenesis {
     pub log_messages_bytes_limit: Option<usize>,
     pub transaction_account_lock_limit: Option<usize>,
     pub tpu_enable_udp: bool,
+    // Single-validator mode (only voter, always own leader): processed-safe
+    // guards in ReplayStage/Validator. Unsafe in a multi-validator cluster.
+    pub single_validator: bool,
     pub geyser_plugin_manager: Arc<RwLock<GeyserPluginManager>>,
     /// Hot writable accounts statically pinned across worker threads by
     /// the hot-pinned block-production scheduler. Populated from
     /// `--hot-accounts <PATH>` on the test-validator binary.
     pub hot_accounts: Vec<HotAccount>,
+    pub scheduler_bind: Option<String>,
     admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
 }
 
@@ -154,6 +158,7 @@ impl Default for TestValidatorGenesis {
         // Default to Tower consensus to ensure proper converage pre-Alpenglow.
         let deactivate_feature_set = [alpenglow::id()].into_iter().collect();
         Self {
+            scheduler_bind: None,
             fee_rate_governor: FeeRateGovernor::default(),
             ledger_path: Option::<PathBuf>::default(),
             tower_storage: Option::<Arc<dyn TowerStorage>>::default(),
@@ -180,6 +185,7 @@ impl Default for TestValidatorGenesis {
             log_messages_bytes_limit: Option::<usize>::default(),
             transaction_account_lock_limit: Option::<usize>::default(),
             tpu_enable_udp: DEFAULT_TPU_ENABLE_UDP,
+            single_validator: false,
             geyser_plugin_manager: Arc::new(RwLock::new(GeyserPluginManager::default())),
             hot_accounts: Vec::new(),
             admin_rpc_service_post_init:
@@ -256,6 +262,11 @@ impl TestValidatorGenesis {
 
     pub fn tpu_enable_udp(&mut self, tpu_enable_udp: bool) -> &mut Self {
         self.tpu_enable_udp = tpu_enable_udp;
+        self
+    }
+
+    pub fn single_validator(&mut self, single_validator: bool) -> &mut Self {
+        self.single_validator = single_validator;
         self
     }
 
@@ -1109,6 +1120,7 @@ impl TestValidator {
         };
 
         let mut validator_config = ValidatorConfig {
+            external_scheduler: config.scheduler_bind.clone(),
             on_start_geyser_plugin_config_files: config.geyser_plugin_config_files.clone(),
             rpc_addrs: Some((
                 SocketAddr::new(
@@ -1142,6 +1154,7 @@ impl TestValidator {
             validator_exit: config.validator_exit.clone(),
             max_ledger_shreds: config.max_ledger_shreds,
             no_wait_for_vote_to_start_leader: true,
+            single_validator: config.single_validator,
             staked_nodes_overrides: config.staked_nodes_overrides.clone(),
             accounts_db_config,
             runtime_config,

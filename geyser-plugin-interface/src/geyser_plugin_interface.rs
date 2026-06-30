@@ -5,9 +5,15 @@
 use {
     solana_clock::{Slot, UnixTimestamp},
     solana_hash::Hash,
+    solana_message::v0::LoadedAddresses,
     solana_signature::Signature,
     solana_transaction::{sanitized::SanitizedTransaction, versioned::VersionedTransaction},
-    solana_transaction_status::{Reward, RewardsAndNumPartitions, TransactionStatusMeta},
+    solana_transaction_context::TransactionReturnData,
+    solana_transaction_error::TransactionResult,
+    solana_transaction_status::{
+        InnerInstructions, Reward, Rewards, RewardsAndNumPartitions, TransactionStatusMeta,
+        TransactionTokenBalance,
+    },
     std::{any::Any, error, io},
     thiserror::Error,
 };
@@ -120,6 +126,68 @@ pub enum ReplicaAccountInfoVersions<'a> {
     V0_0_3(&'a ReplicaAccountInfoV3<'a>),
 }
 
+/// Frozen, ABI-stable copy of `TransactionStatusMeta` exposed to Geyser plugins.
+///
+/// Geyser plugins are dynamic libraries compiled separately from the validator
+/// and receive the transaction metadata by reference across the FFI boundary.
+/// `TransactionStatusMeta` keeps evolving for ledger storage and RPC (e.g. the
+/// `subaccount_addresses` / `unchanged_subaccount_addresses` fields added by
+/// PRS-155/PRS-314), and because it is `repr(Rust)` *any* change to its fields
+/// reshuffles its memory layout. A plugin built against an older layout then
+/// reads fields at stale offsets and corrupts memory (e.g. interpreting random
+/// bytes as a `Vec` length, producing absurd allocation sizes).
+///
+/// To keep already-compiled plugins working, the `ReplicaTransactionInfo`
+/// versions below borrow this type instead of `TransactionStatusMeta`. Its
+/// field set and order MUST stay byte-for-byte identical to the
+/// `TransactionStatusMeta` layout that existed before PRS-155 (the 13 fields up
+/// to and including `cost_units`). Do NOT add, remove, reorder fields, or add
+/// `#[repr(C)]` here — any of those would break the very ABI this type freezes.
+/// New metadata must travel in a new `ReplicaTransactionInfoV4`, not here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransactionStatusMetaLegacy {
+    pub status: TransactionResult<()>,
+    pub fee: u64,
+    pub pre_balances: Vec<u64>,
+    pub post_balances: Vec<u64>,
+    pub inner_instructions: Option<Vec<InnerInstructions>>,
+    pub log_messages: Option<Vec<String>>,
+    pub pre_token_balances: Option<Vec<TransactionTokenBalance>>,
+    pub post_token_balances: Option<Vec<TransactionTokenBalance>>,
+    pub rewards: Option<Rewards>,
+    pub loaded_addresses: LoadedAddresses,
+    pub return_data: Option<TransactionReturnData>,
+    pub compute_units_consumed: Option<u64>,
+    pub cost_units: Option<u64>,
+}
+const _: () = assert!(core::mem::size_of::<TransactionStatusMetaLegacy>() == 328);
+
+
+impl From<&TransactionStatusMeta> for TransactionStatusMetaLegacy {
+    /// Builds the frozen legacy view, dropping any fields added after the
+    /// pre-PRS-155 layout (e.g. the subaccount address lists). Clones the owned
+    /// collections because `repr(Rust)` gives no guarantee that the shared
+    /// fields keep the same offsets once `TransactionStatusMeta` gains fields,
+    /// so the bytes cannot simply be reinterpreted.
+    fn from(meta: &TransactionStatusMeta) -> Self {
+        Self {
+            status: meta.status.clone(),
+            fee: meta.fee,
+            pre_balances: meta.pre_balances.clone(),
+            post_balances: meta.post_balances.clone(),
+            inner_instructions: meta.inner_instructions.clone(),
+            log_messages: meta.log_messages.clone(),
+            pre_token_balances: meta.pre_token_balances.clone(),
+            post_token_balances: meta.post_token_balances.clone(),
+            rewards: meta.rewards.clone(),
+            loaded_addresses: meta.loaded_addresses.clone(),
+            return_data: meta.return_data.clone(),
+            compute_units_consumed: meta.compute_units_consumed,
+            cost_units: meta.cost_units,
+        }
+    }
+}
+
 /// Information about a transaction
 #[derive(Clone, Debug)]
 #[repr(C)]
@@ -134,7 +202,7 @@ pub struct ReplicaTransactionInfo<'a> {
     pub transaction: &'a SanitizedTransaction,
 
     /// Metadata of the transaction status.
-    pub transaction_status_meta: &'a TransactionStatusMeta,
+    pub transaction_status_meta: &'a TransactionStatusMetaLegacy,
 }
 
 /// Information about a transaction, including index in block
@@ -151,7 +219,7 @@ pub struct ReplicaTransactionInfoV2<'a> {
     pub transaction: &'a SanitizedTransaction,
 
     /// Metadata of the transaction status.
-    pub transaction_status_meta: &'a TransactionStatusMeta,
+    pub transaction_status_meta: &'a TransactionStatusMetaLegacy,
 
     /// The transaction's index in the block
     pub index: usize,
@@ -174,7 +242,7 @@ pub struct ReplicaTransactionInfoV3<'a> {
     pub transaction: &'a VersionedTransaction,
 
     /// Metadata of the transaction status.
-    pub transaction_status_meta: &'a TransactionStatusMeta,
+    pub transaction_status_meta: &'a TransactionStatusMetaLegacy,
 
     /// The transaction's index in the block
     pub index: usize,

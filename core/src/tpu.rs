@@ -120,6 +120,7 @@ pub struct Tpu {
     staked_nodes_updater_service: StakedNodesUpdaterService,
     tracer_thread_hdl: TracerThread,
     tpu_vote_quic_t: thread::JoinHandle<()>,
+    _external_scheduling_server: Option<thread::JoinHandle<()>>
 }
 
 impl Tpu {
@@ -167,6 +168,7 @@ impl Tpu {
         _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
         key_notifiers: Arc<RwLock<KeyUpdaters>>,
         cancel: CancellationToken,
+        external_scheduler: Option<String>
     ) -> Self {
         let TpuSockets {
             transactions: transactions_sockets,
@@ -332,7 +334,7 @@ impl Tpu {
             duplicate_confirmed_slot_sender,
         );
 
-        let banking_stage = BankingStage::new_num_threads(
+        let banking_stage = Arc::new(RwLock::new(Some(BankingStage::new_num_threads(
             block_production_method,
             poh_recorder.clone(),
             transaction_recorder,
@@ -346,7 +348,36 @@ impl Tpu {
             log_messages_bytes_limit,
             bank_forks.clone(),
             prioritization_fee_cache.clone(),
-        );
+        ))));
+
+        let external_scheduling_server = match external_scheduler {
+            Some(path) => {
+                let banking_stage = banking_stage.clone();
+                let mut server = agave_scheduling_utils::handshake::server::Server::new(path).unwrap();
+
+                banking_stage.write().unwrap().as_mut().unwrap().spawn_external_threads(server.accept().unwrap()).unwrap();
+
+                Some(thread::spawn(move || {
+                    loop {
+                        if || -> Result<bool, Box<dyn std::error::Error>> {
+                            let session = server.accept()?;
+                            match banking_stage.write()?.as_mut() {
+                                Some(banking_stage) => {
+                                    let _ = banking_stage.spawn_external_threads(session);
+                                    Ok(true)
+                                }
+                                None => {
+                                    Ok(false)
+                                }
+                            }
+                        }().ok() == Some(false) {
+                            break;
+                        }
+                    }
+                }))
+            },
+            None => None
+        };
 
         let SpawnForwardingStageResult {
             join_handle: forwarding_stage,
@@ -402,7 +433,7 @@ impl Tpu {
             fetch_stage,
             sig_verifier,
             vote_sigverify_stage,
-            banking_stage: Arc::new(RwLock::new(Some(banking_stage))),
+            banking_stage,
             forwarding_stage,
             cluster_info_vote_listener,
             broadcast_stage,
@@ -412,6 +443,7 @@ impl Tpu {
             staked_nodes_updater_service,
             tracer_thread_hdl,
             tpu_vote_quic_t,
+            _external_scheduling_server: external_scheduling_server
         }
     }
 

@@ -3,8 +3,8 @@
 
 use {
     agave_banking_stage_ingress_types::BankingPacketReceiver,
-    agave_scheduler_bindings::{tpu_message_flags, SharableTransactionRegion, TpuToPackMessage},
-    agave_scheduling_utils::handshake::server::AgaveTpuToPackSession,
+    agave_scheduler_bindings::{SharableTransactionRegion, TpuToPackMessage, tpu_message_flags},
+    agave_scheduling_utils::handshake::AgaveTpuToPackSession,
     rts_alloc::Allocator,
     solana_packet::PacketFlags,
     solana_perf::packet::PacketBatch,
@@ -46,7 +46,7 @@ fn tpu_to_pack(
     exit: Arc<AtomicBool>,
     receivers: BankingPacketReceivers,
     allocator: Allocator,
-    mut producer: shaq::Producer<TpuToPackMessage>,
+    mut producer: shaq::spsc::Producer<TpuToPackMessage>,
 ) {
     // select! requires actual receivers, so in the case of None for vote receivers,
     // we create a dummy channel that can never receive.
@@ -76,7 +76,7 @@ fn tpu_to_pack(
 
 fn handle_packet_batches(
     allocator: &Allocator,
-    producer: &mut shaq::Producer<TpuToPackMessage>,
+    producer: &mut shaq::spsc::Producer<TpuToPackMessage>,
     packet_batches: Arc<Vec<PacketBatch>>,
 ) {
     // Clean all remote frees in allocator so we have as much
@@ -94,8 +94,9 @@ fn handle_packet_batches(
             };
             let packet_size = packet_bytes.len();
 
+            // SAFETY: message written by `copy_pack_and_populate_message` below.
             let Some((allocated_ptr, tpu_to_pack_message)) =
-                allocate_and_reserve_message(allocator, producer, packet_size)
+                (unsafe { allocate_and_reserve_message(allocator, producer, packet_size) })
             else {
                 warn!("Failed to allocate/reserve message. Dropping the rest of the batch.");
                 break 'batch_loop;
@@ -125,16 +126,19 @@ fn handle_packet_batches(
     producer.commit();
 }
 
-fn allocate_and_reserve_message(
+/// # Safety
+/// - returned `TpuToPackMessage` pointer must be populated with a valid message.
+unsafe fn allocate_and_reserve_message(
     allocator: &Allocator,
-    producer: &mut shaq::Producer<TpuToPackMessage>,
+    producer: &mut shaq::spsc::Producer<TpuToPackMessage>,
     packet_size: usize,
 ) -> Option<(NonNull<u8>, NonNull<TpuToPackMessage>)> {
     // Allocate enough memory for the packet in the allocator.
     let allocated_ptr = allocator.allocate(packet_size as u32)?;
 
     // Reserve space in the producer queue for the packet message.
-    let Some(tpu_to_pack_message) = producer.reserve() else {
+    // SAFETY: unsafe condition of the function is that the message is populated
+    let Some(tpu_to_pack_message) = (unsafe { producer.reserve() }) else {
         // Free the allocated packet if we can't reserve space in the queue.
         // SAFETY: `allocated_ptr` was allocated from `allocator`.
         unsafe {

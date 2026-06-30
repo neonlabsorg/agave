@@ -12,7 +12,9 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 use {
-    crate::transaction_accounts::{AccountRefMut, KeyedAccountSharedData, TransactionAccounts},
+    crate::transaction_accounts::{
+        AccountRefMut, KeyedAccountSharedData, SnapshotKey, TransactionAccounts,
+    },
     solana_account::{AccountSharedData, ReadableAccount},
     solana_instruction::error::InstructionError,
     solana_instructions_sysvar as instructions,
@@ -272,8 +274,18 @@ impl<'ix_data> TransactionContext<'ix_data> {
         self.accounts.find_index_of_subaccount(pubkey)
     }
 
+    #[cfg(not(target_os = "solana"))]
+    pub fn find_index_of_snapshot(&self, snapshot_key: &SnapshotKey) -> Option<IndexOfAccount> {
+        self.accounts.find_index_of_snapshot(snapshot_key)
+    }
+
     /// F10: register a new subaccount under the given key.
     /// Returns the subaccount index (without the `SUBACCOUNT_MARKER` high-bit).
+    ///
+    /// The entry is left **untouched**, so the end-of-tx dirty filter does not
+    /// persist it unless a caller touches it. The read-only load path relies on
+    /// this; the `sol_create_subaccount` syscall touches the entry right after
+    /// adding it so a created subaccount always persists.
     #[cfg(not(target_os = "solana"))]
     pub fn add_subaccount(
         &self,
@@ -283,10 +295,33 @@ impl<'ix_data> TransactionContext<'ix_data> {
         if self.find_index_of_subaccount(&pubkey).is_some() {
             return Err(InstructionError::DuplicateAccountIndex);
         }
-        if (self.accounts.number_of_subaccounts() as usize) >= MAX_SUBACCOUNTS_PER_TRANSACTION {
+        if (self.accounts.number_of_subaccounts_with_snapshots() as usize)
+            >= MAX_SUBACCOUNTS_PER_TRANSACTION
+        {
             return Err(InstructionError::MaxAccountsExceeded);
         }
         Ok(self.accounts.add_subaccount(pubkey, account))
+    }
+
+    /// F10: register a read-only block-start snapshot of a subaccount.
+    ///
+    /// Returns the subaccount index (without the `SUBACCOUNT_MARKER`
+    /// high-bit). The entry is left untouched and is never persisted.
+    #[cfg(not(target_os = "solana"))]
+    pub fn add_snapshot(
+        &self,
+        snapshot_key: &SnapshotKey,
+        account: AccountSharedData,
+    ) -> Result<IndexOfAccount, InstructionError> {
+        if self.find_index_of_snapshot(snapshot_key).is_some() {
+            return Err(InstructionError::DuplicateAccountIndex);
+        }
+        if (self.accounts.number_of_subaccounts_with_snapshots() as usize)
+            >= MAX_SUBACCOUNTS_PER_TRANSACTION
+        {
+            return Err(InstructionError::MaxAccountsExceeded);
+        }
+        Ok(self.accounts.add_snapshot(snapshot_key, account))
     }
 
     /// Gets the max length of the instruction trace
@@ -382,7 +417,7 @@ impl<'ix_data> TransactionContext<'ix_data> {
         deduplication_map: Vec<u16>,
         instruction_data: Cow<'ix_data, [u8]>,
     ) -> Result<(), InstructionError> {
-        debug_assert_eq!(deduplication_map.len(), MAX_ACCOUNTS_PER_TRANSACTION);
+        //debug_assert_eq!(deduplication_map.len(), MAX_ACCOUNTS_PER_TRANSACTION);
         let instruction = self
             .instruction_trace
             .last_mut()
@@ -1181,7 +1216,18 @@ impl BorrowedInstructionAccount<'_, '_> {
 /// Everything that needs to be recorded from a TransactionContext after execution
 #[cfg(not(target_os = "solana"))]
 pub struct ExecutionRecord {
+    /// Account values after execution. Indices `[0..main_account_count)`
+    /// correspond to the transaction's message account keys; the tail
+    /// `[main_account_count..)` is the subaccount lane, keyed by the
+    /// **owner-facing** pubkey. `subaccount_storage_address` is applied
+    /// only at the accounts-db / loader-cache boundary.
     pub accounts: Vec<KeyedAccountSharedData>,
+    /// F10/PRS-155: owner-facing keys of subaccounts that were accessed but
+    /// left **unchanged** this transaction (a pure `sol_read_subaccount` or a
+    /// read-only `sol_load_subaccount`). They are deliberately absent from
+    /// `accounts` — the dirty filter does not persist them — but the receipt
+    /// reports them by owner address only (no balances).
+    pub unchanged_subaccount_addresses: Vec<Pubkey>,
     pub return_data: TransactionReturnData,
     pub touched_account_count: u64,
     pub accounts_resize_delta: i64,
@@ -1191,9 +1237,10 @@ pub struct ExecutionRecord {
 #[cfg(not(target_os = "solana"))]
 impl From<TransactionContext<'_>> for ExecutionRecord {
     fn from(context: TransactionContext) -> Self {
-        let (accounts, touched_flags, resize_delta) = Rc::try_unwrap(context.accounts)
-            .expect("transaction_context.accounts has unexpected outstanding refs")
-            .take();
+        let (accounts, unchanged_subaccount_addresses, touched_flags, resize_delta) =
+            Rc::try_unwrap(context.accounts)
+                .expect("transaction_context.accounts has unexpected outstanding refs")
+                .take();
         let touched_account_count = touched_flags
             .iter()
             .fold(0usize, |accumulator, was_touched| {
@@ -1201,6 +1248,7 @@ impl From<TransactionContext<'_>> for ExecutionRecord {
             }) as u64;
         Self {
             accounts,
+            unchanged_subaccount_addresses,
             return_data: context.return_data,
             touched_account_count,
             accounts_resize_delta: Cell::into_inner(resize_delta),

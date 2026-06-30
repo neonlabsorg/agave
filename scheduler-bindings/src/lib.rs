@@ -10,7 +10,7 @@
 #![no_std]
 
 //! Messages passed between agave and an external pack process.
-//! Messages are passed via `shaq::Consumer/Producer`.
+//! Messages are passed via `shaq::spsc::Consumer/Producer`.
 //!
 //! Memory freeing is responsibility of the external pack process,
 //! and is done via `rts-alloc` crate. It is also possible the external
@@ -55,12 +55,19 @@
 //!   back to the external scheduler process. This passes back the results
 //!   of processing the transactions.
 //!
+//! Ownership and pointer lifetime rule:
+//! - Sending a message that contains offsets or pointers to memory transfers
+//!   ownership of that memory to the receiver for the lifetime defined by the
+//!   protocol.
+//! - The sender must treat that memory as not owned until ownership is
+//!   explicitly returned by a later message, if any. In particular, the sender
+//!   must not free or modify that memory while it is not owned.
+//! - If the protocol does not return the memory to the sender, the receiver is
+//!   responsible for freeing it.
+//!
 
 /// Reference to a transaction that can shared safely across processes.
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct SharableTransactionRegion {
     /// Offset within the shared memory allocator.
@@ -70,10 +77,7 @@ pub struct SharableTransactionRegion {
 }
 
 /// Reference to an array of Pubkeys that can be shared safely across processes.
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct SharablePubkeys {
     /// Offset within the shared memory allocator.
@@ -94,8 +98,7 @@ pub struct SharablePubkeys {
 /// 4. External pack process frees all transaction memory pointed to by the
 ///    [`SharableTransactionRegion`] in the batch, then frees the memory for
 ///    the array of [`SharableTransactionRegion`].
-#[cfg_attr(feature = "dev-context-only-utils", derive(Debug, PartialEq, Eq))]
-#[derive(Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[repr(C)]
 pub struct SharableTransactionBatchRegion {
     /// Number of transactions in the batch.
@@ -111,15 +114,12 @@ pub struct SharableTransactionBatchRegion {
 /// 2. agave sends a [`WorkerToPackMessage`] with `responses`.
 /// 3. External pack process processes the inner messages. Potentially freeing
 ///    any memory within each inner message (see [`worker_message_types`] for details).
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct TransactionResponseRegion {
     /// Tag indicating the type of message.
     /// See [`worker_message_types`] for details.
-    /// All inner messages/responses per trasaction will be of the same type.
+    /// All inner messages/responses per transaction will be of the same type.
     pub tag: u8,
     /// The number of transactions in the original message.
     /// This corresponds to the number of inner response
@@ -139,10 +139,7 @@ pub struct TransactionResponseRegion {
 /// TPU passes transactions to the external pack process.
 /// This is also a transfer of ownership of the transaction:
 ///   the external pack process is responsible for freeing the memory.
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct TpuToPackMessage {
     pub transaction: SharableTransactionRegion,
@@ -167,30 +164,46 @@ pub mod tpu_message_flags {
     pub const FROM_STAKED_NODE: u8 = 1 << 2;
 }
 
-/// Indicates the node is not leader.
-pub const IS_NOT_LEADER: u8 = 0;
-/// Indicates the node is leader.
-pub const IS_LEADER: u8 = 1;
+/// The node is not currently in a leader slot.
+pub const NOT_LEADER: u8 = 0;
+/// The node is in a leader slot but the working bank is not yet ready.
+///
+/// Transactions cannot be processed in this state.
+pub const LEADER_STARTING: u8 = 1;
+/// The node is in a leader slot and has a working bank ready.
+///
+/// Transactions can be processed in this state.
+pub const LEADER_READY: u8 = 2;
+
+#[allow(deprecated)]
+#[deprecated(since = "3.1.0", note = "Use NOT_LEADER instead")]
+pub const IS_NOT_LEADER: u8 = NOT_LEADER;
+#[allow(deprecated)]
+#[deprecated(since = "3.1.0", note = "Use LEADER_READY instead")]
+pub const IS_LEADER: u8 = LEADER_READY;
 
 /// Message: [Agave -> Pack]
 /// Agave passes leader status to the external pack process.
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct ProgressMessage {
-    /// Indicates if node is currently leader or not.
-    /// [`IS_LEADER`] if the node is leader.
-    /// [`IS_NOT_LEADER`] if the node is not leader.
-    /// Other values should be considered invalid.
+    /// Indicates the current leader status of the node.
+    ///
+    /// - [`NOT_LEADER`]: Node is not in a leader slot.
+    /// - [`LEADER_STARTING`]: Node is in a leader slot but bank is not ready.
+    /// - [`LEADER_READY`]: Node is in a leader slot with bank ready for transactions.
+    ///
+    /// # Usage
+    ///
+    /// - To check if within a leader slot: `leader_state != NOT_LEADER`.
+    /// - To check if transactions can be processed: `leader_state == LEADER_READY`.
     pub leader_state: u8,
-    /// The current slot. This along with a leader schedule is not sufficient
-    /// for determining if the node is currently leader. There is a slight
-    /// delay between when a node is supposed to begin its' leader slot, and
-    /// when a bank is ready for processing transactions as leader.
-    /// Using [`Self::leader_state`] for determining if the node is leader
-    /// and has a bank available.
+    /// Progress through the current slot in percentage.
+    pub current_slot_progress: u8,
+    /// The current epoch of the working bank.
+    /// Only valid if `leader_state == LEADER_READY`, otherwise zeroed.
+    pub epoch: u64,
+    /// The current slot.
     pub current_slot: u64,
     /// Next known leader slot or u64::MAX if unknown.
     /// This will **not** include the current slot if leader.
@@ -205,8 +218,9 @@ pub struct ProgressMessage {
     /// i.e. block_limit - current_cost_units_used.
     /// Only valid if currently leader, otherwise the value is undefined.
     pub remaining_cost_units: u64,
-    /// Progress through the current slot in percentage.
-    pub current_slot_progress: u8,
+    /// The latest blockhash of the working bank.
+    /// Only valid if `leader_state == LEADER_READY`, otherwise zeroed.
+    pub latest_blockhash: [u8; 32],
 }
 
 /// Maximum number of transactions allowed in a [`PackToWorkerMessage`].
@@ -224,20 +238,17 @@ pub const MAX_TRANSACTIONS_PER_MESSAGE: usize = 64;
 ///
 /// These messages do not transfer ownership of the transactions.
 /// The external pack process is still responsible for freeing the memory.
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct PackToWorkerMessage {
     /// Flags on how to handle this message.
     /// See [`pack_message_flags`] for details.
     pub flags: u16,
-    /// If [`pack_message_flags::RESOLVE`] flag is not set, this is the
-    /// maximum slot the transactions can be processed in. If the working
-    /// bank's slot in the worker thread is greater than this slot,
-    /// the transaction will not be processed.
-    pub max_execution_slot: u64,
+    /// Maximum working bank slot that this message will be processed
+    /// for. For execution, this will check the leader bank if it exists.
+    /// If the working bank is ahead of the slot, the return message will
+    /// be set with [`processed_codes::MAX_WORKING_SLOT_EXCEEDED`].
+    pub max_working_slot: u64,
     /// Offset and number of transactions in the batch.
     /// See [`SharableTransactionBatchRegion`] for details.
     /// Agave will return this batch in the response message, it is
@@ -248,33 +259,59 @@ pub struct PackToWorkerMessage {
 
 pub mod pack_message_flags {
     //! Flags for [`crate::PackToWorkerMessage::flags`].
-    //! These flags can be ORed together so must be unique bits, with
-    //! the exception of [`NONE`].
-    //! The *default* behavior, [`NONE`], is to attempt execution and
-    //! inclusion in the specified `max_execution_slot`.
+    //! Use [`CHECK`] or [`EXECUTE`] to specify how a batch should be processed.
+    //! See [`check_flags`] and [`execution_flags`] for details.
 
-    /// No special handling - execute the transactions normally.
-    pub const NONE: u16 = 0;
+    /// Combine with [`check_flags`] for performing checks on transactions.
+    /// Worker will respond with [`super::worker_message_types::CheckResponse`] if
+    /// the message is processed.
+    pub const CHECK: u16 = 0;
+    /// Combine with additional [`execution_flags`] for executing a batch of transactions.
+    /// Worker will responsd with [`super::worker_message_types::ExecutionResponse`] if
+    /// the message is processed.
+    pub const EXECUTE: u16 = 1;
 
-    /// Transactions on the [`super::PackToWorkerMessage`] should have their
-    /// addresses resolved.
-    ///
-    /// If this flag, the transaction will attempt to be executed and included
-    /// in the current block.
-    pub const RESOLVE: u16 = 1 << 1;
+    pub mod execution_flags {
+        /// Should failing transactions within the batch be dropped (no fee charged & not
+        /// committed).
+        pub const DROP_ON_FAILURE: u16 = 1 << 1;
+        /// If any transaction in the batch is not committed then the entire batch should not be
+        /// committed.
+        ///
+        /// # Note
+        ///
+        /// Without `drop_on_failure` this flag will still allow processed but failing transactions
+        /// to be committed. If both flags are set then any failing transaction will cause all
+        /// transactions to be aborted.
+        pub const ALL_OR_NOTHING: u16 = 1 << 2;
+    }
+
+    pub mod check_flags {
+        /// Transactions should check status: if transaction has already been processed
+        /// or the nonce is invalid.
+        pub const STATUS_CHECKS: u16 = 1 << 1;
+
+        /// Fee-payer balance should be fetched for transactions.
+        pub const LOAD_FEE_PAYER_BALANCE: u16 = 1 << 2;
+
+        /// Transactions should have ATL pubkeys resolved and returned.
+        pub const LOAD_ADDRESS_LOOKUP_TABLES: u16 = 1 << 3;
+    }
 }
 
-/// The message was not processed.
-pub const NOT_PROCESSED: u8 = 0;
-/// The message was processed.
-pub const PROCESSED: u8 = 1;
+pub mod processed_codes {
+    /// The message was processed.
+    pub const PROCESSED: u8 = 0;
+    /// The message was not processed because the message was invalid.
+    pub const INVALID: u8 = 1;
+    /// The message was not processed because `max_working_slot`
+    /// was exceeded.
+    pub const MAX_WORKING_SLOT_EXCEEDED: u8 = 2;
+}
 
 /// Message: [Worker -> Pack]
 /// Message from worker threads in response to a [`PackToWorkerMessage`].
-#[cfg_attr(
-    feature = "dev-context-only-utils",
-    derive(Debug, Clone, Copy, PartialEq, Eq)
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct WorkerToPackMessage {
     /// Offset and number of transactions in the batch.
@@ -284,15 +321,10 @@ pub struct WorkerToPackMessage {
     /// and is safe to do so - agave will hold no references to this memory
     /// after sending this message.
     pub batch: SharableTransactionBatchRegion,
-    /// [`PROCESSED`] if the message was processed.
-    /// [`NOT_PROCESSED`] if the message could not be processed. This will occur
-    /// if the passed message was invalid, and could indicate an issue
-    /// with the external pack process.
-    /// If  [`NOT_PROCESSED`], the value of [`Self::responses`] is undefined.
-    /// Other values should be considered invalid.
-    pub processed: u8,
+    /// See [`processed_codes`] for accepted values.
+    pub processed_code: u8,
     /// Response per transaction in the batch.
-    /// If [`Self::processed`] is false, this field is undefined.
+    /// If message was not processed, this field is undefined.
     /// See [`TransactionResponseRegion`] for details.
     pub responses: TransactionResponseRegion,
 }
@@ -305,13 +337,21 @@ pub mod worker_message_types {
 
     /// Response to pack for a transaction that attempted execution.
     /// This response will only be sent if the original message flags
-    /// requested execution i.e. not [`super::pack_message_flags::RESOLVE`].
-    #[cfg_attr(
-        feature = "dev-context-only-utils",
-        derive(Debug, Clone, Copy, PartialEq, Eq)
-    )]
+    /// requested execution i.e. [`super::pack_message_flags::EXECUTE`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(C)]
     pub struct ExecutionResponse {
+        /// The slot this transaction was executed.
+        ///
+        /// # Note
+        ///
+        /// The current semantics are:
+        ///
+        /// - If we successfully get a bank and try your request, this slot is the latest
+        ///   bank we attempted (during a slot roll we can try 2 banks ).
+        /// - If we do not attempt or attemp and fail to get a bank, this field will be
+        ///   zero.
+        pub execution_slot: u64,
         /// Indicates if the transaction was included in the block or not.
         /// If [`not_included_reasons::NONE`], the transaction was included.
         pub not_included_reason: u8,
@@ -327,9 +367,6 @@ pub mod worker_message_types {
         /// The transaction could not attempt processing because the
         /// working bank was unavailable.
         pub const BANK_NOT_AVAILABLE: u8 = 1;
-        /// The transaction could not be processed because the `slot`
-        /// in the passed message did not match the working bank's slot.
-        pub const SLOT_MISMATCH: u8 = 2;
 
         /// Transaction dropped because the batch was marked as
         /// all_or_nothing and a different transacation failed.
@@ -419,37 +456,94 @@ pub mod worker_message_types {
         pub const PROGRAM_CACHE_HIT_MAX_LIMIT: u8 = 101;
 
         // This error in agave is only internal, and to avoid updating the sdk
-        // it is re-used for mapping into `ALL_OR_NOTHING_BATCH_FAILURE`.
+        // it is reused for mapping into `ALL_OR_NOTHING_BATCH_FAILURE`.
         // /// Commit cancelled internally.
         // pub const COMMIT_CANCELLED: u8 = 102;
     }
 
-    /// Tag indicating [`Resolved`] inner message.
-    pub const RESOLVED: u8 = 1;
+    /// Tag indicating [`CheckResponse`] inner message.
+    pub const CHECK_RESPONSE: u8 = 1;
 
-    /// Resolving was unsuccessful.
-    pub const RESOLVE_FAILURE: u8 = 0;
-    /// Resolving was successful.
-    pub const RESOLVE_SUCCESS: u8 = 1;
+    pub mod parsing_and_sanitization_flags {
+        /// Flag set if parsing and sanitization failed.
+        pub const FAILED: u8 = 1 << 0;
+    }
 
-    #[cfg_attr(
-        feature = "dev-context-only-utils",
-        derive(Debug, Clone, Copy, PartialEq, Eq)
-    )]
+    pub mod status_check_flags {
+        /// Flag set if status checks were requested.
+        pub const REQUESTED: u8 = 1 << 0;
+        /// Flag set if status checks were performed. A previous failure
+        /// could have caused checks to be skipped.
+        pub const PERFORMED: u8 = 1 << 1;
+        /// Flag set if status checks failed due to the transaction being
+        /// too old.
+        pub const TOO_OLD: u8 = 1 << 2;
+        /// Flag set if status checks failed due to the transaction already
+        /// being processed.
+        pub const ALREADY_PROCESSED: u8 = 1 << 3;
+        /// Flag set if status checks failed due to an invalid nonce state.
+        pub const INVALID_NONCE: u8 = 1 << 4;
+        /// Flag set if status checks failed due to unsupported version of
+        /// transaction was received.
+        pub const UNSUPPORTED_VERSION: u8 = 1 << 5;
+    }
+
+    pub mod fee_payer_balance_flags {
+        /// Flag set if fee-payer balance was requested.
+        pub const REQUESTED: u8 = 1 << 0;
+        /// Flag set if fee-payer balance fetching was performed. A previous
+        /// failure could have caused balance fetching to be skipped.
+        pub const PERFORMED: u8 = 1 << 1;
+    }
+
+    pub mod resolve_flags {
+        /// Flag set if resolving pubkeys was requested.
+        pub const REQUESTED: u8 = 1 << 0;
+        /// Flag set if resolving pubkeys was performed.
+        pub const PERFORMED: u8 = 1 << 1;
+        /// Flag set if resolving failed.
+        pub const FAILED: u8 = 1 << 2;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(C)]
-    pub struct Resolved {
-        /// Indicates if resolution was successful.
-        /// [`RESOLVE_SUCCESS`] if resolving succeeded.
-        /// [`RESOLVE_FAILURE`] if resolved failed.
-        /// Other values should be considered invalid.
-        pub success: u8,
-        /// Slot of the bank used for resolution.
-        pub slot: u64,
+    pub struct CheckResponse {
+        /// See [`parsing_and_sanitization_flags`] for details.
+        pub parsing_and_sanitization_flags: u8,
+        /// See [`status_check_flags`] for details.
+        pub status_check_flags: u8,
+        /// See [`fee_payer_balance_flags`] for details.
+        pub fee_payer_balance_flags: u8,
+        /// See [`resolve_flags`] for details.
+        pub resolve_flags: u8,
+
+        /// If [`status_check_flags::ALREADY_PROCESSED`] is set,
+        /// this is the slot the transaction was previously included in.
+        /// Otherwise the value is undefined.
+        pub included_slot: u64,
+
+        /// Set only if [`fee_payer_balance_flags::PERFORMED`] is set,
+        /// otherwise the value is undefined.
+        /// The slot of the bank used to fetch fee-payer balance.
+        pub balance_slot: u64,
+        /// Set only if [`fee_payer_balance_flags::PERFORMED`] is set,
+        /// otherwise the value is undefined.
+        /// The balance of the fee-payer.
+        pub fee_payer_balance: u64,
+
+        /// Set only if [`resolve_flags::PERFORMED`] is set,
+        /// otherwise the value is undefined.
+        /// The slot of the bank used to resolve the pubkeys.
+        pub resolution_slot: u64,
+        /// Set only if [`resolve_flags::PERFORMED`] is set,
+        /// otherwise the value is undefined.
         /// Minimum deactivation slot of any ALT if any.
         /// u64::MAX if no ALTs or deactivation.
         pub min_alt_deactivation_slot: u64,
+        /// Set only if [`resolve_flags::PERFORMED`] is set,
+        /// otherwise the value is undefined.
         /// Resolved pubkeys - writable then readonly.
-        /// Freeing this memory is the responsiblity of the external
+        /// Freeing this memory is the responsibility of the external
         /// pack process.
         pub resolved_pubkeys: SharablePubkeys,
     }
