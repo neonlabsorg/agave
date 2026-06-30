@@ -348,6 +348,9 @@ pub struct RpcVersionInfo {
     pub solana_core: String,
     /// first 4 bytes of the FeatureSet identifier
     pub feature_set: Option<u32>,
+    /// The full git commit hash that solana-core was built from
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_commit: Option<String>,
 }
 
 impl fmt::Debug for RpcVersionInfo {
