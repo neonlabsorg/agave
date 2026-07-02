@@ -71,20 +71,23 @@ jobs:
     outputs:
         image-tag: ${{ steps.vars.outputs.image_tag }}
 
-  prepare-infrastructure:
-    needs: build
+  detect-mode:
     runs-on: gha-runner-scale-set
-    timeout-minutes: 25
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_DEFAULT_REGION: eu-central-1
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    outputs:
+      full: ${{ steps.detect.outputs.full }}
     steps:
-      - name: Checkout repository (full history)
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
+      - name: Detect full-tests label
+        id: detect
+        env:
+          HAS_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-tests') }}
+        run: echo "full=${HAS_LABEL}" >> "$GITHUB_OUTPUT"
 
+  run-tests:
+    needs:
+      - build
+      - detect-mode
+    runs-on: gha-runner-scale-set
+    steps:
       - name: Checkout dynamic-ci-cd workflows
         uses: actions/checkout@v6
         with:
@@ -93,150 +96,23 @@ jobs:
           token: ${{ secrets.GHTOKEN }}
           path: ./dynamic-ci-cd/.github/workflows
 
-      - name: Create instance
-        uses: ./dynamic-ci-cd/.github/workflows/actions/create-instance
-        id: create-instance
+      - name: Dispatch e2e
+        id: dispatch
+        uses: ./dynamic-ci-cd/.github/workflows/actions/dispatch-workflow
         with:
-          project-repository: ${{ github.event.repository.name }}
-          run-id: ${{ github.run_id }}
-          cpu: 4
-          memory: 8
-          hcloud-token: ${{ secrets.HCLOUD_TOKEN }}
+          github-token: ${{ secrets.GHTOKEN }}
+          target-repo: neonlabsorg/dynamic-ci-cd
+          workflow-file: parasol-e2e-dispatch.yml
+          ref: main
+          workflow-inputs: ${{ format('{{"suites":"{0}","image-overrides":"{{\"PARASOL_NODE_IMAGE\":\"neonlabsorg/parasol-node:{1}-yellowstone\"}}","deploy-solana-test-programs":"true"}}', needs.detect-mode.outputs.full == 'true' && 'all' || 'parasol-node', github.sha) }}
 
-      - name: Install Docker on instance
-        uses: ./dynamic-ci-cd/.github/workflows/actions/prepare-docker-instance
-        id: prepare-docker-instance
+      - name: Wait for e2e
+        uses: ./dynamic-ci-cd/.github/workflows/actions/wait-for-workflow
         with:
-          host: ${{ steps.create-instance.outputs.public-ip-v4 }}
-          ssh-user: ${{ steps.create-instance.outputs.ssh-user }}
-          ssh-key: ${{ steps.create-instance.outputs.ssh-key }}
-
-      - name: Install envsubst
-        run: sudo apt-get update && sudo apt-get install -y gettext
-        shell: bash
-
-      - name: Render docker-compose.yml with envsubst
-        id: read_compose_file
-        shell: bash
-        run: |
-          rendered=$(envsubst < ./ci/docker-compose.yml)
-          echo "value<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$rendered" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-        env:
-          PARASOL_NODE_IMAGE: ${{ env.IMAGE_NAME }}:${{github.sha}}
-
-      - name: Debug
-        shell: bash
-        run: echo "${{ steps.read_compose_file.outputs.value }}"
-
-      - name: Run docker containers
-        uses: ./dynamic-ci-cd/.github/workflows/actions/run-docker-containers
-        id: run-docker-containerss
-        with:
-            docker_host: ${{ steps.create-instance.outputs.public-ip-v4 }}
-            docker_ca_cert: ${{ steps.prepare-docker-instance.outputs.docker_ca_cert }}
-            docker_cert: ${{ steps.prepare-docker-instance.outputs.docker_cert }}
-            docker_key: ${{ steps.prepare-docker-instance.outputs.docker_key }}
-            docker_containers_wait_for_ready_seconds: 30
-            docker_compose: ${{ steps.read_compose_file.outputs.value }}
-            docker_username: ${{ secrets.DOCKER_USERNAME }}
-            docker_password: ${{ secrets.DOCKER_PASSWORD }}
-    outputs:
-      parasol_node_ip: ${{ steps.create-instance.outputs.public-ip-v4 }}
-      docker_ca_cert: ${{ steps.prepare-docker-instance.outputs.docker_ca_cert }}
-      docker_cert: ${{ steps.prepare-docker-instance.outputs.docker_cert }}
-      docker_key: ${{ steps.prepare-docker-instance.outputs.docker_key }}
-
-  run-tests:
-    needs: prepare-infrastructure
-    runs-on: gha-runner-scale-set-large
-    env:
-      PARASOL_NODE_IP: ${{ needs.prepare-infrastructure.outputs.parasol_node_ip }}
-      TEST_IMAGE_REPOSITORY: neonlabsorg/parasol-tests
-      CONTAINER_NAME: parasol-tests-${{ github.run_id }}
-      SOLANA_URL: http://${{ needs.prepare-infrastructure.outputs.parasol_node_ip }}:8899
-      WS_SOLANA_URL: ws://${{ needs.prepare-infrastructure.outputs.parasol_node_ip }}:8900
-    steps:
-      - uses: actions/checkout@v6
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-      - name: Docker login
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-      - name: Set PR test image tag candidate
-        id: pr-test-image-tag
-        if: github.event_name == 'pull_request'
-        shell: bash
-        run: echo "tag=${GITHUB_HEAD_REF//\//-}" >> "$GITHUB_OUTPUT"
-      - name: Check PR test image tag
-        id: check-pr-test-image-tag
-        if: github.event_name == 'pull_request'
-        uses: ./.github/actions/check-docker-tag
-        with:
-          repository: ${{ env.TEST_IMAGE_REPOSITORY }}
-          tag: ${{ steps.pr-test-image-tag.outputs.tag }}
-      - name: Resolve test image
-        id: resolve-test-image
-        shell: bash
-        run: |
-          if [[ "${{ steps.check-pr-test-image-tag.outputs.exists }}" == "true" ]]; then
-            image="${TEST_IMAGE_REPOSITORY}:${{ steps.pr-test-image-tag.outputs.tag }}"
-          else
-            image="${TEST_IMAGE_REPOSITORY}:latest"
-          fi
-          echo "image=${image}" >> "$GITHUB_OUTPUT"
-          echo "Using test image: ${image}"
-      - name: Docker pull test image
-        run: docker pull ${{ steps.resolve-test-image.outputs.image }}
-      - name: Deploy test programs
-        run: |
-          docker run --rm \
-            --name ${{ env.CONTAINER_NAME }} \
-            ${{ steps.resolve-test-image.outputs.image }} \
-            /bin/bash -c "./solana_programs/deploy.sh ${{ env.SOLANA_URL }} ${{ env.WS_SOLANA_URL }}"
-      - name: Run tests
-        run: |
-          docker run --rm \
-            --name ${{ env.CONTAINER_NAME }} \
-            ${{ steps.resolve-test-image.outputs.image }}  \
-            /bin/bash -c "python run_tests.py parasol-node --parasol-url ${{ env.SOLANA_URL }} --metrics-url ${{ env.SOLANA_URL }}/metrics"
-
-  destroy-terraform:
-    env:
-      AWS_ACCESS_KEY_ID: ${{secrets.AWS_ACCESS_KEY_ID}}
-      AWS_DEFAULT_REGION: "eu-central-1"
-      AWS_SECRET_ACCESS_KEY: ${{secrets.AWS_SECRET_ACCESS_KEY}}
-    needs:
-      - prepare-infrastructure
-      - run-tests
-    runs-on: ["gha-runner-scale-set"]
-    if: always()
-    steps:
-    - uses: actions/checkout@v6
-    - uses: actions/checkout@v6
-      with:
-        repository: 'neonlabsorg/dynamic-ci-cd'
-        ref: 'main'
-        token: ${{ secrets.GHTOKEN }}
-        path: dynamic-ci-cd
-    - name: Fetch docker logs
-      uses: ./dynamic-ci-cd/actions/fetch-docker-container-logs
-      with:
-          docker_host: ${{ needs.prepare-infrastructure.outputs.parasol_node_ip }}
-          docker_ca_cert: ${{ needs.prepare-infrastructure.outputs.docker_ca_cert }}
-          docker_cert: ${{ needs.prepare-infrastructure.outputs.docker_cert }}
-          docker_key: ${{ needs.prepare-infrastructure.outputs.docker_key }}
-          container_names: "parasol-node"
-    - name: Set output
-      id: vars
-      run: echo "bname=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_OUTPUT
-    - name: Delete instance
-      uses: ./dynamic-ci-cd/actions/delete-instance
-      id: delete-instance
-      with:
-        project-repository: ${{ github.event.repository.name }}
-        run-id: ${{github.run_id}}
-        hcloud-token: ${{ secrets.HCLOUD_TOKEN }}
+          github-token: ${{ secrets.GHTOKEN }}
+          target-repo: neonlabsorg/dynamic-ci-cd
+          workflow-file: parasol-e2e-dispatch.yml
+          ref: main
+          dispatched-at: ${{ steps.dispatch.outputs.dispatched_at }}
+          timeout-minutes: 90
+          poll-interval-seconds: 30
