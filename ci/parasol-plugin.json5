@@ -1,11 +1,6 @@
 {
-  // parasol-plugin geyser config (Redpanda producer). The validator dlopen's
-  // the cdylib built into the image at /opt/parasol/lib/libparasol_plugin.so.
-  //
-  // `__REDPANDA_BROKERS__`, `__PROGRAM_ID__` and `__MARKET_PREFIX__` are
-  // placeholders rendered at container start (by the consuming compose command,
-  // from the REDPANDA_BROKERS / PROGRAM_ID / MARKET_PREFIX env) so the broker
-  // address stays env-driven — no per-deploy edit of this file.
+  // __REDPANDA_BROKERS__ / __PROGRAM_ID__ / __MARKET_PREFIX__ are rendered at
+  // container start by the consuming compose command.
   libpath: "/opt/parasol/lib/libparasol_plugin.so",
   program_id: "__PROGRAM_ID__",
   sink: "kafka",
@@ -16,24 +11,11 @@
     idempotence: true,
   },
   topics: {
-    // User/slot-status/block-meta state frames share one ordered topic; receipts
-    // and account-config updates each go to a separate order-independent topic.
     events: "parasol.events",
     receipts: "parasol.receipts",
     config: "parasol.config",
-    // When non-empty, Market events are split onto per-market topics
-    // `{market_prefix}{market_index}` (e.g. parasol.events.m7) so MDG reads
-    // markets in parallel (consumer-group sharding). Rendered from the
-    // MARKET_PREFIX env; empty (the default) keeps Market events on the shared
-    // `events` topic. MUST be flipped on together with the MDG REDPANDA_MARKET_*
-    // env (a one-sided flip silently drops/duplicates).
     market_prefix: "__MARKET_PREFIX__",
   },
-  // Enable the account subscription and forward program-owned accounts of
-  // EXACTLY this size (8-byte discriminator + bytemuck MarketConfig body =
-  // mdg_state::MARKET_CONFIG_ACCOUNT_LEN) to the `config` topic. MDG consumes
-  // these → ingest_market_config (on-chain funding-config + cycle-anchor sync).
-  // Omit/null to disable account notifications entirely.
   market_config_account_size: 593,
   ring_capacity: 65536,
   parse_ceiling_us: 200,

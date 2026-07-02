@@ -18,6 +18,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Pick the dynamic-ci-cd branch matching the current branch, else main.
+  resolve-dcicd-ref:
+    runs-on: gha-runner-scale-set
+    outputs:
+      ref: ${{ steps.r.outputs.ref }}
+    steps:
+      - name: Resolve dynamic-ci-cd ref
+        id: r
+        env:
+          GHTOKEN: ${{ secrets.GHTOKEN }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          ref=main
+          if [ -n "${BRANCH}" ] && git ls-remote --exit-code --heads \
+              "https://x-access-token:${GHTOKEN}@github.com/neonlabsorg/dynamic-ci-cd.git" "${BRANCH}" >/dev/null 2>&1; then
+            ref="${BRANCH}"
+          fi
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "dynamic-ci-cd ref: ${ref}"
+
   build:
     runs-on: gha-runner-scale-set-large
     steps:
@@ -86,13 +106,14 @@ jobs:
     needs:
       - build
       - detect-mode
+      - resolve-dcicd-ref
     runs-on: gha-runner-scale-set
     steps:
       - name: Checkout dynamic-ci-cd workflows
         uses: actions/checkout@v6
         with:
           repository: neonlabsorg/dynamic-ci-cd
-          ref: main
+          ref: ${{ needs.resolve-dcicd-ref.outputs.ref }}
           token: ${{ secrets.GHTOKEN }}
           path: ./dynamic-ci-cd/.github/workflows
 
@@ -103,8 +124,8 @@ jobs:
           github-token: ${{ secrets.GHTOKEN }}
           target-repo: neonlabsorg/dynamic-ci-cd
           workflow-file: parasol-e2e-dispatch.yml
-          ref: main
-          workflow-inputs: ${{ format('{{"suites":"{0}","image-overrides":"{{\"PARASOL_NODE_IMAGE\":\"neonlabsorg/parasol-node:{1}-yellowstone\"}}","deploy-solana-test-programs":"true"}}', needs.detect-mode.outputs.full == 'true' && 'all' || 'parasol-node', github.sha) }}
+          ref: ${{ needs.resolve-dcicd-ref.outputs.ref }}
+          workflow-inputs: ${{ format('{{"suites":"{0}","image-overrides":"{{\"PARASOL_NODE_IMAGE\":\"neonlabsorg/parasol-node:{1}-plugin\"}}","deploy-solana-test-programs":"true"}}', needs.detect-mode.outputs.full == 'true' && 'all' || 'parasol-node', github.sha) }}
 
       - name: Wait for e2e
         uses: ./dynamic-ci-cd/.github/workflows/actions/wait-for-workflow
@@ -112,7 +133,7 @@ jobs:
           github-token: ${{ secrets.GHTOKEN }}
           target-repo: neonlabsorg/dynamic-ci-cd
           workflow-file: parasol-e2e-dispatch.yml
-          ref: main
+          ref: ${{ needs.resolve-dcicd-ref.outputs.ref }}
           dispatched-at: ${{ steps.dispatch.outputs.dispatched_at }}
           timeout-minutes: 90
           poll-interval-seconds: 30

@@ -22,8 +22,7 @@ RUN cargo build --release
 
 # parasol-plugin cdylib — built as a member of this agave workspace so its
 # GeyserPlugin ABI matches the validator. Guard keeps the base image buildable
-# when PARASOL_PLUGIN_REPO is unset. Private clone uses the GHTOKEN passed as a
-# BuildKit secret (never written to image layers).
+# when PARASOL_PLUGIN_REPO is unset.
 ARG PARASOL_PLUGIN_REPO=
 ARG PARASOL_PLUGIN_REF=dev
 RUN mkdir -p /opt/plugin-out
