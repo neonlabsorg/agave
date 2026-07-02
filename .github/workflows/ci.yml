@@ -55,13 +55,18 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:${{ github.sha }},${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
           push: true
 
-      - name: Build and push Docker image (with Yellowstone gRPC)
+      - name: Build and push Docker image (with parasol-plugin)
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ci/Dockerfile
-          target: runtime-yellowstone
-          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}-yellowstone,${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}-yellowstone
+          target: runtime-parasol-plugin
+          secrets: |
+            gh_token=${{ secrets.GHTOKEN }}
+          build-args: |
+            PARASOL_PLUGIN_REPO=github.com/neonlabsorg/parasol-plugin.git
+            PARASOL_PLUGIN_REF=${{ vars.PARASOL_PLUGIN_REF || 'dev' }}
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}-plugin,${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}-plugin
           push: true
     outputs:
         image-tag: ${{ steps.vars.outputs.image_tag }}
