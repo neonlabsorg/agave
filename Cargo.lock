@@ -5274,6 +5274,7 @@ dependencies = [
 name = "parasol-scheduler"
 version = "3.1.13"
 dependencies = [
+ "agave-feature-set",
  "agave-scheduler-bindings",
  "agave-scheduling-utils",
  "agave-transaction-view",
@@ -5285,6 +5286,8 @@ dependencies = [
  "serde",
  "slotmap",
  "smallvec",
+ "solana-cost-model",
+ "solana-hash 3.1.0",
  "solana-runtime-transaction",
  "solana-transaction",
  "toml 0.9.8",

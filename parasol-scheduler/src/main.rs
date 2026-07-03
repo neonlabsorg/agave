@@ -1,12 +1,18 @@
-use std::{collections::{BTreeSet, BinaryHeap, VecDeque}, panic, time::Duration};
+use std::{collections::{BTreeSet, BinaryHeap, VecDeque}, fmt::Display, panic, time::Duration};
 
-use agave_scheduler_bindings::{pack_message_flags::{self, check_flags}, worker_message_types::{not_included_reasons, parsing_and_sanitization_flags, resolve_flags, status_check_flags}, MAX_TRANSACTIONS_PER_MESSAGE};
+use agave_feature_set::FeatureSet;
+use agave_scheduler_bindings::{pack_message_flags::{self, check_flags}, worker_message_types::{not_included_reasons, parsing_and_sanitization_flags, resolve_flags, status_check_flags}, LEADER_READY, MAX_TRANSACTIONS_PER_MESSAGE};
 use agave_scheduling_utils::{bridge::{KeyedTransactionMeta, ScheduleBatch, TransactionKey, TransactionState, TxDecision, WorkerAction}, handshake::ClientLogon, thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet}};
+use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use clap::Parser;
 use intrusive_list::{Cursor, IntrusiveList, ItemHolder};
+use log::{log_enabled, Level};
 use serde::Deserialize;
 use slotmap::SlotMap;
-use solana_transaction::Address;
+use solana_cost_model::cost_model::CostModel;
+use solana_hash::Hash;
+use solana_runtime_transaction::runtime_transaction::RuntimeTransaction;
+use solana_transaction::{sanitized::MessageHash, Address};
 use ahash::AHashMap;
 
 pub mod intrusive_list;
@@ -17,8 +23,6 @@ struct Args {
     socket: String,
     #[arg(long)]
     config_path: String,
-    #[arg(long, default_value="false")]
-    debug: bool
 }
 
 #[derive(Deserialize, Debug)]
@@ -149,6 +153,10 @@ impl Score {
 type TxExpireQueue = IntrusiveList<SchedulerTxKey, 1, 0, true>;
 type TxExpirePlaceHolder = ItemHolder<SchedulerTxKey, 1>;
 
+struct RetryMeter {
+    stats: Vec<usize>
+}
+
 #[derive(Default)]
 struct TxMeta {
     shared_key: TransactionKey,
@@ -160,12 +168,51 @@ struct TxMeta {
     affinity_requirements_count: usize,
     state: TxState,
     score: Score,
+    #[allow(dead_code)]
+    cost: u64,
     expire_slot: u64,
     rebalance_locked: bool,
 
     active_balancing_weight: usize,
 
     expire_queue_holder: Option<TxExpirePlaceHolder>,
+
+    retries: usize,
+}
+
+impl Display for RetryMeter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "retry stats {:?}", self.stats)
+    }
+}
+
+impl Default for RetryMeter {
+    fn default() -> Self {
+        Self::new(Self::RETRY_DEFAULT_SIZE)
+    }
+}
+
+impl RetryMeter {
+    const RETRY_DEFAULT_SIZE: usize = 30;
+
+    fn new(size: usize) -> Self {
+        Self { stats: make_vector(size, || 0) }
+    }
+
+    fn clamp_index(&self, retries: usize) -> usize {
+        std::cmp::min(retries, self.stats.len() - 1)
+    }
+
+    fn track(&mut self, meta: &mut TxMeta) {
+        if meta.retries > 0 {
+            let index = self.clamp_index(meta.retries - 1);
+            self.stats[index] -= 1;
+        }
+        let index = self.clamp_index(meta.retries);
+        self.stats[index] += 1;
+
+        meta.retries += 1;
+    }
 }
 
 impl Drop for TxMeta {
@@ -184,7 +231,7 @@ impl TxMeta {
         front.map(|item| item.contained().1)
     }
 
-    fn new(shared_key: TransactionKey, score: Score, slot: u64) -> Self {
+    fn new(shared_key: TransactionKey, score: Score, cost: u64, slot: u64) -> Self {
         Self {
             shared_key,
             affinity_requirements: Vec::new(),
@@ -193,10 +240,12 @@ impl TxMeta {
             affinity_subs: AffinitySubscriptionList::new(),
             resource_queue_subs: TxLocksSubscriptionList::new(),
             score,
+            cost,
             expire_slot: slot,
             rebalance_locked: false,
             active_balancing_weight: 0,
             expire_queue_holder: None,
+            retries: 0
         }
     }
 
@@ -407,7 +456,6 @@ struct LockingQueue {
     rebalances: usize,
 
     drain_round: usize,
-    debug: bool
 }
 
 fn make_vector<T>(size: usize, f: impl FnMut() -> T) -> Vec<T> {
@@ -418,7 +466,7 @@ fn make_vector<T>(size: usize, f: impl FnMut() -> T) -> Vec<T> {
 
 #[allow(dead_code)]
 impl LockingQueue {
-    fn new(num_threads: usize, max_worker_backlog: usize, debug: bool) -> Self {
+    fn new(num_threads: usize, max_worker_backlog: usize) -> Self {
         assert!(num_threads > 0);
         Self {
             drain_round: 0,
@@ -441,7 +489,6 @@ impl LockingQueue {
             rebalance_queue: make_vector(num_threads, || ActiveTxsRebalanceQueue::new()),
             actives_assigned_weight: make_vector(num_threads, || 0),
             txs_in_arrival_order: TxExpireQueue::new(),
-            debug,
         }
     }
 
@@ -497,7 +544,7 @@ impl LockingQueue {
                 let tx_meta = self.metas.get(key).unwrap();
                 tx_meta.state.is_picked() || tx_meta.state.is_active()
             });
-        } else if self.debug {
+        } else if log_enabled!(Level::Debug) {
             let mut sum_weight = 0;
             for i in 0..self.num_threads {
                 if tx_meta.affinity_requirements[i] > 0 {
@@ -505,7 +552,7 @@ impl LockingQueue {
                 }
             }
             if sum_weight > self.max_worker_backlog {
-                println!("tx {:?} serializes with workers {:?}",
+                log::debug!("tx {:?} serializes with workers {:?}",
                     tx.data.signatures().first(),
                     (0..self.num_threads).filter(|x| tx_meta.affinity_requirements[*x] > 0).collect::<Vec<_>>());
             }
@@ -605,7 +652,7 @@ impl LockingQueue {
                 return true;
             };
             assert!(!meta.state.is_picked());
-            let expired = meta.expire_slot <= self.slot;
+            let expired = meta.expire_slot < self.slot;
             if expired {
                 if let TxState::Active { assigned_to, .. } = meta.state {
                     self.actives_assigned_weight[assigned_to] -= meta.active_balancing_weight;
@@ -711,9 +758,9 @@ impl LockingQueue {
                     break;
                 }
 
-                if self.debug {
+                if log::log_enabled!(Level::Debug) {
                     self.actives_assigned_weight[i] += weight;
-                    println!("round {} rebalance {:?} [{i}] -> [{thread}] with [{weight}] will be locked {}",
+                    log::debug!("round {} rebalance {:?} [{i}] -> [{thread}] with [{weight}] will be locked {}",
                         self.drain_round,
                         self.actives_assigned_weight,
                         becomespickable);
@@ -903,6 +950,146 @@ impl Config {
     }
 }
 
+struct SLotStatCollectorState {
+    slot: u64,
+    underflow: Vec<u64>,
+    sent_txs: Vec<usize>,
+    executed_txs: Vec<u64>,
+    cus_burnt: Vec<u64>,
+    inflight_txs: usize
+}
+
+impl SLotStatCollectorState {
+    fn new(slot: u64, workers: usize) -> Self {
+        Self {
+            slot,
+            underflow: make_vector(workers, || 0),
+            executed_txs: make_vector(workers, || 0),
+            sent_txs: make_vector(workers, || 0),
+            cus_burnt: make_vector(workers, || 0),
+            inflight_txs: 0
+        }
+    }
+
+    fn reinit(&mut self, slot: u64) {
+        self.slot = slot;
+        self.inflight_txs = 0;
+        for i in 0..self.underflow.len() {
+            self.underflow[i] = 0;
+            self.sent_txs[i] = 0;
+            self.executed_txs[i] = 0;
+            self.cus_burnt[i] = 0;
+        }
+    }
+}
+
+impl Display for SLotStatCollectorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "slot {} sent txs {}/{:?} executed txs {}/{:?} underflows {}/{:?} cus {}/{:?}",
+            self.slot,
+            self.sent_txs.iter().sum::<usize>(),
+            self.sent_txs,
+            self.executed_txs.iter().sum::<u64>(),
+            self.executed_txs,
+            self.underflow.iter().sum::<u64>(),
+            self.underflow,
+            self.cus_burnt.iter().sum::<u64>(),
+            self.cus_burnt)
+    }
+}
+
+struct SlotStatCollector {
+    states: VecDeque<SLotStatCollectorState>,
+    worker_send_slot: Vec<u64>,
+    inflight_txs: Vec<usize>,
+    workers: usize
+}
+
+impl SlotStatCollector {
+    fn new(workers: usize) -> Self {
+        Self {
+            states: VecDeque::new(),
+            worker_send_slot: make_vector(workers, || 0),
+            inflight_txs: make_vector(workers, || 0),
+            workers
+        }
+    }
+
+    fn announce(&mut self, slot: u64) {
+        if self.states.back().map(|x| x.slot == slot).unwrap_or(false) {
+            return;
+        }
+
+        let mut pushed = false;
+        while self.states.front().map(|x| x.inflight_txs == 0 && x.slot != slot).unwrap_or(false) {
+            let mut state = self.states.pop_front().unwrap();
+            log::debug!("{}", state);
+            if !pushed {
+                state.reinit(slot);
+                self.states.push_back(state);
+                pushed = true;
+            }
+        }
+        if !pushed {
+            self.states.push_back(SLotStatCollectorState::new(slot, self.workers));
+        }
+    }
+
+    fn can_send(&mut self, worker: usize) -> bool {
+        let slot = self.states.back().unwrap().slot;
+        let old_slot = self.worker_send_slot[worker];
+        if old_slot != slot {
+            if self.inflight_txs[worker] == 0 {
+                self.worker_send_slot[worker] = slot;
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        }
+    }
+
+    fn check_underflow(&mut self, worker: usize) {
+        if self.inflight_txs[worker] == 0 {
+            self.states.back_mut().unwrap().underflow[worker] += 1;
+        }
+    }
+
+    fn account_sent(&mut self, worker: usize, cnt: usize) {
+        self.inflight_txs[worker] += cnt;
+        let state = self.states.back_mut().unwrap();
+        state.sent_txs[worker] += cnt;
+        state.inflight_txs += cnt;
+    }
+
+    fn account_dropped(&mut self, worker: usize) {
+        let slot = self.worker_send_slot[worker];
+        self.inflight_txs[worker] -= 1;
+        for state in self.states.iter_mut().rev() {
+            if state.slot == slot {
+                state.inflight_txs -= 1;
+                return;
+            }
+        }
+        panic!("unknown slot {slot}");
+    }
+
+    fn account_executed(&mut self, worker: usize, cus: u64) {
+        let slot = self.worker_send_slot[worker];
+        self.inflight_txs[worker] -= 1;
+        for state in self.states.iter_mut().rev() {
+            if state.slot == slot {
+                state.executed_txs[worker] += 1;
+                state.cus_burnt[worker] += cus;
+                state.inflight_txs -= 1;
+                return;
+            }
+        }
+        panic!("unknown slot {slot}");
+    }
+}
+
 
 fn main() {
     let args = Args::parse();
@@ -911,7 +1098,7 @@ fn main() {
     let config: Config = toml::from_slice(&std::fs::read(args.config_path).unwrap()).unwrap();
     //assert!(RULES_MAX >= config.priority_rules.len());
     //assert!(RULES_MAX > config.default_priority);
-    println!("config {config:?}");
+    log::info!("config {config:?}");
     // Both per-worker rings are bounded by the same backpressure limit, so derive
     // their capacity instead of trusting hand-tuned config. The scheduler caps
     // per-worker in-flight txs (`max_txs_per_worker` for execute workers,
@@ -950,22 +1137,29 @@ fn main() {
     let mut to_check = BTreeSet::new();
     let mut check_inflight = 0;
 
-    let mut locking_queue = LockingQueue::new(workers, config.max_txs_per_worker, args.debug);
+    let mut locking_queue = LockingQueue::new(workers, config.max_txs_per_worker);
 
     let mut slot = 0;
     let mut last_report = std::time::Instant::now();
     let mut reschedules = 0;
     let mut drops = 0;
+    let mut rejected = 0;
+
+    let mut slot_stats = SlotStatCollector::new(workers);
 
     let mut send_stats = make_vector(workers, || 0);
-    let mut inflight = make_vector(workers, || 0);
     let mut tx_num = 0;
+    let mut is_leader = false;
+    let mut retry_tracker = RetryMeter::default();
+    let mut reschedule_reason = make_vector(5, || 0);
 
     loop {
         let mut to_spin = true;
         if let Some(item) = bridge.drain_progress() {
+            is_leader = item.leader_state == LEADER_READY;
             slot = item.current_slot;
             locking_queue.slot = slot;
+            slot_stats.announce(slot);
         }
 
         // Proactively expire the oldest transactions before pulling new work in.
@@ -1005,18 +1199,30 @@ fn main() {
         }, config.drain_tpu_granularity);
 
         if !to_check.is_empty() {
-            let mut batch = Vec::new();
+            let mut batch = smallvec::SmallVec::<[_; MAX_TRANSACTIONS_PER_MESSAGE]>::new();
+            macro_rules! send_check_batch {
+                () => {
+                    if !batch.is_empty() {
+                        assert!(batch.len() <= MAX_TRANSACTIONS_PER_MESSAGE);
+                        bridge.schedule(ScheduleBatch {
+                            worker: check_worker,
+                            max_working_slot: slot + config.slot_deadline,
+                            flags: pack_message_flags::CHECK | check_flags::STATUS_CHECKS | check_flags::LOAD_FEE_PAYER_BALANCE | check_flags::LOAD_ADDRESS_LOOKUP_TABLES,
+                            transactions: batch.as_slice()
+                        }).unwrap();
+                        batch.clear();
+                    }
+                };
+            }
             while check_inflight < config.check_max_inflight && !to_check.is_empty() {
                 let key = to_check.pop_last().unwrap();
                 batch.push(KeyedTransactionMeta { key, meta: SchedulerTxKey::default() });
                 check_inflight += 1;
+                if batch.len() == MAX_TRANSACTIONS_PER_MESSAGE {
+                    send_check_batch!();
+                }
             }
-            bridge.schedule(ScheduleBatch {
-                worker: check_worker,
-                max_working_slot: slot + config.slot_deadline,
-                flags: pack_message_flags::CHECK | check_flags::STATUS_CHECKS | check_flags::LOAD_FEE_PAYER_BALANCE | check_flags::LOAD_ADDRESS_LOOKUP_TABLES,
-                transactions: &batch
-            }).unwrap();
+            send_check_batch!();
         }
 
         bridge.drain_worker(check_worker, |bridge, worker_resp| {
@@ -1048,36 +1254,86 @@ fn main() {
 
         new_txs.sort();
         for (score, shared_key) in new_txs.into_iter() {
-            locking_queue.new_tx(TxMeta::new(shared_key, Score::new(score, tx_num), slot + config.slot_deadline), bridge.transaction(shared_key));
+            let tx = bridge.transaction(shared_key);
+            // The cost model needs cached static metadata (`StaticMeta`), which the
+            // bridge's bare `SanitizedTransactionView` does not carry. Wrap a borrowed
+            // view over the same transaction bytes in a `RuntimeTransaction` to compute
+            // and cache that metadata. `&TransactionPtr: TransactionData`, so the view
+            // aliases the bridge's allocation rather than copying it.
+            let view = SanitizedTransactionView::try_new_sanitized(tx.data.inner_data(), true)
+                .expect("bridge only stores transactions that already sanitized on ingress");
+            // The message hash is never read by cost estimation; zero-fill it to avoid
+            // rehashing the message on the hot path.
+            let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
+                view,
+                MessageHash::Precomputed(Hash::default()),
+                Some(tx.is_simple_vote()),
+            )
+            .expect("bridge only stores transactions that already sanitized on ingress");
+            let cost = CostModel::estimate_cost(
+                &runtime_tx,
+                runtime_tx.program_instructions_iter(),
+                runtime_tx.num_requested_write_locks(),
+                &FeatureSet::all_enabled(),
+            )
+            .sum();
+            locking_queue.new_tx(TxMeta::new(shared_key, Score::new(score, tx_num), cost, slot + config.slot_deadline), bridge.transaction(shared_key));
             tx_num += 1;
         }
 
         for worker in 0..workers {
             bridge.drain_worker(worker, |bridge, worker_resp| {
-                inflight[worker] -= 1;
                 to_spin = false;
                 let shared_key = worker_resp.key;
                 let key = worker_resp.meta;
+                let score = locking_queue.metas.get(key).unwrap().score;
                 match worker_resp.response {
                     WorkerAction::Check(_, _) => panic!("unexpected worker response"),
                     WorkerAction::Execute(item) => {
                         assert!(item.not_included_reason != not_included_reasons::ACCOUNT_IN_USE);
-                        let score = locking_queue.metas.get(key).unwrap().score;
                         if item.not_included_reason == not_included_reasons::WOULD_EXCEED_MAX_ACCOUNT_COST_LIMIT ||
                             item.not_included_reason == not_included_reasons::WOULD_EXCEED_ACCOUNT_DATA_BLOCK_LIMIT ||
-                            item.not_included_reason == not_included_reasons::PROGRAM_EXECUTION_TEMPORARILY_RESTRICTED
+                            item.not_included_reason == not_included_reasons::PROGRAM_EXECUTION_TEMPORARILY_RESTRICTED ||
+                            item.not_included_reason == not_included_reasons::BANK_NOT_AVAILABLE
                         {
+                            if item.not_included_reason == not_included_reasons::WOULD_EXCEED_MAX_ACCOUNT_COST_LIMIT {
+                                reschedule_reason[0] += 1;
+                            }
+                            if item.not_included_reason == not_included_reasons::WOULD_EXCEED_ACCOUNT_DATA_BLOCK_LIMIT {
+                                reschedule_reason[1] += 1;
+                            }
+                            if item.not_included_reason == not_included_reasons::PROGRAM_EXECUTION_TEMPORARILY_RESTRICTED {
+                                reschedule_reason[2] += 1;
+                            }
+                            if item.not_included_reason == not_included_reasons::BANK_NOT_AVAILABLE {
+                                reschedule_reason[3] += 1;
+                            }
+
                             reschedules += 1;
                             locking_queue.picked[worker].push(PickedTx(score, key));
+                            slot_stats.account_dropped(worker);
                             TxDecision::Keep
                         } else {
-                            locking_queue.remove_completed(key, bridge.transaction(shared_key), worker);
+                            let tx = bridge.transaction(shared_key);
+                            if item.not_included_reason != not_included_reasons::NONE {
+                                log::warn!("tx {:?} dropped by worker reason {}",
+                                    tx.data.signatures().first(), item.not_included_reason);
+                                rejected += 1;
+                                slot_stats.account_dropped(worker);
+                            } else {
+                                slot_stats.account_executed(worker, item.cost_units);
+                            }
+                            locking_queue.remove_completed(key, tx, worker);
                             TxDecision::Drop
                         }
                     },
                     WorkerAction::Unprocessed => {
-                        locking_queue.remove_completed(key, bridge.transaction(shared_key), worker);
-                        TxDecision::Drop // max_working_slot violation
+                        locking_queue.picked[worker].push(PickedTx(score, key));
+                        reschedules += 1;
+                        reschedule_reason[4] += 1;
+                        // no proper execution slot here so use the current fixed slot
+                        slot_stats.account_dropped(worker);
+                        TxDecision::Keep // max_working_slot violation
                     }
                 }
             }, config.max_txs_per_worker);
@@ -1147,10 +1403,13 @@ fn main() {
                 }
 
                 let rebalances = locking_queue.rebalances;
-                println!("{}/{workers} saturated(backlog/inflight {:?}/{:?}) (sent {send_stats:?}); enqueued {queue_len}/{picked_queue_len} actives {:?}, rebalances {rebalances}; txs seen/expires/reschedules/drops {passed_txs}/{expires}/{reschedules}/{drops} slot {slot}",
+                log::debug!("retry stats {}", retry_tracker);
+                log::debug!("retry reasons {:?}", reschedule_reason);
+
+                log::info!("{}/{workers} saturated(backlog/inflight {:?}/{:?}) (sent {send_stats:?}); enqueued {queue_len}/{picked_queue_len} actives {:?}, rebalances {rebalances}; txs seen/expires/reschedules/drops/rejects {passed_txs}/{expires}/{reschedules}/{drops}/{rejected} slot {slot}",
 
                     locking_queue.backlogs.iter().filter(|x| **x>0).count(),
-                    locking_queue.backlogs, inflight,
+                    locking_queue.backlogs, slot_stats.inflight_txs,
                     locking_queue.actives_assigned_weight);
 
                 last_report = now;
@@ -1159,37 +1418,56 @@ fn main() {
 
         locking_queue.drain_round += 1;
 
-        for worker in 0..workers {
-            locking_queue.drain_actives(worker, &mut bridge, config.round_budget_per_worker.unwrap_or(config.max_txs_per_worker));
-            let mut batch = smallvec::SmallVec::<[_; MAX_TRANSACTIONS_PER_MESSAGE]>::new();
-            macro_rules! send_batch {
-                () => {
-                    assert!(batch.len() <= MAX_TRANSACTIONS_PER_MESSAGE);
-                    bridge.schedule(ScheduleBatch{
-                        worker,
-                        transactions: batch.as_slice(),
-                        max_working_slot: slot + config.slot_deadline,
-                        flags: pack_message_flags::EXECUTE
-                    }).unwrap();
-                    send_stats[worker] += batch.len();
-                    batch.clear();
-                };
-            }
-            while inflight[worker] < config.max_txs_per_worker {
-                let Some(PickedTx(_, key)) = locking_queue.picked[worker].pop() else {
-                    break;
-                };
-                inflight[worker] += 1;
-                batch.push(KeyedTransactionMeta::<SchedulerTxKey>{
-                    key: locking_queue.metas.get(key).unwrap().shared_key,
-                    meta: key
-                });
-                if batch.len() == config.send_to_worker_granularity {
+        if is_leader {
+            for worker in 0..workers {
+                if !slot_stats.can_send(worker) {
+                    continue;
+                }
+                slot_stats.check_underflow(worker);
+                locking_queue.drain_actives(worker, &mut bridge, config.round_budget_per_worker.unwrap_or(config.max_txs_per_worker));
+                let mut batch = smallvec::SmallVec::<[_; MAX_TRANSACTIONS_PER_MESSAGE]>::new();
+                macro_rules! send_batch {
+                    () => {
+                        assert!(batch.len() <= MAX_TRANSACTIONS_PER_MESSAGE);
+                        to_spin = false;
+                        bridge.schedule(ScheduleBatch{
+                            worker,
+                            transactions: batch.as_slice(),
+                            max_working_slot: slot,
+                            flags: pack_message_flags::EXECUTE
+                        }).unwrap();
+                        send_stats[worker] += batch.len();
+                        slot_stats.account_sent(worker, batch.len());
+                        batch.clear();
+                    };
+                }
+                while slot_stats.inflight_txs[worker] + batch.len() < config.max_txs_per_worker {
+                    let Some(PickedTx(_, key)) = locking_queue.picked[worker].pop() else {
+                        break;
+                    };
+                    let (shared_key, _cost) = {
+                        let meta = locking_queue.metas.get_mut(key).unwrap();
+                        retry_tracker.track(meta);
+                        let shared_key = meta.shared_key;
+                        if meta.expire_slot < slot {
+                            locking_queue.remove_completed(key, bridge.transaction(shared_key), worker);
+                            bridge.remove_tx(shared_key);
+                            locking_queue.expires += 1;
+                            continue;
+                        }
+                        (shared_key, meta.cost)
+                    };
+                    batch.push(KeyedTransactionMeta::<SchedulerTxKey>{
+                        key: shared_key,
+                        meta: key
+                    });
+                    if batch.len() == config.send_to_worker_granularity {
+                        send_batch!();
+                    }
+                }
+                if !batch.is_empty() {
                     send_batch!();
                 }
-            }
-            if !batch.is_empty() {
-                send_batch!();
             }
         }
 
