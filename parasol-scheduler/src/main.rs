@@ -1,7 +1,7 @@
-use std::{collections::{BTreeSet, BinaryHeap, VecDeque}, fmt::Display, panic, time::Duration};
+use std::{collections::{BTreeSet, BinaryHeap, VecDeque}, fmt::Display, panic, time::{Duration, Instant}};
 
 use agave_feature_set::FeatureSet;
-use agave_scheduler_bindings::{pack_message_flags::{self, check_flags}, worker_message_types::{not_included_reasons, parsing_and_sanitization_flags, resolve_flags, status_check_flags}, LEADER_READY, MAX_TRANSACTIONS_PER_MESSAGE};
+use agave_scheduler_bindings::{pack_message_flags::{self, check_flags}, worker_message_types::{not_included_reasons, parsing_and_sanitization_flags, resolve_flags, status_check_flags}, LEADER_READY, LEADER_STARTING, MAX_TRANSACTIONS_PER_MESSAGE};
 use agave_scheduling_utils::{bridge::{KeyedTransactionMeta, ScheduleBatch, TransactionKey, TransactionState, TxDecision, WorkerAction}, handshake::ClientLogon, thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet}};
 use agave_transaction_view::transaction_view::SanitizedTransactionView;
 use clap::Parser;
@@ -55,6 +55,11 @@ struct Config {
     pub round_budget_per_worker: Option<usize>,
     pub max_txs_per_worker: usize,
     pub slot_deadline: u64,
+    // During LEADER_STARTING the progress tracker already reports the upcoming slot
+    // (tick-derived), so batches can be sent before the bank is installed; the worker
+    // holds them up to its 50ms bank-wait before bouncing BANK_NOT_AVAILABLE.
+    #[serde(default)]
+    pub prefill_on_leader_starting: bool,
     #[serde(with = "humantime_serde")]
     pub report_delay: Option<Duration>,
     max_queue_size: usize,
@@ -956,7 +961,16 @@ struct SLotStatCollectorState {
     sent_txs: Vec<usize>,
     executed_txs: Vec<u64>,
     cus_burnt: Vec<u64>,
-    inflight_txs: usize
+    inflight_txs: usize,
+    // Slot-roll timing as observed from the scheduler side.
+    // bank_gap: from the first not-READY progress message (after a READY period)
+    // to the first READY progress message for this slot. None means the roll was
+    // faster than the progress-message granularity (one PoH tick).
+    bank_gap: Option<Duration>,
+    ready_at: Option<Instant>,
+    first_send_at: Option<Instant>,
+    // Txs sent to workers while the bank was not yet installed (LEADER_STARTING).
+    prefill_sent: usize,
 }
 
 impl SLotStatCollectorState {
@@ -967,13 +981,21 @@ impl SLotStatCollectorState {
             executed_txs: make_vector(workers, || 0),
             sent_txs: make_vector(workers, || 0),
             cus_burnt: make_vector(workers, || 0),
-            inflight_txs: 0
+            inflight_txs: 0,
+            bank_gap: None,
+            ready_at: None,
+            first_send_at: None,
+            prefill_sent: 0,
         }
     }
 
     fn reinit(&mut self, slot: u64) {
         self.slot = slot;
         self.inflight_txs = 0;
+        self.bank_gap = None;
+        self.ready_at = None;
+        self.first_send_at = None;
+        self.prefill_sent = 0;
         for i in 0..self.underflow.len() {
             self.underflow[i] = 0;
             self.sent_txs[i] = 0;
@@ -981,11 +1003,19 @@ impl SLotStatCollectorState {
             self.cus_burnt[i] = 0;
         }
     }
+
+    // Zero means a prefill send was already queued when the bank appeared.
+    fn send_delay(&self) -> Option<Duration> {
+        match (self.ready_at, self.first_send_at) {
+            (Some(ready), Some(send)) => Some(send.saturating_duration_since(ready)),
+            _ => None,
+        }
+    }
 }
 
 impl Display for SLotStatCollectorState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "slot {} sent txs {}/{:?} executed txs {}/{:?} underflows {}/{:?} cus {}/{:?}",
+        write!(f, "slot {} sent txs {}/{:?} executed txs {}/{:?} underflows {}/{:?} cus {}/{:?} bank_gap {:?} send_delay {:?} prefill {}",
             self.slot,
             self.sent_txs.iter().sum::<usize>(),
             self.sent_txs,
@@ -994,7 +1024,10 @@ impl Display for SLotStatCollectorState {
             self.underflow.iter().sum::<u64>(),
             self.underflow,
             self.cus_burnt.iter().sum::<u64>(),
-            self.cus_burnt)
+            self.cus_burnt,
+            self.bank_gap,
+            self.send_delay(),
+            self.prefill_sent)
     }
 }
 
@@ -1002,7 +1035,9 @@ struct SlotStatCollector {
     states: VecDeque<SLotStatCollectorState>,
     worker_send_slot: Vec<u64>,
     inflight_txs: Vec<usize>,
-    workers: usize
+    workers: usize,
+    leader_ready: bool,
+    gap_started_at: Option<Instant>,
 }
 
 impl SlotStatCollector {
@@ -1011,27 +1046,44 @@ impl SlotStatCollector {
             states: VecDeque::new(),
             worker_send_slot: make_vector(workers, || 0),
             inflight_txs: make_vector(workers, || 0),
-            workers
+            workers,
+            leader_ready: false,
+            gap_started_at: None,
         }
     }
 
-    fn announce(&mut self, slot: u64) {
-        if self.states.back().map(|x| x.slot == slot).unwrap_or(false) {
-            return;
+    fn announce(&mut self, slot: u64, leader_ready: bool) {
+        let now = Instant::now();
+        // A READY -> not-READY edge marks the working bank disappearing; the gap
+        // closes on the first READY message for the (possibly already announced,
+        // since LEADER_STARTING reports the upcoming slot) new slot.
+        if self.leader_ready && !leader_ready {
+            self.gap_started_at = Some(now);
         }
+        self.leader_ready = leader_ready;
 
-        let mut pushed = false;
-        while self.states.front().map(|x| x.inflight_txs == 0 && x.slot != slot).unwrap_or(false) {
-            let mut state = self.states.pop_front().unwrap();
-            log::debug!("{}", state);
+        if !self.states.back().map(|x| x.slot == slot).unwrap_or(false) {
+            let mut pushed = false;
+            while self.states.front().map(|x| x.inflight_txs == 0 && x.slot != slot).unwrap_or(false) {
+                let mut state = self.states.pop_front().unwrap();
+                log::debug!("{}", state);
+                if !pushed {
+                    state.reinit(slot);
+                    self.states.push_back(state);
+                    pushed = true;
+                }
+            }
             if !pushed {
-                state.reinit(slot);
-                self.states.push_back(state);
-                pushed = true;
+                self.states.push_back(SLotStatCollectorState::new(slot, self.workers));
             }
         }
-        if !pushed {
-            self.states.push_back(SLotStatCollectorState::new(slot, self.workers));
+
+        if leader_ready {
+            let state = self.states.back_mut().unwrap();
+            if state.ready_at.is_none() {
+                state.ready_at = Some(now);
+                state.bank_gap = self.gap_started_at.take().map(|t| now.duration_since(t));
+            }
         }
     }
 
@@ -1058,7 +1110,14 @@ impl SlotStatCollector {
 
     fn account_sent(&mut self, worker: usize, cnt: usize) {
         self.inflight_txs[worker] += cnt;
+        let leader_ready = self.leader_ready;
         let state = self.states.back_mut().unwrap();
+        if state.first_send_at.is_none() {
+            state.first_send_at = Some(Instant::now());
+        }
+        if !leader_ready {
+            state.prefill_sent += cnt;
+        }
         state.sent_txs[worker] += cnt;
         state.inflight_txs += cnt;
     }
@@ -1150,6 +1209,7 @@ fn main() {
     let mut send_stats = make_vector(workers, || 0);
     let mut tx_num = 0;
     let mut is_leader = false;
+    let mut leader_starting = false;
     let mut retry_tracker = RetryMeter::default();
     let mut reschedule_reason = make_vector(5, || 0);
 
@@ -1157,9 +1217,10 @@ fn main() {
         let mut to_spin = true;
         if let Some(item) = bridge.drain_progress() {
             is_leader = item.leader_state == LEADER_READY;
+            leader_starting = item.leader_state == LEADER_STARTING;
             slot = item.current_slot;
             locking_queue.slot = slot;
-            slot_stats.announce(slot);
+            slot_stats.announce(slot, is_leader);
         }
 
         // Proactively expire the oldest transactions before pulling new work in.
@@ -1418,12 +1479,21 @@ fn main() {
 
         locking_queue.drain_round += 1;
 
-        if is_leader {
+        // During LEADER_STARTING `slot` already names the upcoming slot (tick-derived
+        // by the progress tracker), so the regular send path with
+        // `max_working_slot: slot` is valid as-is: prefilled batches wait at the
+        // worker for the bank instead of the worker waiting for the scheduler.
+        let prefill = config.prefill_on_leader_starting && leader_starting;
+        if is_leader || prefill {
             for worker in 0..workers {
                 if !slot_stats.can_send(worker) {
                     continue;
                 }
-                slot_stats.check_underflow(worker);
+                if is_leader {
+                    // Prefill rounds don't count: the worker is idle because there
+                    // is no bank, not because the scheduler starved it.
+                    slot_stats.check_underflow(worker);
+                }
                 locking_queue.drain_actives(worker, &mut bridge, config.round_budget_per_worker.unwrap_or(config.max_txs_per_worker));
                 let mut batch = smallvec::SmallVec::<[_; MAX_TRANSACTIONS_PER_MESSAGE]>::new();
                 macro_rules! send_batch {
