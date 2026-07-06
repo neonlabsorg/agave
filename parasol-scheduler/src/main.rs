@@ -39,6 +39,13 @@ fn default_connect_timeout() -> std::time::Duration { std::time::Duration::from_
 fn default_check_txs() -> usize { 0 }
 
 #[derive(Deserialize, Debug)]
+struct PriorityRule {
+    pub program: Address,
+    pub prefix: Vec<u8>,
+    pub priority: usize
+}
+
+#[derive(Deserialize, Debug)]
 struct Config {
     pub tpu: TpuConfig,
     #[serde(with = "humantime_serde")]
@@ -58,7 +65,7 @@ struct Config {
     #[serde(with = "humantime_serde")]
     pub report_delay: Option<Duration>,
     max_queue_size: usize,
-    priority_rules: Vec<Vec<Vec<u8>>>,
+    priority_rules: Vec<PriorityRule>,
     default_priority: usize,
 }
 
@@ -938,15 +945,25 @@ impl LockingQueue {
 
 impl Config {
     fn tx_score(&self, data: &TransactionState) -> usize {
-        let instruction_data = data.data.data();
-        for (priority, rule) in self.priority_rules.iter().enumerate() {
-            for prefix in rule.iter() {
-                if instruction_data.len() >= prefix.len() && &instruction_data[0..prefix.len()] == prefix {
-                    return priority;
+        let mut result_priority: Option<usize> = None;
+        for (instruction_program, instruction) in data.data.program_instructions_iter() {
+            let instruction_data = instruction.data;
+            for PriorityRule{prefix, program, priority} in self.priority_rules.iter() {
+                if program == instruction_program &&
+                    instruction_data.len() >= prefix.len() &&
+                    &instruction_data[0..prefix.len()] == prefix
+                {
+                    result_priority = Some(
+                        match result_priority {
+                            Some(x) => std::cmp::min(x, *priority),
+                            None => *priority
+                        }
+                    );
                 }
             }
         }
-        self.default_priority
+
+        result_priority.unwrap_or(self.default_priority)
     }
 }
 
