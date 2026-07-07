@@ -664,3 +664,113 @@ codegen-units = 1
 crossbeam-epoch = { git = "https://github.com/anza-xyz/crossbeam", rev = "fd279d707025f0e60951e429bf778b4813d1b6bf" }
 rustls-webpki = { git = "https://github.com/anza-xyz/rustls-webpki", tag = "anza-0.103.10-2" }
 rustls-webpki2 = { git = "https://github.com/anza-xyz/rustls-webpki", package = "rustls-webpki", tag = "anza-0.101.7-2" }
+
+# Parasol fork (franken-branch parasol-fork-dev-v4): blanket path-patch of the SDK onto agave-4.0.3
+# versions, carrying F1(100ms clock)/F2(gasless fee-calculator)/F3(rent-removal rent). parasol/solana-sdk
+# is a sibling on disk, mounted at /solana-sdk inside the Docker build (see agave-build/build.sh).
+# v3-style blanket: every franken crate whose version matches a version agave uses is patched, so a
+# patched crate never drags a mismatched foundational version (the E0308 trap). MULTI crates (address,
+# hash, pubkey, packet, define-syscall, system-interface) are patched at the franken version; agave's
+# OTHER version of each still resolves from registry (patch replaces exactly the matching version).
+# rent stays franken 3.0.0 carrying F3 (economics=0, minimum_balance()==0). agave's own workspace pins
+# `solana-rent = "3.0.0"` (^3) and pristine sysvar 3.1.1 / genesis-config 3.0.0 also want rent 3.0.0, so
+# the franken workspace root must pin `solana-rent version="3.0.0"` (NOT the stale 4.0.0) -> every rent
+# consumer unifies on the patched franken rent 3.0.0 (single version, serde feature enabled once).
+# genesis-config (pristine 3.0.0) resolves against it and is patched too.
+# EXCLUDED: logger + quic-definitions (absent from franken). Former-MISMATCH crates are re-pinned to
+# agave versions (above) and patched. Regenerate: agave-build/gen_blanket_patch.sh -> scratchpad/compose_patch_block.sh.
+solana-clock = { path = "parasol/solana-sdk/clock" }
+solana-rent = { path = "parasol/solana-sdk/rent" }
+solana-fee-calculator = { path = "parasol/solana-sdk/fee-calculator" }
+# former MISMATCH crates, re-pinned (git checkout <dir>@v<agave-ver>) to agave-4.0.3 versions and
+# patched so a patched franken crate can't drag its franken version transitively and collide with
+# the registry version at a bridge crate -> E0277/E0308 (e.g. stake-interface's `?` vs two ProgramErrors).
+solana-account-info = { path = "parasol/solana-sdk/account-info" }
+solana-bls-signatures = { path = "parasol/solana-sdk/bls-signatures" }
+solana-borsh = { path = "parasol/solana-sdk/borsh" }
+solana-program-error = { path = "parasol/solana-sdk/program-error" }
+solana-program-option = { path = "parasol/solana-sdk/program-option" }
+solana-short-vec = { path = "parasol/solana-sdk/short-vec" }
+solana-slot-history = { path = "parasol/solana-sdk/slot-history" }
+solana-stable-layout = { path = "parasol/solana-sdk/stable-layout" }
+solana-account = { path = "parasol/solana-sdk/account" }
+solana-address = { path = "parasol/solana-sdk/address" }
+solana-address-lookup-table-interface = { path = "parasol/solana-sdk/address-lookup-table-interface" }
+solana-atomic-u64 = { path = "parasol/solana-sdk/atomic-u64" }
+solana-big-mod-exp = { path = "parasol/solana-sdk/big-mod-exp" }
+solana-bincode = { path = "parasol/solana-sdk/bincode" }
+solana-blake3-hasher = { path = "parasol/solana-sdk/blake3-hasher" }
+solana-bn254 = { path = "parasol/solana-sdk/bn254" }
+solana-client-traits = { path = "parasol/solana-sdk/client-traits" }
+solana-cluster-type = { path = "parasol/solana-sdk/cluster-type" }
+solana-commitment-config = { path = "parasol/solana-sdk/commitment-config" }
+solana-compute-budget-interface = { path = "parasol/solana-sdk/compute-budget-interface" }
+solana-cpi = { path = "parasol/solana-sdk/cpi" }
+solana-define-syscall = { path = "parasol/solana-sdk/define-syscall" }
+solana-derivation-path = { path = "parasol/solana-sdk/derivation-path" }
+solana-ed25519-program = { path = "parasol/solana-sdk/ed25519-program" }
+solana-epoch-info = { path = "parasol/solana-sdk/epoch-info" }
+solana-epoch-rewards = { path = "parasol/solana-sdk/epoch-rewards" }
+solana-epoch-rewards-hasher = { path = "parasol/solana-sdk/epoch-rewards-hasher" }
+solana-epoch-schedule = { path = "parasol/solana-sdk/epoch-schedule" }
+solana-epoch-stake = { path = "parasol/solana-sdk/epoch-stake" }
+solana-example-mocks = { path = "parasol/solana-sdk/example-mocks" }
+solana-feature-gate-interface = { path = "parasol/solana-sdk/feature-gate-interface" }
+solana-fee-structure = { path = "parasol/solana-sdk/fee-structure" }
+solana-file-download = { path = "parasol/solana-sdk/file-download" }
+solana-frozen-abi = { path = "parasol/solana-sdk/frozen-abi" }
+solana-genesis-config = { path = "parasol/solana-sdk/genesis-config" }
+solana-hard-forks = { path = "parasol/solana-sdk/hard-forks" }
+solana-hash = { path = "parasol/solana-sdk/hash" }
+solana-inflation = { path = "parasol/solana-sdk/inflation" }
+solana-instruction = { path = "parasol/solana-sdk/instruction" }
+solana-instruction-error = { path = "parasol/solana-sdk/instruction-error" }
+solana-instructions-sysvar = { path = "parasol/solana-sdk/instructions-sysvar" }
+solana-keccak-hasher = { path = "parasol/solana-sdk/keccak-hasher" }
+solana-keypair = { path = "parasol/solana-sdk/keypair" }
+solana-last-restart-slot = { path = "parasol/solana-sdk/last-restart-slot" }
+solana-loader-v2-interface = { path = "parasol/solana-sdk/loader-v2-interface" }
+solana-loader-v3-interface = { path = "parasol/solana-sdk/loader-v3-interface" }
+solana-loader-v4-interface = { path = "parasol/solana-sdk/loader-v4-interface" }
+solana-message = { path = "parasol/solana-sdk/message" }
+solana-msg = { path = "parasol/solana-sdk/msg" }
+solana-native-token = { path = "parasol/solana-sdk/native-token" }
+solana-nonce = { path = "parasol/solana-sdk/nonce" }
+solana-nonce-account = { path = "parasol/solana-sdk/nonce-account" }
+solana-offchain-message = { path = "parasol/solana-sdk/offchain-message" }
+solana-packet = { path = "parasol/solana-sdk/packet" }
+solana-poh-config = { path = "parasol/solana-sdk/poh-config" }
+solana-precompile-error = { path = "parasol/solana-sdk/precompile-error" }
+solana-presigner = { path = "parasol/solana-sdk/presigner" }
+solana-program = { path = "parasol/solana-sdk/program" }
+solana-program-entrypoint = { path = "parasol/solana-sdk/program-entrypoint" }
+solana-program-memory = { path = "parasol/solana-sdk/program-memory" }
+solana-program-pack = { path = "parasol/solana-sdk/program-pack" }
+solana-pubkey = { path = "parasol/solana-sdk/pubkey" }
+solana-reward-info = { path = "parasol/solana-sdk/reward-info" }
+solana-sanitize = { path = "parasol/solana-sdk/sanitize" }
+solana-sdk-ids = { path = "parasol/solana-sdk/sdk-ids" }
+solana-sdk-macro = { path = "parasol/solana-sdk/sdk-macro" }
+solana-secp256k1-program = { path = "parasol/solana-sdk/secp256k1-program" }
+solana-secp256k1-recover = { path = "parasol/solana-sdk/secp256k1-recover" }
+solana-secp256r1-program = { path = "parasol/solana-sdk/secp256r1-program" }
+solana-seed-derivable = { path = "parasol/solana-sdk/seed-derivable" }
+solana-seed-phrase = { path = "parasol/solana-sdk/seed-phrase" }
+solana-serde = { path = "parasol/solana-sdk/serde" }
+solana-serde-varint = { path = "parasol/solana-sdk/serde-varint" }
+solana-serialize-utils = { path = "parasol/solana-sdk/serialize-utils" }
+solana-sha256-hasher = { path = "parasol/solana-sdk/sha256-hasher" }
+solana-shred-version = { path = "parasol/solana-sdk/shred-version" }
+solana-signature = { path = "parasol/solana-sdk/signature" }
+solana-signer = { path = "parasol/solana-sdk/signer" }
+solana-signer-store = { path = "parasol/solana-sdk/signer-store" }
+solana-slot-hashes = { path = "parasol/solana-sdk/slot-hashes" }
+solana-system-interface = { path = "parasol/solana-sdk/system-interface" }
+solana-system-transaction = { path = "parasol/solana-sdk/system-transaction" }
+solana-sysvar = { path = "parasol/solana-sdk/sysvar" }
+solana-sysvar-id = { path = "parasol/solana-sdk/sysvar-id" }
+solana-time-utils = { path = "parasol/solana-sdk/time-utils" }
+solana-transaction = { path = "parasol/solana-sdk/transaction" }
+solana-transaction-error = { path = "parasol/solana-sdk/transaction-error" }
+solana-validator-exit = { path = "parasol/solana-sdk/validator-exit" }
+solana-vote-interface = { path = "parasol/solana-sdk/vote-interface" }
