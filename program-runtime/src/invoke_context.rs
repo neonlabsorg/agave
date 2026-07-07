@@ -884,10 +884,13 @@ macro_rules! with_mock_invoke_context_with_feature_set {
         $transaction_accounts:expr $(,)?
     ) => {
         use {
-            solana_svm_callback::InvokeContextCallback,
+            solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
             solana_svm_log_collector::LogCollector,
             $crate::{
-                __private::{Hash, ReadableAccount, Rent, TransactionContext},
+                __private::{
+                    AccountSharedData, Hash, Pubkey, ReadableAccount, Rent, Slot,
+                    TransactionContext,
+                },
                 execution_budget::{SVMTransactionExecutionBudget, SVMTransactionExecutionCost},
                 invoke_context::{EnvironmentConfig, InvokeContext},
                 loaded_programs::{ProgramCacheForTxBatch, ProgramRuntimeEnvironments},
@@ -897,6 +900,14 @@ macro_rules! with_mock_invoke_context_with_feature_set {
 
         struct MockInvokeContextCallback {}
         impl InvokeContextCallback for MockInvokeContextCallback {}
+        impl TransactionProcessingCallback for MockInvokeContextCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, Slot)> {
+                None
+            }
+        }
 
         let compute_budget = SVMTransactionExecutionBudget::new_with_defaults(
             $feature_set.raise_cpi_nesting_limit_to_8,

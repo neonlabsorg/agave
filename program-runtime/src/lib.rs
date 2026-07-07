@@ -20,9 +20,11 @@ pub mod vm;
 pub mod __private {
     pub use {
         crate::vm::{MEMORY_POOL, calculate_heap_cost, create_vm},
-        solana_account::ReadableAccount,
+        solana_account::{AccountSharedData, ReadableAccount},
+        solana_clock::Slot,
         solana_hash::Hash,
         solana_instruction::error::InstructionError,
+        solana_pubkey::Pubkey,
         solana_rent::Rent,
         solana_transaction_context::transaction::TransactionContext,
     };
