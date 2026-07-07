@@ -2229,13 +2229,18 @@ mod tests {
         let mock_bank = MockBankCallback::default();
         let mut account_loader = (&mock_bank).into();
         let mut error_counters = TransactionErrorMetrics::default();
+        // Parasol fork (F2): with fee == 0 the gasless path synthesizes a fee-payer
+        // on-the-fly and returns Ok, so the AccountNotFound assertion only triggers
+        // when the fee is strictly positive. Pin the non-zero-fee path.
         let result =
             TransactionBatchProcessor::<TestForkGraph>::validate_transaction_nonce_and_fee_payer(
                 &mut account_loader,
                 &message,
                 CheckedTransactionDetails::new(
                     None,
-                    SVMTransactionExecutionAndFeeBudgetLimits::default(),
+                    SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
+                        MockBankCallback::calculate_fee_details(&message, lamports_per_signature, 0),
+                    ),
                 ),
                 &Hash::default(),
                 lamports_per_signature,
@@ -2297,8 +2302,10 @@ mod tests {
         let fee_payer_address = message.fee_payer();
         let transaction_fee = lamports_per_signature;
         let rent = Rent::default();
-        let min_balance = rent.minimum_balance(0);
-        let starting_balance = min_balance + transaction_fee - 1;
+        // Parasol fork (F2/F3): rent enforcement is gone — minimum_balance returns 0,
+        // so the upstream "min_balance + fee - 1" setup reduces to "fee - 1" and the
+        // validator returns InsufficientFundsForFee rather than InsufficientFundsForRent.
+        let starting_balance = transaction_fee - 1;
         let fee_payer_account = AccountSharedData::new(starting_balance, 0, &Pubkey::default());
         let mut mock_accounts = HashMap::new();
         mock_accounts.insert(*fee_payer_address, fee_payer_account);
@@ -2330,10 +2337,8 @@ mod tests {
                 &mut error_counters,
             );
 
-        assert_eq!(
-            result,
-            Err(TransactionError::InsufficientFundsForRent { account_index: 0 })
-        );
+        assert_eq!(error_counters.insufficient_funds.0, 1);
+        assert_eq!(result, Err(TransactionError::InsufficientFundsForFee));
     }
 
     #[test]
@@ -2592,7 +2597,10 @@ mod tests {
         // Insufficient Fees
         {
             let fee_payer_account = AccountSharedData::new_data(
-                transaction_fee + priority_fee, // no min_balance this time
+                // Parasol fork (F2/F3): nonce accounts no longer need a min_balance
+                // reserve (rent removed); drop balance one lamport below fee+priority
+                // so the InsufficientFundsForFee path still triggers.
+                transaction_fee + priority_fee - 1,
                 &nonce_versions,
                 &system_program::id(),
             )

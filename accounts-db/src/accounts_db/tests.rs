@@ -5818,7 +5818,10 @@ fn test_shrink_collect_with_obsolete_accounts() {
         unref_pubkeys.iter().clone().collect::<HashSet<_>>()
     );
 
-    // Ensure that the obsolete accounts and accounts to unref are not in the alive list
+    // Ensure that the obsolete accounts and accounts to unref are not in the alive list.
+    // Under F8, zero-lamport accounts whose data is non-empty (data_len=128 here) are
+    // NOT cleanable and therefore stay alive through shrink — so both the regular and
+    // the (non-obsolete, non-unref) zero-lamport accounts appear in the alive set.
     assert_eq!(
         shrink_collect
             .alive_accounts
@@ -5829,6 +5832,7 @@ fn test_shrink_collect_with_obsolete_accounts() {
             .collect::<Vec<Pubkey>>(),
         regular_pubkeys
             .into_iter()
+            .chain(zero_lamport_pubkeys.into_iter())
             .filter(|account| !unref_pubkeys.contains(account))
             .filter(|account| !obsolete_pubkeys.contains(account))
             .sorted()

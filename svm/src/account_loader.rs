@@ -1255,8 +1255,10 @@ mod tests {
             }
         }
 
-        // If payer account has no balance, expected AccountNotFound Error
-        // regardless feature gate status, or if payer is nonce account.
+        // Parasol fork (F2): zero-balance fee-payer with fee > 0 now returns
+        // InsufficientFundsForFee (non-existent / zero-lamport fee-payers are
+        // synthesized upstream in transaction_processor when fee == 0), not
+        // AccountNotFound. Holds for both nonce and non-nonce payers.
         {
             for is_nonce in [true, false] {
                 validate_fee_payer_account(
@@ -1264,7 +1266,7 @@ mod tests {
                         is_nonce,
                         payer_init_balance: 0,
                         fee,
-                        expected_result: Err(TransactionError::AccountNotFound),
+                        expected_result: Err(TransactionError::InsufficientFundsForFee),
                         payer_post_balance: 0,
                     },
                     &rent,
@@ -1312,19 +1314,122 @@ mod tests {
             ..Rent::default()
         };
 
-        // nonce payer account has balance of u64::MAX, so does fee; due to nonce account
-        // requires additional min_balance, expect InsufficientFundsForFee error if feature gate is
-        // enabled
+        // Parasol fork (F2/F3): zero-rent economics — Rent::minimum_balance returns 0,
+        // so a nonce payer never needs an extra rent reserve. With balance == fee ==
+        // u64::MAX the validator subtracts cleanly to a 0 post-balance instead of
+        // tripping the upstream "min_balance + fee" checked-arithmetic overflow path.
         validate_fee_payer_account(
             ValidateFeePayerTestParameter {
                 is_nonce: true,
                 payer_init_balance: u64::MAX,
                 fee: u64::MAX,
-                expected_result: Err(TransactionError::InsufficientFundsForFee),
-                payer_post_balance: u64::MAX,
+                expected_result: Ok(()),
+                payer_post_balance: 0,
             },
             &rent,
         );
+    }
+
+    // F8: direct AccountLoader-level verification of the cleanable predicate — a
+    // (0, 0, system_program) entry in the loader's scratch is treated as deallocated,
+    // while a (0, 0, custom_program) entry is returned unchanged (stays loadable).
+    #[test]
+    fn test_account_loader_treats_system_zero_lamport_empty_account_as_deallocated() {
+        let callbacks = TestCallbacks::default();
+        let mut account_loader: AccountLoader<TestCallbacks> = (&callbacks).into();
+        let account_key = Pubkey::new_unique();
+
+        let mut account = AccountSharedData::default();
+        account.set_owner(system_program::id());
+        account.set_rent_epoch(u64::MAX - 1);
+
+        account_loader
+            .loaded_accounts
+            .insert(account_key, (account, 0));
+
+        assert_eq!(account_loader.load_account(&account_key), None);
+    }
+
+    #[test]
+    fn test_account_loader_keeps_non_system_zero_lamport_empty_account_alive() {
+        let callbacks = TestCallbacks::default();
+        let mut account_loader: AccountLoader<TestCallbacks> = (&callbacks).into();
+        let account_key = Pubkey::new_unique();
+
+        let mut account = AccountSharedData::default();
+        account.set_owner(Pubkey::new_unique());
+        account.set_rent_epoch(u64::MAX - 1);
+
+        account_loader
+            .loaded_accounts
+            .insert(account_key, (account.clone(), 0));
+
+        assert_eq!(account_loader.load_account(&account_key), Some(account));
+    }
+
+    // F2 (gasless): fee == 0 must pass for any signer account regardless of owner /
+    // data / lamports. Aligned with F8: program-owned zero-lamport accounts stay alive
+    // and must remain valid fee-payers under gasless economics.
+    #[test]
+    fn test_validate_fee_payer_zero_fee_program_owned() {
+        let rent = Rent::default();
+        let payer_address = Keypair::new().pubkey();
+        let program_owner = Pubkey::new_unique();
+        let mut error_metrics = TransactionErrorMetrics::default();
+
+        // program-owned, zero lamports, empty data
+        let mut account = AccountSharedData::new(0, 0, &program_owner);
+        let result =
+            validate_fee_payer(&payer_address, &mut account, 0, &mut error_metrics, &rent, 0);
+        assert_eq!(result, Ok(()));
+        assert_eq!(account.lamports(), 0);
+        assert_eq!(error_metrics.invalid_account_for_fee.0, 0);
+        assert_eq!(error_metrics.insufficient_funds.0, 0);
+
+        // program-owned, zero lamports, with data
+        let mut account = AccountSharedData::new(0, 64, &program_owner);
+        let result =
+            validate_fee_payer(&payer_address, &mut account, 0, &mut error_metrics, &rent, 0);
+        assert_eq!(result, Ok(()));
+        assert_eq!(error_metrics.invalid_account_for_fee.0, 0);
+
+        // program-owned, non-zero lamports — fee == 0, no deduction
+        let mut account = AccountSharedData::new(1_000, 0, &program_owner);
+        let result =
+            validate_fee_payer(&payer_address, &mut account, 0, &mut error_metrics, &rent, 0);
+        assert_eq!(result, Ok(()));
+        assert_eq!(account.lamports(), 1_000);
+    }
+
+    // F2 (gasless): system-owned account with non-empty data (e.g. a closed-but-not-
+    // cleared stake/token leftover) must pass fee == 0.
+    #[test]
+    fn test_validate_fee_payer_zero_fee_system_owned_with_data() {
+        let rent = Rent::default();
+        let payer_address = Keypair::new().pubkey();
+        let mut error_metrics = TransactionErrorMetrics::default();
+
+        let mut account = AccountSharedData::new(0, 128, &system_program::id());
+        let result =
+            validate_fee_payer(&payer_address, &mut account, 0, &mut error_metrics, &rent, 0);
+        assert_eq!(result, Ok(()));
+        assert_eq!(error_metrics.invalid_account_for_fee.0, 0);
+    }
+
+    // F2 (gasless): non-zero-fee path is unchanged — a program-owned account is still
+    // rejected as InvalidAccountForFee (defence-in-depth for the non-gasless path).
+    #[test]
+    fn test_validate_fee_payer_nonzero_fee_program_owned_rejected() {
+        let rent = Rent::default();
+        let payer_address = Keypair::new().pubkey();
+        let program_owner = Pubkey::new_unique();
+        let mut error_metrics = TransactionErrorMetrics::default();
+
+        let mut account = AccountSharedData::new(1_000_000, 0, &program_owner);
+        let result =
+            validate_fee_payer(&payer_address, &mut account, 0, &mut error_metrics, &rent, 500);
+        assert_eq!(result, Err(TransactionError::InvalidAccountForFee));
+        assert_eq!(error_metrics.invalid_account_for_fee.0, 1);
     }
 
     #[test]
@@ -2127,8 +2232,11 @@ mod tests {
             ..Account::default()
         });
 
+        // Parasol fork (F2/F3): all accounts are rent-exempt regardless of balance
+        // because Rent::minimum_balance returns 0. A 1-lamport account therefore
+        // receives RENT_EXEMPT_RENT_EPOCH, not 0.
         update_rent_exempt_status_for_account(&rent, &mut account);
-        assert_eq!(account.rent_epoch(), 0);
+        assert_eq!(account.rent_epoch(), RENT_EXEMPT_RENT_EPOCH);
         assert_eq!(account.lamports(), 1);
     }
 
