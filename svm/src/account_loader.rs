@@ -14,7 +14,7 @@ use {
         Account, AccountSharedData, PROGRAM_OWNERS, ReadableAccount, WritableAccount,
         state_traits::StateMut,
     },
-    solana_clock::Slot,
+    solana_clock::{Epoch, Slot},
     solana_fee_structure::FeeDetails,
     solana_instruction::{BorrowedAccountMeta, BorrowedInstruction},
     solana_instructions_sysvar::construct_instructions_data,
@@ -27,7 +27,7 @@ use {
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_sdk_ids::{
-        bpf_loader_upgradeable, native_loader,
+        bpf_loader_upgradeable, native_loader, system_program,
         sysvar::{self, slot_history},
     },
     solana_svm_callback::{AccountState, TransactionProcessingCallback},
@@ -37,6 +37,22 @@ use {
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::num::NonZeroU32,
 };
+
+// F8: an account is considered "deallocated" (a tombstone) iff either
+//   1. it is a classic default tombstone (lamports=0, data=[], owner=default,
+//      !executable, rent_epoch=0), or
+//   2. it is a system-program-owned zero-lamport account with empty data.
+// All other zero-lamport accounts are valid and persistent.
+pub(crate) fn is_deallocated_account_local(account: &AccountSharedData) -> bool {
+    (account.lamports() == 0
+        && account.data().is_empty()
+        && !account.executable()
+        && account.rent_epoch() == Epoch::default()
+        && account.owner() == &Pubkey::default())
+        || (account.lamports() == 0
+            && account.data().is_empty()
+            && account.owner() == &system_program::id())
+}
 
 // Per SIMD-0186, all accounts are assigned a base size of 64 bytes to cover
 // the storage cost of metadata.
@@ -259,7 +275,12 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
             // If lamports is 0, a previous transaction deallocated this account.
             // We return None instead of the account we found so it can be created fresh.
             // We *never* remove accounts, or else we would fetch stale state from accounts-db.
-            let option_account = if account.lamports() == 0 {
+            // F8: only treat *cleanable* zero-lamport accounts (classic default
+            // tombstones + system-program-owned empty zero-lamport) as deallocated.
+            // Valid zero-lamport accounts (non-default data/owner) stay loadable.
+            // We *never* remove accounts, or else we would fetch stale state from
+            // accounts-db.
+            let option_account = if is_deallocated_account_local(account) {
                 None
             } else {
                 Some((account.clone(), *slot))

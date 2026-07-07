@@ -1576,7 +1576,18 @@ impl AccountsDb {
                             .accounts
                             .scan_accounts_without_data(|_offset, account| {
                                 let pubkey = *account.pubkey();
-                                let is_zero_lamport = account.is_zero_lamport();
+                                // F8: narrow the "zero-lamport clean candidate" flag to
+                                // tombstone-like accounts only (default-empty or system-program
+                                // owned empty zero-lamport). Valid zero-lamport accounts stay
+                                // out of the clean sweep.
+                                let is_zero_lamport =
+                                    crate::account_utils::is_cleanable_zero_lamport_account_meta(
+                                        account.lamports,
+                                        account.data_len,
+                                        account.owner,
+                                        account.executable,
+                                        account.rent_epoch,
+                                    );
                                 insert_candidate(pubkey, is_zero_lamport);
                             })
                             .expect("must scan accounts storage");
@@ -2498,10 +2509,22 @@ impl AccountsDb {
             .scan_accounts_without_data(|offset, account| {
                 // file_id is unused and can be anything. We will always be loading whatever storage is in the slot.
                 let file_id = 0;
+                // F8: narrow the `is_zero_lamport` flag recorded in `AccountInfo` to
+                // tombstone-like accounts only. A raw `account.is_zero_lamport()` here
+                // would mark every 0-lamport account as a clean candidate, including
+                // valid non-system-owned 0-lamport accounts (or system-owned with
+                // non-empty data) — the behaviour F8 explicitly wants to preserve.
+                let is_tombstone = crate::account_utils::is_cleanable_zero_lamport_account_meta(
+                    account.lamports,
+                    account.data_len,
+                    account.owner,
+                    account.executable,
+                    account.rent_epoch,
+                );
                 stored_accounts.push(AccountFromStorage {
                     index_info: AccountInfo::new(
                         StorageLocation::AppendVec(file_id, offset),
-                        account.is_zero_lamport(),
+                        is_tombstone,
                     ),
                     pubkey: *account.pubkey(),
                     data_len: account.data_len as u64,
@@ -3575,7 +3598,12 @@ impl AccountsDb {
         populate_read_cache: PopulateReadCache,
     ) -> Option<(AccountSharedData, Slot)> {
         self.do_load(ancestors, pubkey, load_hint, populate_read_cache)
-            .filter(|(account, _)| !account.is_zero_lamport())
+            // F8: hide only cleanable-tombstone accounts (classic default-empty or
+            // system-program-owned empty zero-lamport). Valid zero-lamport accounts
+            // (program-owned, or non-empty data) must stay visible to Bank::deposit /
+            // store_account_and_update_capitalization, which otherwise treat a live
+            // program account as missing and overwrite it with a fresh default.
+            .filter(|(account, _)| !crate::account_utils::is_cleanable_zero_lamport_account(account))
     }
 
     fn read_index_for_accessor_or_load_slow<'a>(
@@ -4920,8 +4948,14 @@ impl AccountsDb {
             (start..end).for_each(|i| {
                 if store_account[i as u64] {
                     accounts.account(i, |account| {
-                        let info =
-                            AccountInfo::new(StorageLocation::Cached, account.is_zero_lamport());
+                        // F8: narrow the `is_zero_lamport` flag stored in the in-memory
+                        // `AccountInfo` index entry to *cleanable* zero-lamport accounts
+                        // only, so `clean_accounts` cannot later purge a valid program-owned
+                        // zero-lamport account and make it invisible to RPC `getAccountInfo`.
+                        let info = AccountInfo::new(
+                            StorageLocation::Cached,
+                            crate::account_utils::is_cleanable_zero_lamport_account(&account),
+                        );
                         self.accounts_index.upsert(
                             target_slot,
                             target_slot,
@@ -5563,7 +5597,11 @@ impl AccountsDb {
                     stats.num_duplicate_accounts_skipped += 1;
                     return;
                 }
-                if account.is_zero_lamport() {
+                // F8: the block below is a tombstone-dedup optimization that assumes
+                // "zero lamports == deletion". Restrict it to *cleanable* tombstones so a
+                // valid program-owned zero-lamport account is never skipped (dropped) on
+                // store; such accounts must be persisted like any other account.
+                if crate::account_utils::is_cleanable_zero_lamport_account(&account) {
                     if ancestors.is_some() {
                         if let Some(is_zero_lamport) = self.accounts_index.get_with_and_then(
                             pubkey,
@@ -5632,9 +5670,14 @@ impl AccountsDb {
 
             let store_id = storage.id();
             for (i, offset) in stored_accounts_info.offsets.iter().enumerate() {
+                // F8: narrow the persisted `AccountInfo` flag to *cleanable* zero-lamport
+                // accounts only. `StorableAccounts::is_tombstone(i)` implements the F8
+                // predicate (default-tombstone OR system-program-owned empty zero-lamport);
+                // a raw `is_zero_lamport(i)` would tag every 0-lamport account as a clean
+                // candidate.
                 infos.push(AccountInfo::new(
                     StorageLocation::AppendVec(store_id, *offset),
-                    accounts_and_meta_to_store.is_zero_lamport(i),
+                    accounts_and_meta_to_store.is_tombstone(i),
                 ));
             }
             storage.add_accounts(
@@ -5872,7 +5915,20 @@ impl AccountsDb {
 
                 let data_len = account.data.len();
                 stored_size_alive += storage.accounts.calculate_stored_size(data_len);
-                let is_account_zero_lamport = account.is_zero_lamport();
+                // F8: narrow the "zero-lamport" flag recorded in AccountInfo to cleanable
+                // tombstones only. A raw account.is_zero_lamport() would tag valid
+                // program-owned / non-empty-data zero-lamport accounts as obsolete /
+                // single-ref-dead during index generation, diverging from the clean /
+                // shrink write sites (already F8-narrowed) and reclaiming bytes that
+                // must survive.
+                let is_account_zero_lamport =
+                    crate::account_utils::is_cleanable_zero_lamport_account_meta(
+                        account.lamports,
+                        account.data.len(),
+                        account.owner,
+                        account.executable,
+                        account.rent_epoch,
+                    );
                 if !is_account_zero_lamport {
                     accounts_data_len += data_len as u64;
                     all_accounts_are_zero_lamports = false;
@@ -6129,9 +6185,21 @@ impl AccountsDb {
                             for (slot2, account_info2) in slot_list.iter() {
                                 if *slot2 == slot {
                                     count += 1;
+                                    // F8: must match the narrowed flag stored by
+                                    // generate_index_for_slot — a raw account.is_zero_lamport()
+                                    // here would mis-compare against the F8-narrowed bit that
+                                    // was actually written into the index.
+                                    let is_tombstone =
+                                        crate::account_utils::is_cleanable_zero_lamport_account_meta(
+                                            account.lamports,
+                                            account.data_len,
+                                            account.owner,
+                                            account.executable,
+                                            account.rent_epoch,
+                                        );
                                     let ai = AccountInfo::new(
                                         StorageLocation::AppendVec(store_id, offset), // will never be cached
-                                        account.is_zero_lamport(),
+                                        is_tombstone,
                                     );
                                     assert_eq!(&ai, account_info2);
                                 }

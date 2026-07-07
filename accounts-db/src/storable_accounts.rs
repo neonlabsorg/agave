@@ -3,6 +3,7 @@ use {
     crate::{
         account_storage::stored_account_info::StoredAccountInfo,
         account_storage_entry::AccountStorageEntry,
+        account_utils::is_cleanable_zero_lamport_account,
         accounts_db::{AccountFromStorage, AccountsDb},
         is_zero_lamport::IsZeroLamport,
         utils::create_account_shared_data,
@@ -132,15 +133,27 @@ pub trait StorableAccounts<'a>: Sync {
     fn data_len(&self, index: usize) -> usize;
     /// pubkey of account at 'index'
     fn pubkey(&self, index: usize) -> &Pubkey;
-    /// None if account is zero lamports
+    /// true if the account at `index` is a zero-lamport cleanable tombstone
+    /// (classic default-empty OR system-program-owned empty zero-lamport).
+    fn is_tombstone(&self, index: usize) -> bool {
+        if !self.is_zero_lamport(index) {
+            return false;
+        }
+        self.account(index, |account| is_cleanable_zero_lamport_account(&account))
+    }
+    /// Substitute the classic default tombstone only when the account at `index`
+    /// is truly cleanable; valid zero-lamport accounts (non-default metadata)
+    /// are written through as-is.
     fn account_default_if_zero_lamport<Ret>(
         &self,
         index: usize,
         mut callback: impl for<'local> FnMut(AccountForStorage<'local>) -> Ret,
     ) -> Ret {
         // Calling `self.account` may be expensive if backed by disk storage.
-        // Check if the account is zero lamports first.
-        if self.is_zero_lamport(index) {
+        // Cheap pre-filter first, then verify tombstone via `is_tombstone`.
+        // Original behaviour: substitute default for ANY zero-lamport account.
+        // F8: substitute only for cleanable tombstones.
+        if self.is_tombstone(index) {
             callback(AccountForStorage::AddressAndAccount((
                 self.pubkey(index),
                 &DEFAULT_ACCOUNT_SHARED_DATA,
