@@ -308,7 +308,7 @@ fn add_validator_accounts(
                 identity_pubkey,
                 identity_pubkey,
                 commission,
-                rent.minimum_balance(VoteStateV3::size_of()).max(1),
+                rent.minimum_balance(VoteStateV3::size_of()),
             )
         };
 

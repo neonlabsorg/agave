@@ -79,7 +79,7 @@ fn bpf_loader_program_account(program_id: &Pubkey, elf: &[u8], rent: &Rent) -> (
     (
         *program_id,
         Account {
-            lamports: rent.minimum_balance(elf.len()).max(1),
+            lamports: rent.minimum_balance(elf.len()),
             data: elf.to_vec(),
             owner: bpf_loader::id(),
             executable: true,

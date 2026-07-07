@@ -2410,7 +2410,7 @@ fn main() {
                                     identity_pubkey,
                                     0,
                                     identity_pubkey,
-                                    rent.minimum_balance(VoteStateV4::size_of()).max(1),
+                                    rent.minimum_balance(VoteStateV4::size_of()),
                                 )
                             } else {
                                 vote_state::create_v3_account_with_authorized(
