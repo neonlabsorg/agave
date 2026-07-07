@@ -1,4 +1,4 @@
-use std::{collections::{BTreeSet, BinaryHeap, VecDeque}, fmt::Display, panic, time::Duration};
+use std::{collections::{BTreeSet, BinaryHeap, VecDeque}, fmt::Display, panic, str::FromStr, time::Duration};
 
 use agave_feature_set::FeatureSet;
 use agave_scheduler_bindings::{pack_message_flags::{self, check_flags}, worker_message_types::{not_included_reasons, parsing_and_sanitization_flags, resolve_flags, status_check_flags}, LEADER_READY, MAX_TRANSACTIONS_PER_MESSAGE};
@@ -38,8 +38,17 @@ fn default_connect_timeout() -> std::time::Duration { std::time::Duration::from_
 
 fn default_check_txs() -> usize { 0 }
 
+fn deserialize_address<'de, D>(deserializer: D) -> Result<Address, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Address::from_str(&s).map_err(serde::de::Error::custom)
+}
+
 #[derive(Deserialize, Debug)]
 struct PriorityRule {
+    #[serde(deserialize_with = "deserialize_address")]
     pub program: Address,
     pub prefix: Vec<u8>,
     pub priority: usize
@@ -1112,7 +1121,7 @@ fn main() {
     let args = Args::parse();
     env_logger::init();
 
-    let config: Config = toml::from_slice(&std::fs::read(args.config_path).unwrap()).unwrap();
+    let config: Config = toml::from_str(&std::fs::read_to_string(args.config_path).unwrap()).unwrap();
     //assert!(RULES_MAX >= config.priority_rules.len());
     //assert!(RULES_MAX > config.default_priority);
     log::info!("config {config:?}");
