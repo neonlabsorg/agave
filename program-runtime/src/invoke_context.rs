@@ -9,6 +9,7 @@ use {
         sysvar_cache::SysvarCache,
     },
     solana_account::{AccountSharedData, create_account_shared_data_for_test},
+    solana_clock::Slot,
     solana_epoch_schedule::EpochSchedule,
     solana_hash::Hash,
     solana_instruction::{AccountMeta, Instruction, error::InstructionError},
@@ -24,7 +25,7 @@ use {
     solana_sdk_ids::{
         bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, loader_v4, native_loader, sysvar,
     },
-    solana_svm_callback::InvokeContextCallback,
+    solana_svm_callback::TransactionProcessingCallback,
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_log_collector::{LogCollector, ic_msg},
     solana_svm_measure::measure::Measure,
@@ -139,7 +140,7 @@ impl BpfAllocator {
 pub struct EnvironmentConfig<'a> {
     pub blockhash: Hash,
     pub blockhash_lamports_per_signature: u64,
-    epoch_stake_callback: &'a dyn InvokeContextCallback,
+    transaction_processing_callback: &'a dyn TransactionProcessingCallback,
     feature_set: &'a SVMFeatureSet,
     pub program_runtime_environments_for_execution: &'a ProgramRuntimeEnvironments,
     pub program_runtime_environments_for_deployment: &'a ProgramRuntimeEnvironments,
@@ -149,7 +150,7 @@ impl<'a> EnvironmentConfig<'a> {
     pub fn new(
         blockhash: Hash,
         blockhash_lamports_per_signature: u64,
-        epoch_stake_callback: &'a dyn InvokeContextCallback,
+        transaction_processing_callback: &'a dyn TransactionProcessingCallback,
         feature_set: &'a SVMFeatureSet,
         program_runtime_environments_for_execution: &'a ProgramRuntimeEnvironments,
         program_runtime_environments_for_deployment: &'a ProgramRuntimeEnvironments,
@@ -158,7 +159,7 @@ impl<'a> EnvironmentConfig<'a> {
         Self {
             blockhash,
             blockhash_lamports_per_signature,
-            epoch_stake_callback,
+            transaction_processing_callback,
             feature_set,
             program_runtime_environments_for_execution,
             program_runtime_environments_for_deployment,
@@ -170,6 +171,80 @@ impl<'a> EnvironmentConfig<'a> {
 pub struct SyscallContext {
     pub allocator: BpfAllocator,
     pub accounts_metadata: Vec<SerializedAccountMetadata>,
+    /// F10: per-instruction subaccount metadata parallel to `accounts_metadata`.
+    pub subaccounts_metadata: Vec<SerializedAccountMetadata>,
+    /// F10: pointer+length into VM memory describing the subaccount-info array
+    /// that CPI translation helpers populate at runtime.
+    pub subaccounts_infos: UntypedVmSlice,
+    /// F10: pre-reserved subaccount slots populated by `sol_load_subaccount` /
+    /// freed by `sol_unload_subaccount`. Each slot owns a fixed-size region in
+    /// the VM input buffer that the syscall fills with a serialized subaccount
+    /// record (matching the aligned `serialize_parameters` layout).
+    pub subaccount_slots: Vec<SubaccountSlot>,
+    /// PRS-103 stub: execution trace log (minimal placeholder so SyscallContext
+    /// shape matches parasol-dev).
+    pub trace_log: Vec<[u64; 12]>,
+    /// PRS-103 stub: dynamically-loaded CPI accounts (minimal placeholder; not
+    /// populated in this port — sol_cpi_load_account syscalls are not ported).
+    pub dynamic_cpi_accounts: Vec<DynamicCpiAccount>,
+}
+
+/// Per-slot bookkeeping for a `sol_load_subaccount` reservation.
+///
+/// At VM creation `serialize_parameters_aligned` reserves
+/// [`MAX_SUBACCOUNT_SLOTS`] slots, each backed by **two** memory regions:
+/// a fixed-size header region (88 bytes, holding NON_DUP_MARKER + flags +
+/// key/owner/lamports/data_len) and a placeholder data region whose VM
+/// address is stable across the VM's lifetime but whose host-side backing
+/// is empty until `sol_load_subaccount` swaps it for one pointing at the
+/// loaded subaccount's `AccountSharedData` storage (direct mapping).
+///
+/// The syscall also accepts a caller-supplied `SolAccountInfo` pointer
+/// (`caller_account_view_addr`), fills it to point at the slot's regions,
+/// and stamps `caller_account_metadata` with the VM addresses of the
+/// individual fields — the same metadata layout the CPI sync path uses to
+/// flow state changes back to the program's view after a CPI returns.
+#[derive(Debug, Clone)]
+pub struct SubaccountSlot {
+    pub buffer_position: usize,
+    /// Stable VM address of the slot's 88-byte header region.
+    pub vm_header_addr: u64,
+    /// Stable VM address of the slot's data region. Points at an empty
+    /// readonly placeholder until `sol_load_subaccount` replaces it with a
+    /// region backed by the on-chain `AccountSharedData`.
+    pub vm_data_addr: u64,
+    /// Caller-supplied `SolAccountInfo` pointer captured by `load_subaccount`.
+    /// Zero when the slot is empty.
+    pub caller_account_view_addr: u64,
+    /// Field-pointer metadata for the caller's account view. Populated
+    /// alongside `caller_account_view_addr` so CPI sync (and end-of-
+    /// instruction flush) can locate lamports/owner/data fields in VM memory.
+    pub caller_account_metadata: Option<SerializedAccountMetadata>,
+    /// `Some(index)` once the slot is occupied, naming the subaccount index
+    /// inside `TransactionAccounts` whose state the slot mirrors.
+    pub occupied_subaccount_index: Option<IndexOfAccount>,
+    /// Writability bit recorded at `sol_load_subaccount` time. Re-install of
+    /// the data region (after `sol_create_subaccount` resizes the underlying
+    /// `AccountSharedData`) preserves this bit.
+    pub is_writable: bool,
+}
+
+/// F10: untyped (pointer, length) description of an array in VM memory.
+/// Parallel to `agave_syscalls::VmVmSlice<T>` but without the type parameter.
+#[derive(Default)]
+pub struct UntypedVmSlice {
+    pub vm_data_addr: u64,
+    pub vm_data_len: u64,
+}
+
+/// PRS-103 stub struct: describes a dynamically-added CPI account.
+/// Retained in shape so that PRS-103 code paths can be ported later without
+/// a second infrastructure refactor. Not populated by this F10 port.
+#[derive(Debug, Clone, Copy)]
+pub struct DynamicCpiAccount {
+    pub index_in_transaction: IndexOfAccount,
+    pub is_signer: bool,
+    pub is_writable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -303,7 +378,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             .map(|seeds| Pubkey::create_program_address(seeds, &caller_program_id))
             .collect::<Result<Vec<Pubkey>, solana_pubkey::PubkeyError>>()
             .map_err(|e| e as u64)?;
-        self.prepare_next_cpi_instruction(instruction, &signers)?;
+        self.prepare_next_cpi_instruction(instruction, &signers, Vec::new())?;
         let mut compute_units_consumed = 0;
         self.process_instruction(&mut compute_units_consumed, &mut ExecuteTimings::default())?;
         Ok(())
@@ -315,6 +390,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         &mut self,
         instruction: Instruction,
         signers: &[Pubkey],
+        subaccounts: Vec<InstructionAccount>,
     ) -> Result<(), InstructionError> {
         // We reference accounts by an u8 index, so we have a total of 256 accounts.
         let mut transaction_callee_map: Vec<u16> = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
@@ -453,6 +529,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             transaction_callee_map,
             Cow::Owned(instruction.data),
             Some(caller_index as u16),
+            subaccounts,
         )?;
         Ok(())
     }
@@ -497,6 +574,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             transaction_callee_map,
             Cow::Borrowed(data),
             None,
+            Vec::new(),
         )?;
         Ok(())
     }
@@ -525,7 +603,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         self.push()?;
         let instruction_datas: Vec<_> = message_instruction_datas_iter.collect();
         self.environment_config
-            .epoch_stake_callback
+            .transaction_processing_callback
             .process_precompile(program_id, instruction_data, instruction_datas)
             .map_err(InstructionError::from)
             .and(self.pop())
@@ -686,21 +764,34 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
     /// Get cached epoch total stake.
     pub fn get_epoch_stake(&self) -> u64 {
         self.environment_config
-            .epoch_stake_callback
+            .transaction_processing_callback
             .get_epoch_stake()
     }
 
     /// Get cached stake for the epoch vote account.
     pub fn get_epoch_stake_for_vote_account(&self, pubkey: &'a Pubkey) -> u64 {
         self.environment_config
-            .epoch_stake_callback
+            .transaction_processing_callback
             .get_epoch_stake_for_vote_account(pubkey)
     }
 
     pub fn is_precompile(&self, pubkey: &Pubkey) -> bool {
         self.environment_config
-            .epoch_stake_callback
+            .transaction_processing_callback
             .is_precompile(pubkey)
+    }
+
+    /// F10 W9: load an arbitrary account from accounts-db via the
+    /// `TransactionProcessingCallback` carried by `EnvironmentConfig`. Used
+    /// by subaccount syscalls to materialize pre-existing on-chain state for
+    /// addresses that are not part of the transaction's main account list.
+    pub fn get_account_shared_data(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<(AccountSharedData, Slot)> {
+        self.environment_config
+            .transaction_processing_callback
+            .get_account_shared_data(pubkey)
     }
 
     // Should alignment be enforced during user pointer translation

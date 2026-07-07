@@ -11381,6 +11381,7 @@ dependencies = [
  "solana-rent",
  "solana-sbpf",
  "solana-sdk-ids",
+ "solana-sha256-hasher",
  "solana-signature",
  "solana-system-interface 3.0.0",
  "solana-transaction-context",

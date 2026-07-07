@@ -5,7 +5,10 @@ use qualifier_attr::qualifiers;
 use {
     crate::{
         execution_budget::MAX_INSTRUCTION_STACK_DEPTH,
-        invoke_context::{BpfAllocator, InvokeContext, SerializedAccountMetadata, SyscallContext},
+        invoke_context::{
+            BpfAllocator, InvokeContext, SerializedAccountMetadata, SubaccountSlot,
+            SyscallContext, UntypedVmSlice,
+        },
         mem_pool::VmMemoryPool,
         serialization, stable_log,
     },
@@ -50,6 +53,8 @@ pub fn create_vm<'a, 'b>(
     program: &'a Executable<InvokeContext<'b, 'b>>,
     regions: Vec<MemoryRegion>,
     accounts_metadata: Vec<SerializedAccountMetadata>,
+    subaccounts_metadata: Vec<SerializedAccountMetadata>,
+    subaccount_slots: Vec<SubaccountSlot>,
     invoke_context: &'a mut InvokeContext<'b, 'b>,
     stack: &mut [u8],
     heap: &mut [u8],
@@ -70,6 +75,13 @@ pub fn create_vm<'a, 'b>(
     invoke_context.set_syscall_context(SyscallContext {
         allocator: BpfAllocator::new(heap_size as u64),
         accounts_metadata,
+        // F10: serialize_parameters populates subaccounts_metadata/subaccount_slots
+        // only when the instruction carries subaccounts; otherwise they are empty.
+        subaccounts_metadata,
+        subaccounts_infos: UntypedVmSlice::default(),
+        subaccount_slots,
+        trace_log: Vec::new(),
+        dynamic_cpi_accounts: Vec::new(),
     })?;
     Ok(EbpfVm::new(
         program.get_loader().clone(),
@@ -122,7 +134,7 @@ fn create_memory_mapping<'a, C: ContextObject>(
 /// Create the SBF virtual machine
 #[macro_export]
 macro_rules! create_vm {
-    ($vm:ident, $program:expr, $regions:expr, $accounts_metadata:expr, $invoke_context:expr $(,)?) => {
+    ($vm:ident, $program:expr, $regions:expr, $accounts_metadata:expr, $subaccounts_metadata:expr, $subaccount_slots:expr, $invoke_context:expr $(,)?) => {
         let invoke_context = &*$invoke_context;
         let stack_size = $program.get_config().stack_size();
         let heap_size = invoke_context.get_compute_budget().heap_size;
@@ -138,6 +150,8 @@ macro_rules! create_vm {
                 $program,
                 $regions,
                 $accounts_metadata,
+                $subaccounts_metadata,
+                $subaccount_slots,
                 $invoke_context,
                 stack
                     .as_slice_mut()
@@ -214,19 +228,26 @@ pub fn execute<'a, 'b: 'a>(
         .direct_account_pointers_in_program_input;
 
     let mut serialize_time = Measure::start("serialize");
-    let (parameter_bytes, regions, accounts_metadata, instruction_data_offset) =
-        serialization::serialize_parameters(
-            &instruction_context,
-            virtual_address_space_adjustments,
-            account_data_direct_mapping,
-            direct_account_pointers_in_program_input,
-        )?;
+    let (
+        parameter_bytes,
+        regions,
+        accounts_metadata,
+        subaccounts_metadata,
+        subaccount_slots,
+        instruction_data_offset,
+    ) = serialization::serialize_parameters(
+        &instruction_context,
+        virtual_address_space_adjustments,
+        account_data_direct_mapping,
+        direct_account_pointers_in_program_input,
+    )?;
     serialize_time.stop();
 
     // save the account addresses so in case we hit an AccessViolation error we
     // can map to a more specific error
     let account_region_addrs = accounts_metadata
         .iter()
+        .chain(subaccounts_metadata.iter())
         .map(|m| {
             let vm_end = m
                 .vm_data_addr
@@ -240,10 +261,22 @@ pub fn execute<'a, 'b: 'a>(
         })
         .collect::<Vec<_>>();
 
+    // F10: number of main-account regions, captured before `accounts_metadata`
+    // is moved into `create_vm!`, so the AccessViolation handler below can route
+    // region indices >= this count through the subaccount lane.
+    let n_main_account_regions = accounts_metadata.len();
     let mut create_vm_time = Measure::start("create_vm");
     let execution_result = {
         let compute_meter_prev = invoke_context.get_remaining();
-        create_vm!(vm, executable, regions, accounts_metadata, invoke_context);
+        create_vm!(
+            vm,
+            executable,
+            regions,
+            accounts_metadata,
+            subaccounts_metadata,
+            subaccount_slots,
+            invoke_context
+        );
         let (mut vm, stack, heap) = match vm {
             Ok(info) => info,
             Err(e) => {
@@ -341,9 +374,22 @@ pub fn execute<'a, 'b: 'a>(
                             let transaction_context = &invoke_context.transaction_context;
                             let instruction_context =
                                 transaction_context.get_current_instruction_context()?;
-                            let account = instruction_context.try_borrow_instruction_account(
-                                instruction_account_index as IndexOfAccount,
-                            )?;
+                            // F10: `account_region_addrs` chains main accounts then
+                            // subaccounts; indices >= n_main_account_regions belong to
+                            // the subaccount lane and must be borrowed through
+                            // `try_borrow_subaccount` (the main lane would return
+                            // MissingAccount and mask the real classification).
+                            let account = if instruction_account_index < n_main_account_regions {
+                                instruction_context.try_borrow_instruction_account(
+                                    instruction_account_index as IndexOfAccount,
+                                )?
+                            } else {
+                                instruction_context.try_borrow_subaccount(
+                                    instruction_account_index
+                                        .saturating_sub(n_main_account_regions)
+                                        as IndexOfAccount,
+                                )?
+                            };
                             if vm_addr.saturating_add(len) <= vm_addr_range.end {
                                 // The access was within the range of the accounts address space,
                                 // but it might not be within the range of the actual data.
@@ -399,6 +445,16 @@ pub fn execute<'a, 'b: 'a>(
         virtual_address_space_adjustments: bool,
         account_data_direct_mapping: bool,
     ) -> Result<(), InstructionError> {
+        // F10: flush any subaccount slots the program left occupied (i.e. did
+        // not `sol_unload_subaccount`) so VM-side header mutations persist at
+        // tx commit. Take ownership of the slots vec to avoid a borrow conflict
+        // between `transaction_context` and the syscall context.
+        let slots = mem::take(&mut invoke_context.get_syscall_context_mut()?.subaccount_slots);
+        serialization::flush_subaccount_slots(
+            invoke_context.transaction_context,
+            parameter_bytes,
+            &slots,
+        )?;
         serialization::deserialize_parameters(
             &invoke_context
                 .transaction_context
@@ -407,6 +463,7 @@ pub fn execute<'a, 'b: 'a>(
             account_data_direct_mapping,
             parameter_bytes,
             &invoke_context.get_syscall_context()?.accounts_metadata,
+            &invoke_context.get_syscall_context()?.subaccounts_metadata,
         )
     }
 
