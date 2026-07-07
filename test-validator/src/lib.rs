@@ -145,6 +145,7 @@ pub struct TestValidatorGenesis {
     pub geyser_plugin_config_files: Option<Vec<PathBuf>>,
     pub enable_scheduler_bindings: bool,
     deactivate_feature_set: HashSet<Pubkey>,
+    alpenglow: bool,
     compute_unit_limit: Option<u64>,
     pub log_messages_bytes_limit: Option<usize>,
     pub transaction_account_lock_limit: Option<usize>,
@@ -180,6 +181,7 @@ impl Default for TestValidatorGenesis {
             geyser_plugin_config_files: Option::<Vec<PathBuf>>::default(),
             enable_scheduler_bindings: false,
             deactivate_feature_set,
+            alpenglow: false,
             compute_unit_limit: Option::<u64>::default(),
             log_messages_bytes_limit: Option::<usize>::default(),
             transaction_account_lock_limit: Option::<usize>::default(),
@@ -232,6 +234,15 @@ impl TestValidatorGenesis {
     /// it will be silently ignored
     pub fn deactivate_features(&mut self, deactivate_list: &[Pubkey]) -> &mut Self {
         self.deactivate_feature_set.extend(deactivate_list);
+        self
+    }
+
+    /// Enable Alpenglow (Votor) consensus at genesis instead of the default Tower consensus.
+    pub fn alpenglow(&mut self, enable: bool) -> &mut Self {
+        self.alpenglow = enable;
+        if enable {
+            self.deactivate_feature_set.remove(&alpenglow::id());
+        }
         self
     }
     pub fn ledger_path<P: Into<PathBuf>>(&mut self, ledger_path: P) -> &mut Self {
@@ -1016,13 +1027,20 @@ impl TestValidator {
             );
         }
 
+        // Alpenglow requires the vote account to carry the BLS pubkey the validator will derive
+        // at runtime from its vote (authorized-voter) keypair.
+        let validator_bls_pubkey = config.alpenglow.then(|| {
+            solana_runtime::genesis_utils::derive_validator_bls_pubkey_compressed(
+                &validator_vote_account,
+            )
+        });
         let mut genesis_config = create_genesis_config_with_leader_ex(
             mint_lamports,
             &mint_address,
             &validator_identity.pubkey(),
             &validator_vote_account.pubkey(),
             &validator_stake_account.pubkey(),
-            None,
+            validator_bls_pubkey,
             validator_stake_lamports,
             validator_identity_lamports,
             config.fee_rate_governor.clone(),
@@ -1031,6 +1049,15 @@ impl TestValidator {
             &feature_set,
             accounts.into_iter().collect(),
         );
+
+        // Enable Alpenglow (Votor) consensus at genesis: force-activate the feature (the
+        // `create_genesis_config_with_leader_ex` helper deliberately skips it) and insert the
+        // bootstrap genesis certificate, mirroring `activate_all_features_alpenglow`.
+        if config.alpenglow {
+            solana_runtime::genesis_utils::activate_feature(&mut genesis_config, alpenglow::id());
+            solana_runtime::genesis_utils::insert_genesis_certificate(&mut genesis_config);
+        }
+
         genesis_config.epoch_schedule = config
             .epoch_schedule
             .as_ref()

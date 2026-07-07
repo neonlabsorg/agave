@@ -338,9 +338,13 @@ pub fn create_genesis_config_with_leader_with_mint_keypair(
 
 pub fn activate_all_features_alpenglow(genesis_config: &mut GenesisConfig) {
     do_activate_all_features::<true>(genesis_config);
+    insert_genesis_certificate(genesis_config);
+}
 
-    // This is a dev cluster with alpenglow enabled at genesis. We don't want to test the migration pathway
-    // so we add a fake genesis certificate.
+/// Insert the "genesis certificate" account that Alpenglow needs to bootstrap consensus at
+/// genesis. This is a dev cluster with alpenglow enabled at genesis; we don't want to test the
+/// migration pathway, so we add a fake genesis certificate.
+pub fn insert_genesis_certificate(genesis_config: &mut GenesisConfig) {
     let cert = Certificate {
         cert_type: CertificateType::Genesis(0, Hash::default()),
         signature: BLSSignature::default(),
@@ -353,6 +357,18 @@ pub fn activate_all_features_alpenglow(genesis_config: &mut GenesisConfig) {
     genesis_config
         .accounts
         .insert(*GENESIS_CERTIFICATE_ACCOUNT, certificate_account);
+}
+
+/// Derive the compressed BLS pubkey a validator uses for Alpenglow voting from its vote
+/// (authorized-voter) keypair. Must match what the running validator derives at runtime (see
+/// votor `voting_utils`), otherwise the validator panics on a BLS pubkey mismatch.
+pub fn derive_validator_bls_pubkey_compressed(
+    vote_keypair: &Keypair,
+) -> [u8; BLS_PUBLIC_KEY_COMPRESSED_SIZE] {
+    BLSKeypair::derive_from_signer(vote_keypair, BLS_KEYPAIR_DERIVE_SEED)
+        .unwrap()
+        .public
+        .to_bytes_compressed()
 }
 
 pub fn activate_all_features(genesis_config: &mut GenesisConfig) {

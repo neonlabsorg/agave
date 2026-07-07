@@ -484,6 +484,10 @@ fn main() {
         })
         .deactivate_features(&features_to_deactivate);
 
+    if matches.is_present("alpenglow") {
+        genesis.alpenglow(true);
+    }
+
     genesis.rpc_config(JsonRpcConfig {
         enable_rpc_transaction_history: true,
         enable_extended_tx_metadata_storage: true,

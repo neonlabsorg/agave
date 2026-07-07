@@ -779,6 +779,12 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                 .help("deactivate this feature in genesis."),
         )
         .arg(
+            Arg::with_name("alpenglow")
+                .long("alpenglow")
+                .takes_value(false)
+                .help("Enable Alpenglow (Votor) consensus at genesis instead of Tower"),
+        )
+        .arg(
             Arg::with_name("compute_unit_limit")
                 .long("compute-unit-limit")
                 .alias("max-compute-units")
