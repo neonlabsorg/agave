@@ -30,6 +30,7 @@ libsecp256k1 = { workspace = true }
 num-traits = { workspace = true }
 solana-account = { workspace = true }
 solana-account-info = { workspace = true }
+solana-address = { workspace = true }
 solana-big-mod-exp = { workspace = true }
 solana-blake3-hasher = { workspace = true, features = ["blake3"] }
 solana-bn254 = { workspace = true }
@@ -56,6 +57,7 @@ solana-svm-log-collector = { workspace = true }
 solana-svm-measure = { workspace = true }
 solana-svm-timings = { workspace = true }
 solana-svm-type-overrides = { workspace = true }
+solana-system-interface = { workspace = true }
 solana-sysvar = { workspace = true }
 solana-sysvar-id = { workspace = true }
 solana-transaction-context = { workspace = true, features = ["bincode"] }

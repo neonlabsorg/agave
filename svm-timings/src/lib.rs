@@ -391,6 +391,10 @@ pub struct ExecuteDetailsTimings {
     pub create_executor_load_elf_us: Saturating<u64>,
     pub create_executor_verify_code_us: Saturating<u64>,
     pub create_executor_jit_compile_us: Saturating<u64>,
+    /// F10: time spent in `sol_load_subaccount` loading on-chain subaccount state.
+    pub load_subaccounts_us: Saturating<u64>,
+    /// F10: time spent in subaccount create/self-invoke compute.
+    pub compute_subaccounts_us: Saturating<u64>,
     pub per_program_timings: HashMap<Pubkey, ProgramTiming>,
 }
 
@@ -407,6 +411,8 @@ impl ExecuteDetailsTimings {
         self.create_executor_load_elf_us += other.create_executor_load_elf_us;
         self.create_executor_verify_code_us += other.create_executor_verify_code_us;
         self.create_executor_jit_compile_us += other.create_executor_jit_compile_us;
+        self.load_subaccounts_us += other.load_subaccounts_us;
+        self.compute_subaccounts_us += other.compute_subaccounts_us;
         for (id, other) in &other.per_program_timings {
             let program_timing = self.per_program_timings.entry(*id).or_default();
             program_timing.accumulate_program_timings(other);
