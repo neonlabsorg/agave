@@ -141,8 +141,14 @@ pub fn invoke_builtin_function(
         .direct_account_pointers_in_program_input;
 
     // Serialize entrypoint parameters with SBF ABI
-    let (mut parameter_bytes, _regions, _account_lengths, _instruction_data_offset) =
-        serialize_parameters(
+    let (
+        mut parameter_bytes,
+        _regions,
+        _account_lengths,
+        _subaccounts_metadata,
+        _subaccount_slots,
+        _instruction_data_offset,
+    ) = serialize_parameters(
             &instruction_context,
             false, // There is no VM so virtual_address_space_adjustments can not be implemented here
             false, // There is no VM so account_data_direct_mapping can not be implemented here
@@ -342,7 +348,7 @@ impl solana_sysvar::program_stubs::SyscallStubs for SyscallStubs {
             .collect::<Vec<_>>();
 
         invoke_context
-            .prepare_next_cpi_instruction(instruction.clone(), &signers)
+            .prepare_next_cpi_instruction(instruction.clone(), &signers, Vec::new())
             .unwrap();
 
         // Copy caller's account_info modifications into invoke_context accounts

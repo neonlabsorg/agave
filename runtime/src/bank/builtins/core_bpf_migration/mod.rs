@@ -167,6 +167,17 @@ impl Bank {
 
             struct MockCallback {}
             impl InvokeContextCallback for MockCallback {}
+            // F10 BLOCKER-2: EnvironmentConfig now carries a
+            // &dyn TransactionProcessingCallback; this migration path has no
+            // accounts-db to consult, so return None.
+            impl solana_svm_callback::TransactionProcessingCallback for MockCallback {
+                fn get_account_shared_data(
+                    &self,
+                    _pubkey: &solana_pubkey::Pubkey,
+                ) -> Option<(solana_account::AccountSharedData, solana_clock::Slot)> {
+                    None
+                }
+            }
             let feature_set = self.feature_set.runtime_features();
             let mut dummy_invoke_context = InvokeContext::new(
                 &mut dummy_transaction_context,
