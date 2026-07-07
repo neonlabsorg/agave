@@ -3,6 +3,7 @@ use qualifier_attr::qualifiers;
 use {
     crate::{
         IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION, MAX_ACCOUNT_DATA_LEN,
+        SUBACCOUNT_MARKER,
         vm_addresses::{GUEST_ACCOUNT_PAYLOAD_BASE_ADDRESS, GUEST_REGION_SIZE},
         vm_slice::VmSlice,
     },
@@ -10,7 +11,7 @@ use {
     solana_instruction::error::InstructionError,
     solana_pubkey::Pubkey,
     std::{
-        cell::{Cell, UnsafeCell},
+        cell::{Cell, RefCell, UnsafeCell},
         ops::{Deref, DerefMut},
         ptr,
         sync::Arc,
@@ -255,6 +256,21 @@ pub struct TransactionAccounts {
     touched_flags: Box<[Cell<bool>]>,
     resize_delta: Cell<i64>,
     lamports_delta: Cell<i128>,
+    /// F10 W10: running sum of lamports introduced by `add_subaccount`
+    /// (i.e. by the `sol_create_subaccount` syscall) for accounts that did
+    /// not exist in the original transaction account list.
+    dynamic_accounts_lamports_sum: Cell<u128>,
+    /// F10 subaccount lane — split-storage mirror of the main-account
+    /// representation. Append-only; each element is boxed so heap addresses of
+    /// the inner cells are stable across `Vec::push` reallocations, keeping
+    /// outstanding `AccountRef`/`AccountRefMut` borrows sound.
+    #[allow(clippy::vec_box)]
+    subaccount_shared_fields: RefCell<Vec<Box<UnsafeCell<AccountSharedFields>>>>,
+    #[allow(clippy::vec_box)]
+    subaccount_private_fields: RefCell<Vec<Box<UnsafeCell<AccountPrivateFields>>>>,
+    #[allow(clippy::vec_box)]
+    subaccount_borrow_counters: RefCell<Vec<Box<BorrowCounter>>>,
+    touched_subaccounts: RefCell<Vec<bool>>,
 }
 
 #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
@@ -296,6 +312,11 @@ impl TransactionAccounts {
             touched_flags,
             resize_delta: Cell::new(0),
             lamports_delta: Cell::new(0),
+            subaccount_shared_fields: RefCell::new(Vec::new()),
+            subaccount_private_fields: RefCell::new(Vec::new()),
+            subaccount_borrow_counters: RefCell::new(Vec::new()),
+            touched_subaccounts: RefCell::new(Vec::new()),
+            dynamic_accounts_lamports_sum: Cell::new(0),
         }
     }
 
@@ -304,11 +325,163 @@ impl TransactionAccounts {
     }
 
     pub fn touch(&self, index: IndexOfAccount) -> Result<(), InstructionError> {
-        self.touched_flags
+        if index & SUBACCOUNT_MARKER != 0 {
+            let subaccount_index = (index & !SUBACCOUNT_MARKER) as usize;
+            let mut touched = self.touched_subaccounts.borrow_mut();
+            *touched
+                .get_mut(subaccount_index)
+                .ok_or(InstructionError::NotEnoughAccountKeys)? = true;
+            Ok(())
+        } else {
+            self.touched_flags
+                .get(index as usize)
+                .ok_or(InstructionError::MissingAccount)?
+                .set(true);
+            Ok(())
+        }
+    }
+
+    /// F10: append a new subaccount into the split-storage lane. Populates the
+    /// three parallel Vecs plus `touched_subaccounts`. Caller
+    /// (`TransactionContext::add_subaccount`) is responsible for dedup.
+    #[allow(dead_code)] // wired in by later F10 waves (syscalls + TransactionContext helpers)
+    pub(crate) fn add_subaccount(
+        &self,
+        pubkey: Pubkey,
+        account: AccountSharedData,
+    ) -> IndexOfAccount {
+        let lamports = account.lamports();
+        let mut shared = self.subaccount_shared_fields.borrow_mut();
+        let mut private = self.subaccount_private_fields.borrow_mut();
+        let mut counters = self.subaccount_borrow_counters.borrow_mut();
+        let mut touched = self.touched_subaccounts.borrow_mut();
+        let index = shared.len() as IndexOfAccount;
+        shared.push(Box::new(UnsafeCell::new(AccountSharedFields {
+            key: pubkey,
+            owner: *account.owner(),
+            lamports,
+            payload: VmSlice::new(0, account.data().len() as u64),
+        })));
+        private.push(Box::new(UnsafeCell::new(AccountPrivateFields {
+            rent_epoch: account.rent_epoch(),
+            executable: account.executable(),
+            payload: account.data_clone(),
+        })));
+        counters.push(Box::new(BorrowCounter::default()));
+        touched.push(false);
+        self.dynamic_accounts_lamports_sum.set(
+            self.dynamic_accounts_lamports_sum
+                .get()
+                .saturating_add(lamports as u128),
+        );
+        index
+    }
+
+    /// F10 W10: lamports introduced by `add_subaccount` for accounts not
+    /// present in the original tx account list.
+    pub fn get_dynamic_accounts_lamports_sum(&self) -> u128 {
+        self.dynamic_accounts_lamports_sum.get()
+    }
+
+    pub fn number_of_subaccounts(&self) -> IndexOfAccount {
+        self.subaccount_shared_fields.borrow().len() as IndexOfAccount
+    }
+
+    pub fn find_index_of_subaccount(&self, pubkey: &Pubkey) -> Option<IndexOfAccount> {
+        let shared = self.subaccount_shared_fields.borrow();
+        shared
+            .iter()
+            .position(|boxed| {
+                // SAFETY: append-only lane; `key` never mutated after construction.
+                unsafe { (*boxed.get()).key == *pubkey }
+            })
+            .map(|i| i as IndexOfAccount)
+    }
+
+    pub fn subaccount_key(&self, index: IndexOfAccount) -> Option<Pubkey> {
+        let shared = self.subaccount_shared_fields.borrow();
+        // SAFETY: `key` is set at construction and never mutated.
+        shared
             .get(index as usize)
-            .ok_or(InstructionError::MissingAccount)?
-            .set(true);
-        Ok(())
+            .map(|boxed| unsafe { (*boxed.get()).key })
+    }
+
+    /// F10: borrow a subaccount (immutable) via the split-storage format.
+    pub fn try_borrow_subaccount(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<AccountRef<'_>, InstructionError> {
+        let (shared_ptr, private_ptr, counter_ptr) = self.subaccount_raw_ptrs(index)?;
+
+        // SAFETY: pointers from Box-owned entries in append-only Vecs — stable
+        // for the life of `self`. Borrow counter excludes a live AccountRefMut.
+        let borrow_counter = unsafe { &*counter_ptr };
+        borrow_counter.try_borrow()?;
+        let abi_account = unsafe { &*(*shared_ptr).get() };
+        let private_fields = unsafe { &*(*private_ptr).get() };
+        let account = TransactionAccountView {
+            abi_account,
+            private_fields,
+        };
+        Ok(AccountRef {
+            account,
+            borrow_counter,
+        })
+    }
+
+    /// F10: borrow a subaccount (mutable) via the split-storage format.
+    pub fn try_borrow_mut_subaccount(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<AccountRefMut<'_>, InstructionError> {
+        let (shared_ptr, private_ptr, counter_ptr) = self.subaccount_raw_ptrs(index)?;
+
+        // SAFETY: see `try_borrow_subaccount`; counter excludes concurrent borrows.
+        let borrow_counter = unsafe { &*counter_ptr };
+        borrow_counter.try_borrow_mut()?;
+        let abi_account = unsafe { &mut *(*shared_ptr).get() };
+        let private_fields = unsafe { &mut *(*private_ptr).get() };
+        let account = TransactionAccountViewMut {
+            abi_account,
+            private_fields,
+        };
+        Ok(AccountRefMut {
+            account,
+            borrow_counter,
+        })
+    }
+
+    /// Extracts stable raw pointers to the three split-storage cells of the
+    /// subaccount at `index`. RefCell borrows are dropped before returning
+    /// because Box-owned heap addresses are stable for the life of `self`.
+    fn subaccount_raw_ptrs(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<
+        (
+            *mut UnsafeCell<AccountSharedFields>,
+            *mut UnsafeCell<AccountPrivateFields>,
+            *const BorrowCounter,
+        ),
+        InstructionError,
+    > {
+        let shared = self.subaccount_shared_fields.borrow();
+        let private = self.subaccount_private_fields.borrow();
+        let counters = self.subaccount_borrow_counters.borrow();
+        let shared_box = shared
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        let private_box = private
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        let counter_box = counters
+            .get(index as usize)
+            .ok_or(InstructionError::MissingAccount)?;
+        let shared_ptr: *mut UnsafeCell<AccountSharedFields> = &**shared_box as *const _ as *mut _;
+        let private_ptr: *mut UnsafeCell<AccountPrivateFields> =
+            &**private_box as *const _ as *mut _;
+        let counter_ptr: *const BorrowCounter = &**counter_box;
+        Ok((shared_ptr, private_ptr, counter_ptr))
     }
 
     pub(crate) fn update_accounts_resize_delta(
@@ -347,6 +520,12 @@ impl TransactionAccounts {
         &self,
         index: IndexOfAccount,
     ) -> Result<AccountRefMut<'_>, InstructionError> {
+        // F10: route subaccount-lane indices (high bit set) into the subaccount
+        // storage. Without this, `access_violation_handler` silently bails when a
+        // write hits a shared subaccount, surfacing as InvalidRealloc.
+        if index & SUBACCOUNT_MARKER != 0 {
+            return self.try_borrow_mut_subaccount(index & !SUBACCOUNT_MARKER);
+        }
         let borrow_counter = self
             .borrow_counters
             .get(index as usize)
@@ -437,7 +616,7 @@ impl TransactionAccounts {
     fn deconstruct_into_keyed_account_shared_data(&mut self) -> Vec<KeyedAccountSharedData> {
         let shared_account_fields = std::mem::take(&mut self.shared_account_fields);
         let private_account_fields = std::mem::take(&mut self.private_account_fields);
-        shared_account_fields
+        let mut accounts: Vec<_> = shared_account_fields
             .into_iter()
             .zip(private_account_fields)
             .map(|(shared_fields_cell, private_fields_cell)| {
@@ -454,13 +633,37 @@ impl TransactionAccounts {
                     ),
                 )
             })
-            .collect()
+            .collect();
+        // F10 W10: drain the subaccount lane and append each entry under its
+        // derived *storage* address `hashv(&[&[1u8], pda])`. Without this,
+        // subaccount state created by `sol_create_subaccount` is dropped at tx
+        // commit and accounts-db never receives it.
+        let sub_shared = std::mem::take(&mut *self.subaccount_shared_fields.borrow_mut());
+        let sub_private = std::mem::take(&mut *self.subaccount_private_fields.borrow_mut());
+        for (shared_box, private_box) in sub_shared.into_iter().zip(sub_private.into_iter()) {
+            let shared = (*shared_box).into_inner();
+            let private = (*private_box).into_inner();
+            let storage_address = Pubkey::new_from_array(
+                solana_sha256_hasher::hashv(&[&[1u8], shared.key.as_ref()]).to_bytes(),
+            );
+            accounts.push((
+                storage_address,
+                AccountSharedData::create_from_existing_shared_data(
+                    shared.lamports,
+                    private.payload,
+                    shared.owner,
+                    private.executable,
+                    private.rent_epoch,
+                ),
+            ));
+        }
+        accounts
     }
 
     pub(crate) fn deconstruct_into_account_shared_data(&mut self) -> Vec<AccountSharedData> {
         let shared_account_fields = std::mem::take(&mut self.shared_account_fields);
         let private_account_fields = std::mem::take(&mut self.private_account_fields);
-        shared_account_fields
+        let mut accounts: Vec<_> = shared_account_fields
             .into_iter()
             .zip(private_account_fields)
             .map(|(shared_fields_cell, private_fields_cell)| {
@@ -474,7 +677,23 @@ impl TransactionAccounts {
                     private_fields.rent_epoch,
                 )
             })
-            .collect()
+            .collect();
+        // F10 W10: mirror the keyed variant so mock_process_instruction sees
+        // subaccount state instead of dropping it.
+        let sub_shared = std::mem::take(&mut *self.subaccount_shared_fields.borrow_mut());
+        let sub_private = std::mem::take(&mut *self.subaccount_private_fields.borrow_mut());
+        for (shared_box, private_box) in sub_shared.into_iter().zip(sub_private.into_iter()) {
+            let shared = (*shared_box).into_inner();
+            let private = (*private_box).into_inner();
+            accounts.push(AccountSharedData::create_from_existing_shared_data(
+                shared.lamports,
+                private.payload,
+                shared.owner,
+                private.executable,
+                private.rent_epoch,
+            ));
+        }
+        accounts
     }
 
     pub(crate) fn take(mut self) -> DeconstructedTransactionAccounts {
@@ -487,6 +706,18 @@ impl TransactionAccounts {
     }
 
     pub(crate) fn account_key(&self, index: IndexOfAccount) -> Option<&Pubkey> {
+        // F10: subaccount-marker bit redirects to the subaccount lane.
+        if index & SUBACCOUNT_MARKER != 0 {
+            let sub_index = (index & !SUBACCOUNT_MARKER) as usize;
+            let shared = self.subaccount_shared_fields.borrow();
+            let boxed = shared.get(sub_index)?;
+            // SAFETY: subaccount keys are set at `add_subaccount` and never
+            // mutated; `Box<UnsafeCell<_>>` gives a stable heap address, so
+            // extending the Ref-scoped borrow to `&self` is sound (append-only).
+            let key_ptr: *const Pubkey = unsafe { &(*boxed.get()).key };
+            drop(shared);
+            return Some(unsafe { &*key_ptr });
+        }
         // SAFETY: We never modify an account key, so returning a reference to it is safe.
         unsafe {
             self.shared_account_fields

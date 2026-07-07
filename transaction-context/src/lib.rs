@@ -48,3 +48,10 @@ static_assertions::const_assert_eq!(
 
 /// Index of an account inside of the transaction or an instruction.
 pub type IndexOfAccount = u16;
+
+/// F10: high bit of an `IndexOfAccount` flags a subaccount entry (see
+/// `InstructionAccount::new_subaccount`). Subaccount lanes are stored in a
+/// parallel Vec in `TransactionAccounts`, and instruction account indices with
+/// this marker set are de-referenced via the subaccount lane instead of the
+/// main account lane.
+pub const SUBACCOUNT_MARKER: u16 = 1 << 15;

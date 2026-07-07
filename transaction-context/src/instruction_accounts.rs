@@ -1,7 +1,7 @@
 use {
     crate::{
-        IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_INSTRUCTION, transaction::TransactionContext,
-        transaction_accounts::AccountRefMut,
+        IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_INSTRUCTION, SUBACCOUNT_MARKER,
+        transaction::TransactionContext, transaction_accounts::AccountRefMut,
     },
     solana_account::{ReadableAccount, WritableAccount},
     solana_instruction::error::InstructionError,
@@ -33,6 +33,20 @@ impl InstructionAccount {
     ) -> InstructionAccount {
         InstructionAccount {
             index_in_transaction,
+            is_signer: is_signer as u8,
+            is_writable: is_writable as u8,
+        }
+    }
+
+    /// F10: build an instruction account pointing into the subaccount lane
+    /// (sets the high-bit `SUBACCOUNT_MARKER`).
+    pub fn new_subaccount(
+        index_in_transaction: IndexOfAccount,
+        is_signer: bool,
+        is_writable: bool,
+    ) -> InstructionAccount {
+        InstructionAccount {
+            index_in_transaction: index_in_transaction | SUBACCOUNT_MARKER,
             is_signer: is_signer as u8,
             is_writable: is_writable as u8,
         }
