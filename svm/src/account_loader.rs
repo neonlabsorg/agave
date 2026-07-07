@@ -358,9 +358,15 @@ pub fn validate_fee_payer(
     rent: &Rent,
     fee: u64,
 ) -> Result<()> {
+    // F2 (gasless): zero-fee transactions charge nothing, so all fee-payer state checks
+    // below are noops (no balance subtraction, no rent-state transition, no min_balance).
+    // Skip them so any signed account can be a fee-payer for a fee==0 tx.
+    if fee == 0 {
+        return Ok(());
+    }
     if payer_account.lamports() == 0 {
-        error_metrics.account_not_found += 1;
-        return Err(TransactionError::AccountNotFound);
+        error_metrics.insufficient_funds += 1;
+        return Err(TransactionError::InsufficientFundsForFee);
     }
     let system_account_kind = get_system_account_kind(payer_account).ok_or_else(|| {
         error_metrics.invalid_account_for_fee += 1;

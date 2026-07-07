@@ -100,8 +100,11 @@ impl Bank {
     const fn burn_percent(&self) -> u64 {
         // NOTE: burn percent is statically 50%, in case it needs to change in the future,
         // burn_percent can be bank property that being passed down from bank to bank, without
-        // needing fee-rate-governor
-        static_assertions::const_assert!(solana_fee_calculator::DEFAULT_BURN_PERCENT <= 100);
+        // needing fee-rate-governor. Under parasol F2+F3, DEFAULT_BURN_PERCENT = 0.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            static_assertions::const_assert!(solana_fee_calculator::DEFAULT_BURN_PERCENT <= 100);
+        }
 
         solana_fee_calculator::DEFAULT_BURN_PERCENT as u64
     }

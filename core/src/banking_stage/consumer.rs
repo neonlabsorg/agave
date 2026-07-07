@@ -544,6 +544,14 @@ impl Consumer {
             fee_budget_limits.prioritization_fee,
             FeeFeatures::from(bank.feature_set.as_ref()),
         );
+        // F2 (gasless): zero-fee transactions don't need a funded fee-payer.
+        // Skip the accounts-db load + validate_fee_payer chain so a tx with a
+        // missing or zero-lamport fee-payer can pass the banking-stage pre-check;
+        // svm::validate_transaction_fee_payer synthesizes a temporary system-owned
+        // fee-payer account when needed.
+        if fee == 0 {
+            return Ok(());
+        }
         let (mut fee_payer_account, _slot) = bank
             .rc
             .accounts
