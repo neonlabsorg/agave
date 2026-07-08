@@ -813,6 +813,18 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             .get_account_shared_data(pubkey)
     }
 
+    /// Load an account as of the beginning of the current block (parent-slot
+    /// state), before any transaction in this block modified it. Used by the
+    /// read-only `sol_load_subaccount_snapshot_*` syscalls.
+    pub fn get_account_shared_data_at_block_start(
+        &self,
+        pubkey: &Pubkey,
+    ) -> Option<(AccountSharedData, Slot)> {
+        self.environment_config
+            .transaction_processing_callback
+            .get_account_shared_data_at_block_start(pubkey)
+    }
+
     // Should alignment be enforced during user pointer translation
     pub fn get_check_aligned(&self) -> bool {
         self.transaction_context
