@@ -26,7 +26,8 @@ use {
     solana_system_interface::instruction::SystemInstruction,
     solana_transaction_context::{
         IndexOfAccount, MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER, create_subaccount_address,
-        instruction_accounts::InstructionAccount, subaccount_storage_address, vm_slice::VmSlice,
+        instruction_accounts::InstructionAccount, subaccount_storage_address,
+        transaction_accounts::SnapshotKey, vm_slice::VmSlice,
     },
 };
 
@@ -110,11 +111,41 @@ fn find_or_add_subaccount(
     Ok(subaccount_index)
 }
 
+fn find_or_add_snapshot(
+    invoke_context: &mut InvokeContext,
+    snapshot_key: &SnapshotKey,
+) -> Result<IndexOfAccount, Error> {
+    let snapshot_index = if let Some(snapshot_index) = invoke_context
+        .transaction_context
+        .find_index_of_snapshot(snapshot_key)
+    {
+        snapshot_index
+    } else {
+        let storage_address = match snapshot_key {
+            SnapshotKey::Account(pubkey) => *pubkey,
+            SnapshotKey::Subaccount(pubkey) => subaccount_storage_address(pubkey),
+        };
+        let (snapshot, _slot) = invoke_context
+            .get_account_shared_data_at_block_start(&storage_address)
+            .unwrap_or_else(|| (AccountSharedData::default(), 0));
+        let data_len_cost = (snapshot.data().len() as u64)
+            .checked_div(invoke_context.get_execution_cost().cpi_bytes_per_unit)
+            .unwrap_or(u64::MAX);
+        consume_compute_meter(invoke_context, data_len_cost)?;
+
+        invoke_context
+            .transaction_context
+            .add_snapshot(snapshot_key, snapshot)?
+    };
+
+    Ok(snapshot_index)
+}
+
 // ============================================================================
 // F10 — Subaccounts syscalls (PRS-153)
 //
-// This module implements the currently supported subaccount syscall surface:
-// create, load, and unload. (read/snapshot loads are DEFER-R2.)
+// This module implements the subaccount syscall surface:
+// create, load, read, snapshot, and unload.
 // ============================================================================
 
 declare_builtin_function!(
@@ -517,6 +548,38 @@ fn install_subaccount_data_region(
     Ok(())
 }
 
+/// Replaces the slot's data region with a **read-only** one backed by a
+/// snapshot-lane entry's storage. Mirrors [`install_subaccount_data_region`]'s
+/// read-only branch, but reads from the snapshot lane
+/// ([`get_snapshot`](solana_transaction_context::transaction_accounts)) rather
+/// than the subaccount lane — the two lanes use independent index spaces, and a
+/// snapshot read never write-locks or persists, so it is always read-only and
+/// must never be `touch`ed.
+///
+/// SAFETY: the host pointer captured in the `MemoryRegion` must remain valid
+/// for the lifetime of the VM. The snapshot lane is append-only and its
+/// `AccountSharedData` storage is pinned to the transaction context for the
+/// whole instruction's duration, so the slice address is stable.
+fn install_snapshot_data_region(
+    invoke_context: &mut InvokeContext,
+    memory_mapping: &mut MemoryMapping,
+    snapshot_index: solana_transaction_context::IndexOfAccount,
+    vm_data_addr: u64,
+) -> Result<(), Error> {
+    let snapshot = invoke_context
+        .transaction_context
+        .accounts()
+        .get_snapshot(snapshot_index)?;
+    let new_region = MemoryRegion::new_readonly(snapshot.data(), vm_data_addr);
+    let (region_index, _) = memory_mapping
+        .find_region(vm_data_addr)
+        .ok_or(InstructionError::MissingAccount)?;
+    memory_mapping
+        .replace_region(region_index, new_region)
+        .map_err(|_| InstructionError::InvalidArgument)?;
+    Ok(())
+}
+
 /// Restores the slot's data region to the empty readonly placeholder so the
 /// next `sol_load_subaccount` call can install a fresh region.
 fn restore_subaccount_data_placeholder(
@@ -747,6 +810,24 @@ fn translate_subaccount_seed_slices<'a>(
         .iter()
         .map(|untranslated_seed| translate_vm_slice(untranslated_seed, memory_mapping, check_aligned))
         .collect::<Result<Vec<_>, Error>>()
+}
+
+/// Translate seeds and derive the subaccount address **without** requiring the
+/// base account (the first seed) to be present in the transaction. Used by the
+/// read-only `sol_load_subaccount_snapshot` syscalls, which never write-lock a
+/// base account because the load is read-only.
+fn translate_subaccount_seeds_no_base(
+    program_id: &Pubkey,
+    seeds_addr: u64,
+    seeds_len: u64,
+    memory_mapping: &MemoryMapping,
+    check_aligned: bool,
+) -> Result<Pubkey, Error> {
+    let seeds =
+        translate_subaccount_seed_slices(seeds_addr, seeds_len, memory_mapping, check_aligned)?;
+    let subaccount_pubkey =
+        create_subaccount_address(&seeds, program_id).map_err(|_| InstructionError::InvalidSeeds)?;
+    Ok(subaccount_pubkey)
 }
 
 fn translate_subaccount_seeds(
@@ -1028,6 +1109,277 @@ declare_builtin_function!(
     }
 );
 
+/// Shared body of the read-only `sol_load_subaccount_snapshot` and
+/// `sol_load_account_snapshot` syscalls.
+///
+/// Like [`load_subaccount_impl`], but:
+///   - it does **not** require a base account in the transaction — the address
+///     is derived from the seeds alone ([`translate_subaccount_seeds_no_base`]),
+///     because a read-only load never write-locks a base account;
+///   - the slot is always **read-only** (`is_writable == false`), so the data
+///     region is mapped read-only and the entry is never touched/persisted; and
+///   - the on-chain state is read **as of the beginning of the block**
+///     (parent-slot state) via `get_account_shared_data_at_block_start`, then
+///     stored in a fresh, deduplicated lane entry ([`find_or_add_snapshot`]) so
+///     the snapshot is independent of any mid-block load of the same subaccount.
+///   - doesn't use the account-locking model because the snapshot is read-only
+///     and never persisted, so it doesn't need to be locked for reading or
+///     writing.
+///
+/// The slot is released by the same `sol_unload_subaccount`.
+fn load_snapshot_impl(
+    invoke_context: &mut InvokeContext,
+    out_header_addr: u64,
+    memory_mapping: &mut MemoryMapping,
+    get_snapshot_key: impl FnOnce(
+        &mut InvokeContext,
+        &mut MemoryMapping,
+    ) -> Result<SnapshotKey, Error>,
+) -> Result<u64, Error> {
+    let mut load_subaccount_time = Measure::start("load_subaccount");
+    let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
+    consume_compute_meter(invoke_context, syscall_base_cost)?;
+    let check_aligned = invoke_context.get_check_aligned();
+
+    let mut compute_subaccounts_time = Measure::start("compute_subaccounts");
+    let snapshot_key = get_snapshot_key(invoke_context, memory_mapping)?;
+    compute_subaccounts_time.stop();
+    invoke_context.timings.compute_subaccounts_us += compute_subaccounts_time.as_us();
+    let is_writable = false; // snapshot loads are always read-only
+
+    // Load the start-of-block on-chain state into the (deduplicated) snapshot
+    // lane and snapshot a copy of the header fields for the slot. The snapshot
+    // lane is independent of the live subaccount lane, so this is unaffected by
+    // any mid-block load of the same subaccount.
+    let (snapshot_index, data_len, lamports, owner_bytes) = {
+        let snapshot_index = find_or_add_snapshot(invoke_context, &snapshot_key)?;
+        let snapshot = invoke_context
+            .transaction_context
+            .accounts()
+            .get_snapshot(snapshot_index)?;
+        let data_len = snapshot.data().len();
+        let lamports = snapshot.lamports();
+        let owner_bytes = *snapshot.owner();
+        (snapshot_index, data_len, lamports, owner_bytes)
+    };
+
+    // Reject loading the same snapshot twice in one instruction:
+    // `find_or_add_snapshot` dedups by key, so a repeat load returns the same
+    // snapshot index — refuse if a slot already holds it. Then pick a free slot.
+    let (slot_index, vm_header_addr, vm_data_addr) = {
+        let syscall_context = invoke_context.get_syscall_context_mut()?;
+        if syscall_context.subaccount_slots.iter().any(|s| {
+            s.occupied_subaccount_index == OccupiedSubaccountIndex::Snapshot(snapshot_index)
+        }) {
+            ic_msg!(
+                invoke_context,
+                "sol_load_subaccount_snapshot: snapshot {} is already loaded",
+                snapshot_key.as_pubkey(),
+            );
+            return Err(InstructionError::AccountAlreadyInitialized.into());
+        }
+        let Some((slot_index, slot)) = syscall_context
+            .subaccount_slots
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.occupied_subaccount_index.is_empty())
+        else {
+            ic_msg!(invoke_context, "sol_load_subaccount_snapshot: all slots in use");
+            return Err(InstructionError::MaxAccountsExceeded.into());
+        };
+        (slot_index, slot.vm_header_addr, slot.vm_data_addr)
+    };
+
+    // Stamp the slot header with the loaded subaccount's metadata.
+    write_subaccount_slot_header(
+        memory_mapping,
+        check_aligned,
+        vm_header_addr,
+        snapshot_key.as_pubkey(),
+        &owner_bytes,
+        lamports,
+        data_len,
+        is_writable,
+    )?;
+
+    // Map the slot's data region read-only onto the snapshot-lane storage.
+    // Snapshot reads use the independent snapshot lane (not the subaccount
+    // lane), are always read-only, and are never touched/persisted.
+    install_snapshot_data_region(invoke_context, memory_mapping, snapshot_index, vm_data_addr)?;
+
+    // v4 adaptation: `SerializedAccountMetadata` carries a leading `vm_addr`
+    // (SIMD-0449 / access-violation ranges); for a slot that first byte is the
+    // header start, so `vm_addr == vm_header_addr`.
+    let metadata = SerializedAccountMetadata {
+        vm_addr: vm_header_addr,
+        original_data_len: data_len,
+        vm_key_addr: vm_header_addr.saturating_add(SLOT_HEADER_OFFSET_KEY),
+        vm_owner_addr: vm_header_addr.saturating_add(SLOT_HEADER_OFFSET_OWNER),
+        vm_lamports_addr: vm_header_addr.saturating_add(SLOT_HEADER_OFFSET_LAMPORTS),
+        vm_data_addr,
+    };
+
+    let syscall_context = invoke_context.get_syscall_context_mut()?;
+    let header_out = translate_type_mut::<u64>(memory_mapping, out_header_addr, check_aligned)?;
+
+    if let Some(slot) = syscall_context.subaccount_slots.get_mut(slot_index) {
+        slot.occupied_subaccount_index = OccupiedSubaccountIndex::Snapshot(snapshot_index);
+        slot.caller_account_metadata = Some(metadata);
+        // Snapshot loads don't have a program-written view because the
+        // subaccount is not changed.
+        slot.account_view_kind = None;
+        slot.is_writable = false;
+    }
+    *header_out = vm_header_addr;
+
+    load_subaccount_time.stop();
+    invoke_context.timings.load_subaccounts_us += load_subaccount_time.as_us();
+
+    Ok(SUCCESS)
+}
+
+declare_builtin_function!(
+    /// F10: read-only, base-free, start-of-block load of a subaccount into a
+    /// pre-reserved VM slot. See [`load_snapshot_impl`] for the shared semantics.
+    SyscallLoadSubaccountSnapshot,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        seeds_addr: u64,
+        seeds_len: u64,
+        out_header_addr: u64,
+        _arg4: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        check_subaccount_syscall_enabled(invoke_context, "sol_load_subaccount_snapshot")?;
+        load_snapshot_impl(
+            invoke_context,
+            out_header_addr,
+            memory_mapping,
+            |invoke_context, memory_mapping| {
+                // Translate seeds → derive PDA. Read-only snapshot loads never
+                // require a base account, so writability is unconditionally false.
+                let instruction_context = invoke_context
+                    .transaction_context
+                    .get_current_instruction_context()?;
+                let program_id = *instruction_context.get_program_key()?;
+                let snapshot_pubkey = translate_subaccount_seeds_no_base(
+                    &program_id,
+                    seeds_addr,
+                    seeds_len,
+                    memory_mapping,
+                    invoke_context.get_check_aligned(),
+                )?;
+                Ok(SnapshotKey::Subaccount(snapshot_pubkey))
+            },
+        )
+    }
+);
+
+declare_builtin_function!(
+    /// F10: read-only, base-free, start-of-block load of an account into a
+    /// pre-reserved VM slot. See [`load_snapshot_impl`] for the shared semantics.
+    SyscallLoadAccountSnapshot,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        pubkey_addr: u64,
+        out_header_addr: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _arg5: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        check_subaccount_syscall_enabled(invoke_context, "sol_load_account_snapshot")?;
+        load_snapshot_impl(
+            invoke_context,
+            out_header_addr,
+            memory_mapping,
+            |invoke_context, memory_mapping| {
+                let pubkey = *translate_type::<Pubkey>(
+                    memory_mapping,
+                    pubkey_addr,
+                    invoke_context.get_check_aligned(),
+                )?;
+                Ok(SnapshotKey::Account(pubkey))
+            },
+        )
+    }
+);
+
+declare_builtin_function!(
+    /// F10: read data from a subaccount without loading it into a slot.
+    SyscallReadSubaccount,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        seeds_addr: u64,
+        seeds_len: u64,
+        buff: u64,
+        offset: u64,
+        length: u64,
+        memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Error> {
+        check_subaccount_syscall_enabled(invoke_context, "sol_read_subaccount")?;
+
+        // We use the `load_subaccount` measure here to capture the time spent on
+        // loading the subaccount from the AccountsDB.
+        let mut load_subaccount_time = Measure::start("load_subaccount");
+        let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
+        consume_compute_meter(invoke_context, syscall_base_cost)?;
+        let check_aligned = invoke_context.get_check_aligned();
+
+        let mut compute_subaccounts_time = Measure::start("compute_subaccounts");
+        // Translate seeds → derive PDA → inherit base account writable bit.
+        let (subaccount_pubkey, _) = {
+            let instruction_context = invoke_context
+                .transaction_context
+                .get_current_instruction_context()?;
+            let program_id = *instruction_context.get_program_key()?;
+            translate_subaccount_seeds(
+                &program_id,
+                seeds_addr,
+                seeds_len,
+                memory_mapping,
+                check_aligned,
+                invoke_context,
+                &instruction_context,
+            )?
+        };
+        compute_subaccounts_time.stop();
+        invoke_context.timings.compute_subaccounts_us += compute_subaccounts_time.as_us();
+
+        let subaccount_index = find_or_add_subaccount(invoke_context, subaccount_pubkey)?;
+        let borrowed = invoke_context
+            .transaction_context
+            .accounts()
+            .try_borrow_subaccount(subaccount_index)?;
+
+        let data = borrowed.data();
+        let start = offset as usize;
+        let end = start
+            .checked_add(length as usize)
+            .ok_or(InstructionError::InvalidArgument)?;
+        let src = data
+            .get(start..end)
+            .ok_or(InstructionError::InvalidArgument)?;
+        let dst = translate_slice_mut::<u8>(memory_mapping, buff, length, check_aligned)?;
+        dst.copy_from_slice(src);
+
+        // Charge for copying `length` bytes into guest memory.
+        let compute_cost = invoke_context.get_execution_cost();
+        let copy_cost = compute_cost.mem_op_base_cost.max(
+            length
+                .checked_div(compute_cost.cpi_bytes_per_unit)
+                .unwrap_or(u64::MAX),
+        );
+        consume_compute_meter(invoke_context, copy_cost)?;
+
+        load_subaccount_time.stop();
+        invoke_context.timings.load_subaccounts_us += load_subaccount_time.as_us();
+
+        Ok(0)
+    }
+);
+
 declare_builtin_function!(
     /// F10: release a subaccount slot previously populated by either
     /// `sol_load_subaccount_rust` or `sol_load_subaccount_c`. The data region
@@ -1056,7 +1408,7 @@ declare_builtin_function!(
         consume_compute_meter(invoke_context, syscall_base_cost)?;
         let check_aligned = invoke_context.get_check_aligned();
 
-        let (slot_index, occupied, is_writable, _vm_data_addr) = {
+        let (slot_index, occupied, is_writable, vm_data_addr) = {
             let syscall_context = invoke_context.get_syscall_context()?;
             let entry = syscall_context
                 .subaccount_slots
@@ -1087,12 +1439,31 @@ declare_builtin_function!(
             )
         };
 
-        // DEFER-R2: the fork also handles an `OccupiedSubaccountIndex::Snapshot`
-        // branch here (read-only snapshot slots). The `Snapshot` enum variant
-        // ships inert in R1 (never produced by the trio), so we skip that branch
-        // entirely and fall through to the `Subaccount` reconciliation path.
-        // `get_subaccount_index()` returns `None` for a (never-produced)
-        // `Snapshot`, which the `?` below rejects defensively.
+        // Read-only snapshot slots never mutated any lane and were direct-mapped
+        // read-only, so there is nothing to reconcile back into storage. Just
+        // restore the data placeholder, zero the header, and free the slot.
+        if let OccupiedSubaccountIndex::Snapshot(_) = occupied {
+            restore_subaccount_data_placeholder(memory_mapping, vm_data_addr)?;
+            write_subaccount_slot_header(
+                memory_mapping,
+                check_aligned,
+                vm_header_addr,
+                &Pubkey::default(),
+                &Pubkey::default(),
+                0,
+                0,
+                false,
+            )?;
+            let syscall_context = invoke_context.get_syscall_context_mut()?;
+            if let Some(slot) = syscall_context.subaccount_slots.get_mut(slot_index) {
+                slot.occupied_subaccount_index = OccupiedSubaccountIndex::Empty;
+                slot.caller_account_metadata = None;
+                slot.account_view_kind = None;
+                slot.is_writable = false;
+            }
+            return Ok(SUCCESS);
+        }
+
         let subaccount_index = occupied
             .get_subaccount_index()
             .ok_or(InstructionError::InvalidArgument)?;
