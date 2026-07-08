@@ -1514,12 +1514,12 @@ fn main() {
                 if !slot_stats.can_send(worker) {
                     continue;
                 }
-                if is_leader {
+                locking_queue.drain_actives(worker, &mut bridge, config.round_budget_per_worker.unwrap_or(config.max_txs_per_worker));
+                if is_leader && /* all txs are already scheduled, so no-work no-underflow */ !locking_queue.picked[worker].is_empty() {
                     // Prefill rounds don't count: the worker is idle because there
                     // is no bank, not because the scheduler starved it.
                     slot_stats.check_underflow(worker);
                 }
-                locking_queue.drain_actives(worker, &mut bridge, config.round_budget_per_worker.unwrap_or(config.max_txs_per_worker));
                 let mut batch = smallvec::SmallVec::<[_; MAX_TRANSACTIONS_PER_MESSAGE]>::new();
                 macro_rules! send_batch {
                     () => {
