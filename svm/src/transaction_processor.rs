@@ -1094,6 +1094,10 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             return_data,
             touched_account_count,
             accounts_resize_delta: accounts_data_len_delta,
+            // R1.4/DEFER-R2: subaccount receipt plumbing (unchanged-subaccount
+            // addresses) is not wired yet — ignore the field for now so the
+            // OLD glue keeps compiling against R1.1's widened ExecutionRecord.
+            unchanged_subaccount_addresses: _,
         } = execution_record;
 
         if status.is_ok()
