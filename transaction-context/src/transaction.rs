@@ -4,7 +4,9 @@ use {
         MAX_ACCOUNTS_PER_TRANSACTION, MAX_SUBACCOUNTS_PER_TRANSACTION,
         instruction::{InstructionContext, InstructionFrame},
         instruction_accounts::InstructionAccount,
-        transaction_accounts::{KeyedAccountSharedData, TransactionAccounts},
+        transaction_accounts::{
+            KeyedAccountSharedData, SnapshotKey, TransactionAccountView, TransactionAccounts,
+        },
         vm_addresses::{
             GUEST_INSTRUCTION_DATA_BASE_ADDRESS, GUEST_REGION_SIZE, RETURN_DATA_SCRATCHPAD,
         },
@@ -156,9 +158,20 @@ impl<'ix_data> TransactionContext<'ix_data> {
         self.accounts.find_index_of_subaccount(pubkey)
     }
 
+    /// F10 R2: searches for a snapshot by its key in the snapshot lane.
+    pub fn find_index_of_snapshot(&self, snapshot_key: &SnapshotKey) -> Option<IndexOfAccount> {
+        self.accounts.find_index_of_snapshot(snapshot_key)
+    }
+
     /// F10: number of subaccounts registered in this transaction so far.
     pub fn number_of_subaccounts(&self) -> IndexOfAccount {
         self.accounts.number_of_subaccounts()
+    }
+
+    /// F10 R2: number of subaccounts + snapshots registered so far. Both lanes
+    /// share the `MAX_SUBACCOUNTS_PER_TRANSACTION` budget.
+    pub fn number_of_subaccounts_with_snapshots(&self) -> IndexOfAccount {
+        self.accounts.number_of_subaccounts_with_snapshots()
     }
 
     /// F10: register a new subaccount under the given key.
@@ -171,10 +184,42 @@ impl<'ix_data> TransactionContext<'ix_data> {
         if self.find_index_of_subaccount(&pubkey).is_some() {
             return Err(InstructionError::DuplicateAccountIndex);
         }
-        if (self.accounts.number_of_subaccounts() as usize) >= MAX_SUBACCOUNTS_PER_TRANSACTION {
+        // F10 R2: subaccounts and snapshots share the same per-transaction
+        // budget (and the same serializer slot pool), so cap on the combined
+        // count rather than the subaccount lane alone (matches fork).
+        if (self.accounts.number_of_subaccounts_with_snapshots() as usize)
+            >= MAX_SUBACCOUNTS_PER_TRANSACTION
+        {
             return Err(InstructionError::MaxAccountsExceeded);
         }
         Ok(self.accounts.add_subaccount(pubkey, account))
+    }
+
+    /// F10 R2: register a read-only block-start snapshot under the given key.
+    /// Returns the snapshot index (without the `SUBACCOUNT_MARKER` high-bit).
+    /// The entry is left untouched and is never persisted.
+    pub fn add_snapshot(
+        &self,
+        snapshot_key: &SnapshotKey,
+        account: AccountSharedData,
+    ) -> Result<IndexOfAccount, InstructionError> {
+        if self.find_index_of_snapshot(snapshot_key).is_some() {
+            return Err(InstructionError::DuplicateAccountIndex);
+        }
+        if (self.accounts.number_of_subaccounts_with_snapshots() as usize)
+            >= MAX_SUBACCOUNTS_PER_TRANSACTION
+        {
+            return Err(InstructionError::MaxAccountsExceeded);
+        }
+        Ok(self.accounts.add_snapshot(snapshot_key, account))
+    }
+
+    /// F10 R2: read-only view of the snapshot at the given lane index.
+    pub fn get_snapshot(
+        &self,
+        index: IndexOfAccount,
+    ) -> Result<TransactionAccountView<'_>, InstructionError> {
+        self.accounts.get_snapshot(index)
     }
 
     /// Gets the max length of the instruction trace
