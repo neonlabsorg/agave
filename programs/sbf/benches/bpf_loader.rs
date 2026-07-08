@@ -125,6 +125,8 @@ fn bench_program_alu(bencher: &mut Bencher) {
         &executable,
         vec![MemoryRegion::new_writable(&mut inner_iter, MM_INPUT_START)],
         vec![],
+        vec![],
+        vec![],
         &mut invoke_context,
     );
     let (mut vm, _, _) = vm.unwrap();
@@ -269,6 +271,8 @@ fn bench_create_vm(bencher: &mut Bencher) {
             &executable,
             clone_regions(&regions),
             account_lengths.clone(),
+            vec![],
+            vec![],
             &mut invoke_context,
         );
         vm.unwrap();
@@ -320,6 +324,8 @@ fn bench_instruction_count_tuner(_bencher: &mut Bencher) {
         &executable,
         regions,
         account_lengths,
+        vec![],
+        vec![],
         &mut invoke_context,
     );
     let (mut vm, _, _) = vm.unwrap();

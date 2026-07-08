@@ -520,6 +520,8 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
         &verified_executable,
         regions,
         account_lengths,
+        vec![],
+        vec![],
         &mut invoke_context,
     );
     let (mut vm, _, _) = vm.unwrap();
