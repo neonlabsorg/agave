@@ -78,6 +78,12 @@ struct Config {
     #[serde(with = "humantime_serde")]
     pub report_delay: Option<Duration>,
     max_queue_size: usize,
+    // On queue overflow, evict the costliest queued tx to admit a cheaper
+    // incoming one instead of dropping the incoming tx. Off by default, which
+    // keeps the legacy behavior of dropping whatever arrives once the queue is
+    // full.
+    #[serde(default)]
+    evict_costliest_on_overflow: bool,
     priority_rules: Vec<PriorityRule>,
     default_priority: usize,
 }
@@ -188,7 +194,6 @@ struct TxMeta {
     affinity_requirements_count: usize,
     state: TxState,
     score: Score,
-    #[allow(dead_code)]
     cost: u64,
     expire_slot: u64,
     rebalance_locked: bool,
@@ -461,6 +466,11 @@ struct LockingQueue {
 
     txs_in_arrival_order: TxExpireQueue,
 
+    // Non-picked txs ordered by estimated cost so the costliest queued tx can be
+    // found in O(log n) when deciding overflow eviction. Invariant: contains
+    // exactly the txs currently in `metas` that are not yet `Picked`.
+    cost_index: BTreeSet<(u64, SchedulerTxKey)>,
+
     picked_locks: ThreadAwareAccountLocks,
     num_threads: usize,
 
@@ -509,6 +519,7 @@ impl LockingQueue {
             rebalance_queue: make_vector(num_threads, || ActiveTxsRebalanceQueue::new()),
             actives_assigned_weight: make_vector(num_threads, || 0),
             txs_in_arrival_order: TxExpireQueue::new(),
+            cost_index: BTreeSet::new(),
         }
     }
 
@@ -581,7 +592,9 @@ impl LockingQueue {
 
     fn new_tx(&mut self, meta: TxMeta, tx: &TransactionState) {
         self.seen_txs += 1;
+        let cost = meta.cost;
         let key = self.metas.insert(meta);
+        self.cost_index.insert((cost, key));
         {
             // Record arrival: front is newest, so the list tail is the oldest tx.
             let holder = TxExpirePlaceHolder::new(key);
@@ -629,6 +642,7 @@ impl LockingQueue {
         match lock_result {
             Ok(thread) => {
                 let score = tx_meta.score;
+                let cost = tx_meta.cost;
                 if !can_place!(thread) {
                     self.picked_locks.unlock_accounts(
                         write_locks.as_slice().iter().cloned(),
@@ -658,6 +672,9 @@ impl LockingQueue {
 
                 tx_meta.affinity_subs = AffinitySubscriptionList::new();
 
+                // Picked txs are in flight and no longer eligible for eviction.
+                self.cost_index.remove(&(cost, key));
+
                 true
             },
             Err(_err) => false
@@ -665,47 +682,75 @@ impl LockingQueue {
 
     }
 
-    // returns true if the key is already non-valid (expired)
-    fn maybe_expire(&mut self, key: SchedulerTxKey, txdata: &mut impl MutableTxProvider) -> bool {
-        let (shared_key, expired) = {
-            let Some(meta) = self.metas.get_mut(key) else {
-                return true;
-            };
+    // Fully remove a non-picked tx from every queue and bookkeeping structure.
+    // Shared by expiry and overflow eviction. Caller guarantees the tx exists
+    // and is not yet `Picked` (picked txs are in flight and unlinked from the
+    // expire queue / cost index already).
+    fn drop_queued_tx(&mut self, key: SchedulerTxKey, txdata: &mut impl MutableTxProvider) {
+        let (shared_key, cost) = {
+            let meta = self.metas.get_mut(key).unwrap();
             assert!(!meta.state.is_picked());
-            let expired = meta.expire_slot < self.slot;
-            if expired {
-                if let TxState::Active { assigned_to, .. } = meta.state {
-                    self.actives_assigned_weight[assigned_to] -= meta.active_balancing_weight;
+            if let TxState::Active { assigned_to, .. } = meta.state {
+                self.actives_assigned_weight[assigned_to] -= meta.active_balancing_weight;
+            }
+            // compensating unconditional unblocks below
+            while let Some(item) = meta.resource_queue_subs.pop_front() {
+                let (_, is_write, lock) = item.contained();
+                if let Some(queue) = self.resources.get_mut(lock) {
+                    // The tx leaves the acquire queue without being granted, so
+                    // mirror drain()'s bookkeeping: drop its waiter count and
+                    // block() to compensate the unconditional unblock() below.
+                    queue.blocked_txs -= 1;
+                    queue.block(*is_write);
                 }
-                // compensating unconditional unblocks below
-                while let Some(item) = meta.resource_queue_subs.pop_front() {
-                    let (_, is_write, lock) = item.contained();
-                    if let Some(queue) = self.resources.get_mut(lock) {
-                        // The tx leaves the acquire queue without being granted, so
-                        // mirror drain()'s bookkeeping: drop its waiter count and
-                        // block() to compensate the unconditional unblock() below.
-                        queue.blocked_txs -= 1;
-                        queue.block(*is_write);
-                    }
-                }
-                for (lock, is_write) in txdata.txdata(meta.shared_key).locks() {
-                    if let Some(queue) = self.resources.get_mut(lock) {
-                        if queue.unblock(is_write) {
-                            self.unblock_events.push_back(*lock);
-                        }
+            }
+            for (lock, is_write) in txdata.txdata(meta.shared_key).locks() {
+                if let Some(queue) = self.resources.get_mut(lock) {
+                    if queue.unblock(is_write) {
+                        self.unblock_events.push_back(*lock);
                     }
                 }
             }
-            (meta.shared_key, expired)
+            (meta.shared_key, meta.cost)
+        };
+        self.cost_index.remove(&(cost, key));
+        txdata.remove_tx(shared_key);
+        // Dropping the meta unlinks the tx from its remaining intrusive lists
+        // (resource/affinity subscriptions and the active-worker holder) via
+        // their `Drop` impls.
+        self.metas.remove(key);
+    }
+
+    // returns true if the key is already non-valid (expired)
+    fn maybe_expire(&mut self, key: SchedulerTxKey, txdata: &mut impl MutableTxProvider) -> bool {
+        let expired = match self.metas.get(key) {
+            None => return true,
+            Some(meta) => {
+                assert!(!meta.state.is_picked());
+                meta.expire_slot < self.slot
+            }
         };
         if expired {
             self.expires += 1;
-            txdata.remove_tx(shared_key);
-            self.metas.remove(key);
-            true
-        } else {
-            false
+            self.drop_queued_tx(key, txdata);
         }
+        expired
+    }
+
+    // Overflow policy: instead of dropping an incoming tx when the queue is
+    // full, evict the costliest queued (non-picked) tx — but only when it is
+    // strictly more expensive than the incoming one. Returns true when a slot
+    // was freed (caller keeps the incoming tx); false when the incoming tx is
+    // itself among the cheapest and should be dropped instead.
+    fn evict_costliest(&mut self, incoming_cost: u64, txdata: &mut impl MutableTxProvider) -> bool {
+        let Some(&(max_cost, key)) = self.cost_index.last() else {
+            return false;
+        };
+        if max_cost <= incoming_cost {
+            return false;
+        }
+        self.drop_queued_tx(key, txdata);
+        true
     }
 
     fn make_active(&mut self, key: SchedulerTxKey) -> Option<usize> {
@@ -980,6 +1025,34 @@ impl Config {
     }
 }
 
+/// Estimate a transaction's block cost with Agave's cost model, matching what
+/// the runtime charges. Used both to stamp `TxMeta.cost` at ingress and to
+/// compare an incoming tx against the costliest queued tx for overflow eviction.
+fn estimate_cost(tx: &TransactionState) -> u64 {
+    // The cost model needs cached static metadata (`StaticMeta`), which the
+    // bridge's bare `SanitizedTransactionView` does not carry. Wrap a borrowed
+    // view over the same transaction bytes in a `RuntimeTransaction` to compute
+    // and cache that metadata. `&TransactionPtr: TransactionData`, so the view
+    // aliases the bridge's allocation rather than copying it.
+    let view = SanitizedTransactionView::try_new_sanitized(tx.data.inner_data(), true)
+        .expect("bridge only stores transactions that already sanitized on ingress");
+    // The message hash is never read by cost estimation; zero-fill it to avoid
+    // rehashing the message on the hot path.
+    let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
+        view,
+        MessageHash::Precomputed(Hash::default()),
+        Some(tx.is_simple_vote()),
+    )
+    .expect("bridge only stores transactions that already sanitized on ingress");
+    CostModel::estimate_cost(
+        &runtime_tx,
+        runtime_tx.program_instructions_iter(),
+        runtime_tx.num_requested_write_locks(),
+        &FeatureSet::all_enabled(),
+    )
+    .sum()
+}
+
 struct SLotStatCollectorState {
     slot: u64,
     underflow: Vec<u64>,
@@ -1247,6 +1320,7 @@ fn main() {
     let mut last_report = std::time::Instant::now();
     let mut reschedules = 0;
     let mut drops = 0;
+    let mut evicted = 0;
     let mut rejected = 0;
 
     let mut slot_stats = SlotStatCollector::new(workers);
@@ -1290,15 +1364,24 @@ fn main() {
 
         bridge.drain_tpu(|bridge, tx_key| {
             to_spin = false;
-            let data = bridge.transaction(tx_key);
             if locking_queue.size() >= config.max_queue_size {
-                drops += 1;
-                return TxDecision::Drop;
+                // On overflow, make room by evicting the costliest queued tx
+                // rather than throwing this one away — unless the feature is
+                // disabled, or this tx is itself at least as costly as
+                // everything queued, in which case drop it.
+                let made_room = config.evict_costliest_on_overflow
+                    && locking_queue.evict_costliest(estimate_cost(bridge.transaction(tx_key)), bridge);
+                if !made_room {
+                    drops += 1;
+                    return TxDecision::Drop;
+                }
+                evicted += 1;
             }
             if config.check_max_inflight > 0 {
                 to_check.insert(tx_key);
             } else {
-                new_txs.push((config.tx_score(data), tx_key));
+                let score = config.tx_score(bridge.transaction(tx_key));
+                new_txs.push((score, tx_key));
             }
             TxDecision::Keep
 
@@ -1335,10 +1418,6 @@ fn main() {
             check_inflight -= 1;
             match worker_resp.response {
                 WorkerAction::Check(response, _pubkeys) => {
-                    if locking_queue.size() >= config.max_queue_size {
-                        drops += 1;
-                        return TxDecision::Drop;
-                    }
                     if response.parsing_and_sanitization_flags & parsing_and_sanitization_flags::FAILED != 0 {
                         TxDecision::Drop
                     } else if response.status_check_flags != status_check_flags::REQUESTED | status_check_flags::PERFORMED {
@@ -1347,6 +1426,19 @@ fn main() {
                         TxDecision::Drop
                     } else {
                         let key = worker_resp.key;
+                        // Same overflow policy as TPU ingress: evict the costliest
+                        // queued tx to make room, or drop this one if it is no
+                        // cheaper. Checked only for txs that actually enter the
+                        // queue (failures above are dropped without evicting).
+                        if locking_queue.size() >= config.max_queue_size {
+                            let made_room = config.evict_costliest_on_overflow
+                                && locking_queue.evict_costliest(estimate_cost(bridge.transaction(key)), bridge);
+                            if !made_room {
+                                drops += 1;
+                                return TxDecision::Drop;
+                            }
+                            evicted += 1;
+                        }
                         new_txs.push((config.tx_score(bridge.transaction(key)), key));
                         TxDecision::Keep
                     }
@@ -1360,30 +1452,11 @@ fn main() {
 
         new_txs.sort();
         for (score, shared_key) in new_txs.into_iter() {
-            let tx = bridge.transaction(shared_key);
-            // The cost model needs cached static metadata (`StaticMeta`), which the
-            // bridge's bare `SanitizedTransactionView` does not carry. Wrap a borrowed
-            // view over the same transaction bytes in a `RuntimeTransaction` to compute
-            // and cache that metadata. `&TransactionPtr: TransactionData`, so the view
-            // aliases the bridge's allocation rather than copying it.
-            let view = SanitizedTransactionView::try_new_sanitized(tx.data.inner_data(), true)
-                .expect("bridge only stores transactions that already sanitized on ingress");
-            // The message hash is never read by cost estimation; zero-fill it to avoid
-            // rehashing the message on the hot path.
-            let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
-                view,
-                MessageHash::Precomputed(Hash::default()),
-                Some(tx.is_simple_vote()),
-            )
-            .expect("bridge only stores transactions that already sanitized on ingress");
-            let cost = CostModel::estimate_cost(
-                &runtime_tx,
-                runtime_tx.program_instructions_iter(),
-                runtime_tx.num_requested_write_locks(),
-                &FeatureSet::all_enabled(),
-            )
-            .sum();
-            locking_queue.new_tx(TxMeta::new(shared_key, Score::new(score, tx_num), cost, slot + config.slot_deadline), bridge.transaction(shared_key));
+            let cost = estimate_cost(bridge.transaction(shared_key));
+            locking_queue.new_tx(
+                TxMeta::new(shared_key, Score::new(score, tx_num), cost, slot + config.slot_deadline),
+                bridge.transaction(shared_key),
+            );
             tx_num += 1;
         }
 
@@ -1513,7 +1586,7 @@ fn main() {
                 log::debug!("retry stats {}", retry_tracker);
                 log::debug!("retry reasons {:?}", reschedule_reason);
 
-                log::info!("{}/{workers} saturated(backlog/inflight {:?}/{:?}) (sent {send_stats:?}); enqueued {queue_len}/{picked_queue_len} actives {:?}, rebalances {rebalances}; txs seen/expires/reschedules/drops/rejects {passed_txs}/{expires}/{reschedules}/{drops}/{rejected} slot {slot}",
+                log::info!("{}/{workers} saturated(backlog/inflight {:?}/{:?}) (sent {send_stats:?}); enqueued {queue_len}/{picked_queue_len} actives {:?}, rebalances {rebalances}; txs seen/expires/reschedules/drops/evicts/rejects {passed_txs}/{expires}/{reschedules}/{drops}/{evicted}/{rejected} slot {slot}",
 
                     locking_queue.backlogs.iter().filter(|x| **x>0).count(),
                     locking_queue.backlogs, slot_stats.inflight_txs,
