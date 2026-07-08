@@ -1,6 +1,6 @@
 use {
     crate::{
-        IndexOfAccount, SUBACCOUNT_MARKER,
+        IndexOfAccount,
         instruction_accounts::{BorrowedInstructionAccount, InstructionAccount},
         transaction::TransactionContext,
         vm_addresses::{
@@ -80,10 +80,6 @@ pub struct InstructionContext<'a, 'ix_data> {
     pub(crate) instruction_accounts: &'a [InstructionAccount],
     pub(crate) dedup_map: &'a [u16],
     pub(crate) instruction_data: &'ix_data [u8],
-    /// F10 subaccount instruction accounts (parallel-lane in TransactionContext).
-    pub(crate) subaccounts: &'a [InstructionAccount],
-    /// Dedup map over subaccount lane.
-    pub(crate) dedup_subaccounts: &'a [u16],
 }
 
 impl<'a> InstructionContext<'a, '_> {
@@ -280,40 +276,6 @@ impl<'a> InstructionContext<'a, '_> {
             .and_then(|idx| self.transaction_context.get_key_of_account_at_index(idx))
     }
 
-    /// F10: Number of subaccounts supplied to this Instruction (read-only view).
-    pub fn get_number_of_subaccounts(&self) -> IndexOfAccount {
-        self.subaccounts.len() as IndexOfAccount
-    }
-
-    /// F10: Subaccount list for this Instruction.
-    pub fn instruction_subaccounts(&self) -> &[InstructionAccount] {
-        self.subaccounts
-    }
-
-    /// F10: borrow a subaccount referenced by this instruction (instruction-scope).
-    #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
-    pub fn try_borrow_subaccount(
-        &self,
-        index_in_instruction: IndexOfAccount,
-    ) -> Result<BorrowedInstructionAccount<'_, '_>, InstructionError> {
-        let instruction_account = *self
-            .subaccounts
-            .get(index_in_instruction as usize)
-            .ok_or(InstructionError::NotEnoughAccountKeys)?;
-        let index_in_transaction_unmarked =
-            instruction_account.index_in_transaction & !SUBACCOUNT_MARKER;
-        let account = self
-            .transaction_context
-            .accounts
-            .try_borrow_mut_subaccount(index_in_transaction_unmarked)?;
-        Ok(BorrowedInstructionAccount {
-            transaction_context: self.transaction_context,
-            instruction_account,
-            account,
-            index_in_transaction_of_instruction_program: self.program_account_index_in_tx,
-        })
-    }
-
     /// F10: borrow a subaccount via its transaction-level index, with a
     /// synthetic `InstructionAccount` (is_signer=false, is_writable=caller).
     #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
@@ -334,38 +296,5 @@ impl<'a> InstructionContext<'a, '_> {
             account,
             index_in_transaction_of_instruction_program: self.program_account_index_in_tx,
         })
-    }
-
-    /// F10: Returns `Some(instruction_subaccount_index)` if this is a duplicate
-    /// and `None` if it is the first subaccount with this key.
-    pub fn is_instruction_subaccount_duplicate(
-        &self,
-        instruction_subaccount_index: IndexOfAccount,
-    ) -> Result<Option<IndexOfAccount>, InstructionError> {
-        let index_in_transaction = self
-            .subaccounts
-            .get(instruction_subaccount_index as usize)
-            .ok_or(InstructionError::NotEnoughAccountKeys)?
-            .index_in_transaction;
-        let stripped = index_in_transaction & !SUBACCOUNT_MARKER;
-        let first_instruction_subaccount_index = self
-            .dedup_subaccounts
-            .get(stripped as usize)
-            .and_then(|idx| {
-                if (*idx as usize) >= self.subaccounts.len() {
-                    None
-                } else {
-                    Some(*idx as IndexOfAccount)
-                }
-            })
-            .ok_or(InstructionError::MissingAccount)?;
-
-        Ok(
-            if first_instruction_subaccount_index == instruction_subaccount_index {
-                None
-            } else {
-                Some(first_instruction_subaccount_index)
-            },
-        )
     }
 }

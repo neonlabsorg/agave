@@ -12,6 +12,7 @@ use {
     solana_pubkey::Pubkey,
     std::{
         cell::{Cell, RefCell, UnsafeCell},
+        collections::HashMap,
         ops::{Deref, DerefMut},
         ptr,
         sync::Arc,
@@ -244,8 +245,15 @@ impl WritableAccount for TransactionAccountViewMut<'_> {
 #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 pub type KeyedAccountSharedData = (Pubkey, AccountSharedData);
 #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
-pub(crate) type DeconstructedTransactionAccounts =
-    (Vec<KeyedAccountSharedData>, Box<[Cell<bool>]>, Cell<i64>);
+pub(crate) type DeconstructedTransactionAccounts = (
+    Vec<KeyedAccountSharedData>,
+    // F10/PRS-155: owner-facing keys of subaccounts that were accessed but
+    // not modified this transaction (drained out of the persisted lane by the
+    // dirty filter). The receipt lists them by owner address only.
+    Vec<Pubkey>,
+    Box<[Cell<bool>]>,
+    Cell<i64>,
+);
 
 #[derive(Debug)]
 #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
@@ -271,6 +279,9 @@ pub struct TransactionAccounts {
     #[allow(clippy::vec_box)]
     subaccount_borrow_counters: RefCell<Vec<Box<BorrowCounter>>>,
     touched_subaccounts: RefCell<Vec<bool>>,
+    /// F10: PDA (owner-facing key) -> subaccount-lane index, so
+    /// `find_index_of_subaccount` is O(1) instead of a linear scan.
+    subaccount_indexes: RefCell<HashMap<Pubkey, IndexOfAccount>>,
 }
 
 #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
@@ -316,6 +327,7 @@ impl TransactionAccounts {
             subaccount_private_fields: RefCell::new(Vec::new()),
             subaccount_borrow_counters: RefCell::new(Vec::new()),
             touched_subaccounts: RefCell::new(Vec::new()),
+            subaccount_indexes: RefCell::new(HashMap::new()),
             dynamic_accounts_lamports_sum: Cell::new(0),
         }
     }
@@ -355,6 +367,7 @@ impl TransactionAccounts {
         let mut private = self.subaccount_private_fields.borrow_mut();
         let mut counters = self.subaccount_borrow_counters.borrow_mut();
         let mut touched = self.touched_subaccounts.borrow_mut();
+        let mut indexes = self.subaccount_indexes.borrow_mut();
         let index = shared.len() as IndexOfAccount;
         shared.push(Box::new(UnsafeCell::new(AccountSharedFields {
             key: pubkey,
@@ -374,13 +387,37 @@ impl TransactionAccounts {
                 .get()
                 .saturating_add(lamports as u128),
         );
+        indexes.insert(pubkey, index);
         index
     }
 
     /// F10 W10: lamports introduced by `add_subaccount` for accounts not
-    /// present in the original tx account list.
+    /// present in the original tx account list. SVM/runtime callers add this to
+    /// the expected post-tx lamport sum to avoid false `UnbalancedTransaction`.
+    ///
+    /// `dynamic_accounts_lamports_sum` eagerly tallies the load-time lamports of
+    /// *every* subaccount pulled into the lane this transaction. But
+    /// `deconstruct_*` only persists *touched* subaccounts (dirty filter), so an
+    /// untouched read-only subaccount's lamports never reach the post-tx account
+    /// list. Subtract their contribution here so the balance check
+    /// (`lamports_before + this_sum == lamports_after`) stays consistent with
+    /// what is actually persisted. An untouched subaccount is by definition
+    /// unmodified, so its current lamports equal the load-time value that was
+    /// added to the running sum.
     pub fn get_dynamic_accounts_lamports_sum(&self) -> u128 {
-        self.dynamic_accounts_lamports_sum.get()
+        let mut sum = self.dynamic_accounts_lamports_sum.get();
+        let shared = self.subaccount_shared_fields.borrow();
+        let touched = self.touched_subaccounts.borrow();
+        for (idx, boxed) in shared.iter().enumerate() {
+            if !touched.get(idx).copied().unwrap_or(false) {
+                // SAFETY: `lamports` is only read here; this runs after
+                // execution completes, so there are no outstanding
+                // `AccountRef`/`AccountRefMut` borrows of the subaccount lane.
+                let lamports = unsafe { (*boxed.get()).lamports };
+                sum = sum.saturating_sub(lamports as u128);
+            }
+        }
+        sum
     }
 
     pub fn number_of_subaccounts(&self) -> IndexOfAccount {
@@ -388,14 +425,8 @@ impl TransactionAccounts {
     }
 
     pub fn find_index_of_subaccount(&self, pubkey: &Pubkey) -> Option<IndexOfAccount> {
-        let shared = self.subaccount_shared_fields.borrow();
-        shared
-            .iter()
-            .position(|boxed| {
-                // SAFETY: append-only lane; `key` never mutated after construction.
-                unsafe { (*boxed.get()).key == *pubkey }
-            })
-            .map(|i| i as IndexOfAccount)
+        let indexes = self.subaccount_indexes.borrow();
+        indexes.get(pubkey).copied()
     }
 
     pub fn subaccount_key(&self, index: IndexOfAccount) -> Option<Pubkey> {
@@ -613,15 +644,22 @@ impl TransactionAccounts {
         self.lamports_delta.get()
     }
 
-    fn deconstruct_into_keyed_account_shared_data(&mut self) -> Vec<KeyedAccountSharedData> {
-        let shared_account_fields = std::mem::take(&mut self.shared_account_fields);
-        let private_account_fields = std::mem::take(&mut self.private_account_fields);
+    /// Returns the persisted accounts (main lane + the *changed* subaccount
+    /// lane, keyed by owner pubkey) together with the owner-facing keys of
+    /// subaccounts that were accessed but left unchanged this transaction.
+    /// The latter are reported in the receipt by owner address only — they are
+    /// deliberately excluded from the persisted accounts by the dirty filter.
+    fn deconstruct_into_keyed_account_shared_data(
+        &mut self,
+    ) -> (Vec<KeyedAccountSharedData>, Vec<Pubkey>) {
+        let mut shared_account_fields = std::mem::take(&mut self.shared_account_fields);
+        let mut private_account_fields = std::mem::take(&mut self.private_account_fields);
         let mut accounts: Vec<_> = shared_account_fields
-            .into_iter()
-            .zip(private_account_fields)
+            .iter_mut()
+            .zip(private_account_fields.iter_mut())
             .map(|(shared_fields_cell, private_fields_cell)| {
-                let shared_fields = shared_fields_cell.into_inner();
-                let private_fields = private_fields_cell.into_inner();
+                let shared_fields = shared_fields_cell.get_mut();
+                let private_fields = private_fields_cell.get_mut();
                 (
                     shared_fields.key,
                     AccountSharedData::create_from_existing_shared_data(
@@ -634,20 +672,40 @@ impl TransactionAccounts {
                 )
             })
             .collect();
-        // F10 W10: drain the subaccount lane and append each entry under its
-        // derived *storage* address `hashv(&[&[1u8], pda])`. Without this,
-        // subaccount state created by `sol_create_subaccount` is dropped at tx
-        // commit and accounts-db never receives it.
+        // F10 W10 / PRS-314: drain the subaccount lane and append entries to the
+        // main accounts vec keyed by the **owner-facing** pubkey (the address
+        // `sol_create_subaccount` / `sol_load_subaccount` returns to the
+        // program). Consumers that need accounts-db addressing —
+        // `account_saver::collect_accounts_to_store` and
+        // `AccountLoader::update_accounts_for_successful_tx` — apply
+        // `subaccount_storage_address` at the boundary themselves. Keeping owner
+        // pubkeys in the lane lets the balance collector report them verbatim in
+        // the transaction receipt without a parallel owner-keys channel.
         let sub_shared = std::mem::take(&mut *self.subaccount_shared_fields.borrow_mut());
         let sub_private = std::mem::take(&mut *self.subaccount_private_fields.borrow_mut());
-        for (shared_box, private_box) in sub_shared.into_iter().zip(sub_private.into_iter()) {
+        let sub_touched = std::mem::take(&mut *self.touched_subaccounts.borrow_mut());
+        let mut unchanged_subaccounts: Vec<Pubkey> = Vec::new();
+        for (idx, (shared_box, private_box)) in sub_shared
+            .into_iter()
+            .zip(sub_private.into_iter())
+            .enumerate()
+        {
             let shared = (*shared_box).into_inner();
+            // F10: only persist subaccounts that were actually modified this
+            // transaction. `touched_subaccounts[idx]` is set by `touch()`
+            // whenever a subaccount is created, funded, written, or loaded
+            // writable; a read-only load borrows it immutably and never sets the
+            // flag. Draining an unchanged subaccount would re-store an identical
+            // payload and, for a subaccount that never existed on-chain,
+            // resurrect an all-default tombstone. The unchanged subaccount is
+            // still surfaced to the receipt by owner-facing key only.
+            if !sub_touched.get(idx).copied().unwrap_or(false) {
+                unchanged_subaccounts.push(shared.key);
+                continue;
+            }
             let private = (*private_box).into_inner();
-            let storage_address = Pubkey::new_from_array(
-                solana_sha256_hasher::hashv(&[&[1u8], shared.key.as_ref()]).to_bytes(),
-            );
             accounts.push((
-                storage_address,
+                shared.key,
                 AccountSharedData::create_from_existing_shared_data(
                     shared.lamports,
                     private.payload,
@@ -657,18 +715,18 @@ impl TransactionAccounts {
                 ),
             ));
         }
-        accounts
+        (accounts, unchanged_subaccounts)
     }
 
     pub(crate) fn deconstruct_into_account_shared_data(&mut self) -> Vec<AccountSharedData> {
-        let shared_account_fields = std::mem::take(&mut self.shared_account_fields);
-        let private_account_fields = std::mem::take(&mut self.private_account_fields);
+        let mut shared_account_fields = std::mem::take(&mut self.shared_account_fields);
+        let mut private_account_fields = std::mem::take(&mut self.private_account_fields);
         let mut accounts: Vec<_> = shared_account_fields
-            .into_iter()
-            .zip(private_account_fields)
+            .iter_mut()
+            .zip(private_account_fields.iter_mut())
             .map(|(shared_fields_cell, private_fields_cell)| {
-                let shared_fields = shared_fields_cell.into_inner();
-                let private_fields = private_fields_cell.into_inner();
+                let shared_fields = shared_fields_cell.get_mut();
+                let private_fields = private_fields_cell.get_mut();
                 AccountSharedData::create_from_existing_shared_data(
                     shared_fields.lamports,
                     private_fields.payload.clone(),
@@ -678,11 +736,21 @@ impl TransactionAccounts {
                 )
             })
             .collect();
-        // F10 W10: mirror the keyed variant so mock_process_instruction sees
-        // subaccount state instead of dropping it.
+        // F10 W10: mirror the keyed variant — drain subaccount lane so
+        // mock_process_instruction (and any other no-keys deconstruct consumer)
+        // sees subaccount state instead of dropping it. Same dirty filter: skip
+        // subaccounts that were never modified.
         let sub_shared = std::mem::take(&mut *self.subaccount_shared_fields.borrow_mut());
         let sub_private = std::mem::take(&mut *self.subaccount_private_fields.borrow_mut());
-        for (shared_box, private_box) in sub_shared.into_iter().zip(sub_private.into_iter()) {
+        let sub_touched = std::mem::take(&mut *self.touched_subaccounts.borrow_mut());
+        for (idx, (shared_box, private_box)) in sub_shared
+            .into_iter()
+            .zip(sub_private.into_iter())
+            .enumerate()
+        {
+            if !sub_touched.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
             let shared = (*shared_box).into_inner();
             let private = (*private_box).into_inner();
             accounts.push(AccountSharedData::create_from_existing_shared_data(
@@ -697,8 +765,14 @@ impl TransactionAccounts {
     }
 
     pub(crate) fn take(mut self) -> DeconstructedTransactionAccounts {
-        let shared_data = self.deconstruct_into_keyed_account_shared_data();
-        (shared_data, self.touched_flags, self.resize_delta)
+        let (shared_data, unchanged_subaccounts) =
+            self.deconstruct_into_keyed_account_shared_data();
+        (
+            shared_data,
+            unchanged_subaccounts,
+            self.touched_flags,
+            self.resize_delta,
+        )
     }
 
     pub fn resize_delta(&self) -> i64 {

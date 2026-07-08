@@ -1,12 +1,10 @@
 use {
     crate::{
         IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION, MAX_ACCOUNT_DATA_LEN,
-        MAX_ACCOUNTS_PER_INSTRUCTION, MAX_ACCOUNTS_PER_TRANSACTION, SUBACCOUNT_MARKER,
+        MAX_ACCOUNTS_PER_TRANSACTION, MAX_SUBACCOUNTS_PER_TRANSACTION,
         instruction::{InstructionContext, InstructionFrame},
         instruction_accounts::InstructionAccount,
-        transaction_accounts::{
-            AccountRef, AccountRefMut, KeyedAccountSharedData, TransactionAccounts,
-        },
+        transaction_accounts::{KeyedAccountSharedData, TransactionAccounts},
         vm_addresses::{
             GUEST_INSTRUCTION_DATA_BASE_ADDRESS, GUEST_REGION_SIZE, RETURN_DATA_SCRATCHPAD,
         },
@@ -75,15 +73,6 @@ pub struct TransactionContext<'ix_data> {
     /// Each entry in `instruction_data` represents the data for instruction at the corresponding
     /// index.
     instruction_data: Vec<Cow<'ix_data, [u8]>>,
-    /// F10 subaccount lane, parallel to `instruction_accounts`. Each entry is
-    /// the CPI subaccount list for the instruction at the corresponding trace
-    /// index. Each `InstructionAccount`'s `index_in_transaction` carries the
-    /// `SUBACCOUNT_MARKER` high bit.
-    subaccounts: Vec<Box<[InstructionAccount]>>,
-    /// F10 dedup map parallel to `subaccounts`: indexed by
-    /// (subaccount_index & !SUBACCOUNT_MARKER), values are positions within the
-    /// instruction's subaccount list (u16::MAX when unused).
-    dedup_subaccounts: Vec<Box<[u16]>>,
 }
 
 #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
@@ -119,8 +108,6 @@ impl<'ix_data> TransactionContext<'ix_data> {
             instruction_accounts: Vec::with_capacity(instruction_trace_capacity),
             deduplication_maps: Vec::with_capacity(instruction_trace_capacity),
             instruction_data: Vec::with_capacity(instruction_trace_capacity),
-            subaccounts: Vec::with_capacity(instruction_trace_capacity),
-            dedup_subaccounts: Vec::with_capacity(instruction_trace_capacity),
         }
     }
 
@@ -184,26 +171,10 @@ impl<'ix_data> TransactionContext<'ix_data> {
         if self.find_index_of_subaccount(&pubkey).is_some() {
             return Err(InstructionError::DuplicateAccountIndex);
         }
-        if (self.accounts.number_of_subaccounts() as usize) >= MAX_ACCOUNTS_PER_TRANSACTION {
+        if (self.accounts.number_of_subaccounts() as usize) >= MAX_SUBACCOUNTS_PER_TRANSACTION {
             return Err(InstructionError::MaxAccountsExceeded);
         }
         Ok(self.accounts.add_subaccount(pubkey, account))
-    }
-
-    /// F10: borrow a subaccount by its (unmarked) index — read-only view.
-    pub fn try_borrow_subaccount(
-        &self,
-        index: IndexOfAccount,
-    ) -> Result<AccountRef<'_>, InstructionError> {
-        self.accounts.try_borrow_subaccount(index)
-    }
-
-    /// F10: borrow a subaccount mutably by its (unmarked) index.
-    pub fn try_borrow_mut_subaccount(
-        &self,
-        index: IndexOfAccount,
-    ) -> Result<AccountRefMut<'_>, InstructionError> {
-        self.accounts.try_borrow_mut_subaccount(index)
     }
 
     /// Gets the max length of the instruction trace
@@ -245,16 +216,6 @@ impl<'ix_data> TransactionContext<'ix_data> {
             .get(index_in_trace)
             .map(|item| item.as_ref())
             .unwrap_or_default();
-        let subaccounts = self
-            .subaccounts
-            .get(index_in_trace)
-            .map(|item| item.as_ref())
-            .unwrap_or_default();
-        let dedup_subaccounts = self
-            .dedup_subaccounts
-            .get(index_in_trace)
-            .map(|item| item.as_ref())
-            .unwrap_or_default();
         Ok(InstructionContext {
             transaction_context: self,
             index_in_trace,
@@ -264,8 +225,6 @@ impl<'ix_data> TransactionContext<'ix_data> {
             dedup_map,
             instruction_data,
             index_of_caller_instruction: instruction.index_of_caller_instruction as usize,
-            subaccounts,
-            dedup_subaccounts,
         })
     }
 
@@ -325,10 +284,6 @@ impl<'ix_data> TransactionContext<'ix_data> {
     }
 
     /// Configures an instruction at a specific index in trace.
-    ///
-    /// F10: `subaccounts` is the CPI subaccount list for this instruction. Top-level
-    /// invokes and regular (non-subaccount-bearing) CPIs pass `Vec::new()`. The
-    /// dedup map over the subaccount lane is built here.
     pub fn configure_instruction_at_index(
         &mut self,
         instruction_index: usize,
@@ -337,27 +292,8 @@ impl<'ix_data> TransactionContext<'ix_data> {
         deduplication_map: Vec<u16>,
         instruction_data: Cow<'ix_data, [u8]>,
         caller_index: Option<u16>,
-        subaccounts: Vec<InstructionAccount>,
     ) -> Result<(), InstructionError> {
         debug_assert_eq!(deduplication_map.len(), MAX_ACCOUNTS_PER_TRANSACTION);
-        if subaccounts.len() > MAX_ACCOUNTS_PER_INSTRUCTION {
-            return Err(InstructionError::MissingAccount);
-        }
-        let mut dedup_subaccounts = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
-        let number_of_subaccounts = self.accounts.number_of_subaccounts() as usize;
-        for (position, subaccount) in subaccounts.iter().enumerate() {
-            let index_in_transaction = subaccount.index_in_transaction & !SUBACCOUNT_MARKER;
-            if (index_in_transaction as usize) >= number_of_subaccounts {
-                return Err(InstructionError::MissingAccount);
-            }
-            let slot = dedup_subaccounts
-                .get_mut(index_in_transaction as usize)
-                .ok_or(InstructionError::MissingAccount)?;
-            if *slot == u16::MAX {
-                *slot = position as u16;
-            }
-        }
-
         let instruction = self
             .instruction_trace
             .get_mut(instruction_index)
@@ -390,9 +326,6 @@ impl<'ix_data> TransactionContext<'ix_data> {
         self.instruction_accounts
             .push(instruction_accounts.into_boxed_slice());
         self.instruction_data.push(instruction_data);
-        self.subaccounts.push(subaccounts.into_boxed_slice());
-        self.dedup_subaccounts
-            .push(dedup_subaccounts.into_boxed_slice());
         Ok(())
     }
 
@@ -427,7 +360,6 @@ impl<'ix_data> TransactionContext<'ix_data> {
             dedup_map,
             Cow::Owned(instruction_data),
             None,
-            Vec::new(),
         )?;
         Ok(())
     }
@@ -450,7 +382,6 @@ impl<'ix_data> TransactionContext<'ix_data> {
             dedup_map,
             Cow::Owned(instruction_data),
             Some(caller_index as u16),
-            Vec::new(),
         )?;
         Ok(())
     }
@@ -683,6 +614,10 @@ pub struct TransactionReturnData {
 #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 pub struct ExecutionRecord {
     pub accounts: Vec<KeyedAccountSharedData>,
+    /// F10/PRS-155: owner-facing keys of subaccounts touched read-only this
+    /// transaction (drained out of the persisted `accounts` lane by the dirty
+    /// filter). Reported in the receipt by owner address only.
+    pub unchanged_subaccount_addresses: Vec<Pubkey>,
     pub return_data: TransactionReturnData,
     pub touched_account_count: u64,
     pub accounts_resize_delta: i64,
@@ -692,9 +627,10 @@ pub struct ExecutionRecord {
 #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl From<TransactionContext<'_>> for ExecutionRecord {
     fn from(context: TransactionContext) -> Self {
-        let (accounts, touched_flags, resize_delta) = Rc::try_unwrap(context.accounts)
-            .expect("transaction_context.accounts has unexpected outstanding refs")
-            .take();
+        let (accounts, unchanged_subaccount_addresses, touched_flags, resize_delta) =
+            Rc::try_unwrap(context.accounts)
+                .expect("transaction_context.accounts has unexpected outstanding refs")
+                .take();
         let touched_account_count = touched_flags
             .iter()
             .fold(0usize, |accumulator, was_touched| {
@@ -708,6 +644,7 @@ impl From<TransactionContext<'_>> for ExecutionRecord {
 
         Self {
             accounts,
+            unchanged_subaccount_addresses,
             return_data,
             touched_account_count,
             accounts_resize_delta: Cell::into_inner(resize_delta),
@@ -938,7 +875,6 @@ mod tests {
                 vec![0; MAX_ACCOUNTS_PER_TRANSACTION],
                 Vec::new().into(),
                 None,
-                Vec::new(),
             )
             .unwrap();
 
@@ -1285,7 +1221,6 @@ mod tests {
                 vec![u16::MAX; 256],
                 Cow::Owned(Vec::new()),
                 None,
-                Vec::new(),
             )
             .unwrap();
         transaction_context.push().unwrap();
@@ -1307,7 +1242,6 @@ mod tests {
                 vec![u16::MAX; 256],
                 Cow::Owned(Vec::new()),
                 None,
-                Vec::new(),
             )
             .unwrap();
         transaction_context.push().unwrap();
