@@ -11,7 +11,9 @@ use {
     },
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction::sanitized::SanitizedTransaction,
-    solana_transaction_context::transaction_accounts::KeyedAccountSharedData,
+    solana_transaction_context::{
+        subaccount_storage_address, transaction_accounts::KeyedAccountSharedData,
+    },
 };
 
 // Used to approximate how many accounts will be calculated for storage so that
@@ -53,7 +55,11 @@ pub fn collect_accounts_to_store<'a, T: SVMMessage>(
     txs_refs: &'a Option<Vec<impl Borrow<SanitizedTransaction>>>,
     processing_results: &'a [TransactionProcessingResult],
 ) -> (
-    Vec<(&'a Pubkey, &'a AccountSharedData)>,
+    // F10/PRS-314: owned `Pubkey` (not `&Pubkey`) so subaccount tail entries
+    // can carry the derived `subaccount_storage_address(owner)` — that key is
+    // computed inline and has no stable backing storage. `Pubkey` is a 32-byte
+    // `Copy`, so non-subaccount entries are dereferenced for free.
+    Vec<(Pubkey, &'a AccountSharedData)>,
     Option<Vec<&'a SanitizedTransaction>>,
 ) {
     let collect_capacity = max_number_of_accounts_to_collect(txs, processing_results);
@@ -102,7 +108,7 @@ pub fn collect_accounts_to_store<'a, T: SVMMessage>(
 }
 
 fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
-    collected_accounts: &mut Vec<(&'a Pubkey, &'a AccountSharedData)>,
+    collected_accounts: &mut Vec<(Pubkey, &'a AccountSharedData)>,
     collected_account_transactions: &mut Option<Vec<&'a SanitizedTransaction>>,
     transaction: &'a T,
     transaction_ref: Option<&'a SanitizedTransaction>,
@@ -121,24 +127,29 @@ fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
             continue;
         }
 
-        collected_accounts.push((address, account));
+        collected_accounts.push((*address, account));
         if let Some(collected_account_transactions) = collected_account_transactions {
             collected_account_transactions
                 .push(transaction_ref.expect("transaction ref must exist if collecting"));
         }
     }
 
-    // F10 W10: subaccount lane entries appended by
+    // F10 W10 / PRS-314: subaccount lane entries appended by
     // `TransactionAccounts::deconstruct_into_keyed_account_shared_data` sit
-    // after `transaction.account_keys().len()`. They are always writable and
-    // not part of the original tx account list, so the `is_writable` /
-    // `is_invoked` checks above do not apply — persist them unconditionally so
-    // accounts-db carries subaccount state to subsequent transactions.
-    for (address, account) in transaction_accounts
+    // after `transaction.account_keys().len()` and are keyed by the
+    // owner-facing pubkey. Apply `subaccount_storage_address` here at the
+    // accounts-db boundary so the on-disk entry lives under the hashed address
+    // (preventing collisions with regular user accounts) while the lane stays
+    // addressable by owner pubkey for the recipe / balance collector. They are
+    // always writable and not part of the original tx account list, so the
+    // `is_writable` / `is_invoked` checks above do not apply — persist them
+    // unconditionally so accounts-db carries subaccount state to subsequent
+    // transactions.
+    for (owner_address, account) in transaction_accounts
         .iter()
         .skip(transaction.account_keys().len())
     {
-        collected_accounts.push((address, account));
+        collected_accounts.push((subaccount_storage_address(owner_address), account));
         if let Some(collected_account_transactions) = collected_account_transactions {
             collected_account_transactions
                 .push(transaction_ref.expect("transaction ref must exist if collecting"));
@@ -147,13 +158,13 @@ fn collect_accounts_for_successful_tx<'a, T: SVMMessage>(
 }
 
 fn collect_accounts_for_failed_tx<'a>(
-    collected_accounts: &mut Vec<(&'a Pubkey, &'a AccountSharedData)>,
+    collected_accounts: &mut Vec<(Pubkey, &'a AccountSharedData)>,
     collected_account_transactions: &mut Option<Vec<&'a SanitizedTransaction>>,
     transaction_ref: Option<&'a SanitizedTransaction>,
     rollback_accounts: &'a RollbackAccounts,
 ) {
     for (address, account) in rollback_accounts {
-        collected_accounts.push((address, account));
+        collected_accounts.push((*address, account));
         if let Some(collected_account_transactions) = collected_account_transactions {
             collected_account_transactions
                 .push(transaction_ref.expect("transaction ref must exist if collecting"));
@@ -294,12 +305,12 @@ mod tests {
             assert!(
                 collected_accounts
                     .iter()
-                    .any(|(pubkey, _account)| *pubkey == &keypair0.pubkey())
+                    .any(|(pubkey, _account)| *pubkey == keypair0.pubkey())
             );
             assert!(
                 collected_accounts
                     .iter()
-                    .any(|(pubkey, _account)| *pubkey == &keypair1.pubkey())
+                    .any(|(pubkey, _account)| *pubkey == keypair1.pubkey())
             );
 
             if collect_transactions {
@@ -362,7 +373,7 @@ mod tests {
             assert_eq!(
                 collected_accounts
                     .iter()
-                    .find(|(pubkey, _account)| *pubkey == &from_address)
+                    .find(|(pubkey, _account)| *pubkey == from_address)
                     .map(|(_pubkey, account)| *account)
                     .cloned()
                     .unwrap(),
@@ -454,7 +465,7 @@ mod tests {
             assert_eq!(
                 collected_accounts
                     .iter()
-                    .find(|(pubkey, _account)| *pubkey == &from_address)
+                    .find(|(pubkey, _account)| *pubkey == from_address)
                     .map(|(_pubkey, account)| *account)
                     .cloned()
                     .unwrap(),
@@ -462,7 +473,7 @@ mod tests {
             );
             let collected_nonce_account = collected_accounts
                 .iter()
-                .find(|(pubkey, _account)| *pubkey == &nonce_address)
+                .find(|(pubkey, _account)| *pubkey == nonce_address)
                 .map(|(_pubkey, account)| *account)
                 .cloned()
                 .unwrap();
@@ -560,7 +571,7 @@ mod tests {
             assert_eq!(collected_accounts.len(), 1);
             let collected_nonce_account = collected_accounts
                 .iter()
-                .find(|(pubkey, _account)| *pubkey == &nonce_address)
+                .find(|(pubkey, _account)| *pubkey == nonce_address)
                 .map(|(_pubkey, account)| *account)
                 .cloned()
                 .unwrap();
@@ -619,7 +630,7 @@ mod tests {
             assert_eq!(
                 collected_accounts
                     .iter()
-                    .find(|(pubkey, _account)| *pubkey == &from_address)
+                    .find(|(pubkey, _account)| *pubkey == from_address)
                     .map(|(_pubkey, account)| *account)
                     .cloned()
                     .unwrap(),

@@ -217,6 +217,49 @@ impl<'a: 'b, 'b> StorableAccounts<'a> for (Slot, &'b [(&'a Pubkey, &'a AccountSh
     }
 }
 
+// F10/PRS-314: owned `Pubkey` + borrowed `AccountSharedData` so callers like
+// `account_saver::collect_accounts_to_store` can emit derived addresses
+// (e.g. `subaccount_storage_address(owner)`) without backing storage for the
+// derived key. Mirrors the borrowed/borrowed impl above but carries the key
+// by value; the borrowed `AccountSharedData` avoids cloning the payload.
+impl<'a: 'b, 'b> StorableAccounts<'a> for (Slot, &'b [(Pubkey, &'a AccountSharedData)]) {
+    fn account<Ret>(
+        &self,
+        index: usize,
+        mut callback: impl for<'local> FnMut(AccountForStorage<'local>) -> Ret,
+    ) -> Ret {
+        callback((&self.1[index].0, self.1[index].1).into())
+    }
+    fn account_for_geyser<Ret>(
+        &self,
+        index: usize,
+        mut callback: impl for<'local> FnMut(&'local Pubkey, &'local AccountSharedData) -> Ret,
+    ) -> Ret {
+        let pubkey = self.pubkey(index);
+        let account = self.1[index].1;
+        callback(pubkey, account)
+    }
+    fn is_zero_lamport(&self, index: usize) -> bool {
+        self.1[index].1.is_zero_lamport()
+    }
+    fn data_len(&self, index: usize) -> usize {
+        self.1[index].1.data().len()
+    }
+    fn pubkey(&self, index: usize) -> &Pubkey {
+        &self.1[index].0
+    }
+    fn slot(&self, _index: usize) -> Slot {
+        // per-index slot is not unique per slot when per-account slot is not included in the source data
+        self.target_slot()
+    }
+    fn target_slot(&self) -> Slot {
+        self.0
+    }
+    fn len(&self) -> usize {
+        self.1.len()
+    }
+}
+
 impl<'a: 'b, 'b> StorableAccounts<'a> for (Slot, &'b [(Pubkey, AccountSharedData)]) {
     fn account<Ret>(
         &self,

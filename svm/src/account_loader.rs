@@ -33,7 +33,9 @@ use {
     solana_svm_callback::{AccountState, TransactionProcessingCallback},
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_transaction::svm_message::SVMMessage,
-    solana_transaction_context::{IndexOfAccount, transaction_accounts::KeyedAccountSharedData},
+    solana_transaction_context::{
+        subaccount_storage_address, transaction_accounts::KeyedAccountSharedData, IndexOfAccount,
+    },
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     std::num::NonZeroU32,
 };
@@ -326,6 +328,21 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
 
             self.loaded_accounts
                 .insert(*address, (account.clone(), current_slot));
+        }
+        // F10/PRS-314: subaccount tail is keyed by the owner-facing pubkey;
+        // accounts-db addresses subaccounts by
+        // `subaccount_storage_address(owner)`, so apply the transform here at
+        // the cache-write boundary so subsequent
+        // `load_account(&subaccount_storage_address(owner))` calls hit
+        // post-execution state.
+        for (owner_address, account) in transaction_accounts
+            .iter()
+            .skip(message.account_keys().len())
+        {
+            self.loaded_accounts.insert(
+                subaccount_storage_address(owner_address),
+                (account.clone(), current_slot),
+            );
         }
     }
 }
