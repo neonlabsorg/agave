@@ -13,9 +13,10 @@ use {
 pub fn compile_collected_balances(
     balance_collector: BalanceCollector,
 ) -> (TransactionBalancesSet, TransactionTokenBalancesSet) {
-    // F10/PRS-314: `into_vecs` now also yields the per-tx subaccount owner-key
-    // lane; the ledger balance set does not surface it, so drop it here.
-    let (native_pre, native_post, token_pre, token_post, _subaccount_keys) =
+    // F10/PRS-314 + PRS-155: `into_vecs` now also yields the per-tx subaccount
+    // owner-key lanes (changed + unchanged); the ledger balance set does not
+    // surface them, so drop both here.
+    let (native_pre, native_post, token_pre, token_post, _subaccount_keys, _unchanged_subaccount_keys) =
         balance_collector.into_vecs();
 
     let native_balances = TransactionBalancesSet::new(native_pre, native_post);
@@ -146,6 +147,7 @@ mod tests {
             token_pre,
             token_post,
             subaccount_keys: vec![],
+            unchanged_subaccount_keys: vec![],
         };
 
         let (actual_native, actual_token) = compile_collected_balances(balance_collector);

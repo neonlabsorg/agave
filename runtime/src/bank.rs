@@ -3538,6 +3538,7 @@ impl Bank {
                         mut token_pre,
                         mut token_post,
                         _subaccount_keys,
+                        _unchanged_subaccount_keys,
                     ) = balance_collector.into_vecs();
 
                     (

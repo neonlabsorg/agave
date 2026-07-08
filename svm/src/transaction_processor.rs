@@ -611,21 +611,29 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             // subaccounts the program actually touched. For failed/non-executed
             // transactions, subaccount changes are rolled back, so we pass an
             // empty slice.
-            let subaccount_lane: &[_] = match &processing_result {
+            // R2.4/F10/PRS-155: also expose the read-only (unchanged)
+            // subaccounts — owner keys only, no balances — so the receipt can
+            // list them in a separate lane. Rolled back on failed/non-executed
+            // txs, so empty there.
+            let (subaccount_lane, unchanged_subaccounts): (&[_], &[_]) = match &processing_result {
                 Ok(ProcessedTransaction::Executed(executed_tx)) if executed_tx.was_successful() => {
                     let head = tx.account_keys().len();
-                    executed_tx
-                        .loaded_transaction
-                        .accounts
-                        .get(head..)
-                        .unwrap_or(&[])
+                    (
+                        executed_tx
+                            .loaded_transaction
+                            .accounts
+                            .get(head..)
+                            .unwrap_or(&[]),
+                        &executed_tx.execution_details.unchanged_subaccount_addresses,
+                    )
                 }
-                _ => &[],
+                _ => (&[], &[]),
             };
             let ((), collect_balances_us) = measure_us!(balance_collector.collect_post_balances(
                 &mut account_loader,
                 tx,
                 subaccount_lane,
+                unchanged_subaccounts,
             ));
             execute_timings
                 .saturating_add_in_place(ExecuteTimingType::CollectBalancesUs, collect_balances_us);
@@ -1133,10 +1141,11 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
             return_data,
             touched_account_count,
             accounts_resize_delta: accounts_data_len_delta,
-            // R1.4/DEFER-R2: subaccount receipt plumbing (unchanged-subaccount
-            // addresses) is not wired yet — ignore the field for now so the
-            // OLD glue keeps compiling against R1.1's widened ExecutionRecord.
-            unchanged_subaccount_addresses: _,
+            // R2.4/F10/PRS-155: owner-facing keys of subaccounts accessed but
+            // left unchanged this tx. Carried onto the execution details as
+            // receipt-only metadata (never committed) so the balance collector
+            // can list them in the receipt's unchanged lane.
+            unchanged_subaccount_addresses,
         } = execution_record;
 
         if status.is_ok()
@@ -1171,6 +1180,10 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
                 return_data,
                 executed_units,
                 accounts_data_len_delta,
+                // R2.4/F10/PRS-155: read-only subaccounts (owner keys only)
+                // carried as receipt metadata so the balance collector can list
+                // them in the receipt's unchanged lane. Never committed.
+                unchanged_subaccount_addresses,
             },
             loaded_transaction,
             programs_modified_by_tx: program_cache_for_tx_batch.drain_modified_entries(),

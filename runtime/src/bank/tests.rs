@@ -245,6 +245,7 @@ fn new_executed_processing_result(
                 return_data: None,
                 executed_units: 0,
                 accounts_data_len_delta: 0,
+                unchanged_subaccount_addresses: Vec::new(),
             },
             programs_modified_by_tx: HashMap::new(),
         },
@@ -4848,7 +4849,7 @@ fn test_pre_post_transaction_balances() {
         None,
     );
 
-    let (native_pre, native_post, _, _, _) = balance_collector.unwrap().into_vecs();
+    let (native_pre, native_post, _, _, _, _) = balance_collector.unwrap().into_vecs();
     let transaction_balances_set = TransactionBalancesSet::new(native_pre, native_post);
 
     assert_eq!(transaction_balances_set.pre_balances.len(), 3);
