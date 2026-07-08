@@ -265,7 +265,7 @@ impl TxMeta {
             rebalance_locked: false,
             active_balancing_weight: 0,
             expire_queue_holder: None,
-            retries: 0
+            retries: 0,
         }
     }
 
@@ -996,6 +996,7 @@ struct SLotStatCollectorState {
     first_send_at: Option<Instant>,
     // Txs sent to workers while the bank was not yet installed (LEADER_STARTING).
     prefill_sent: usize,
+    dead: bool
 }
 
 impl SLotStatCollectorState {
@@ -1011,6 +1012,7 @@ impl SLotStatCollectorState {
             ready_at: None,
             first_send_at: None,
             prefill_sent: 0,
+            dead: false
         }
     }
 
@@ -1021,6 +1023,7 @@ impl SLotStatCollectorState {
         self.ready_at = None;
         self.first_send_at = None;
         self.prefill_sent = 0;
+        self.dead = false;
         for i in 0..self.underflow.len() {
             self.underflow[i] = 0;
             self.sent_txs[i] = 0;
@@ -1112,8 +1115,25 @@ impl SlotStatCollector {
         }
     }
 
+    fn mark_dead(&mut self, worker: usize) {
+        let slot = self.worker_send_slot[worker];
+        for state in self.states.iter_mut().rev() {
+            if state.slot == slot {
+                state.dead = true;
+                return;
+            }
+        }
+        panic!("unknown slot {slot}");
+    }
+
     fn can_send(&mut self, worker: usize) -> bool {
-        let slot = self.states.back().unwrap().slot;
+        let slot = {
+            let state = self.states.back().unwrap();
+            if state.dead {
+                return false;
+            }
+            state.slot
+        };
         let old_slot = self.worker_send_slot[worker];
         if old_slot != slot {
             if self.inflight_txs[worker] == 0 {
@@ -1418,6 +1438,7 @@ fn main() {
                         reschedules += 1;
                         reschedule_reason[4] += 1;
                         // no proper execution slot here so use the current fixed slot
+                        slot_stats.mark_dead(worker);
                         slot_stats.account_dropped(worker);
                         TxDecision::Keep // max_working_slot violation
                     }
