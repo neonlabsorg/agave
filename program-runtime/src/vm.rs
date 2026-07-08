@@ -7,7 +7,7 @@ use {
         execution_budget::MAX_INSTRUCTION_STACK_DEPTH,
         invoke_context::{
             BpfAllocator, InvokeContext, SerializedAccountMetadata, SubaccountSlot,
-            SyscallContext, UntypedVmSlice,
+            SyscallContext,
         },
         mem_pool::VmMemoryPool,
         serialization, stable_log,
@@ -53,7 +53,6 @@ pub fn create_vm<'a, 'b>(
     program: &'a Executable<InvokeContext<'b, 'b>>,
     regions: Vec<MemoryRegion>,
     accounts_metadata: Vec<SerializedAccountMetadata>,
-    subaccounts_metadata: Vec<SerializedAccountMetadata>,
     subaccount_slots: Vec<SubaccountSlot>,
     invoke_context: &'a mut InvokeContext<'b, 'b>,
     stack: &mut [u8],
@@ -75,13 +74,10 @@ pub fn create_vm<'a, 'b>(
     invoke_context.set_syscall_context(SyscallContext {
         allocator: BpfAllocator::new(heap_size as u64),
         accounts_metadata,
-        // F10: serialize_parameters populates subaccounts_metadata/subaccount_slots
-        // only when the instruction carries subaccounts; otherwise they are empty.
-        subaccounts_metadata,
-        subaccounts_infos: UntypedVmSlice::default(),
+        // F10: serialize_parameters populates subaccount_slots only when the
+        // aligned loader reserves them; otherwise this is empty.
         subaccount_slots,
         trace_log: Vec::new(),
-        dynamic_cpi_accounts: Vec::new(),
     })?;
     Ok(EbpfVm::new(
         program.get_loader().clone(),
@@ -134,7 +130,7 @@ fn create_memory_mapping<'a, C: ContextObject>(
 /// Create the SBF virtual machine
 #[macro_export]
 macro_rules! create_vm {
-    ($vm:ident, $program:expr, $regions:expr, $accounts_metadata:expr, $subaccounts_metadata:expr, $subaccount_slots:expr, $invoke_context:expr $(,)?) => {
+    ($vm:ident, $program:expr, $regions:expr, $accounts_metadata:expr, $subaccount_slots:expr, $invoke_context:expr $(,)?) => {
         let invoke_context = &*$invoke_context;
         let stack_size = $program.get_config().stack_size();
         let heap_size = invoke_context.get_compute_budget().heap_size;
@@ -150,7 +146,6 @@ macro_rules! create_vm {
                 $program,
                 $regions,
                 $accounts_metadata,
-                $subaccounts_metadata,
                 $subaccount_slots,
                 $invoke_context,
                 stack
@@ -228,26 +223,19 @@ pub fn execute<'a, 'b: 'a>(
         .direct_account_pointers_in_program_input;
 
     let mut serialize_time = Measure::start("serialize");
-    let (
-        parameter_bytes,
-        regions,
-        accounts_metadata,
-        subaccounts_metadata,
-        subaccount_slots,
-        instruction_data_offset,
-    ) = serialization::serialize_parameters(
-        &instruction_context,
-        virtual_address_space_adjustments,
-        account_data_direct_mapping,
-        direct_account_pointers_in_program_input,
-    )?;
+    let (parameter_bytes, regions, accounts_metadata, subaccount_slots, instruction_data_offset) =
+        serialization::serialize_parameters(
+            &instruction_context,
+            virtual_address_space_adjustments,
+            account_data_direct_mapping,
+            direct_account_pointers_in_program_input,
+        )?;
     serialize_time.stop();
 
     // save the account addresses so in case we hit an AccessViolation error we
     // can map to a more specific error
     let account_region_addrs = accounts_metadata
         .iter()
-        .chain(subaccounts_metadata.iter())
         .map(|m| {
             let vm_end = m
                 .vm_data_addr
@@ -261,10 +249,6 @@ pub fn execute<'a, 'b: 'a>(
         })
         .collect::<Vec<_>>();
 
-    // F10: number of main-account regions, captured before `accounts_metadata`
-    // is moved into `create_vm!`, so the AccessViolation handler below can route
-    // region indices >= this count through the subaccount lane.
-    let n_main_account_regions = accounts_metadata.len();
     let mut create_vm_time = Measure::start("create_vm");
     let execution_result = {
         let compute_meter_prev = invoke_context.get_remaining();
@@ -273,7 +257,6 @@ pub fn execute<'a, 'b: 'a>(
             executable,
             regions,
             accounts_metadata,
-            subaccounts_metadata,
             subaccount_slots,
             invoke_context
         );
@@ -365,30 +348,82 @@ pub fn execute<'a, 'b: 'a>(
                         // If virtual_address_space_adjustments is enabled and a program tries to write to a readonly
                         // region we'll get a memory access violation. Map it to a more specific
                         // error so it's easier for developers to see what happened.
-                        if let Some((instruction_account_index, vm_addr_range)) =
-                            account_region_addrs
-                                .iter()
-                                .enumerate()
-                                .find(|(_, vm_addr_range)| vm_addr_range.contains(&vm_addr))
-                        {
+                        // The faulting address can fall inside a regular
+                        // instruction account's region or inside one of the
+                        // runtime-owned subaccount slots a program loaded via
+                        // `sol_load_subaccount`. Resolve which one it is, then
+                        // borrow the matching account so we can produce the same
+                        // specific error in both cases.
+                        enum FaultingRegion {
+                            Account(IndexOfAccount),
+                            Subaccount {
+                                subaccount_index: IndexOfAccount,
+                                is_writable: bool,
+                            },
+                        }
+                        let faulting_region = account_region_addrs
+                            .iter()
+                            .enumerate()
+                            .find(|(_, vm_addr_range)| vm_addr_range.contains(&vm_addr))
+                            .map(|(instruction_account_index, vm_addr_range)| {
+                                (
+                                    FaultingRegion::Account(
+                                        instruction_account_index as IndexOfAccount,
+                                    ),
+                                    vm_addr_range.clone(),
+                                )
+                            })
+                            .or_else(|| {
+                                // Walk the occupied subaccount slots, building each
+                                // slot's reserved data range the same way
+                                // `account_region_addrs` does for accounts, and pick
+                                // the one containing the faulting address.
+                                invoke_context
+                                    .get_syscall_context()
+                                    .ok()?
+                                    .subaccount_slots
+                                    .iter()
+                                    .find_map(|slot| {
+                                        let subaccount_index =
+                                            slot.occupied_subaccount_index.get_subaccount_index()?;
+                                        let metadata = slot.caller_account_metadata.as_ref()?;
+                                        let vm_end = slot
+                                            .vm_data_addr
+                                            .saturating_add(metadata.original_data_len as u64)
+                                            .saturating_add(if !is_loader_deprecated {
+                                                MAX_PERMITTED_DATA_INCREASE as u64
+                                            } else {
+                                                0
+                                            });
+                                        let vm_addr_range = slot.vm_data_addr..vm_end;
+                                        vm_addr_range.contains(&vm_addr).then(|| {
+                                            (
+                                                FaultingRegion::Subaccount {
+                                                    subaccount_index,
+                                                    is_writable: slot.is_writable,
+                                                },
+                                                vm_addr_range,
+                                            )
+                                        })
+                                    })
+                            });
+                        if let Some((faulting_region, vm_addr_range)) = faulting_region {
                             let transaction_context = &invoke_context.transaction_context;
                             let instruction_context =
                                 transaction_context.get_current_instruction_context()?;
-                            // F10: `account_region_addrs` chains main accounts then
-                            // subaccounts; indices >= n_main_account_regions belong to
-                            // the subaccount lane and must be borrowed through
-                            // `try_borrow_subaccount` (the main lane would return
-                            // MissingAccount and mask the real classification).
-                            let account = if instruction_account_index < n_main_account_regions {
-                                instruction_context.try_borrow_instruction_account(
-                                    instruction_account_index as IndexOfAccount,
-                                )?
-                            } else {
-                                instruction_context.try_borrow_subaccount(
-                                    instruction_account_index
-                                        .saturating_sub(n_main_account_regions)
-                                        as IndexOfAccount,
-                                )?
+                            let account = match faulting_region {
+                                FaultingRegion::Account(instruction_account_index) => {
+                                    instruction_context.try_borrow_instruction_account(
+                                        instruction_account_index,
+                                    )?
+                                }
+                                FaultingRegion::Subaccount {
+                                    subaccount_index,
+                                    is_writable,
+                                } => instruction_context.try_borrow_subaccount_by_tx_index(
+                                    subaccount_index,
+                                    is_writable,
+                                )?,
                             };
                             if vm_addr.saturating_add(len) <= vm_addr_range.end {
                                 // The access was within the range of the accounts address space,
@@ -463,7 +498,6 @@ pub fn execute<'a, 'b: 'a>(
             account_data_direct_mapping,
             parameter_bytes,
             &invoke_context.get_syscall_context()?.accounts_metadata,
-            &invoke_context.get_syscall_context()?.subaccounts_metadata,
         )
     }
 

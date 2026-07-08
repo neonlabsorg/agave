@@ -171,11 +171,6 @@ impl<'a> EnvironmentConfig<'a> {
 pub struct SyscallContext {
     pub allocator: BpfAllocator,
     pub accounts_metadata: Vec<SerializedAccountMetadata>,
-    /// F10: per-instruction subaccount metadata parallel to `accounts_metadata`.
-    pub subaccounts_metadata: Vec<SerializedAccountMetadata>,
-    /// F10: pointer+length into VM memory describing the subaccount-info array
-    /// that CPI translation helpers populate at runtime.
-    pub subaccounts_infos: UntypedVmSlice,
     /// F10: pre-reserved subaccount slots populated by `sol_load_subaccount` /
     /// freed by `sol_unload_subaccount`. Each slot owns a fixed-size region in
     /// the VM input buffer that the syscall fills with a serialized subaccount
@@ -184,66 +179,93 @@ pub struct SyscallContext {
     /// PRS-103 stub: execution trace log (minimal placeholder so SyscallContext
     /// shape matches parasol-dev).
     pub trace_log: Vec<[u64; 12]>,
-    /// PRS-103 stub: dynamically-loaded CPI accounts (minimal placeholder; not
-    /// populated in this port — sol_cpi_load_account syscalls are not ported).
-    pub dynamic_cpi_accounts: Vec<DynamicCpiAccount>,
+}
+
+/// Source-language ABI of the account-view bytes a program writes into a
+/// subaccount slot's reserved view buffer. Captured by the `sol_load_subaccount_*`
+/// syscalls so the runtime can dispatch the CPI sync path to the matching
+/// `CallerAccount::from_*` decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountViewKind {
+    /// Rust SDK `solana_account_info::AccountInfo<'_>` layout.
+    Rust,
+    /// C ABI `SolAccountInfo` layout (mirrors `solana_program_runtime::cpi::SolAccountInfo`).
+    C,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OccupiedSubaccountIndex {
+    Empty,
+    Subaccount(IndexOfAccount),
+    Snapshot(IndexOfAccount),
+}
+
+impl OccupiedSubaccountIndex {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    #[inline]
+    pub fn get_subaccount_index(&self) -> Option<IndexOfAccount> {
+        match self {
+            Self::Subaccount(idx) => Some(*idx),
+            _ => None,
+        }
+    }
 }
 
 /// Per-slot bookkeeping for a `sol_load_subaccount` reservation.
 ///
 /// At VM creation `serialize_parameters_aligned` reserves
 /// [`MAX_SUBACCOUNT_SLOTS`] slots, each backed by **two** memory regions:
-/// a fixed-size header region (88 bytes, holding NON_DUP_MARKER + flags +
-/// key/owner/lamports/data_len) and a placeholder data region whose VM
-/// address is stable across the VM's lifetime but whose host-side backing
-/// is empty until `sol_load_subaccount` swaps it for one pointing at the
-/// loaded subaccount's `AccountSharedData` storage (direct mapping).
+/// a writable region containing a runtime-owned account-view buffer
+/// (`SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE` bytes for an `AccountInfo` /
+/// `SolAccountInfo`) followed by the fixed-size 88-byte header
+/// (NON_DUP_MARKER + flags + key/owner/lamports/data_len), and a placeholder
+/// data region whose VM address is stable across the VM's lifetime but
+/// whose host-side backing is empty until `sol_load_subaccount` swaps it
+/// for one pointing at the loaded subaccount's `AccountSharedData` storage
+/// (direct mapping).
 ///
-/// The syscall also accepts a caller-supplied `SolAccountInfo` pointer
-/// (`caller_account_view_addr`), fills it to point at the slot's regions,
-/// and stamps `caller_account_metadata` with the VM addresses of the
-/// individual fields — the same metadata layout the CPI sync path uses to
-/// flow state changes back to the program's view after a CPI returns.
+/// `sol_load_subaccount` returns the view buffer address through an
+/// out-pointer; the program writes its `AccountInfo` / `SolAccountInfo`
+/// there and the runtime stamps `caller_account_metadata` with the VM
+/// addresses of the individual fields — the same metadata layout the CPI
+/// sync path uses to flow state changes back to the program's view after a
+/// CPI returns.
 #[derive(Debug, Clone)]
 pub struct SubaccountSlot {
     pub buffer_position: usize,
+    /// Stable VM address of the slot's runtime-owned account-view buffer.
+    /// `sol_load_subaccount` returns this address to the program through an
+    /// out-pointer; the program writes its `AccountInfo` / `SolAccountInfo`
+    /// view here.
+    pub vm_account_view_addr: u64,
     /// Stable VM address of the slot's 88-byte header region.
     pub vm_header_addr: u64,
     /// Stable VM address of the slot's data region. Points at an empty
     /// readonly placeholder until `sol_load_subaccount` replaces it with a
     /// region backed by the on-chain `AccountSharedData`.
     pub vm_data_addr: u64,
-    /// Caller-supplied `SolAccountInfo` pointer captured by `load_subaccount`.
-    /// Zero when the slot is empty.
-    pub caller_account_view_addr: u64,
-    /// Field-pointer metadata for the caller's account view. Populated
-    /// alongside `caller_account_view_addr` so CPI sync (and end-of-
-    /// instruction flush) can locate lamports/owner/data fields in VM memory.
+    /// Field-pointer metadata for the slot's account view. Populated when
+    /// the slot is loaded so CPI sync (and end-of-instruction flush) can
+    /// locate lamports/owner/data fields in VM memory.
     pub caller_account_metadata: Option<SerializedAccountMetadata>,
-    /// `Some(index)` once the slot is occupied, naming the subaccount index
-    /// inside `TransactionAccounts` whose state the slot mirrors.
-    pub occupied_subaccount_index: Option<IndexOfAccount>,
+    /// Source-language ABI of the bytes the program wrote into the view
+    /// buffer at `vm_account_view_addr`. `Some(Rust)` when
+    /// `sol_load_subaccount_rust` loaded the slot, `Some(C)` when
+    /// `sol_load_subaccount_c` loaded it, and `None` when the slot is empty.
+    /// CPI sync uses this to dispatch between
+    /// [`crate::cpi::CallerAccount::from_account_info`] and
+    /// [`crate::cpi::CallerAccount::from_sol_account_info`].
+    pub account_view_kind: Option<AccountViewKind>,
+    /// Specify object that is mirrored by the slot, either a subaccount or
+    /// a snapshot entry (for account or subaccount).
+    pub occupied_subaccount_index: OccupiedSubaccountIndex,
     /// Writability bit recorded at `sol_load_subaccount` time. Re-install of
     /// the data region (after `sol_create_subaccount` resizes the underlying
     /// `AccountSharedData`) preserves this bit.
-    pub is_writable: bool,
-}
-
-/// F10: untyped (pointer, length) description of an array in VM memory.
-/// Parallel to `agave_syscalls::VmVmSlice<T>` but without the type parameter.
-#[derive(Default)]
-pub struct UntypedVmSlice {
-    pub vm_data_addr: u64,
-    pub vm_data_len: u64,
-}
-
-/// PRS-103 stub struct: describes a dynamically-added CPI account.
-/// Retained in shape so that PRS-103 code paths can be ported later without
-/// a second infrastructure refactor. Not populated by this F10 port.
-#[derive(Debug, Clone, Copy)]
-pub struct DynamicCpiAccount {
-    pub index_in_transaction: IndexOfAccount,
-    pub is_signer: bool,
     pub is_writable: bool,
 }
 
@@ -378,7 +400,7 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             .map(|seeds| Pubkey::create_program_address(seeds, &caller_program_id))
             .collect::<Result<Vec<Pubkey>, solana_pubkey::PubkeyError>>()
             .map_err(|e| e as u64)?;
-        self.prepare_next_cpi_instruction(instruction, &signers, Vec::new())?;
+        self.prepare_next_cpi_instruction(instruction, &signers)?;
         let mut compute_units_consumed = 0;
         self.process_instruction(&mut compute_units_consumed, &mut ExecuteTimings::default())?;
         Ok(())
@@ -390,7 +412,6 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
         &mut self,
         instruction: Instruction,
         signers: &[Pubkey],
-        subaccounts: Vec<InstructionAccount>,
     ) -> Result<(), InstructionError> {
         // We reference accounts by an u8 index, so we have a total of 256 accounts.
         let mut transaction_callee_map: Vec<u16> = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
@@ -529,7 +550,6 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             transaction_callee_map,
             Cow::Owned(instruction.data),
             Some(caller_index as u16),
-            subaccounts,
         )?;
         Ok(())
     }
@@ -574,7 +594,6 @@ impl<'a, 'ix_data> InvokeContext<'a, 'ix_data> {
             transaction_callee_map,
             Cow::Borrowed(data),
             None,
-            Vec::new(),
         )?;
         Ok(())
     }

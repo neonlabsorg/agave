@@ -1,8 +1,7 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use {
-    crate::invoke_context::{SerializedAccountMetadata, SubaccountSlot},
-    solana_account::{ReadableAccount, WritableAccount},
+    crate::invoke_context::{OccupiedSubaccountIndex, SerializedAccountMetadata, SubaccountSlot},
     solana_instruction::error::InstructionError,
     solana_program_entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, NON_DUP_MARKER},
     solana_pubkey::Pubkey,
@@ -32,6 +31,12 @@ pub const MAX_SUBACCOUNT_SLOTS: usize = 16;
 ///   padding (4) + key (32) + owner (32) + lamports (8) + data_len (8).
 pub const SUBACCOUNT_SLOT_HEADER_SIZE: usize = 88;
 
+/// F10: bytes reserved at the start of each subaccount slot for the program's
+/// account-view buffer (enough for an `AccountInfo` / `SolAccountInfo`).
+/// Inlined here (decision 1): the `solana-program-subaccount` SDK crate is
+/// intentionally absent from this port, so the constant is defined directly.
+pub const SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE: usize = 56;
+
 /// F10: VM address space reserved per slot's data region. The slot's data
 /// region starts as an empty readonly placeholder; `sol_load_subaccount`
 /// swaps it for a region pointing at the on-chain `AccountSharedData`. The
@@ -56,13 +61,11 @@ pub const SLOT_HEADER_OFFSET_DATA_LEN: u64 = 80;
 /// Return shape of `serialize_parameters` and its aligned/unaligned helpers.
 ///
 /// Fields, in order: the VM input buffer, its memory regions, per-account
-/// metadata, F10 per-subaccount metadata (empty until subaccount syscalls
-/// wire in), F10 reserved subaccount slots that `sol_load_subaccount` can
+/// metadata, F10 reserved subaccount slots that `sol_load_subaccount` can
 /// populate at runtime, and the instruction-data offset in the buffer.
 type SerializedParameters = (
     AlignedMemory<HOST_ALIGN>,
     Vec<MemoryRegion>,
-    Vec<SerializedAccountMetadata>,
     Vec<SerializedAccountMetadata>,
     Vec<SubaccountSlot>,
     usize,
@@ -326,24 +329,6 @@ pub fn serialize_parameters(
         // time it's iterated on.
         .collect::<Vec<_>>();
 
-    // F10: build the subaccount serialize list (empty unless the instruction
-    // registered subaccounts via `sol_create_subaccount`/`sol_load_subaccount`).
-    let subaccounts = (0..instruction_context.get_number_of_subaccounts())
-        .map(|subaccount_index| {
-            if let Some(duplicate_position) = instruction_context
-                .is_instruction_subaccount_duplicate(subaccount_index)
-                .unwrap()
-            {
-                SerializeAccount::Duplicate(duplicate_position)
-            } else {
-                let account = instruction_context
-                    .try_borrow_subaccount(subaccount_index)
-                    .unwrap();
-                SerializeAccount::Account(subaccount_index, account)
-            }
-        })
-        .collect::<Vec<_>>();
-
     if is_loader_deprecated {
         // Used by loader-v1 (bpf_loader_deprecated)
         serialize_parameters_for_abiv0(
@@ -357,7 +342,6 @@ pub fn serialize_parameters(
         // Used by loader-v2 (bpf_loader) and loader-v3 (bpf_loader_upgradeable)
         serialize_parameters_for_abiv1(
             accounts,
-            subaccounts,
             instruction_context.get_instruction_data(),
             &program_id,
             virtual_address_space_adjustments,
@@ -384,7 +368,8 @@ pub fn flush_subaccount_slots(
     slots: &[SubaccountSlot],
 ) -> Result<(), InstructionError> {
     for slot in slots {
-        let Some(subaccount_index) = slot.occupied_subaccount_index else {
+        let OccupiedSubaccountIndex::Subaccount(subaccount_index) = slot.occupied_subaccount_index
+        else {
             continue;
         };
         let header_offset = slot.buffer_position;
@@ -392,38 +377,39 @@ pub fn flush_subaccount_slots(
             .get(header_offset..header_offset.saturating_add(SUBACCOUNT_SLOT_HEADER_SIZE))
             .ok_or(InstructionError::InvalidArgument)?;
         let owner_bytes: [u8; 32] = header
-            [SLOT_HEADER_OFFSET_OWNER as usize..SLOT_HEADER_OFFSET_LAMPORTS as usize]
+            .get(SLOT_HEADER_OFFSET_OWNER as usize..SLOT_HEADER_OFFSET_LAMPORTS as usize)
+            .ok_or(InstructionError::InvalidArgument)?
             .try_into()
             .map_err(|_| InstructionError::InvalidArgument)?;
         let lamports = u64::from_le_bytes(
-            header[SLOT_HEADER_OFFSET_LAMPORTS as usize..SLOT_HEADER_OFFSET_DATA_LEN as usize]
+            header
+                .get(SLOT_HEADER_OFFSET_LAMPORTS as usize..SLOT_HEADER_OFFSET_DATA_LEN as usize)
+                .ok_or(InstructionError::InvalidArgument)?
                 .try_into()
                 .map_err(|_| InstructionError::InvalidArgument)?,
         );
         let data_len = u64::from_le_bytes(
-            header[SLOT_HEADER_OFFSET_DATA_LEN as usize
-                ..SLOT_HEADER_OFFSET_DATA_LEN as usize + 8]
+            header
+                .get(SLOT_HEADER_OFFSET_DATA_LEN as usize..SLOT_HEADER_OFFSET_DATA_LEN as usize + 8)
+                .ok_or(InstructionError::InvalidArgument)?
                 .try_into()
                 .map_err(|_| InstructionError::InvalidArgument)?,
         ) as usize;
-        if data_len > MAX_PERMITTED_DATA_LENGTH as usize {
-            return Err(InstructionError::InvalidRealloc);
-        }
-        let mut borrowed = transaction_context
-            .accounts()
-            .try_borrow_mut_subaccount(subaccount_index)?;
-        if borrowed.lamports() != lamports {
-            borrowed.set_lamports(lamports);
+        let instruction_context = transaction_context.get_current_instruction_context()?;
+        let mut borrowed = instruction_context
+            .try_borrow_subaccount_by_tx_index(subaccount_index, slot.is_writable)?;
+        if borrowed.get_lamports() != lamports {
+            borrowed.set_lamports(lamports)?;
         }
         // Data was direct-mapped, so any in-place mutation already lives in
         // `AccountSharedData`; only resize is required if the program changed
         // data_len through the header.
-        if borrowed.data().len() != data_len {
-            borrowed.resize(data_len, 0);
+        if borrowed.get_data().len() != data_len {
+            borrowed.set_data_length(data_len)?;
         }
         let owner_pubkey = Pubkey::new_from_array(owner_bytes);
-        if *borrowed.owner() != owner_pubkey {
-            borrowed.set_owner(owner_pubkey);
+        if *borrowed.get_owner() != owner_pubkey {
+            borrowed.set_owner(&owner_bytes)?;
         }
     }
     Ok(())
@@ -435,13 +421,10 @@ pub fn deserialize_parameters(
     account_data_direct_mapping: bool,
     buffer: &[u8],
     accounts_metadata: &[SerializedAccountMetadata],
-    subaccounts_metadata: &[SerializedAccountMetadata],
 ) -> Result<(), InstructionError> {
     let is_loader_deprecated =
         instruction_context.get_program_owner()? == bpf_loader_deprecated::id();
     let account_lengths = accounts_metadata.iter().map(|a| a.original_data_len);
-    // F10: subaccount data lengths, parallel to `account_lengths`.
-    let subaccount_lengths = subaccounts_metadata.iter().map(|a| a.original_data_len);
     if is_loader_deprecated {
         // Used by loader-v1 (bpf_loader_deprecated)
         deserialize_parameters_for_abiv0(
@@ -450,7 +433,6 @@ pub fn deserialize_parameters(
             account_data_direct_mapping,
             buffer,
             account_lengths,
-            subaccount_lengths,
         )
     } else {
         // Used by loader-v2 (bpf_loader) and loader-v3 (bpf_loader_upgradeable)
@@ -460,7 +442,6 @@ pub fn deserialize_parameters(
             account_data_direct_mapping,
             buffer,
             account_lengths,
-            subaccount_lengths,
         )
     }
 }
@@ -495,8 +476,7 @@ fn serialize_parameters_for_abiv0(
     }
     size += size_of::<u64>() // instruction data len
          + instruction_data.len() // instruction data
-         + size_of::<Pubkey>() // program id
-         + size_of::<u64>(); // F10: subaccount count placeholder
+         + size_of::<Pubkey>(); // program id
 
     let mut s = Serializer::new(
         size,
@@ -541,8 +521,6 @@ fn serialize_parameters_for_abiv0(
     s.write::<u64>((instruction_data.len() as u64).to_le());
     let instruction_data_offset = s.write_all(instruction_data);
     s.write_all(program_id.as_ref());
-    // F10: subaccount count placeholder (abiv0/loader-v1 never reserves slots).
-    s.write::<u64>(0u64.to_le());
 
     let (mem, regions) = s.finish();
     Ok((
@@ -550,18 +528,16 @@ fn serialize_parameters_for_abiv0(
         regions,
         accounts_metadata,
         Vec::new(),
-        Vec::new(),
         instruction_data_offset as usize,
     ))
 }
 
-fn deserialize_parameters_for_abiv0<I: IntoIterator<Item = usize>, J: IntoIterator<Item = usize>>(
+fn deserialize_parameters_for_abiv0<I: IntoIterator<Item = usize>>(
     instruction_context: &InstructionContext,
     virtual_address_space_adjustments: bool,
     account_data_direct_mapping: bool,
     buffer: &[u8],
     account_lengths: I,
-    _subaccount_lengths: J,
 ) -> Result<(), InstructionError> {
     let mut start = size_of::<u64>(); // number of accounts
     for (instruction_account_index, pre_len) in (0..instruction_context
@@ -620,7 +596,6 @@ fn deserialize_parameters_for_abiv0<I: IntoIterator<Item = usize>, J: IntoIterat
 
 fn serialize_parameters_for_abiv1(
     accounts: Vec<SerializeAccount>,
-    subaccounts: Vec<SerializeAccount>,
     instruction_data: &[u8],
     program_id: &Pubkey,
     virtual_address_space_adjustments: bool,
@@ -628,7 +603,6 @@ fn serialize_parameters_for_abiv1(
     direct_account_pointers_program_input: bool,
 ) -> Result<SerializedParameters, InstructionError> {
     let mut accounts_metadata = Vec::with_capacity(accounts.len());
-    let mut subaccounts_metadata = Vec::with_capacity(subaccounts.len());
     // Calculate size in order to alloc once
     let mut size = size_of::<u64>();
     for account in &accounts {
@@ -667,39 +641,17 @@ fn serialize_parameters_for_abiv1(
         Some(offset)
     } else {
         // F10 (SIMD-0449 mutual-gate): when direct account pointers are NOT
-        // active, reserve the subaccount region (alignment padding + u64 count +
-        // subaccount records + MAX_SUBACCOUNT_SLOTS header slots) in the same
-        // post-program_id byte range the pointer array would occupy. The two
-        // are mutually exclusive by construction — `sol_load_subaccount` is
-        // gated off whenever SIMD-0449 is active — so they never collide.
-        size += (instruction_data.len() as *const u8).align_offset(BPF_ALIGN_OF_U128)
-            + size_of::<u64>(); // alignment padding + subaccount count
-        for subaccount in &subaccounts {
-            size += 1; // dup
-            match subaccount {
-                SerializeAccount::Duplicate(_) => size += 7, // padding to 64-bit aligned
-                SerializeAccount::Account(_, account) => {
-                    let data_len = account.get_data().len();
-                    size += size_of::<u8>() // is_signer
-                    + size_of::<u8>() // is_writable
-                    + size_of::<u8>() // executable
-                    + size_of::<u32>() // original_data_len
-                    + size_of::<Pubkey>()  // key
-                    + size_of::<Pubkey>() // owner
-                    + size_of::<u64>()  // lamports
-                    + size_of::<u64>()  // data len
-                    + size_of::<u64>(); // rent epoch
-                    if !(virtual_address_space_adjustments && account_data_direct_mapping) {
-                        size += data_len
-                            + MAX_PERMITTED_DATA_INCREASE
-                            + (data_len as *const u8).align_offset(BPF_ALIGN_OF_U128);
-                    } else {
-                        size += BPF_ALIGN_OF_U128;
-                    }
-                }
-            }
-        }
-        size += MAX_SUBACCOUNT_SLOTS.saturating_mul(SUBACCOUNT_SLOT_HEADER_SIZE);
+        // active, reserve the subaccount slot region in the same post-program_id
+        // byte range the pointer array would occupy. The two are mutually
+        // exclusive by construction — `sol_load_subaccount` is gated off whenever
+        // SIMD-0449 is active — so they never collide. In the direct-map model no
+        // real-subaccount records are serialized (data is direct-mapped); only the
+        // MAX_SUBACCOUNT_SLOTS reserved slots (each an account-view buffer + the
+        // 88-byte header) are laid out, after alignment padding.
+        size += (instruction_data.len() as *const u8).align_offset(BPF_ALIGN_OF_U128);
+        size += MAX_SUBACCOUNT_SLOTS.saturating_mul(
+            SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE.saturating_add(SUBACCOUNT_SLOT_HEADER_SIZE),
+        );
         None
     };
 
@@ -759,58 +711,38 @@ fn serialize_parameters_for_abiv1(
             s.write::<u64>(entry.vm_addr.to_le());
         }
     } else {
-        // F10 (SIMD-0449 mutual-gate else): write the subaccount region.
-        // Alignment padding so the u64 subaccount count + records land on a
-        // BPF_ALIGN_OF_U128 boundary.
+        // F10 (SIMD-0449 mutual-gate else): write the subaccount slot region.
+        // Alignment padding so the reserved slots land on a BPF_ALIGN_OF_U128
+        // boundary. No real-subaccount records are written — subaccount data is
+        // direct-mapped, so only the MAX_SUBACCOUNT_SLOTS reserved slots follow.
         let align_offset = (instruction_data.len() as *const u8).align_offset(BPF_ALIGN_OF_U128);
         s.fill_write(align_offset, 0)
             .map_err(|_| InstructionError::InvalidArgument)?;
-        s.write::<u64>((subaccounts.len() as u64).to_le());
-        for subaccount in subaccounts {
-            match subaccount {
-                SerializeAccount::Account(_, mut borrowed_account) => {
-                    let vm_addr = s.write::<u8>(NON_DUP_MARKER);
-                    s.write::<u8>(borrowed_account.is_signer() as u8);
-                    s.write::<u8>(borrowed_account.is_writable() as u8);
-                    #[allow(deprecated)]
-                    s.write::<u8>(borrowed_account.is_executable() as u8);
-                    s.write_all(&[0u8, 0, 0, 0]);
-                    let vm_key_addr = s.write_all(borrowed_account.get_key().as_ref());
-                    let vm_owner_addr = s.write_all(borrowed_account.get_owner().as_ref());
-                    let vm_lamports_addr = s.write::<u64>(borrowed_account.get_lamports().to_le());
-                    s.write::<u64>((borrowed_account.get_data().len() as u64).to_le());
-                    let vm_data_addr = s.write_account(&mut borrowed_account)?;
-                    let rent_epoch = u64::MAX;
-                    s.write::<u64>(rent_epoch.to_le());
-                    subaccounts_metadata.push(SerializedAccountMetadata {
-                        vm_addr,
-                        original_data_len: borrowed_account.get_data().len(),
-                        vm_key_addr,
-                        vm_owner_addr,
-                        vm_lamports_addr,
-                        vm_data_addr,
-                    });
-                }
-                SerializeAccount::Duplicate(position) => {
-                    subaccounts_metadata
-                        .push(subaccounts_metadata.get(position as usize).unwrap().clone());
-                    s.write::<u8>(position as u8);
-                    s.write_all(&[0u8, 0, 0, 0, 0, 0, 0]);
-                }
-            };
-        }
 
-        // F10: reserve MAX_SUBACCOUNT_SLOTS slots after the subaccount region.
-        // Each slot = an 88-byte writable header region inside the input buffer
-        // + an empty readonly placeholder data region whose VM address is
-        // reserved with SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES so a later
-        // MemoryMapping::replace_region can install a region backed by the
-        // loaded subaccount's AccountSharedData without colliding with the next
-        // slot. Slots beyond the real-subaccount count are invisible to the
-        // deserialize loop (which iterates only instruction_subaccounts).
+        // F10: reserve MAX_SUBACCOUNT_SLOTS slots. Each slot consists of two
+        // memory regions:
+        //   1. a writable region inside the input buffer holding a runtime-owned
+        //      account-view buffer (SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE bytes,
+        //      used by the program as either `AccountInfo` or `SolAccountInfo`)
+        //      immediately followed by the 88-byte serialized slot header
+        //      (NON_DUP_MARKER + flags + key + owner + lamports + data_len),
+        //   2. an empty readonly placeholder data region whose VM address is
+        //      reserved with SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES so a later
+        //      MemoryMapping::replace_region can install a region backed by the
+        //      loaded subaccount's AccountSharedData without colliding with the
+        //      next slot's reserved range.
+        // Close any preceding region first so each slot's view-buffer + header
+        // pair lives in its own region.
         s.push_region();
         subaccount_slots.reserve(MAX_SUBACCOUNT_SLOTS);
         for _ in 0..MAX_SUBACCOUNT_SLOTS {
+            // Runtime-owned account-view buffer: the program writes its
+            // `AccountInfo` / `SolAccountInfo` here after `sol_load_subaccount`
+            // returns the address. Zero-initialized so the program observes a
+            // clean slate per slot.
+            let vm_account_view_addr = s.current_vaddr();
+            s.fill_write(SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE, 0)
+                .map_err(|_| InstructionError::InvalidArgument)?;
             let vm_header_addr = s.current_vaddr();
             let buffer_position = s.current_len();
             s.write::<u8>(NON_DUP_MARKER);
@@ -826,7 +758,8 @@ fn serialize_parameters_for_abiv1(
                 s.current_vaddr().saturating_sub(vm_header_addr),
                 SUBACCOUNT_SLOT_HEADER_SIZE as u64,
             );
-            // Close the header region so it lives at vm_header_addr..+88 only.
+            // Close the [view + header] region so it lives at
+            // vm_account_view_addr..+(view+header) only.
             s.push_region();
             // Reserve the slot's data VM address space behind an empty readonly
             // region; `sol_load_subaccount` swaps this for a writable region.
@@ -834,11 +767,12 @@ fn serialize_parameters_for_abiv1(
             s.push_data_placeholder(SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES);
             subaccount_slots.push(SubaccountSlot {
                 buffer_position,
+                vm_account_view_addr,
                 vm_header_addr,
                 vm_data_addr,
-                caller_account_view_addr: 0,
                 caller_account_metadata: None,
-                occupied_subaccount_index: None,
+                account_view_kind: None,
+                occupied_subaccount_index: OccupiedSubaccountIndex::Empty,
                 is_writable: false,
             });
         }
@@ -849,101 +783,18 @@ fn serialize_parameters_for_abiv1(
         mem,
         regions,
         accounts_metadata,
-        subaccounts_metadata,
         subaccount_slots,
         instruction_data_offset as usize,
     ))
 }
 
-fn deserialize_parameters_for_abiv1<
-    I: IntoIterator<Item = usize>,
-    J: IntoIterator<Item = usize>,
->(
+fn deserialize_parameters_for_abiv1<I: IntoIterator<Item = usize>>(
     instruction_context: &InstructionContext,
     virtual_address_space_adjustments: bool,
     account_data_direct_mapping: bool,
     buffer: &[u8],
     account_lengths: I,
-    subaccount_lengths: J,
 ) -> Result<(), InstructionError> {
-    // F10: decode one serialized account record (ABIv1) from `buffer` at
-    // `start` into `borrowed_account`, returning the updated offset. Shared by
-    // the main-account loop and the subaccount walk so both use the identical
-    // decode (the byte layout must match `serialize_parameters_for_abiv1`).
-    fn deserialize_account(
-        virtual_address_space_adjustments: bool,
-        account_data_direct_mapping: bool,
-        buffer: &[u8],
-        mut start: usize,
-        borrowed_account: &mut BorrowedInstructionAccount<'_, '_>,
-        pre_len: usize,
-    ) -> Result<usize, InstructionError> {
-        start += size_of::<u8>() // is_signer
-            + size_of::<u8>() // is_writable
-            + size_of::<u8>() // executable
-            + size_of::<u32>() // original_data_len
-            + size_of::<Pubkey>(); // key
-        let owner = buffer
-            .get(start..start + size_of::<Pubkey>())
-            .ok_or(InstructionError::InvalidArgument)?;
-        start += size_of::<Pubkey>(); // owner
-        let lamports = buffer
-            .get(start..start.saturating_add(8))
-            .map(<[u8; 8]>::try_from)
-            .and_then(Result::ok)
-            .map(u64::from_le_bytes)
-            .ok_or(InstructionError::InvalidArgument)?;
-        if borrowed_account.get_lamports() != lamports {
-            borrowed_account.set_lamports(lamports)?;
-        }
-        start += size_of::<u64>(); // lamports
-        let post_len = buffer
-            .get(start..start.saturating_add(8))
-            .map(<[u8; 8]>::try_from)
-            .and_then(Result::ok)
-            .map(u64::from_le_bytes)
-            .ok_or(InstructionError::InvalidArgument)? as usize;
-        start += size_of::<u64>(); // data length
-        if post_len.saturating_sub(pre_len) > MAX_PERMITTED_DATA_INCREASE
-            || post_len > MAX_PERMITTED_DATA_LENGTH as usize
-        {
-            return Err(InstructionError::InvalidRealloc);
-        }
-        if !virtual_address_space_adjustments {
-            let data = buffer
-                .get(start..start + post_len)
-                .ok_or(InstructionError::InvalidArgument)?;
-            // The redundant check helps to avoid the expensive data comparison if we can
-            match borrowed_account.can_data_be_resized(post_len) {
-                Ok(()) => borrowed_account.set_data_from_slice(data)?,
-                Err(err) if borrowed_account.get_data() != data => return Err(err),
-                _ => {}
-            }
-        } else if !account_data_direct_mapping && borrowed_account.can_data_be_changed().is_ok() {
-            let data = buffer
-                .get(start..start + post_len)
-                .ok_or(InstructionError::InvalidArgument)?;
-            borrowed_account.set_data_from_slice(data)?;
-        } else if borrowed_account.get_data().len() != post_len {
-            borrowed_account.set_data_length(post_len)?;
-        }
-        start += if !(virtual_address_space_adjustments && account_data_direct_mapping) {
-            let alignment_offset = (pre_len as *const u8).align_offset(BPF_ALIGN_OF_U128);
-            pre_len // data
-                .saturating_add(MAX_PERMITTED_DATA_INCREASE) // realloc padding
-                .saturating_add(alignment_offset)
-        } else {
-            // See Serializer::write_account() as to why we have this
-            BPF_ALIGN_OF_U128
-        };
-        start += size_of::<u64>(); // rent_epoch
-        if borrowed_account.get_owner().to_bytes() != owner {
-            // Change the owner at the end so that we are allowed to change the lamports and data before
-            borrowed_account.set_owner(owner)?;
-        }
-        Ok(start)
-    }
-
     let mut start = size_of::<u64>(); // number of accounts
     for (instruction_account_index, pre_len) in (0..instruction_context
         .get_number_of_instruction_accounts())
@@ -957,58 +808,72 @@ fn deserialize_parameters_for_abiv1<
         } else {
             let mut borrowed_account =
                 instruction_context.try_borrow_instruction_account(instruction_account_index)?;
-            start = deserialize_account(
-                virtual_address_space_adjustments,
-                account_data_direct_mapping,
-                buffer,
-                start,
-                &mut borrowed_account,
-                pre_len,
-            )?;
+            start += size_of::<u8>() // is_signer
+                + size_of::<u8>() // is_writable
+                + size_of::<u8>() // executable
+                + size_of::<u32>() // original_data_len
+                + size_of::<Pubkey>(); // key
+            let owner = buffer
+                .get(start..start + size_of::<Pubkey>())
+                .ok_or(InstructionError::InvalidArgument)?;
+            start += size_of::<Pubkey>(); // owner
+            let lamports = buffer
+                .get(start..start.saturating_add(8))
+                .map(<[u8; 8]>::try_from)
+                .and_then(Result::ok)
+                .map(u64::from_le_bytes)
+                .ok_or(InstructionError::InvalidArgument)?;
+            if borrowed_account.get_lamports() != lamports {
+                borrowed_account.set_lamports(lamports)?;
+            }
+            start += size_of::<u64>(); // lamports
+            let post_len = buffer
+                .get(start..start.saturating_add(8))
+                .map(<[u8; 8]>::try_from)
+                .and_then(Result::ok)
+                .map(u64::from_le_bytes)
+                .ok_or(InstructionError::InvalidArgument)? as usize;
+            start += size_of::<u64>(); // data length
+            if post_len.saturating_sub(pre_len) > MAX_PERMITTED_DATA_INCREASE
+                || post_len > MAX_PERMITTED_DATA_LENGTH as usize
+            {
+                return Err(InstructionError::InvalidRealloc);
+            }
+            if !virtual_address_space_adjustments {
+                let data = buffer
+                    .get(start..start + post_len)
+                    .ok_or(InstructionError::InvalidArgument)?;
+                // The redundant check helps to avoid the expensive data comparison if we can
+                match borrowed_account.can_data_be_resized(post_len) {
+                    Ok(()) => borrowed_account.set_data_from_slice(data)?,
+                    Err(err) if borrowed_account.get_data() != data => return Err(err),
+                    _ => {}
+                }
+            } else if !account_data_direct_mapping && borrowed_account.can_data_be_changed().is_ok()
+            {
+                let data = buffer
+                    .get(start..start + post_len)
+                    .ok_or(InstructionError::InvalidArgument)?;
+                borrowed_account.set_data_from_slice(data)?;
+            } else if borrowed_account.get_data().len() != post_len {
+                borrowed_account.set_data_length(post_len)?;
+            }
+            start += if !(virtual_address_space_adjustments && account_data_direct_mapping) {
+                let alignment_offset = (pre_len as *const u8).align_offset(BPF_ALIGN_OF_U128);
+                pre_len // data
+                    .saturating_add(MAX_PERMITTED_DATA_INCREASE) // realloc padding
+                    .saturating_add(alignment_offset)
+            } else {
+                // See Serializer::write_account() as to why we have this
+                BPF_ALIGN_OF_U128
+            };
+            start += size_of::<u64>(); // rent_epoch
+            if borrowed_account.get_owner().to_bytes() != owner {
+                // Change the owner at the end so that we are allowed to change the lamports and data before
+                borrowed_account.set_owner(owner)?;
+            }
         }
     }
-
-    // F10: walk past the instruction data / program id / alignment padding,
-    // then deserialize the subaccount region the VM wrote into shared memory.
-    // This mirrors `serialize_parameters_for_abiv1`'s write order — any
-    // host-side skew here corrupts the VM → host write-back of direct
-    // subaccount writes. When SIMD-0449 is active there are no subaccounts
-    // (get_number_of_subaccounts() == 0), so these trailing reads are unused.
-    let instruction_len = buffer
-        .get(start..start.saturating_add(8))
-        .map(<[u8; 8]>::try_from)
-        .and_then(Result::ok)
-        .map(u64::from_le_bytes)
-        .ok_or(InstructionError::InvalidArgument)?;
-    start += size_of::<u64>(); // instruction data length
-    start += instruction_len as usize; // instruction data
-    start += size_of::<Pubkey>(); // program id
-    let align_offset = (instruction_len as *const u8).align_offset(BPF_ALIGN_OF_U128);
-    start += align_offset; // padding to align subaccounts region
-    start += size_of::<u64>(); // subaccounts len
-
-    for (subaccount_index, pre_len) in
-        (0..instruction_context.get_number_of_subaccounts()).zip(subaccount_lengths.into_iter())
-    {
-        let duplicate =
-            instruction_context.is_instruction_subaccount_duplicate(subaccount_index)?;
-        start += size_of::<u8>(); // NON_DUP_MARKER / position
-        if duplicate.is_some() {
-            start += 7; // padding to 64-bit aligned
-        } else {
-            let mut borrowed_account =
-                instruction_context.try_borrow_subaccount(subaccount_index)?;
-            start = deserialize_account(
-                virtual_address_space_adjustments,
-                account_data_direct_mapping,
-                buffer,
-                start,
-                &mut borrowed_account,
-                pre_len,
-            )?;
-        }
-    }
-
     Ok(())
 }
 

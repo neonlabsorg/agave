@@ -2,7 +2,7 @@
 
 use {
     crate::{
-        invoke_context::{InvokeContext, SerializedAccountMetadata},
+        invoke_context::{InvokeContext, OccupiedSubaccountIndex, SerializedAccountMetadata},
         memory::{translate_slice, translate_type, translate_type_mut_for_cpi, translate_vm_slice},
         serialization::{create_memory_region_of_account, modify_memory_region_of_account},
     },
@@ -19,7 +19,7 @@ use {
     solana_svm_timings::ExecuteTimings,
     solana_transaction_context::{
         IndexOfAccount, MAX_ACCOUNTS_PER_INSTRUCTION, MAX_INSTRUCTION_DATA_LEN, SUBACCOUNT_MARKER,
-        instruction_accounts::{BorrowedInstructionAccount, InstructionAccount},
+        instruction_accounts::BorrowedInstructionAccount,
         vm_slice::VmSlice,
     },
     std::mem,
@@ -565,19 +565,12 @@ pub trait SyscallInvokeSigned {
         check_aligned: bool,
     ) -> Result<Vec<TranslatedAccount<'a>>, Error>;
     /// F10: translate the caller-side subaccount AccountInfo array into
-    /// `TranslatedAccount` entries tagged with `SUBACCOUNT_MARKER`. The default
-    /// implementation returns an empty vector so existing Rust/C invoke
-    /// syscalls (which don't carry subaccounts) need no override. The
-    /// self-invoke syscalls override this to read `syscall_context.subaccounts_infos`.
+    /// `TranslatedAccount` entries tagged with `SUBACCOUNT_MARKER`.
     fn translate_subaccounts<'a>(
-        _subaccount_infos_addr: u64,
-        _subaccount_infos_len: u64,
-        _memory_mapping: &MemoryMapping,
-        _invoke_context: &mut InvokeContext,
-        _check_aligned: bool,
-    ) -> Result<Vec<TranslatedAccount<'a>>, Error> {
-        Ok(Vec::new())
-    }
+        memory_mapping: &MemoryMapping,
+        invoke_context: &mut InvokeContext,
+        check_aligned: bool,
+    ) -> Result<Vec<TranslatedAccount<'a>>, Error>;
     fn translate_signers(
         program_id: &Pubkey,
         signers_seeds_addr: u64,
@@ -868,7 +861,6 @@ pub fn cpi_common<S: SyscallInvokeSigned>(
     signers_seeds_addr: u64,
     signers_seeds_len: u64,
     memory_mapping: &mut MemoryMapping,
-    subaccounts: Vec<InstructionAccount>,
 ) -> Result<u64, Error> {
     // CPI entry.
     //
@@ -908,7 +900,7 @@ pub fn cpi_common<S: SyscallInvokeSigned>(
         check_aligned,
     )?;
     check_authorized_program(&instruction.program_id, &instruction.data, invoke_context)?;
-    invoke_context.prepare_next_cpi_instruction(instruction, &signers, subaccounts)?;
+    invoke_context.prepare_next_cpi_instruction(instruction, &signers)?;
 
     let mut accounts = S::translate_accounts(
         account_infos_addr,
@@ -918,24 +910,9 @@ pub fn cpi_common<S: SyscallInvokeSigned>(
         check_aligned,
     )?;
 
-    // F10: translate the caller-side subaccount AccountInfo slice, if any.
-    // `subaccounts_infos` is populated by `sol_set_subaccount_slice`; for
-    // regular invoke syscalls (non self-invoke) the default trait impl
-    // returns an empty vector.
-    let syscall_context = invoke_context.get_syscall_context()?;
-    let subaccounts_metadata_len = syscall_context.subaccounts_metadata.len() as u64;
-    let subaccount_infos_len = syscall_context.subaccounts_infos.vm_data_len;
-    let subaccount_infos_addr = syscall_context.subaccounts_infos.vm_data_addr;
-    if subaccounts_metadata_len != subaccount_infos_len {
-        return Err(Box::new(InstructionError::MissingAccount));
-    }
-    let mut subaccounts = S::translate_subaccounts(
-        subaccount_infos_addr,
-        subaccount_infos_len,
-        memory_mapping,
-        invoke_context,
-        check_aligned,
-    )?;
+    // F10: translate the caller-side subaccount slots loaded via
+    // `sol_load_subaccount` (empty for regular invoke syscalls).
+    let mut subaccounts = S::translate_subaccounts(memory_mapping, invoke_context, check_aligned)?;
 
     if syscall_parameter_address_restrictions {
         // before initiating CPI, the caller may have modified the
@@ -945,17 +922,14 @@ pub fn cpi_common<S: SyscallInvokeSigned>(
         let transaction_context = &invoke_context.transaction_context;
         let instruction_context = transaction_context.get_current_instruction_context()?;
         for translated_account in accounts.iter_mut().chain(subaccounts.iter_mut()) {
-            // F10: route subaccount slots (loaded via sol_load_subaccount, carry
-            // an explicit tx-level slot) and instruction subaccounts (marked with
-            // SUBACCOUNT_MARKER) to the subaccount lane; everything else to the
+            // F10: route subaccounts (marked with SUBACCOUNT_MARKER) to the
+            // subaccount lane via a tx-level borrow; everything else to the
             // regular instruction-account lane.
-            let callee_account = if let Some((tx_idx, writable)) =
-                translated_account.subaccount_slot
-            {
-                instruction_context.try_borrow_subaccount_by_tx_index(tx_idx, writable)?
-            } else if translated_account.index_in_caller & SUBACCOUNT_MARKER != 0 {
-                let subaccount_index = translated_account.index_in_caller & !SUBACCOUNT_MARKER;
-                instruction_context.try_borrow_subaccount(subaccount_index)?
+            let callee_account = if translated_account.index_in_caller & SUBACCOUNT_MARKER != 0 {
+                instruction_context.try_borrow_subaccount_by_tx_index(
+                    translated_account.index_in_caller & !SUBACCOUNT_MARKER,
+                    translated_account.update_caller_account_info,
+                )?
             } else {
                 instruction_context
                     .try_borrow_instruction_account(translated_account.index_in_caller)?
@@ -988,13 +962,11 @@ pub fn cpi_common<S: SyscallInvokeSigned>(
     //
     // Synchronize the callee's account changes so the caller can see them.
     for translated_account in accounts.iter_mut().chain(subaccounts.iter_mut()) {
-        let mut callee_account = if let Some((tx_idx, writable)) =
-            translated_account.subaccount_slot
-        {
-            instruction_context.try_borrow_subaccount_by_tx_index(tx_idx, writable)?
-        } else if translated_account.index_in_caller & SUBACCOUNT_MARKER != 0 {
-            let subaccount_index = translated_account.index_in_caller & !SUBACCOUNT_MARKER;
-            instruction_context.try_borrow_subaccount(subaccount_index)?
+        let mut callee_account = if translated_account.index_in_caller & SUBACCOUNT_MARKER != 0 {
+            instruction_context.try_borrow_subaccount_by_tx_index(
+                translated_account.index_in_caller & !SUBACCOUNT_MARKER,
+                translated_account.update_caller_account_info,
+            )?
         } else {
             instruction_context
                 .try_borrow_instruction_account(translated_account.index_in_caller)?
@@ -1015,13 +987,11 @@ pub fn cpi_common<S: SyscallInvokeSigned>(
 
     if virtual_address_space_adjustments {
         for translated_account in accounts.iter().chain(subaccounts.iter()) {
-            let mut callee_account = if let Some((tx_idx, writable)) =
-                translated_account.subaccount_slot
-            {
-                instruction_context.try_borrow_subaccount_by_tx_index(tx_idx, writable)?
-            } else if translated_account.index_in_caller & SUBACCOUNT_MARKER != 0 {
-                let subaccount_index = translated_account.index_in_caller & !SUBACCOUNT_MARKER;
-                instruction_context.try_borrow_subaccount(subaccount_index)?
+            let mut callee_account = if translated_account.index_in_caller & SUBACCOUNT_MARKER != 0 {
+                instruction_context.try_borrow_subaccount_by_tx_index(
+                    translated_account.index_in_caller & !SUBACCOUNT_MARKER,
+                    translated_account.update_caller_account_info,
+                )?
             } else {
                 instruction_context
                     .try_borrow_instruction_account(translated_account.index_in_caller)?
@@ -1048,13 +1018,6 @@ pub struct TranslatedAccount<'a> {
     pub caller_account: CallerAccount<'a>,
     pub update_caller_account_region: bool,
     pub update_caller_account_info: bool,
-    /// F10: when `Some((tx_index, is_writable))`, the entry refers to a
-    /// `sol_load_subaccount` slot rather than an instruction subaccount.
-    /// `index_in_caller` is unused for slot entries; CPI sync uses
-    /// `InstructionContext::try_borrow_subaccount_by_tx_index` against the
-    /// stored tx-level index + writability instead of the instruction-level
-    /// `try_borrow_subaccount` lookup.
-    pub subaccount_slot: Option<(IndexOfAccount, bool)>,
 }
 
 pub fn translate_account_infos<'a, T, F>(
@@ -1251,7 +1214,6 @@ where
                 caller_account,
                 update_caller_account_region: instruction_account.is_writable() || update_caller,
                 update_caller_account_info: instruction_account.is_writable(),
-                subaccount_slot: None,
             });
         } else {
             ic_msg!(
@@ -1266,130 +1228,36 @@ where
     Ok(accounts)
 }
 
-/// F10: finish translating subaccounts from the caller's `AccountInfo`-slice
-/// view and build `TranslatedAccount` entries tagged with `SUBACCOUNT_MARKER`.
-///
-/// Parallel to [`translate_accounts_common`], but iterates the current
-/// instruction context's `instruction_subaccounts()` list and borrows each
-/// slot through `try_borrow_subaccount`. Sync with the callee is handled by
-/// the existing `cpi_common` pre/post-CPI loops via the `SUBACCOUNT_MARKER`
-/// dispatch — this helper does not call `update_callee_account` directly.
-pub fn translate_subaccounts_common<'a, T, F>(
-    subaccount_infos: &[T],
-    subaccount_infos_addr: u64,
-    invoke_context: &mut InvokeContext,
-    memory_mapping: &MemoryMapping,
-    check_aligned: bool,
-    do_translate: F,
-) -> Result<Vec<TranslatedAccount<'a>>, Error>
-where
-    F: Fn(
-        &InvokeContext,
-        &MemoryMapping,
-        bool,
-        u64,
-        &T,
-        &SerializedAccountMetadata,
-    ) -> Result<CallerAccount<'a>, Error>,
-{
-    let transaction_context = &invoke_context.transaction_context;
-    let instruction_context = transaction_context.get_current_instruction_context()?;
-
-    let subaccounts_metadata = &invoke_context
-        .get_syscall_context()
-        .unwrap()
-        .subaccounts_metadata;
-
-    let instruction_subaccounts = instruction_context.instruction_subaccounts();
-    let mut subaccounts = Vec::with_capacity(instruction_subaccounts.len());
-
-    for (index_in_caller, instruction_subaccount) in instruction_subaccounts.iter().enumerate() {
-        if instruction_context
-            .is_instruction_subaccount_duplicate(index_in_caller as IndexOfAccount)?
-            .is_some()
-        {
-            continue; // Skip duplicate subaccount
-        }
-
-        let serialized_metadata = subaccounts_metadata.get(index_in_caller).ok_or_else(|| {
-            ic_msg!(
-                invoke_context,
-                "Internal error: index mismatch for subaccount {}: out of bounds for \
-                 subaccounts_metadata with length {}",
-                index_in_caller,
-                subaccounts_metadata.len(),
-            );
-            Box::new(InstructionError::MissingAccount)
-        })?;
-        let subaccount_info = subaccount_infos.get(index_in_caller).ok_or_else(|| {
-            ic_msg!(
-                invoke_context,
-                "Internal error: invalid subaccount index {}: out of bounds for \
-                 subaccount_infos with length {}",
-                index_in_caller,
-                subaccount_infos.len(),
-            );
-            Box::new(InstructionError::MissingAccount)
-        })?;
-
-        let caller_account = do_translate(
-            invoke_context,
-            memory_mapping,
-            check_aligned,
-            subaccount_infos_addr.saturating_add(
-                (index_in_caller as u64).saturating_mul(mem::size_of::<T>() as u64),
-            ),
-            subaccount_info,
-            serialized_metadata,
-        )?;
-
-        subaccounts.push(TranslatedAccount {
-            index_in_caller: (index_in_caller as IndexOfAccount) | SUBACCOUNT_MARKER,
-            caller_account,
-            update_caller_account_region: instruction_subaccount.is_writable(),
-            update_caller_account_info: instruction_subaccount.is_writable(),
-            subaccount_slot: None,
-        });
-    }
-
-    Ok(subaccounts)
-}
-
 /// F10: build [`TranslatedAccount`] entries for every occupied
 /// `sol_load_subaccount` slot, performing the pre-CPI sync (caller's view →
 /// `AccountSharedData`) inline.
 ///
-/// Each occupied slot's `caller_account_view_addr` is interpreted by the
-/// language-specific `do_translate` closure (Rust impls dereference it as
-/// `solana_account_info::AccountInfo`, C impls dereference it as
-/// [`SolAccountInfo`]). The returned `CallerAccount` is verified against
-/// `slot.caller_account_metadata` via `check_account_info_pointer` inside
-/// `from_(sol_)account_info` under `syscall_parameter_address_restrictions`.
+/// Each occupied slot's `vm_account_view_addr` is interpreted according to the
+/// slot's `account_view_kind`: `Rust` dereferences it as
+/// `solana_account_info::AccountInfo`, `C` as [`SolAccountInfo`]. The returned
+/// `CallerAccount` is verified against `slot.caller_account_metadata` via
+/// `check_account_info_pointer` inside `from_(sol_)account_info` under
+/// `syscall_parameter_address_restrictions`.
 ///
 /// Pre-CPI sync runs unconditionally so the callee always sees the program's
 /// most recent header writes via the slot, mirroring what the standard CPI
 /// machinery does for declared subaccounts under stricter ABI.
 ///
-/// Each returned entry is tagged with `subaccount_slot = Some((tx_idx,
-/// is_writable))`; `cpi_common`'s post-CPI sync uses that field to route
-/// state changes back through `try_borrow_subaccount_by_tx_index`.
-pub fn translate_subaccount_slots<'a, T, F>(
+/// Each returned entry is tagged with `index_in_caller = tx_idx |
+/// SUBACCOUNT_MARKER`; `cpi_common`'s sync loops route state changes back
+/// through `try_borrow_subaccount_by_tx_index`.
+pub fn translate_subaccount_slots<'a>(
     invoke_context: &mut InvokeContext,
     memory_mapping: &MemoryMapping,
     check_aligned: bool,
-    do_translate: F,
-) -> Result<Vec<TranslatedAccount<'a>>, Error>
-where
-    F: Fn(
-        &InvokeContext,
-        &MemoryMapping,
-        bool,
+) -> Result<Vec<TranslatedAccount<'a>>, Error> {
+    let slot_infos: Vec<(
         u64,
-        &T,
-        &SerializedAccountMetadata,
-    ) -> Result<CallerAccount<'a>, Error>,
-{
-    let slot_infos: Vec<(u64, SerializedAccountMetadata, IndexOfAccount, bool)> = {
+        SerializedAccountMetadata,
+        IndexOfAccount,
+        bool,
+        crate::invoke_context::AccountViewKind,
+    )> = {
         let syscall_context = invoke_context.get_syscall_context()?;
         syscall_context
             .subaccount_slots
@@ -1398,10 +1266,15 @@ where
                 match (
                     s.occupied_subaccount_index,
                     s.caller_account_metadata.as_ref(),
+                    s.account_view_kind,
                 ) {
-                    (Some(idx), Some(meta)) => {
-                        Some((s.caller_account_view_addr, meta.clone(), idx, s.is_writable))
-                    }
+                    (OccupiedSubaccountIndex::Subaccount(idx), Some(meta), Some(kind)) => Some((
+                        s.vm_account_view_addr,
+                        meta.clone(),
+                        idx,
+                        s.is_writable,
+                        kind,
+                    )),
                     _ => None,
                 }
             })
@@ -1421,16 +1294,32 @@ where
     let account_data_direct_mapping = invoke_context.get_feature_set().account_data_direct_mapping;
 
     let mut result = Vec::with_capacity(slot_infos.len());
-    for (view_addr, metadata, tx_idx, is_writable) in slot_infos {
-        let view = translate_type::<T>(memory_mapping, view_addr, check_aligned)?;
-        let caller_account = do_translate(
-            invoke_context,
-            memory_mapping,
-            check_aligned,
-            view_addr,
-            view,
-            &metadata,
-        )?;
+    for (view_addr, metadata, tx_idx, is_writable, kind) in slot_infos {
+        let caller_account = match kind {
+            crate::invoke_context::AccountViewKind::Rust => {
+                let view = translate_type::<AccountInfo>(memory_mapping, view_addr, check_aligned)?;
+                CallerAccount::from_account_info(
+                    invoke_context,
+                    memory_mapping,
+                    check_aligned,
+                    view_addr,
+                    view,
+                    &metadata,
+                )?
+            }
+            crate::invoke_context::AccountViewKind::C => {
+                let view =
+                    translate_type::<SolAccountInfo>(memory_mapping, view_addr, check_aligned)?;
+                CallerAccount::from_sol_account_info(
+                    invoke_context,
+                    memory_mapping,
+                    check_aligned,
+                    view_addr,
+                    view,
+                    &metadata,
+                )?
+            }
+        };
 
         // Pre-CPI: push the caller's view → host AccountSharedData so the
         // callee sees the latest state. Run unconditionally; slot subaccounts
@@ -1455,7 +1344,6 @@ where
             caller_account,
             update_caller_account_region: is_writable,
             update_caller_account_info: is_writable,
-            subaccount_slot: Some((tx_idx, is_writable)),
         });
     }
 
