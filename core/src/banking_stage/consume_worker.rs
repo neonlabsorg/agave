@@ -438,8 +438,17 @@ pub(crate) mod external {
                         &self.allocator,
                     )
                 };
+                // Perf instrumentation: this re-parse/sanitize/resolve runs on
+                // every send (including re-sends of bounced batches); the
+                // in-proc path pays the equivalent cost once at ingest
+                // (PERF_INGEST_PARSE).
+                let translate_start = std::time::Instant::now();
                 let (translation_results, transactions, max_ages) =
                     Self::translate_transaction_batch(&batch, bank, &root_bank);
+                crate::banking_stage::perf_stats::record_translate(
+                    translate_start.elapsed(),
+                    transactions.len(),
+                );
 
                 // Enforce all or nothing on translation_results.
                 let execution_flags = ExecutionFlags {

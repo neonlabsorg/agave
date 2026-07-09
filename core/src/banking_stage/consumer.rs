@@ -2,6 +2,7 @@ use {
     super::{
         committer::{CommitTransactionDetails, Committer},
         leader_slot_timing_metrics::LeaderExecuteAndCommitTimings,
+        perf_stats,
         qos_service::QosService,
         scheduler_messages::MaxAge,
     },
@@ -255,6 +256,38 @@ impl Consumer {
             commit_transactions_result.as_ref().ok(),
             bank,
         );
+
+        // Perf instrumentation (scheduler comparison runs): cumulative CU
+        // histograms over committed non-vote transactions — cost-model
+        // estimate reserved before execution vs actual block cost after the
+        // execution confirmation — plus a per-slot committed tx/CU line.
+        // `transaction_qos_cost_results` zips 1:1 with the commit details,
+        // mirroring `remove_or_update_costs` above.
+        if let Ok(details) = commit_transactions_result.as_ref() {
+            let mut batch_txs = 0u64;
+            let mut batch_actual_cu = 0u64;
+            for (cost_result, detail) in transaction_qos_cost_results.iter().zip(details.iter()) {
+                let Ok(cost) = cost_result else { continue };
+                let CommitTransactionDetails::Committed { compute_units, .. } = detail else {
+                    continue;
+                };
+                if cost.is_simple_vote() {
+                    continue;
+                }
+                let pre_cost = cost.sum();
+                let actual_cost = pre_cost
+                    .saturating_sub(cost.programs_execution_cost())
+                    .saturating_add(*compute_units);
+                perf_stats::PRE_COST_HIST.record(pre_cost);
+                perf_stats::ACTUAL_COST_HIST.record(actual_cost);
+                batch_txs += 1;
+                batch_actual_cu += actual_cost;
+            }
+            if batch_txs > 0 {
+                perf_stats::record_committed_batch(bank.slot(), batch_txs, batch_actual_cu);
+            }
+        }
+        perf_stats::maybe_report();
 
         // reports qos service stats for this batch
         self.qos_service.report_metrics(bank.slot());

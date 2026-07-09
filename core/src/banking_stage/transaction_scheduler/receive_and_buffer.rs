@@ -410,13 +410,20 @@ impl TransactionViewReceiveAndBuffer {
         enable_static_instruction_limit: bool,
         transaction_account_lock_limit: usize,
     ) -> Result<TransactionViewState, PacketHandlingError> {
-        let (view, deactivation_slot) = translate_to_runtime_view(
+        // Perf instrumentation: the in-proc path pays the parse/sanitize/
+        // resolve cost here, once per transaction lifetime; the external
+        // worker pays the equivalent on every send (PERF_TRANSLATE). Failed
+        // packets are counted too — they burn the same CPU.
+        let parse_start = Instant::now();
+        let translate_result = translate_to_runtime_view(
             bytes,
             working_bank,
             root_bank,
             enable_static_instruction_limit,
             transaction_account_lock_limit,
-        )?;
+        );
+        crate::banking_stage::perf_stats::record_ingest_parse(parse_start.elapsed());
+        let (view, deactivation_slot) = translate_result?;
         if validate_account_locks(
             view.account_keys(),
             root_bank.get_transaction_account_lock_limit(),
