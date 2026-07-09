@@ -84,8 +84,22 @@ struct Config {
     // full.
     #[serde(default)]
     evict_costliest_on_overflow: bool,
+    // Cap on each resource-locking queue's occupancy (blockers + waiters). A tx
+    // that cannot enter *every* one of its resource queues is held in a
+    // per-resource cost-ordered buffer instead, and admitted (into all its
+    // queues at once) only once it is the cheapest buffered tx on each of its
+    // resources and all of them have room. Acquire queues keep their FIFO
+    // (admission) order, so this only changes *which* txs enter, not the
+    // deadlock-free ordering within the queues. Defaults to `usize::MAX`, which
+    // never buffers and reproduces the un-capped behavior exactly.
+    #[serde(default = "default_resource_queue_cap")]
+    resource_queue_cap: usize,
     priority_rules: Vec<PriorityRule>,
     default_priority: usize,
+}
+
+fn default_resource_queue_cap() -> usize {
+    usize::MAX
 }
 
 slotmap::new_key_type! {
@@ -98,6 +112,9 @@ type ActiveTxsListPlaceHolder = ItemHolder<SchedulerTxKey, 2>;
 
 #[derive(Clone, Debug)]
 enum TxState {
+    // Held in its resources' cost-ordered buffers, not yet in any acquire queue
+    // (only reachable when `resource_queue_cap` is finite).
+    Buffered,
     Enqueued,
     Locked,
     Active{
@@ -133,6 +150,13 @@ impl TxState {
     fn is_enqueued(&self) -> bool {
         match self {
             Self::Enqueued => true,
+            _ => false
+        }
+    }
+
+    fn is_buffered(&self) -> bool {
+        match self {
+            Self::Buffered => true,
             _ => false
         }
     }
@@ -306,11 +330,27 @@ struct ResourceLockingQueue {
     blocked_writes: usize,
 
     blocked_txs: usize,
+
+    // Txs that want this resource but were denied admission because some
+    // resource of theirs was at capacity. Ordered by (cost, key); a tx lives in
+    // the buffer of *every* one of its resources until it can enter all of them
+    // at once. Only ever non-empty when `resource_queue_cap` is finite.
+    buffer: BTreeSet<(u64, SchedulerTxKey)>,
 }
 
 impl ResourceLockingQueue {
     fn empty(&self) -> bool {
-        self.acquire_queue.is_empty() && self.blocked_reads == 0 && self.blocked_writes == 0
+        self.acquire_queue.is_empty()
+            && self.blocked_reads == 0
+            && self.blocked_writes == 0
+            && self.buffer.is_empty()
+    }
+
+    // Occupancy counted against `resource_queue_cap`: current holders (blockers)
+    // plus queued waiters. Buffered txs are deliberately excluded — they have
+    // not entered the queue yet.
+    fn occupancy(&self) -> usize {
+        self.blocked_reads + self.blocked_writes + self.blocked_txs
     }
 
     fn push(&mut self, key: SchedulerTxKey, txmeta: &mut TxMeta, is_write: bool, lock: &Address) {
@@ -485,6 +525,12 @@ struct LockingQueue {
     expires: usize,
     rebalances: usize,
 
+    // Per-resource occupancy cap (`usize::MAX` disables buffering).
+    resource_queue_cap: usize,
+    // Resources whose buffer front may now be admittable (room freed or front
+    // changed). Drained by `dispatch_advance_events`, mirroring `unblock_events`.
+    advance_events: VecDeque<Address>,
+
     drain_round: usize,
 }
 
@@ -496,11 +542,13 @@ fn make_vector<T>(size: usize, f: impl FnMut() -> T) -> Vec<T> {
 
 #[allow(dead_code)]
 impl LockingQueue {
-    fn new(num_threads: usize, max_worker_backlog: usize) -> Self {
+    fn new(num_threads: usize, max_worker_backlog: usize, resource_queue_cap: usize) -> Self {
         assert!(num_threads > 0);
         Self {
             drain_round: 0,
             rebalances: 0,
+            resource_queue_cap,
+            advance_events: VecDeque::new(),
             max_worker_backlog,
             resources: AHashMap::new(),
             metas: SlotMap::with_key(),
@@ -590,9 +638,10 @@ impl LockingQueue {
         }
     }
 
-    fn new_tx(&mut self, meta: TxMeta, tx: &TransactionState) {
+    fn new_tx(&mut self, meta: TxMeta, txdata: &mut impl MutableTxProvider) {
         self.seen_txs += 1;
         let cost = meta.cost;
+        let shared_key = meta.shared_key;
         let key = self.metas.insert(meta);
         self.cost_index.insert((cost, key));
         {
@@ -601,12 +650,107 @@ impl LockingQueue {
             self.txs_in_arrival_order.push_front(&mut holder.clone().into());
             self.metas.get_mut(key).unwrap().expire_queue_holder = Some(holder);
         }
+
+        if self.resource_queue_cap == usize::MAX {
+            // Buffering disabled: admit straight into the resource queues.
+            self.admit_to_queues(key, txdata.txdata(shared_key));
+            return;
+        }
+
+        // Buffer the tx in every one of its resources, then try to admit it (and
+        // anything its arrival may have made admittable).
+        {
+            let tx = txdata.txdata(shared_key);
+            for (lock, _is_write) in tx.locks() {
+                self.resources.entry(*lock).or_default().buffer.insert((cost, key));
+            }
+        }
+        self.metas.get_mut(key).unwrap().state = TxState::Buffered;
+        let seeds: smallvec::SmallVec<[Address; 64]> = txdata
+            .txdata(shared_key)
+            .locks()
+            .map(|(lock, _)| *lock)
+            .collect();
+        self.advance_events.extend(seeds);
+        self.dispatch_advance_events(txdata);
+    }
+
+    // Push `key` into all of its resource acquire queues (granting immediately
+    // where possible) and, if it acquired everything, advance it to
+    // waiting-for-workers. This is the un-buffered admission path; also used to
+    // admit a tx out of the buffers.
+    fn admit_to_queues(&mut self, key: SchedulerTxKey, tx: &TransactionState) {
         let meta = self.metas.get_mut(key).unwrap();
+        meta.state = TxState::Enqueued;
         for (lock, is_write) in tx.locks() {
             self.resources.entry(*lock).or_default().push(key, meta, is_write, lock);
         }
         if meta.resource_queue_subs.is_empty() {
             self.start_waiting_for_workers(key, tx);
+        }
+    }
+
+    // True iff `key` (cost `cost`) can enter the queues right now: it is the
+    // cheapest buffered tx on every resource it needs, and each of those
+    // resources has room under the cap.
+    fn buffer_admittable(&self, key: SchedulerTxKey, cost: u64, tx: &TransactionState, cap: usize) -> bool {
+        for (lock, _is_write) in tx.locks() {
+            match self.resources.get(lock) {
+                Some(queue) => {
+                    if queue.occupancy() >= cap {
+                        return false;
+                    }
+                    if queue.buffer.iter().next() != Some(&(cost, key)) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        true
+    }
+
+    // Remove `key` from all its resource buffers and admit it into the queues,
+    // re-seeding `advance_events` for every touched resource (their buffer
+    // fronts changed, so the next-cheapest tx may now be admittable).
+    fn admit_from_buffer(&mut self, key: SchedulerTxKey, txdata: &mut impl MutableTxProvider) {
+        let (shared_key, cost) = {
+            let meta = self.metas.get(key).unwrap();
+            (meta.shared_key, meta.cost)
+        };
+        {
+            let tx = txdata.txdata(shared_key);
+            for (lock, _is_write) in tx.locks() {
+                if let Some(queue) = self.resources.get_mut(lock) {
+                    queue.buffer.remove(&(cost, key));
+                }
+                self.advance_events.push_back(*lock);
+            }
+        }
+        self.admit_to_queues(key, txdata.txdata(shared_key));
+    }
+
+    // Admit as many buffered txs as the rule and capacity allow. The globally
+    // cheapest buffered tx is always the minimum of every buffer it belongs to,
+    // so this never gets stuck while an admittable tx exists.
+    fn dispatch_advance_events(&mut self, txdata: &mut impl MutableTxProvider) {
+        let cap = self.resource_queue_cap;
+        if cap == usize::MAX {
+            self.advance_events.clear();
+            return;
+        }
+        while let Some(resource) = self.advance_events.pop_front() {
+            let Some(&(cost, key)) = self
+                .resources
+                .get(&resource)
+                .and_then(|queue| queue.buffer.iter().next())
+            else {
+                continue;
+            };
+            let shared_key = self.metas.get(key).unwrap().shared_key;
+            if self.buffer_admittable(key, cost, txdata.txdata(shared_key), cap) {
+                self.admit_from_buffer(key, txdata);
+            }
         }
     }
 
@@ -657,12 +801,19 @@ impl LockingQueue {
 
                 self.picked[thread].push(PickedTx(score, key));
                 {
+                    let buffering = self.resource_queue_cap != usize::MAX;
                     for (lock, is_write) in txdata.locks() {
-                        if {
+                        let hit_zero = {
                             let locks = self.resources.get_mut(lock).unwrap();
                             locks.unblock(is_write)
-                        } {
+                        };
+                        if hit_zero {
                             self.unblock_events.push_back(*lock);
+                        }
+                        // Picking releases this tx's hold, freeing a slot on the
+                        // resource — a buffered tx may now be admittable.
+                        if buffering {
+                            self.advance_events.push_back(*lock);
                         }
                     }
                 }
@@ -687,9 +838,33 @@ impl LockingQueue {
     // and is not yet `Picked` (picked txs are in flight and unlinked from the
     // expire queue / cost index already).
     fn drop_queued_tx(&mut self, key: SchedulerTxKey, txdata: &mut impl MutableTxProvider) {
+        let buffering = self.resource_queue_cap != usize::MAX;
+
+        // A buffered tx never entered any acquire queue and holds no blocked
+        // counters, so it must NOT run the unblock bookkeeping below — just drop
+        // it from every resource buffer it sits in.
+        if self.metas.get(key).unwrap().state.is_buffered() {
+            let (shared_key, cost) = {
+                let meta = self.metas.get(key).unwrap();
+                (meta.shared_key, meta.cost)
+            };
+            for (lock, _is_write) in txdata.txdata(shared_key).locks() {
+                if let Some(queue) = self.resources.get_mut(lock) {
+                    queue.buffer.remove(&(cost, key));
+                }
+                // The buffer front may have changed — re-check for admission.
+                self.advance_events.push_back(*lock);
+            }
+            self.cost_index.remove(&(cost, key));
+            txdata.remove_tx(shared_key);
+            self.metas.remove(key);
+            return;
+        }
+
         let (shared_key, cost) = {
             let meta = self.metas.get_mut(key).unwrap();
             assert!(!meta.state.is_picked());
+            let cost = meta.cost;
             if let TxState::Active { assigned_to, .. } = meta.state {
                 self.actives_assigned_weight[assigned_to] -= meta.active_balancing_weight;
             }
@@ -710,8 +885,12 @@ impl LockingQueue {
                         self.unblock_events.push_back(*lock);
                     }
                 }
+                // The dropped tx freed a slot on this resource.
+                if buffering {
+                    self.advance_events.push_back(*lock);
+                }
             }
-            (meta.shared_key, meta.cost)
+            (meta.shared_key, cost)
         };
         self.cost_index.remove(&(cost, key));
         txdata.remove_tx(shared_key);
@@ -895,6 +1074,9 @@ impl LockingQueue {
         while let Some(ev) = self.unblock_events.pop_front() {
             self.dispatch_unblock_event(ev, txdata);
         }
+        // Draining/dropping above freed slots and shifted buffer fronts; admit
+        // any buffered txs that now fit. No-op (and cheap) when buffering is off.
+        self.dispatch_advance_events(txdata);
     }
 
     fn affinity_weight(&self, worker: usize, tx: &TransactionState) -> usize {
@@ -1314,7 +1496,7 @@ fn main() {
     let mut to_check = BTreeSet::new();
     let mut check_inflight = 0;
 
-    let mut locking_queue = LockingQueue::new(workers, config.max_txs_per_worker);
+    let mut locking_queue = LockingQueue::new(workers, config.max_txs_per_worker, config.resource_queue_cap);
 
     let mut slot = 0;
     let mut last_report = std::time::Instant::now();
@@ -1455,7 +1637,7 @@ fn main() {
             let cost = estimate_cost(bridge.transaction(shared_key));
             locking_queue.new_tx(
                 TxMeta::new(shared_key, Score::new(score, tx_num), cost, slot + config.slot_deadline),
-                bridge.transaction(shared_key),
+                &mut bridge,
             );
             tx_num += 1;
         }
@@ -1533,11 +1715,16 @@ fn main() {
 
                 #[cfg(feature="runtime-checks")]
                 {
-                    let mut statuses = vec![0; 4];
+                    let mut statuses = vec![0; 5];
                     let mut locks_sum = 0_i64;
                     let mut assigned_to_stats = make_vector(workers, || 0);
                     for (_k, v) in locking_queue.metas.iter() {
                         match v.state {
+                            TxState::Buffered => {
+                                assert!(v.resource_queue_subs.is_empty());
+                                assert!(v.affinity_requirements_count == 0);
+                                statuses[4] += 1;
+                            }
                             TxState::Enqueued => {
                                 assert!(!v.resource_queue_subs.is_empty());
                                 assert!(v.affinity_requirements_count == 0);
@@ -1559,7 +1746,9 @@ fn main() {
                                 assert!(v.affinity_requirements_count <= 1);
                             }
                         }
-                        if !v.state.is_picked() {
+                        // Buffered txs hold neither subs nor blocks, so they are
+                        // excluded from the sub/block balance below.
+                        if !v.state.is_picked() && !v.state.is_buffered() {
                             let mut cur = v.resource_queue_subs.front();
                             while cur.is_some() {
                                 locks_sum += 1;
