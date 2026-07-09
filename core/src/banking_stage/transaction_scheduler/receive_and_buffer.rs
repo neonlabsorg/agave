@@ -531,6 +531,26 @@ pub(crate) fn calculate_priority_and_cost(
     let cost = CostModel::calculate_cost(transaction, &bank.feature_set).sum();
     let reward = bank.calculate_reward_for_transaction(transaction, fee_budget_limits);
 
+    // Perf-test invariant: under the zero-fee genesis (`target_lamports_per_signature == 0`,
+    // burn removed) the reward — and therefore the priority — must be zero for every
+    // transaction, so the in-proc schedulers degenerate to a pure lock-contention router
+    // with no cost/revenue ordering. A misconfigured genesis (non-zero base fee) or a load
+    // that sets a priority fee would silently reintroduce revenue ordering during the
+    // measurement.
+    //
+    // A `panic!`/`assert!` is not enough here: this runs on a banking-stage thread whose
+    // unwind is caught, so a panic would just kill the thread and leave the validator
+    // running with the invariant violated. Abort the whole process instead so the
+    // violation is unambiguous. stderr is captured into the validator log by the run
+    // script (`2>${LOGFILE}`).
+    if reward != 0 {
+        eprintln!(
+            "FATAL: perf-test invariant violated — expected zero reward under zero-fee \
+             genesis, got {reward}; aborting process"
+        );
+        std::process::abort();
+    }
+
     // We need a multiplier here to avoid rounding down too aggressively.
     // For many transactions, the cost will be greater than the fees in terms of raw lamports.
     // For the purposes of calculating prioritization, we multiply the fees by a large number so that
