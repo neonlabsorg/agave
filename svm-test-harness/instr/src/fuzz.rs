@@ -16,7 +16,7 @@ use {
     solana_precompile_error::PrecompileError,
     solana_program_runtime::loaded_programs::ProgramRuntimeEnvironments,
     solana_pubkey::Pubkey,
-    solana_svm_callback::InvokeContextCallback,
+    solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
     std::{env, ffi::c_int, sync::Arc},
 };
 
@@ -24,6 +24,15 @@ use {
 ///
 /// All precompiles are enabled for fuzz testing.
 struct FuzzInstrContextCallback;
+
+impl TransactionProcessingCallback for FuzzInstrContextCallback {
+    fn get_account_shared_data(
+        &self,
+        _pubkey: &Pubkey,
+    ) -> Option<(solana_account::AccountSharedData, solana_clock::Slot)> {
+        None
+    }
+}
 
 impl InvokeContextCallback for FuzzInstrContextCallback {
     fn is_precompile(&self, program_id: &Pubkey) -> bool {

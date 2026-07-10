@@ -279,12 +279,18 @@ pub fn instructions_to_load_program_of_loader_v4<T: Client>(
         instructions.push(system_instruction::create_account(
             &payer_keypair.pubkey(),
             &program_keypair.pubkey(),
-            bank_client
-                .get_minimum_balance_for_rent_exemption(
-                    solana_loader_v4_interface::state::LoaderV4State::program_data_offset()
-                        .saturating_add(program.len()),
-                )
-                .unwrap(),
+            // `SetProgramLength` enforces `lamports >= 1.max(rent.minimum_balance(..))`.
+            // Under F3 (rent removed) `minimum_balance` is 0, so without `1.max(..)` the
+            // program account would be funded with 0 lamports and the next instruction
+            // fails with `InsufficientFunds`.
+            1.max(
+                bank_client
+                    .get_minimum_balance_for_rent_exemption(
+                        solana_loader_v4_interface::state::LoaderV4State::program_data_offset()
+                            .saturating_add(program.len()),
+                    )
+                    .unwrap(),
+            ),
             0,
             loader_id,
         ));

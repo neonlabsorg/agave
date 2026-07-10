@@ -14,7 +14,7 @@ use {
         sysvar_cache::SysvarCache,
     },
     solana_pubkey::Pubkey,
-    solana_svm_callback::InvokeContextCallback,
+    solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
     solana_svm_log_collector::LogCollector,
     solana_svm_timings::ExecuteTimings,
     solana_svm_transaction::{instruction::SVMInstruction, svm_message::SVMStaticMessage},
@@ -26,6 +26,15 @@ use {
 struct DefaultCallback;
 
 impl InvokeContextCallback for DefaultCallback {}
+
+impl TransactionProcessingCallback for DefaultCallback {
+    fn get_account_shared_data(
+        &self,
+        _pubkey: &Pubkey,
+    ) -> Option<(AccountSharedData, solana_clock::Slot)> {
+        None
+    }
+}
 
 fn compile_message(
     instruction: &Instruction,
@@ -80,7 +89,7 @@ pub fn execute_instr(
 }
 
 /// Execute a single instruction against the Solana VM with a custom callback.
-pub fn execute_instr_with_callback<C: InvokeContextCallback>(
+pub fn execute_instr_with_callback<C: TransactionProcessingCallback>(
     input: &InstrContext,
     callback: &C,
     compute_budget: &ComputeBudget,
