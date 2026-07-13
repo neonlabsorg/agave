@@ -55,6 +55,26 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:${{ github.sha }},${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
           push: true
 
+      - name: Resolve parasol-plugin branch
+        id: plugin_ref
+        shell: bash
+        env:
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
+          GHTOKEN: ${{ secrets.GHTOKEN }}
+        run: |
+          set -euo pipefail
+          # Same-named parasol-plugin branch if it exists, else dev.
+          if curl -fsS \
+               -H "Authorization: Bearer ${GHTOKEN}" \
+               -H "Accept: application/vnd.github+json" \
+               "https://api.github.com/repos/neonlabsorg/parasol-plugin/branches/${HEAD_REF}" >/dev/null 2>&1; then
+            ref="${HEAD_REF}"
+          else
+            ref="dev"
+          fi
+          echo "resolved parasol-plugin ref: ${ref}"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push Docker image (with parasol-plugin)
         uses: docker/build-push-action@v7
         with:
@@ -65,7 +85,7 @@ jobs:
             gh_token=${{ secrets.GHTOKEN }}
           build-args: |
             PARASOL_PLUGIN_REPO=github.com/neonlabsorg/parasol-plugin.git
-            PARASOL_PLUGIN_REF=${{ vars.PARASOL_PLUGIN_REF || 'dev' }}
+            PARASOL_PLUGIN_REF=${{ steps.plugin_ref.outputs.ref }}
           tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}-plugin,${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}-plugin
           push: true
     outputs:

@@ -7,7 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       build-essential ca-certificates curl git pkg-config \
-      libssl-dev libudev-dev zlib1g-dev llvm clang cmake make \
+      libssl-dev libudev-dev zlib1g-dev libcurl4-openssl-dev llvm clang cmake make \
       libprotobuf-dev protobuf-compiler libclang-dev openssh-client && \
     rm -rf /var/lib/apt/lists/*
 

@@ -1,22 +1,20 @@
 {
-  // __REDPANDA_BROKERS__ / __PROGRAM_ID__ / __MARKET_PREFIX__ are rendered at
-  // container start by the consuming compose command.
-  libpath: "/opt/parasol/lib/libparasol_plugin.so",
-  program_id: "__PROGRAM_ID__",
-  sink: "kafka",
-  kafka: {
-    bootstrap_servers: "__REDPANDA_BROKERS__",
-    compression: "lz4",
-    queue_buffering_max_kbytes: 1048576,
-    idempotence: true,
+  "libpath": "/opt/parasol/lib/libparasol_plugin.so",
+  "program_id": "__PROGRAM_ID__",
+  "sink": "kafka",
+  "kafka": {
+    "bootstrap_servers": "__REDPANDA_BROKERS__",
+    "compression": "lz4",
+    "queue_buffering_max_kbytes": 1048576,
+    "idempotence": true
   },
-  topics: {
-    events: "parasol.events",
-    receipts: "parasol.receipts",
-    config: "parasol.config",
-    market_prefix: "__MARKET_PREFIX__",
+  "topics": {
+    "events": "parasol.events",
+    "receipts": "parasol.receipts",
+    "config": "parasol.config",
+    "market_prefix": "__MARKET_PREFIX__"
   },
-  market_config_account_size: 593,
-  ring_capacity: 65536,
-  parse_ceiling_us: 200,
+  market_config_account_size: 323,
+  "ring_capacity": 65536,
+  "parse_ceiling_us": 200
 }
