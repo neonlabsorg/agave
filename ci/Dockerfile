@@ -17,7 +17,10 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /opt/agave
 COPY . .
-RUN git submodule update --init --recursive
+# TEMPORARY: --remote tracks the tip of solana-sdk's parasol-fork-dev-v4 branch
+# (from .gitmodules) instead of the pinned submodule commit; drop it once the
+# gitlink is bumped routinely.
+RUN git submodule update --init --recursive --remote
 RUN cargo build --release
 
 # parasol-plugin cdylib — built as a member of this agave workspace so its
