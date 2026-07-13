@@ -136,6 +136,9 @@ members = [
 ]
 
 exclude = [
+    # keep the franken-SDK submodule out of this workspace so its [patch] path crates
+    # inherit workspace.dependencies from parasol/solana-sdk/Cargo.toml, not from this file
+    "parasol/solana-sdk",
     "ci/xtask",
     "dev-bins",
     "platform-tools-sdk",
@@ -667,7 +670,8 @@ rustls-webpki2 = { git = "https://github.com/anza-xyz/rustls-webpki", package = 
 
 # Parasol fork (franken-branch parasol-fork-dev-v4): blanket path-patch of the SDK onto agave-4.0.3
 # versions, carrying F1(100ms clock)/F2(gasless fee-calculator)/F3(rent-removal rent). parasol/solana-sdk
-# is a sibling on disk, mounted at /solana-sdk inside the Docker build (see agave-build/build.sh).
+# is a git submodule (neonlabsorg/solana-sdk, branch parasol-fork-dev-v4), excluded from this
+# workspace above so its crates inherit workspace.dependencies from their own root manifest.
 # v3-style blanket: every franken crate whose version matches a version agave uses is patched, so a
 # patched crate never drags a mismatched foundational version (the E0308 trap). MULTI crates (address,
 # hash, pubkey, packet, define-syscall, system-interface) are patched at the franken version; agave's
