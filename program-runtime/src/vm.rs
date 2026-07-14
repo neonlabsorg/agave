@@ -6,8 +6,7 @@ use {
     crate::{
         execution_budget::MAX_INSTRUCTION_STACK_DEPTH,
         invoke_context::{
-            BpfAllocator, InvokeContext, SerializedAccountMetadata, SubaccountSlot,
-            SyscallContext,
+            BpfAllocator, InvokeContext, SerializedAccountMetadata, SubaccountSlot, SyscallContext,
         },
         mem_pool::VmMemoryPool,
         serialization, stable_log,
@@ -384,8 +383,9 @@ pub fn execute<'a, 'b: 'a>(
                                     .subaccount_slots
                                     .iter()
                                     .find_map(|slot| {
-                                        let subaccount_index =
-                                            slot.occupied_subaccount_index.get_subaccount_index()?;
+                                        let subaccount_index = slot
+                                            .occupied_subaccount_index
+                                            .get_subaccount_index()?;
                                         let metadata = slot.caller_account_metadata.as_ref()?;
                                         let vm_end = slot
                                             .vm_data_addr
@@ -408,14 +408,38 @@ pub fn execute<'a, 'b: 'a>(
                                     })
                             });
                         if let Some((faulting_region, vm_addr_range)) = faulting_region {
+                            // [F10-DIAG] temporary — which region faulted (remove after root cause).
+                            match &faulting_region {
+                                FaultingRegion::Account(i) => eprintln!(
+                                    "[F10-DIAG] vm.rs AccessViolation Account idx={} access={:?} vm_addr={:#x} len={} range={:#x}..{:#x}",
+                                    i,
+                                    access_type,
+                                    vm_addr,
+                                    len,
+                                    vm_addr_range.start,
+                                    vm_addr_range.end,
+                                ),
+                                FaultingRegion::Subaccount {
+                                    subaccount_index,
+                                    is_writable,
+                                } => eprintln!(
+                                    "[F10-DIAG] vm.rs AccessViolation Subaccount idx={} writable={} access={:?} vm_addr={:#x} len={} range={:#x}..{:#x}",
+                                    subaccount_index,
+                                    is_writable,
+                                    access_type,
+                                    vm_addr,
+                                    len,
+                                    vm_addr_range.start,
+                                    vm_addr_range.end,
+                                ),
+                            }
                             let transaction_context = &invoke_context.transaction_context;
                             let instruction_context =
                                 transaction_context.get_current_instruction_context()?;
                             let account = match faulting_region {
                                 FaultingRegion::Account(instruction_account_index) => {
-                                    instruction_context.try_borrow_instruction_account(
-                                        instruction_account_index,
-                                    )?
+                                    instruction_context
+                                        .try_borrow_instruction_account(instruction_account_index)?
                                 }
                                 FaultingRegion::Subaccount {
                                     subaccount_index,

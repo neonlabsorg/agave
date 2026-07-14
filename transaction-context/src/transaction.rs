@@ -565,7 +565,27 @@ impl<'ix_data> TransactionContext<'ix_data> {
                 };
                 let requested_length =
                     vm_addr.saturating_add(len).saturating_sub(region.vm_addr) as usize;
+                // [F10-DIAG] temporary subaccount-grow instrumentation (remove after root cause).
+                let f10_diag = index_in_transaction & crate::SUBACCOUNT_MARKER != 0;
+                if f10_diag {
+                    eprintln!(
+                        "[F10-DIAG] avh-enter sub_index={} access={:?} region.vm_addr={:#x} region.len={} host={:#x} writable={} vm_addr={:#x} len={} requested_length={} reserved={}",
+                        index_in_transaction & !crate::SUBACCOUNT_MARKER,
+                        access_type,
+                        region.vm_addr,
+                        region.len,
+                        region.host_addr,
+                        region.writable,
+                        vm_addr,
+                        len,
+                        requested_length,
+                        address_space_reserved_for_account,
+                    );
+                }
                 if requested_length > address_space_reserved_for_account as usize {
+                    if f10_diag {
+                        eprintln!("[F10-DIAG] BAIL requested_length>reserved");
+                    }
                     // Requested access goes further than the account region.
                     return;
                 }
@@ -574,10 +594,16 @@ impl<'ix_data> TransactionContext<'ix_data> {
                 // whatever is writing will trigger an EbpfError::AccessViolation like
                 // if the region was readonly, and the transaction will fail gracefully.
                 let Ok(mut account) = accounts.try_borrow_mut(index_in_transaction) else {
+                    if f10_diag {
+                        eprintln!("[F10-DIAG] BAIL try_borrow_mut failed (borrow conflict?)");
+                    }
                     debug_assert!(false);
                     return;
                 };
                 if accounts.touch(index_in_transaction).is_err() {
+                    if f10_diag {
+                        eprintln!("[F10-DIAG] BAIL touch failed");
+                    }
                     debug_assert!(false);
                     return;
                 }
@@ -594,22 +620,48 @@ impl<'ix_data> TransactionContext<'ix_data> {
                     let new_len = (address_space_reserved_for_account as usize)
                         .min(MAX_ACCOUNT_DATA_LEN as usize)
                         .min(old_len.saturating_add(remaining_allowed_growth));
+                    if f10_diag {
+                        eprintln!(
+                            "[F10-DIAG] grow old_len={} new_len={} remaining_growth={} resize_delta={}",
+                            old_len,
+                            new_len,
+                            remaining_allowed_growth,
+                            accounts.resize_delta(),
+                        );
+                    }
                     // The last two min operations ensure the following:
                     debug_assert!(accounts.can_data_be_resized(old_len, new_len).is_ok());
                     if accounts
                         .update_accounts_resize_delta(old_len, new_len)
                         .is_err()
                     {
+                        if f10_diag {
+                            eprintln!("[F10-DIAG] BAIL update_accounts_resize_delta failed");
+                        }
                         return;
                     }
                     account.resize(new_len, 0);
                     region.len = new_len as u64;
+                } else if f10_diag {
+                    eprintln!("[F10-DIAG] no-grow (requested_length<=region.len)");
                 }
 
                 // Potentially unshare / make the account shared data unique (CoW logic).
                 if virtual_address_space_adjustments && account_data_direct_mapping {
                     region.host_addr = account.data_as_mut_slice().as_mut_ptr() as u64;
                     region.writable = true;
+                    if f10_diag {
+                        let data_len = account.data().len();
+                        eprintln!(
+                            "[F10-DIAG] done region.len={} host={:#x} writable=true data_len={}",
+                            region.len, region.host_addr, data_len,
+                        );
+                    }
+                } else if f10_diag {
+                    eprintln!(
+                        "[F10-DIAG] done-no-repoint vasp={} direct_mapping={}",
+                        virtual_address_space_adjustments, account_data_direct_mapping,
+                    );
                 }
             },
         )
