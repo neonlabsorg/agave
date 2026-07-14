@@ -2200,7 +2200,13 @@ impl Bank {
     }
 
     fn update_clock(&self, parent_epoch: Option<Epoch>) {
-        let mut unix_timestamp = self.clock().unix_timestamp;
+        // Parasol test-only: strip the previously-applied clock offset from
+        // the ancestor reads so the monotonic-floor check below operates on
+        // unshifted timestamps. The current offset is reapplied at the end
+        // of this function. With offset==0 (production default) this is a
+        // no-op.
+        let last_offset = crate::parasol_clock_offset::last_applied();
+        let mut unix_timestamp = self.clock().unix_timestamp.saturating_sub(last_offset);
         // set epoch_start_timestamp to None to warp timestamp
         let epoch_start_timestamp = {
             let epoch = if let Some(epoch) = parent_epoch {
@@ -2216,7 +2222,7 @@ impl Bank {
             slow: MAX_ALLOWABLE_DRIFT_PERCENTAGE_SLOW_V2,
         };
 
-        let ancestor_timestamp = self.clock().unix_timestamp;
+        let ancestor_timestamp = self.clock().unix_timestamp.saturating_sub(last_offset);
         if let Some(timestamp_estimate) =
             self.get_timestamp_estimate(max_allowable_drift, epoch_start_timestamp)
         {
@@ -2243,6 +2249,12 @@ impl Bank {
             unix_timestamp = self.unix_timestamp_from_genesis();
             epoch_start_timestamp = self.unix_timestamp_from_genesis();
         }
+        // Parasol test-only: apply the current offset and remember it so
+        // the next slot can strip it from the ancestor read. Default offset
+        // is 0, so production behaviour is unchanged.
+        let cur_offset = crate::parasol_clock_offset::get();
+        crate::parasol_clock_offset::set_last_applied(cur_offset);
+        let unix_timestamp = unix_timestamp.saturating_add(cur_offset);
         let clock = sysvar::clock::Clock {
             slot: self.slot,
             epoch_start_timestamp,

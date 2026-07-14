@@ -55,6 +55,10 @@ impl FromClapArgMatches for JsonRpcConfig {
             rpc_scan_and_fix_roots: matches.is_present("rpc_scan_and_fix_roots"),
             max_request_body_size: Some(value_t!(matches, "rpc_max_request_body_size", usize)?),
             disable_health_check: false,
+            // Parasol test-only clock offset is opt-in via the
+            // `solana-test-validator --enable-test-clock-offset` flag only;
+            // the regular agave-validator binary never exposes this RPC.
+            enable_test_clock_offset: false,
         })
     }
 }
