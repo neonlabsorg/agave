@@ -1616,10 +1616,14 @@ fn non_blocking_check_slot_state(shared_leader_state: &SharedLeaderState, ticks_
         }
     }
 
+    let (next_leader_range_start, next_leader_range_end) = state
+        .next_leader_slot_range()
+        .unwrap_or((u64::MAX, u64::MAX));
+
     let tick_height = state.tick_height();
     let slot = tick_height / ticks_per_slot;
 
-    if state.leader_first_tick_height().is_some_and(|leader_tick_height| tick_height >= leader_tick_height) {
+    if (next_leader_range_start..=next_leader_range_end).contains(&slot) {
         return CurrentSlotState::Starting(slot)
     }
 
