@@ -133,6 +133,8 @@ dependencies = [
  "log",
  "solana-clock",
  "solana-hash",
+ "solana-lattice-hash",
+ "solana-message",
  "solana-signature",
  "solana-transaction",
  "solana-transaction-status",

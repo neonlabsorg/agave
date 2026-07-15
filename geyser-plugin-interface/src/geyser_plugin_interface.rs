@@ -5,6 +5,8 @@
 use {
     solana_clock::{Slot, UnixTimestamp},
     solana_hash::Hash,
+    solana_lattice_hash::lt_hash::LtHash,
+    solana_message::v0::LoadedAddresses,
     solana_signature::Signature,
     solana_transaction::{sanitized::SanitizedTransaction, versioned::VersionedTransaction},
     solana_transaction_status::{Reward, RewardsAndNumPartitions, TransactionStatusMeta},
@@ -288,12 +290,30 @@ pub struct ReplicaBlockInfoV4<'a> {
     pub entry_count: u64,
 }
 
+/// Extending ReplicaBlockInfo by sending the accounts lattice hash.
+#[derive(Clone, Debug)]
+#[repr(C)]
+pub struct ReplicaBlockInfoV5<'a> {
+    pub parent_slot: Slot,
+    pub parent_blockhash: &'a str,
+    pub slot: Slot,
+    pub blockhash: &'a str,
+    pub rewards: &'a RewardsAndNumPartitions,
+    pub block_time: Option<UnixTimestamp>,
+    pub block_height: Option<u64>,
+    pub executed_transaction_count: u64,
+    pub entry_count: u64,
+    /// The lattice hash of all accounts, as of this (frozen) block.
+    pub account_lt_hash: &'a LtHash,
+}
+
 #[repr(u32)]
 pub enum ReplicaBlockInfoVersions<'a> {
     V0_0_1(&'a ReplicaBlockInfo<'a>),
     V0_0_2(&'a ReplicaBlockInfoV2<'a>),
     V0_0_3(&'a ReplicaBlockInfoV3<'a>),
     V0_0_4(&'a ReplicaBlockInfoV4<'a>),
+    V0_0_5(&'a ReplicaBlockInfoV5<'a>),
 }
 
 /// Errors returned by plugin calls
