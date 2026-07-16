@@ -307,8 +307,10 @@ impl<'a> CallerAccount<'a> {
         _vm_addr: u64,
         account_info: &solana_account_info::AccountInfo,
         account_metadata: &crate::invoke_context::SerializedAccountMetadata,
+        enable_mm_input: bool,
     ) -> Result<CallerAccount<'a>, Error> {
         use crate::memory::{translate_type, translate_type_mut_for_cpi};
+        let max_ptr_value = solana_sbpf::ebpf::MM_INPUT_START + if enable_mm_input {solana_sbpf::ebpf::MM_REGION_SIZE} else {0};
 
         let syscall_parameter_address_restrictions = invoke_context
             .get_feature_set()
@@ -344,7 +346,7 @@ impl<'a> CallerAccount<'a> {
                 check_aligned,
             )?;
             if syscall_parameter_address_restrictions {
-                if account_info.lamports.as_ptr() as u64 >= solana_sbpf::ebpf::MM_INPUT_START {
+                if account_info.lamports.as_ptr() as u64 >= max_ptr_value {
                     return Err(Box::new(CpiError::InvalidPointer));
                 }
 
@@ -366,7 +368,7 @@ impl<'a> CallerAccount<'a> {
 
         let (serialized_data, vm_data_addr, ref_to_len_in_vm) = {
             if syscall_parameter_address_restrictions
-                && account_info.data.as_ptr() as u64 >= solana_sbpf::ebpf::MM_INPUT_START
+                && account_info.data.as_ptr() as u64 >= max_ptr_value
             {
                 return Err(Box::new(CpiError::InvalidPointer));
             }
@@ -399,7 +401,7 @@ impl<'a> CallerAccount<'a> {
                 // In the same vein as the other check_account_info_pointer() checks, we don't lock
                 // this pointer to a specific address but we don't want it to be inside accounts, or
                 // callees might be able to write to the pointed memory.
-                if vm_len_addr >= solana_sbpf::ebpf::MM_INPUT_START {
+                if vm_len_addr >= max_ptr_value {
                     return Err(Box::new(CpiError::InvalidPointer));
                 }
             }
@@ -441,8 +443,10 @@ impl<'a> CallerAccount<'a> {
         vm_addr: u64,
         account_info: &SolAccountInfo,
         account_metadata: &crate::invoke_context::SerializedAccountMetadata,
+        enable_mm_input: bool,
     ) -> Result<CallerAccount<'a>, Error> {
         use crate::memory::translate_type_mut_for_cpi;
+        let max_ptr_value = solana_sbpf::ebpf::MM_INPUT_START + if enable_mm_input {solana_sbpf::ebpf::MM_REGION_SIZE} else {0};
 
         let syscall_parameter_address_restrictions = invoke_context
             .get_feature_set()
@@ -517,7 +521,7 @@ impl<'a> CallerAccount<'a> {
             // In the same vein as the other check_account_info_pointer() checks, we don't lock
             // this pointer to a specific address but we don't want it to be inside accounts, or
             // callees might be able to write to the pointed memory.
-            if vm_len_addr >= solana_sbpf::ebpf::MM_INPUT_START {
+            if vm_len_addr >= max_ptr_value {
                 return Err(Box::new(CpiError::InvalidPointer));
             }
         }
@@ -1100,6 +1104,7 @@ where
         u64,
         &T,
         &SerializedAccountMetadata,
+        bool,
     ) -> Result<CallerAccount<'a>, Error>,
 {
     let transaction_context = &invoke_context.transaction_context;
@@ -1179,6 +1184,7 @@ where
                     ),
                     &account_infos[caller_account_index],
                     serialized_metadata,
+                    false,
                 )?;
 
             if syscall_parameter_address_restrictions {
@@ -1305,6 +1311,7 @@ pub fn translate_subaccount_slots<'a>(
                     view_addr,
                     view,
                     &metadata,
+                    true,
                 )?
             }
             crate::invoke_context::AccountViewKind::C => {
@@ -1317,6 +1324,7 @@ pub fn translate_subaccount_slots<'a>(
                     view_addr,
                     view,
                     &metadata,
+                    true,
                 )?
             }
         };
