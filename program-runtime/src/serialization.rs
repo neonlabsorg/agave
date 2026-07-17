@@ -632,24 +632,19 @@ fn serialize_parameters_for_abiv1(
     }
     size += size_of::<u64>() // data len
     + instruction_data.len()
-    + size_of::<Pubkey>() // program id
-    // F10: alignment padding so the u64 subaccount count lands on BPF_ALIGN_OF_U128
-    // boundary, matching parasol-dev PRS-153 layout.
-    + (instruction_data.len() as *const u8).align_offset(BPF_ALIGN_OF_U128);
+    + size_of::<Pubkey>(); // program id
+    size += (size as *const u8).align_offset(BPF_ALIGN_OF_U128);
 
     // reserve space for account pointer array if SIMD-0449 is enabled
     if direct_account_pointers_program_input {
         size += accounts.len() * size_of::<u64>();
     };
 
-    // F10 (SIMD-0449 mutual-gate): when direct account pointers are NOT
-    // active, reserve the subaccount slot region in the same post-program_id
-    // byte range the pointer array would occupy. The two are mutually
-    // exclusive by construction — `sol_load_subaccount` is gated off whenever
-    // SIMD-0449 is active — so they never collide. In the direct-map model no
-    // real-subaccount records are serialized (data is direct-mapped); only the
-    // MAX_SUBACCOUNT_SLOTS reserved slots (each an account-view buffer + the
-    // 88-byte header) are laid out, after alignment padding.
+    // F10: reserve the subaccount slot region after the program_id (and, when enabled,
+    // the SIMD-0449 account pointer array). `sol_load_subaccount` is gated off whenever
+    // SIMD-0449 is active, so these reserved slots remain unused in that mode.
+    // In the direct-map model no real-subaccount records are serialized (data is direct-mapped);
+    // only MAX_SUBACCOUNT_SLOTS reserved slots (account-view buffer + 88-byte header) are laid out.
     size += MAX_SUBACCOUNT_SLOTS.saturating_mul(
         SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE.saturating_add(SUBACCOUNT_SLOT_HEADER_SIZE),
     );
@@ -699,7 +694,8 @@ fn serialize_parameters_for_abiv1(
     s.write::<u64>((instruction_data.len() as u64).to_le());
     let instruction_data_offset = s.write_all(instruction_data);
     s.write_all(program_id.as_ref());
-    let align_offset = (instruction_data.len() as *const u8).align_offset(BPF_ALIGN_OF_U128);
+
+    let align_offset = (s.current_vaddr() as *const u8).align_offset(BPF_ALIGN_OF_U128);
     s.fill_write(align_offset, 0)
         .map_err(|_| InstructionError::InvalidArgument)?;
 
