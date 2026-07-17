@@ -2157,6 +2157,8 @@ mod tests {
             .set_syscall_context(SyscallContext {
                 allocator: BpfAllocator::new(solana_program_entrypoint::HEAP_LENGTH as u64),
                 accounts_metadata: vec![account_metadata],
+                subaccount_slots: Vec::new(),
+                trace_log: Vec::new(),
             })
             .unwrap();
 
@@ -2254,6 +2256,7 @@ mod tests {
             vm_addr,
             account_info,
             &account_metadata,
+            false,
         )
         .unwrap();
         assert_eq!(*caller_account.lamports, account.lamports());

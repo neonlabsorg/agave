@@ -1033,7 +1033,7 @@ mod tests {
                     continue;
                 }
 
-                let (mut serialized, regions, _account_lengths, _instruction_data_offset) =
+                let (mut serialized, regions, _account_lengths, _subaccount_slots, _instruction_data_offset) =
                     serialization_result.unwrap();
                 let mut serialized_regions = concat_regions(&regions);
                 let (de_program_id, de_accounts, de_instruction_data) = unsafe {
@@ -1180,7 +1180,7 @@ mod tests {
                 .unwrap();
 
             // check serialize_parameters_for_abiv1
-            let (mut serialized, regions, accounts_metadata, _instruction_data_offset) =
+            let (mut serialized, regions, accounts_metadata, _subaccount_slots, _instruction_data_offset) =
                 serialize_parameters(
                     &instruction_context,
                     virtual_address_space_adjustments,
@@ -1280,7 +1280,7 @@ mod tests {
                 .get_current_instruction_context()
                 .unwrap();
 
-            let (mut serialized, regions, account_lengths, _instruction_data_offset) =
+            let (mut serialized, regions, account_lengths, _subaccount_slots, _instruction_data_offset) =
                 serialize_parameters(
                     &instruction_context,
                     virtual_address_space_adjustments,
@@ -1445,7 +1445,7 @@ mod tests {
             .unwrap();
 
         // check serialize_parameters_for_abiv1
-        let (_serialized, regions, _accounts_metadata, _instruction_data_offset) =
+        let (_serialized, regions, _accounts_metadata, _subaccount_slots, _instruction_data_offset) =
             serialize_parameters(
                 &instruction_context,
                 true,
@@ -1478,7 +1478,7 @@ mod tests {
             .get_current_instruction_context()
             .unwrap();
 
-        let (_serialized, regions, _account_lengths, _instruction_data_offset) =
+        let (_serialized, regions, _account_lengths, _subaccount_slots, _instruction_data_offset) =
             serialize_parameters(
                 &instruction_context,
                 true,
