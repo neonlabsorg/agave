@@ -1,0 +1,34 @@
+[package]
+name = "parasol-scheduler"
+version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+agave-scheduler-bindings.workspace = true
+agave-scheduling-utils.workspace = true
+agave-transaction-view.workspace = true
+ahash.workspace = true
+clap = { version = "4.5.60", features = ["derive"] }
+env_logger.workspace = true
+humantime-serde = "1.1.1"
+log.workspace = true
+serde.workspace = true
+slotmap.workspace = true
+smallvec.workspace = true
+solana-cost-model.workspace = true
+solana-hash.workspace = true
+agave-feature-set.workspace = true
+solana-runtime-transaction.workspace = true
+solana-transaction.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+runtime-checks = []

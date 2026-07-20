@@ -720,7 +720,7 @@ mod external {
     use {
         super::*,
         crate::banking_stage::consume_worker::external::ExternalWorker,
-        agave_scheduling_utils::handshake::server::{AgaveSession, AgaveWorkerSession},
+        agave_scheduling_utils::handshake::{AgaveSession, AgaveWorkerSession},
         tpu_to_pack::BankingPacketReceivers,
     };
 
@@ -748,6 +748,7 @@ mod external {
             // Spawn the external consumer workers.
             let mut threads = Vec::with_capacity(workers.len() + 2);
             let mut worker_metrics = Vec::with_capacity(workers.len());
+            let ticks_per_slot = self.poh_recorder.read().unwrap().ticks_per_slot();
             for (
                 index,
                 AgaveWorkerSession {
@@ -771,6 +772,7 @@ mod external {
                     allocator,
                     self.poh_recorder.read().unwrap().shared_leader_state(),
                     self.bank_forks.read().unwrap().sharable_banks(),
+                    ticks_per_slot,
                 );
 
                 worker_metrics.push(consume_worker.metrics_handle());
@@ -838,7 +840,7 @@ pub enum BankingControlMsg {
     },
     #[cfg(unix)]
     External {
-        session: agave_scheduling_utils::handshake::server::AgaveSession,
+        session: agave_scheduling_utils::handshake::AgaveSession,
     },
 }
 

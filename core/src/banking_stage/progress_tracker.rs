@@ -19,7 +19,7 @@ use {
 /// Spawns a thread to track and send progress updates.
 pub fn spawn(
     exit: Arc<AtomicBool>,
-    mut producer: shaq::Producer<ProgressMessage>,
+    mut producer: shaq::spsc::Producer<ProgressMessage>,
     shared_leader_state: SharedLeaderState,
     worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
     ticks_per_slot: u64,
@@ -61,7 +61,7 @@ impl ProgressTracker {
         }
     }
 
-    fn run(mut self, producer: &mut shaq::Producer<ProgressMessage>) {
+    fn run(mut self, producer: &mut shaq::spsc::Producer<ProgressMessage>) {
         let mut last_published_tick_height = u64::MAX;
         while !self.exit.load(Ordering::Relaxed) {
             let (message, tick_height) = self.produce_progress_message();
@@ -85,7 +85,7 @@ impl ProgressTracker {
     /// returns true if a message was published
     fn publish(
         &mut self,
-        producer: &mut shaq::Producer<ProgressMessage>,
+        producer: &mut shaq::spsc::Producer<ProgressMessage>,
         message: ProgressMessage,
     ) -> bool {
         producer.sync();
@@ -119,36 +119,38 @@ impl ProgressTracker {
 
             ProgressMessage {
                 leader_state: agave_scheduler_bindings::LEADER_READY,
-                current_slot: working_bank.slot(),
-                next_leader_slot: next_leader_range_start,
-                leader_range_end: next_leader_range_end,
-                remaining_cost_units: self.remaining_block_cost(),
                 current_slot_progress: progress(
                     working_bank.slot(),
                     tick_height,
                     self.ticks_per_slot,
                 ),
+                epoch: working_bank.epoch(),
+                current_slot: working_bank.slot(),
+                next_leader_slot: next_leader_range_start,
+                leader_range_end: next_leader_range_end,
+                remaining_cost_units: self.remaining_block_cost(),
+                latest_blockhash: working_bank.last_blockhash().to_bytes(),
             }
         } else {
             let current_slot = slot_from_tick_height(tick_height, self.ticks_per_slot);
 
-            // We aren't ready to build a slot yet, however, it may already be our leader
-            // slot which is useful to tell the scheduler.
-            let leader_state = match leader_state
-                .leader_first_tick_height()
-                .is_some_and(|leader_height| tick_height >= leader_height)
-            {
-                true => agave_scheduler_bindings::LEADER_STARTING,
-                false => agave_scheduler_bindings::NOT_LEADER,
-            };
+            // No bank yet but we may already be inside our leader window.
+            let leader_state =
+                if (next_leader_range_start..=next_leader_range_end).contains(&current_slot) {
+                    agave_scheduler_bindings::LEADER_STARTING
+                } else {
+                    agave_scheduler_bindings::NOT_LEADER
+                };
 
             ProgressMessage {
                 leader_state,
+                current_slot_progress: progress(current_slot, tick_height, self.ticks_per_slot),
+                epoch: 0,
                 current_slot,
                 next_leader_slot: next_leader_range_start,
                 leader_range_end: next_leader_range_end,
                 remaining_cost_units: 0,
-                current_slot_progress: progress(current_slot, tick_height, self.ticks_per_slot),
+                latest_blockhash: [0; 32],
             }
         };
 
