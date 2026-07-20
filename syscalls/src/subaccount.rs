@@ -758,6 +758,7 @@ fn sync_subaccount_slot_after_mutation(
                     view_addr,
                     view,
                     &metadata,
+                    true,
                 )?
             }
             AccountViewKind::C => {
@@ -770,6 +771,7 @@ fn sync_subaccount_slot_after_mutation(
                     view_addr,
                     view,
                     &metadata,
+                    true,
                 )?
             }
         };
