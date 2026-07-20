@@ -235,6 +235,7 @@ pub(crate) mod external {
         shared_leader_state: SharedLeaderState,
         sharable_banks: SharableBanks,
         metrics: Arc<ConsumeWorkerMetrics>,
+        ticks_per_slot: u64
     }
 
     type Tx = RuntimeTransaction<ResolvedTransactionView<TransactionPtr>>;
@@ -257,6 +258,7 @@ pub(crate) mod external {
             allocator: rts_alloc::Allocator,
             shared_leader_state: SharedLeaderState,
             sharable_banks: SharableBanks,
+            ticks_per_slot: u64
         ) -> Self {
             Self {
                 exit,
@@ -267,6 +269,7 @@ pub(crate) mod external {
                 shared_leader_state,
                 sharable_banks,
                 metrics: Arc::new(ConsumeWorkerMetrics::new(id)),
+                ticks_per_slot
             }
         }
 
@@ -362,17 +365,56 @@ pub(crate) mod external {
             // not record at the end because the slot has ended, we will retry
             // on the next slot.
             let mut last_attempted_slot = 0;
-            for _ in 0..2 {
-                let Some(leader_state) =
-                    active_leader_state_with_timeout(&self.shared_leader_state)
-                else {
-                    return self
-                        .return_not_included_with_reason(
-                            message,
-                            not_included_reasons::BANK_NOT_AVAILABLE,
-                            last_attempted_slot,
-                        )
-                        .map(|()| true);
+            for attempt in 0..2 {
+                let leader_state = {
+                    let mut leader_probe = non_blocking_check_slot_state(&self.shared_leader_state, self.ticks_per_slot);
+                    if leader_probe.outdated(message.max_working_slot) {
+                        return self
+                            .return_unprocessed_message(
+                                message,
+                                processed_codes::MAX_WORKING_SLOT_EXCEEDED,
+                            )
+                            .map(|()| false);
+                    }
+
+                    if leader_probe.matches(message.max_working_slot) {
+                        if attempt > 0 && !leader_probe.is_ready() {
+                            break;
+                        }
+                        loop {
+                            if leader_probe.outdated(message.max_working_slot) {
+                                return self
+                                    .return_unprocessed_message(
+                                        message,
+                                        processed_codes::MAX_WORKING_SLOT_EXCEEDED,
+                                    )
+                                    .map(|()| false);
+                            }
+                            if leader_probe.is_ready() || self.exit.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            core::hint::spin_loop();
+                            leader_probe = non_blocking_check_slot_state(&self.shared_leader_state, self.ticks_per_slot)
+                        }
+                        if let CurrentSlotState::Ready(_, state) = leader_probe {
+                            state
+                        } else {
+                            break;
+                        }
+                    } else {
+                        let Some(leader_state) =
+                            active_leader_state_with_timeout(&self.shared_leader_state)
+                        else {
+                            return self
+                                .return_not_included_with_reason(
+                                    message,
+                                    not_included_reasons::BANK_NOT_AVAILABLE,
+                                    last_attempted_slot,
+                                )
+                                .map(|()| true);
+                        };
+                        leader_state
+                    }
                 };
 
                 let bank = leader_state
@@ -1532,6 +1574,60 @@ pub(crate) mod external {
 /// starting with the given work item.
 fn try_drain_iter<T>(work: T, receiver: &Receiver<T>) -> impl Iterator<Item = T> + '_ {
     std::iter::once(work).chain(receiver.try_iter())
+}
+
+enum CurrentSlotState {
+    Starting(u64),
+    Ready(u64, arc_swap::Guard<Arc<LeaderState>>),
+    NotLeader(u64)
+}
+
+impl CurrentSlotState {
+    fn matches(&self, slot: u64) -> bool {
+        match self {
+            Self::Starting(state) => slot == *state,
+            Self::Ready(state, _) => slot == *state,
+            Self::NotLeader(_) => false
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        match self {
+            Self::Ready(..) => true,
+            _ => false
+        }
+    }
+
+    fn outdated(&self, batch_working_slot: u64) -> bool {
+        match self {
+            Self::Starting(slot) => batch_working_slot < *slot,
+            Self::Ready(slot, _) => batch_working_slot < *slot,
+            Self::NotLeader(slot) => batch_working_slot < *slot
+        }
+    }
+}
+
+fn non_blocking_check_slot_state(shared_leader_state: &SharedLeaderState, ticks_per_slot: u64) -> CurrentSlotState {
+    let state = shared_leader_state.load();
+
+    if let Some(bank) = state.working_bank() {
+        if !bank.is_complete() {
+            return CurrentSlotState::Ready(bank.slot(), state)
+        }
+    }
+
+    let (next_leader_range_start, next_leader_range_end) = state
+        .next_leader_slot_range()
+        .unwrap_or((u64::MAX, u64::MAX));
+
+    let tick_height = state.tick_height();
+    let slot = tick_height / ticks_per_slot;
+
+    if (next_leader_range_start..=next_leader_range_end).contains(&slot) {
+        return CurrentSlotState::Starting(slot)
+    }
+
+    CurrentSlotState::NotLeader(slot)
 }
 
 /// Get active bank with timeout.

@@ -675,9 +675,16 @@ mod external {
 
                 context.exit_signal.store(false, Ordering::Relaxed);
 
+                // Spawn progress tracker.
+                let (shared_leader_state, ticks_per_slot) = {
+                    let poh = context.poh_recorder.read().unwrap();
+
+                    (poh.shared_leader_state(), poh.ticks_per_slot())
+                };
+
                 // Spawn the new workers.
                 self.thread_hdls.push(Self::spawn_vote_worker(context));
-                Self::spawn_external_workers(&mut self.thread_hdls, context, workers);
+                Self::spawn_external_workers(&mut self.thread_hdls, context, workers, ticks_per_slot);
 
                 // Spawn tpu_to_pack.
                 self.thread_hdls.push(tpu_to_pack::spawn(
@@ -690,12 +697,7 @@ mod external {
                     tpu_to_pack,
                 ));
 
-                // Spawn progress tracker.
-                let (shared_leader_state, ticks_per_slot) = {
-                    let poh = context.poh_recorder.read().unwrap();
 
-                    (poh.shared_leader_state(), poh.ticks_per_slot())
-                };
                 self.thread_hdls.push(progress_tracker::spawn(
                     context.exit_signal.clone(),
                     progress_tracker,
@@ -711,6 +713,7 @@ mod external {
             non_vote_thread_hdls: &mut Vec<JoinHandle<()>>,
             context: &BankingStageContext,
             workers: Vec<AgaveWorkerSession>,
+            ticks_per_slot: u64
         ) {
             static_assertions::const_assert!(
                 agave_scheduling_utils::handshake::MAX_WORKERS
@@ -744,6 +747,7 @@ mod external {
                     allocator,
                     context.poh_recorder.read().unwrap().shared_leader_state(),
                     context.bank_forks.read().unwrap().sharable_banks(),
+                    ticks_per_slot
                 );
 
                 worker_metrics.push(consume_worker.metrics_handle());
