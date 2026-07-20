@@ -1,0 +1,138 @@
+name: Parasol CI
+run-name: "CI / ${{ github.event_name == 'pull_request' && github.event.pull_request.title || 'build' }} / ${{ github.event_name }}"
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review]
+  push:
+    branches:
+      - parasol-fork-dev-v4
+      - '[vt][0-9].[0-9]+.[0-9x]+*'
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: neonlabsorg/parasol-node
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: gha-runner-scale-set-large
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Set image tag
+        id: vars
+        run: |
+          if [[ "${GITHUB_REF}" == refs/pull/* ]]; then
+            tag="${GITHUB_HEAD_REF}"
+          elif [[ "${GITHUB_REF}" == refs/heads/parasol-fork-dev-v4 ]]; then
+            tag="v4-latest"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          tag="${tag//\//-}"
+          echo "image_tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ci/Dockerfile
+          target: runtime
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }},${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+          push: true
+
+      - name: Resolve parasol-plugin branch
+        id: plugin_ref
+        shell: bash
+        env:
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
+          GHTOKEN: ${{ secrets.GHTOKEN }}
+        run: |
+          set -euo pipefail
+          # Same-named parasol-plugin branch if it exists, else dev.
+          if curl -fsS \
+               -H "Authorization: Bearer ${GHTOKEN}" \
+               -H "Accept: application/vnd.github+json" \
+               "https://api.github.com/repos/neonlabsorg/parasol-plugin/branches/${HEAD_REF}" >/dev/null 2>&1; then
+            ref="${HEAD_REF}"
+          else
+            ref="dev"
+          fi
+          echo "resolved parasol-plugin ref: ${ref}"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image (with parasol-plugin)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ci/Dockerfile
+          target: runtime-parasol-plugin
+          secrets: |
+            gh_token=${{ secrets.GHTOKEN }}
+          build-args: |
+            PARASOL_PLUGIN_REPO=github.com/neonlabsorg/parasol-plugin.git
+            PARASOL_PLUGIN_REF=${{ steps.plugin_ref.outputs.ref }}
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}-plugin,${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}-plugin
+          push: true
+    outputs:
+        image-tag: ${{ steps.vars.outputs.image_tag }}
+
+  detect-mode:
+    runs-on: gha-runner-scale-set
+    outputs:
+      full: ${{ steps.detect.outputs.full }}
+    steps:
+      - name: Detect full-tests label
+        id: detect
+        env:
+          HAS_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-tests') }}
+        run: echo "full=${HAS_LABEL}" >> "$GITHUB_OUTPUT"
+
+  run-tests:
+    needs:
+      - build
+      - detect-mode
+    runs-on: gha-runner-scale-set
+    steps:
+      - name: Checkout dynamic-ci-cd workflows
+        uses: actions/checkout@v6
+        with:
+          repository: neonlabsorg/dynamic-ci-cd
+          ref: main
+          token: ${{ secrets.GHTOKEN }}
+          path: ./dynamic-ci-cd/.github/workflows
+
+      - name: Dispatch e2e
+        id: dispatch
+        uses: ./dynamic-ci-cd/.github/workflows/actions/dispatch-workflow
+        with:
+          github-token: ${{ secrets.GHTOKEN }}
+          target-repo: neonlabsorg/dynamic-ci-cd
+          workflow-file: parasol-e2e-dispatch.yml
+          ref: main
+          workflow-inputs: ${{ format('{{"suites":"{0}","image-overrides":"{{\"PARASOL_NODE_IMAGE\":\"neonlabsorg/parasol-node:{1}-plugin\"}}","deploy-solana-test-programs":"true","ref":"{2}"}}', needs.detect-mode.outputs.full == 'true' && 'all' || 'parasol-node', github.sha, github.head_ref || github.ref_name) }}
+
+      - name: Wait for e2e
+        uses: ./dynamic-ci-cd/.github/workflows/actions/wait-for-workflow
+        with:
+          github-token: ${{ secrets.GHTOKEN }}
+          target-repo: neonlabsorg/dynamic-ci-cd
+          workflow-file: parasol-e2e-dispatch.yml
+          ref: main
+          dispatched-at: ${{ steps.dispatch.outputs.dispatched_at }}
+          timeout-minutes: 90
+          poll-interval-seconds: 30

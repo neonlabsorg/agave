@@ -632,28 +632,22 @@ fn serialize_parameters_for_abiv1(
     }
     size += size_of::<u64>() // data len
     + instruction_data.len()
-    + size_of::<Pubkey>(); // program id;
+    + size_of::<Pubkey>(); // program id
+    size += (size as *const u8).align_offset(BPF_ALIGN_OF_U128);
 
     // reserve space for account pointer array if SIMD-0449 is enabled
-    let account_pointers_offset = if direct_account_pointers_program_input {
-        let offset = (size as *const u8).align_offset(BPF_ALIGN_OF_U128);
-        size += offset + accounts.len() * size_of::<u64>();
-        Some(offset)
-    } else {
-        // F10 (SIMD-0449 mutual-gate): when direct account pointers are NOT
-        // active, reserve the subaccount slot region in the same post-program_id
-        // byte range the pointer array would occupy. The two are mutually
-        // exclusive by construction — `sol_load_subaccount` is gated off whenever
-        // SIMD-0449 is active — so they never collide. In the direct-map model no
-        // real-subaccount records are serialized (data is direct-mapped); only the
-        // MAX_SUBACCOUNT_SLOTS reserved slots (each an account-view buffer + the
-        // 88-byte header) are laid out, after alignment padding.
-        size += (instruction_data.len() as *const u8).align_offset(BPF_ALIGN_OF_U128);
-        size += MAX_SUBACCOUNT_SLOTS.saturating_mul(
-            SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE.saturating_add(SUBACCOUNT_SLOT_HEADER_SIZE),
-        );
-        None
+    if direct_account_pointers_program_input {
+        size += accounts.len() * size_of::<u64>();
     };
+
+    // F10: reserve the subaccount slot region after the program_id (and, when enabled,
+    // the SIMD-0449 account pointer array). `sol_load_subaccount` is gated off whenever
+    // SIMD-0449 is active, so these reserved slots remain unused in that mode.
+    // In the direct-map model no real-subaccount records are serialized (data is direct-mapped);
+    // only MAX_SUBACCOUNT_SLOTS reserved slots (account-view buffer + 88-byte header) are laid out.
+    size += MAX_SUBACCOUNT_SLOTS.saturating_mul(
+        SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE.saturating_add(SUBACCOUNT_SLOT_HEADER_SIZE),
+    );
 
     let mut s = Serializer::new(
         size,
@@ -701,81 +695,72 @@ fn serialize_parameters_for_abiv1(
     let instruction_data_offset = s.write_all(instruction_data);
     s.write_all(program_id.as_ref());
 
-    let mut subaccount_slots: Vec<SubaccountSlot> = Vec::new();
-    if let Some(offset) = account_pointers_offset {
-        // Add padding before the account pointer array to reach 8-byte alignment
-        // (BPF_ALIGN_OF_U128). SIMD-0449 branch: no subaccount region is written.
-        s.fill_write(offset, 0)
-            .map_err(|_| InstructionError::InvalidArgument)?;
+    let align_offset = (s.current_vaddr() as *const u8).align_offset(BPF_ALIGN_OF_U128);
+    s.fill_write(align_offset, 0)
+        .map_err(|_| InstructionError::InvalidArgument)?;
+
+    if direct_account_pointers_program_input {
         for entry in accounts_metadata.iter() {
             s.write::<u64>(entry.vm_addr.to_le());
         }
-    } else {
-        // F10 (SIMD-0449 mutual-gate else): write the subaccount slot region.
-        // Alignment padding so the reserved slots land on a BPF_ALIGN_OF_U128
-        // boundary. No real-subaccount records are written — subaccount data is
-        // direct-mapped, so only the MAX_SUBACCOUNT_SLOTS reserved slots follow.
-        let align_offset = (instruction_data.len() as *const u8).align_offset(BPF_ALIGN_OF_U128);
-        s.fill_write(align_offset, 0)
-            .map_err(|_| InstructionError::InvalidArgument)?;
+    }
 
-        // F10: reserve MAX_SUBACCOUNT_SLOTS slots. Each slot consists of two
-        // memory regions:
-        //   1. a writable region inside the input buffer holding a runtime-owned
-        //      account-view buffer (SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE bytes,
-        //      used by the program as either `AccountInfo` or `SolAccountInfo`)
-        //      immediately followed by the 88-byte serialized slot header
-        //      (NON_DUP_MARKER + flags + key + owner + lamports + data_len),
-        //   2. an empty readonly placeholder data region whose VM address is
-        //      reserved with SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES so a later
-        //      MemoryMapping::replace_region can install a region backed by the
-        //      loaded subaccount's AccountSharedData without colliding with the
-        //      next slot's reserved range.
-        // Close any preceding region first so each slot's view-buffer + header
-        // pair lives in its own region.
+    // F10: reserve MAX_SUBACCOUNT_SLOTS slots. Each slot consists of two
+    // memory regions:
+    //   1. a writable region inside the input buffer holding a runtime-owned
+    //      account-view buffer (SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE bytes,
+    //      used by the program as either `AccountInfo` or `SolAccountInfo`)
+    //      immediately followed by the 88-byte serialized slot header
+    //      (NON_DUP_MARKER + flags + key + owner + lamports + data_len),
+    //   2. an empty readonly placeholder data region whose VM address is
+    //      reserved with SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES so a later
+    //      MemoryMapping::replace_region can install a region backed by the
+    //      loaded subaccount's AccountSharedData without colliding with the
+    //      next slot's reserved range.
+    // Close any preceding region first so each slot's view-buffer + header
+    // pair lives in its own region.
+    s.push_region();
+    let mut subaccount_slots = Vec::with_capacity(MAX_SUBACCOUNT_SLOTS);
+    for _ in 0..MAX_SUBACCOUNT_SLOTS {
+        // Runtime-owned account-view buffer: the program writes its
+        // `AccountInfo` / `SolAccountInfo` here after `sol_load_subaccount`
+        // returns the address. Zero-initialized so the program observes a
+        // clean slate per slot.
+        let vm_account_view_addr = s.current_vaddr();
+        s.fill_write(SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE, 0)
+            .map_err(|_| InstructionError::InvalidArgument)?;
+        let vm_header_addr = s.current_vaddr();
+        let buffer_position = s.current_len();
+        s.write::<u8>(NON_DUP_MARKER);
+        s.write::<u8>(0u8); // is_signer
+        s.write::<u8>(0u8); // is_writable
+        s.write::<u8>(0u8); // is_executable
+        s.write_all(&[0u8, 0, 0, 0]); // padding
+        s.write_all(&[0u8; size_of::<Pubkey>()]); // key
+        s.write_all(&[0u8; size_of::<Pubkey>()]); // owner
+        s.write::<u64>(0u64); // lamports
+        s.write::<u64>(0u64); // data_len
+        debug_assert_eq!(
+            s.current_vaddr().saturating_sub(vm_header_addr),
+            SUBACCOUNT_SLOT_HEADER_SIZE as u64,
+        );
+        // Close the [view + header] region so it lives at
+        // vm_account_view_addr..+(view+header) only.
         s.push_region();
-        subaccount_slots.reserve(MAX_SUBACCOUNT_SLOTS);
-        for _ in 0..MAX_SUBACCOUNT_SLOTS {
-            // Runtime-owned account-view buffer: the program writes its
-            // `AccountInfo` / `SolAccountInfo` here after `sol_load_subaccount`
-            // returns the address. Zero-initialized so the program observes a
-            // clean slate per slot.
-            let vm_account_view_addr = s.current_vaddr();
-            s.fill_write(SUBACCOUNT_ACCOUNT_VIEW_RESERVED_SIZE, 0)
-                .map_err(|_| InstructionError::InvalidArgument)?;
-            let vm_header_addr = s.current_vaddr();
-            let buffer_position = s.current_len();
-            s.write::<u8>(NON_DUP_MARKER);
-            s.write::<u8>(0u8); // is_signer
-            s.write::<u8>(0u8); // is_writable
-            s.write::<u8>(0u8); // is_executable
-            s.write_all(&[0u8, 0, 0, 0]); // padding
-            s.write_all(&[0u8; size_of::<Pubkey>()]); // key
-            s.write_all(&[0u8; size_of::<Pubkey>()]); // owner
-            s.write::<u64>(0u64); // lamports
-            s.write::<u64>(0u64); // data_len
-            debug_assert_eq!(
-                s.current_vaddr().saturating_sub(vm_header_addr),
-                SUBACCOUNT_SLOT_HEADER_SIZE as u64,
-            );
-            // Close the [view + header] region so it lives at
-            // vm_account_view_addr..+(view+header) only.
-            s.push_region();
-            // Reserve the slot's data VM address space behind an empty readonly
-            // region; `sol_load_subaccount` swaps this for a writable region.
-            let vm_data_addr = s.current_vaddr();
-            s.push_data_placeholder(SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES);
-            subaccount_slots.push(SubaccountSlot {
-                buffer_position,
-                vm_account_view_addr,
-                vm_header_addr,
-                vm_data_addr,
-                caller_account_metadata: None,
-                account_view_kind: None,
-                occupied_subaccount_index: OccupiedSubaccountIndex::Empty,
-                is_writable: false,
-            });
-        }
+        // Reserve the slot's data VM address space behind an empty readonly
+        // region; `sol_load_subaccount` swaps this for a writable region.
+        let vm_data_addr = s.current_vaddr();
+        s.push_data_placeholder(SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES);
+        subaccount_slots.push(SubaccountSlot {
+            buffer_position,
+            vm_account_view_addr,
+            vm_header_addr,
+            vm_data_addr,
+            caller_account_metadata: None,
+            account_view_kind: None,
+            occupied_subaccount_index: OccupiedSubaccountIndex::Empty,
+            is_writable: false,
+        });
     }
 
     let (mem, regions) = s.finish();
@@ -1044,7 +1029,7 @@ mod tests {
                     continue;
                 }
 
-                let (mut serialized, regions, _account_lengths, _instruction_data_offset) =
+                let (mut serialized, regions, _account_lengths, _subaccount_slots, _instruction_data_offset) =
                     serialization_result.unwrap();
                 let mut serialized_regions = concat_regions(&regions);
                 let (de_program_id, de_accounts, de_instruction_data) = unsafe {
@@ -1191,7 +1176,7 @@ mod tests {
                 .unwrap();
 
             // check serialize_parameters_for_abiv1
-            let (mut serialized, regions, accounts_metadata, _instruction_data_offset) =
+            let (mut serialized, regions, accounts_metadata, _subaccount_slots, _instruction_data_offset) =
                 serialize_parameters(
                     &instruction_context,
                     virtual_address_space_adjustments,
@@ -1291,7 +1276,7 @@ mod tests {
                 .get_current_instruction_context()
                 .unwrap();
 
-            let (mut serialized, regions, account_lengths, _instruction_data_offset) =
+            let (mut serialized, regions, account_lengths, _subaccount_slots, _instruction_data_offset) =
                 serialize_parameters(
                     &instruction_context,
                     virtual_address_space_adjustments,
@@ -1456,7 +1441,7 @@ mod tests {
             .unwrap();
 
         // check serialize_parameters_for_abiv1
-        let (_serialized, regions, _accounts_metadata, _instruction_data_offset) =
+        let (_serialized, regions, _accounts_metadata, _subaccount_slots, _instruction_data_offset) =
             serialize_parameters(
                 &instruction_context,
                 true,
@@ -1489,7 +1474,7 @@ mod tests {
             .get_current_instruction_context()
             .unwrap();
 
-        let (_serialized, regions, _account_lengths, _instruction_data_offset) =
+        let (_serialized, regions, _account_lengths, _subaccount_slots, _instruction_data_offset) =
             serialize_parameters(
                 &instruction_context,
                 true,

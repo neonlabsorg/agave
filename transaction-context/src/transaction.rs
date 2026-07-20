@@ -591,7 +591,20 @@ impl<'ix_data> TransactionContext<'ix_data> {
                     // then later in CPI or deserialization realloc again to the
                     // account length the program stored in AccountInfo.
                     let old_len = account.data().len();
-                    let new_len = (address_space_reserved_for_account as usize)
+                    // F10: each subaccount slot reserves SUBACCOUNT_SLOT_DATA_RESERVED_VM_BYTES
+                    // (~10 MB) of virtual address space, so `address_space_reserved_for_account`
+                    // is not a tight upper bound for a subaccount the way it is for an ordinary
+                    // account. Growing straight to that reserved span would allocate ~10 MB on the
+                    // first store into any subaccount and exhaust
+                    // MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION after only a couple of slots, leaving
+                    // later slots unable to realloc (surfacing as InvalidRealloc). For subaccounts
+                    // grow only to what the faulting store actually needs.
+                    let grow_ceiling = if index_in_transaction & crate::SUBACCOUNT_MARKER != 0 {
+                        requested_length
+                    } else {
+                        address_space_reserved_for_account as usize
+                    };
+                    let new_len = grow_ceiling
                         .min(MAX_ACCOUNT_DATA_LEN as usize)
                         .min(old_len.saturating_add(remaining_allowed_growth));
                     // The last two min operations ensure the following:

@@ -3080,7 +3080,17 @@ mod tests {
         )
         .unwrap();
 
-        invoke_context.mock_set_remaining(400 - 1);
+        // Each `sol_log` costs max(syscall_base_cost, len). We need `ComputationalBudgetExceeded` on the last call,
+        // so set remaining compute units to 1 less than the total cost of the 4 calls below.
+        let syscall_base_cost = invoke_context.get_execution_cost().syscall_base_cost;
+        let string_len = string.len() as u64;
+        invoke_context.mock_set_remaining(
+            syscall_base_cost.max(string_len)
+                + syscall_base_cost.max(string_len * 2)
+                + syscall_base_cost.max(string_len)
+                + syscall_base_cost.max(string_len)
+                - 1,
+        );
         let result = SyscallLog::rust(
             &mut invoke_context,
             0x100000001, // AccessViolation
@@ -3219,6 +3229,8 @@ mod tests {
                 .set_syscall_context(SyscallContext {
                     allocator: BpfAllocator::new(solana_program_entrypoint::HEAP_LENGTH as u64),
                     accounts_metadata: Vec::new(),
+                    subaccount_slots: Vec::new(),
+                    trace_log: Vec::new(),
                 })
                 .unwrap();
             let config = Config {
@@ -6092,6 +6104,14 @@ mod tests {
             }
             // Vote accounts are not needed for this test.
         }
+        impl solana_svm_callback::TransactionProcessingCallback for MockCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, solana_clock::Slot)> {
+                None
+            }
+        }
 
         // Compute units, as specified by SIMD-0133.
         // cu = syscall_base_cost
@@ -6152,6 +6172,14 @@ mod tests {
                 } else {
                     0
                 }
+            }
+        }
+        impl solana_svm_callback::TransactionProcessingCallback for MockCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, solana_clock::Slot)> {
+                None
             }
         }
 

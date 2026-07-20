@@ -113,7 +113,7 @@ mod tests {
         },
         solana_secp256r1_program::{new_secp256r1_instruction_with_signature, sign_message},
         solana_signer::Signer,
-        solana_svm_callback::InvokeContextCallback,
+        solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
         solana_svm_feature_set::SVMFeatureSet,
         solana_transaction_context::transaction::TransactionContext,
         std::{collections::HashSet, sync::Arc},
@@ -121,6 +121,14 @@ mod tests {
 
     struct MockCallback {}
     impl InvokeContextCallback for MockCallback {}
+    impl TransactionProcessingCallback for MockCallback {
+        fn get_account_shared_data(
+            &self,
+            _pubkey: &Pubkey,
+        ) -> Option<(AccountSharedData, solana_clock::Slot)> {
+            None
+        }
+    }
 
     fn create_loadable_account_for_test(name: &str) -> AccountSharedData {
         let (lamports, rent_epoch) = DUMMY_INHERITABLE_ACCOUNT_FIELDS;
@@ -704,6 +712,14 @@ mod tests {
                 } else {
                     Err(PrecompileError::InvalidPublicKey)
                 }
+            }
+        }
+        impl TransactionProcessingCallback for MockCallback {
+            fn get_account_shared_data(
+                &self,
+                _pubkey: &Pubkey,
+            ) -> Option<(AccountSharedData, solana_clock::Slot)> {
+                None
             }
         }
         let feature_set = SVMFeatureSet::all_enabled();

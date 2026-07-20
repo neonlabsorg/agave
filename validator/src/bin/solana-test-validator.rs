@@ -494,6 +494,7 @@ fn main() {
         rpc_bigtable_config,
         faucet_addr: Some(faucet_addr),
         account_indexes,
+        enable_test_clock_offset: matches.is_present("enable_test_clock_offset"),
         ..JsonRpcConfig::default_for_test()
     });
 
