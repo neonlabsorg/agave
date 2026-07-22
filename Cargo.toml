@@ -54,6 +54,7 @@ members = [
     "metrics",
     "net-utils",
     "notifier",
+    "parasol-scheduler",
     "perf",
     "platform-tools-sdk/gen-headers",
     "poh",
@@ -366,7 +367,7 @@ reqwest = { version = "0.12.28", default-features = false }
 reqwest-middleware = "0.4.2"
 rolling-file = "0.2.0"
 rpassword = "7.4"
-rts-alloc = { version = "2.0.0" }
+rts-alloc = { version = "3.0.0" }
 rustls = { version = "0.23.36", features = ["std"], default-features = false }
 scopeguard = "1.2.0"
 semver = "1.0.27"
@@ -380,11 +381,12 @@ serde_yaml = "0.9.34"
 serial_test = "3.4.0"
 sha2 = "0.10.9"
 sha3 = "0.10.8"
-shaq = { version = "1.0.2" }
+shaq = { version = "2.0.0" }
 shuttle = "0.7.1"
 signal-hook = "0.4.3"
 siphasher = "1.0.2"
 slab = "0.4.12"
+slotmap = "1.0.7"
 smallvec = { version = "1.15.1", default-features = false, features = ["union"] }
 smpl_jwt = "0.7.1"
 socket2 = "0.6.2"
