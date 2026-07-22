@@ -3715,6 +3715,7 @@ impl ReplayStage {
                         bank.executed_transaction_count(),
                         r_replay_progress.num_entries as u64,
                         commission_rate_in_basis_points,
+                        &bank.accounts_lt_hash(),
                     )
                 }
                 bank_complete_time.stop();

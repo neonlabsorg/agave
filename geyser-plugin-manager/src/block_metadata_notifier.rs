@@ -4,9 +4,10 @@ use {
         geyser_plugin_manager::GeyserPluginManager,
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
-        ReplicaBlockInfoV4, ReplicaBlockInfoVersions,
+        ReplicaBlockInfoV5, ReplicaBlockInfoVersions,
     },
     log::*,
+    solana_accounts_db::accounts_hash::AccountsLtHash,
     solana_clock::UnixTimestamp,
     solana_runtime::bank::KeyedRewardsAndNumPartitions,
     solana_transaction_status::{Reward, RewardsAndNumPartitions},
@@ -31,6 +32,7 @@ impl BlockMetadataNotifier for BlockMetadataNotifierImpl {
         executed_transaction_count: u64,
         entry_count: u64,
         commission_rate_in_basis_points: bool,
+        accounts_lt_hash: &AccountsLtHash,
     ) {
         let plugin_manager = self.plugin_manager.read().unwrap();
         if plugin_manager.plugins.is_empty() {
@@ -48,10 +50,11 @@ impl BlockMetadataNotifier for BlockMetadataNotifierImpl {
             block_height,
             executed_transaction_count,
             entry_count,
+            accounts_lt_hash,
         );
 
         for plugin in plugin_manager.plugins.iter() {
-            let block_info = ReplicaBlockInfoVersions::V0_0_4(&block_info);
+            let block_info = ReplicaBlockInfoVersions::V0_0_5(&block_info);
             match plugin.notify_block_metadata(block_info) {
                 Err(err) => {
                     error!(
@@ -113,8 +116,9 @@ impl BlockMetadataNotifierImpl {
         block_height: Option<u64>,
         executed_transaction_count: u64,
         entry_count: u64,
-    ) -> ReplicaBlockInfoV4<'a> {
-        ReplicaBlockInfoV4 {
+        accounts_lt_hash: &'a AccountsLtHash,
+    ) -> ReplicaBlockInfoV5<'a> {
+        ReplicaBlockInfoV5 {
             parent_slot,
             parent_blockhash,
             slot,
@@ -124,6 +128,7 @@ impl BlockMetadataNotifierImpl {
             block_height,
             executed_transaction_count,
             entry_count,
+            accounts_lt_hash: &accounts_lt_hash.0,
         }
     }
 

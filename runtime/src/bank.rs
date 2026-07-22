@@ -6169,6 +6169,13 @@ impl Bank {
         *self.accounts_lt_hash.lock().unwrap() = accounts_lt_hash;
     }
 
+    /// Returns the lattice hash of all accounts.
+    ///
+    /// The value is only meaningful after the bank is frozen.
+    pub fn accounts_lt_hash(&self) -> AccountsLtHash {
+        self.accounts_lt_hash.lock().unwrap().clone()
+    }
+
     /// Return total transaction fee collected
     pub fn get_collector_fee_details(&self) -> CollectorFeeDetails {
         self.collector_fee_details.read().unwrap().clone()
