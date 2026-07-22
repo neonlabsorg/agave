@@ -19,7 +19,7 @@ pub trait BlockMetadataNotifier {
         executed_transaction_count: u64,
         entry_count: u64,
         commission_rate_in_basis_points: bool,
-        account_lt_hash: &AccountsLtHash,
+        accounts_lt_hash: &AccountsLtHash,
     );
 }
 

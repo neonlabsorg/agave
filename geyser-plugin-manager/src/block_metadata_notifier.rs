@@ -32,7 +32,7 @@ impl BlockMetadataNotifier for BlockMetadataNotifierImpl {
         executed_transaction_count: u64,
         entry_count: u64,
         commission_rate_in_basis_points: bool,
-        account_lt_hash: &AccountsLtHash,
+        accounts_lt_hash: &AccountsLtHash,
     ) {
         let plugin_manager = self.plugin_manager.read().unwrap();
         if plugin_manager.plugins.is_empty() {
@@ -50,7 +50,7 @@ impl BlockMetadataNotifier for BlockMetadataNotifierImpl {
             block_height,
             executed_transaction_count,
             entry_count,
-            account_lt_hash,
+            accounts_lt_hash,
         );
 
         for plugin in plugin_manager.plugins.iter() {
@@ -116,7 +116,7 @@ impl BlockMetadataNotifierImpl {
         block_height: Option<u64>,
         executed_transaction_count: u64,
         entry_count: u64,
-        account_lt_hash: &'a AccountsLtHash,
+        accounts_lt_hash: &'a AccountsLtHash,
     ) -> ReplicaBlockInfoV5<'a> {
         ReplicaBlockInfoV5 {
             parent_slot,
@@ -128,7 +128,7 @@ impl BlockMetadataNotifierImpl {
             block_height,
             executed_transaction_count,
             entry_count,
-            account_lt_hash: &account_lt_hash.0,
+            accounts_lt_hash: &accounts_lt_hash.0,
         }
     }
 

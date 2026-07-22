@@ -6,7 +6,6 @@ use {
     solana_clock::{Slot, UnixTimestamp},
     solana_hash::Hash,
     solana_lattice_hash::lt_hash::LtHash,
-    solana_message::v0::LoadedAddresses,
     solana_signature::Signature,
     solana_transaction::{sanitized::SanitizedTransaction, versioned::VersionedTransaction},
     solana_transaction_status::{Reward, RewardsAndNumPartitions, TransactionStatusMeta},
@@ -304,7 +303,7 @@ pub struct ReplicaBlockInfoV5<'a> {
     pub executed_transaction_count: u64,
     pub entry_count: u64,
     /// The lattice hash of all accounts, as of this (frozen) block.
-    pub account_lt_hash: &'a LtHash,
+    pub accounts_lt_hash: &'a LtHash,
 }
 
 #[repr(u32)]
