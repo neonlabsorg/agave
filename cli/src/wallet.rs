@@ -104,6 +104,31 @@ impl WalletSubCommands for App<'_, '_> {
                 ),
         )
         .subcommand(
+            SubCommand::with_name("subaccount")
+                .about("Show the contents of a subaccount")
+                .arg(pubkey!(
+                    Arg::with_name("subaccount_pubkey")
+                        .index(1)
+                        .value_name("SUBACCOUNT_ADDRESS")
+                        .required(true),
+                    "Owner-facing subaccount address whose contents to show."
+                ))
+                .arg(
+                    Arg::with_name("output_file")
+                        .long("output-file")
+                        .short("o")
+                        .value_name("FILEPATH")
+                        .takes_value(true)
+                        .help("Write the subaccount data to this file"),
+                )
+                .arg(
+                    Arg::with_name("lamports")
+                        .long("lamports")
+                        .takes_value(false)
+                        .help("Display balance in lamports instead of SOL"),
+                ),
+        )
+        .subcommand(
             SubCommand::with_name("address")
                 .about("Get your public key")
                 .arg(
@@ -414,6 +439,23 @@ pub fn parse_account(
     }))
 }
 
+pub fn parse_subaccount(
+    matches: &ArgMatches<'_>,
+    wallet_manager: &mut Option<Rc<RemoteWalletManager>>,
+) -> Result<CliCommandInfo, CliError> {
+    let subaccount_pubkey =
+        pubkey_of_signer(matches, "subaccount_pubkey", wallet_manager)?.unwrap();
+    let output_file = matches.value_of("output_file");
+    let use_lamports_unit = matches.is_present("lamports");
+    Ok(CliCommandInfo::without_signers(
+        CliCommand::ShowSubaccount {
+            pubkey: subaccount_pubkey,
+            output_file: output_file.map(ToString::to_string),
+            use_lamports_unit,
+        },
+    ))
+}
+
 pub fn parse_airdrop(
     matches: &ArgMatches<'_>,
     default_signer: &DefaultSigner,
@@ -675,6 +717,48 @@ pub async fn process_show_account(
                 f.write_all(data)?;
                 writeln!(&mut account_string)?;
                 writeln!(&mut account_string, "Wrote account data to {output_file}")?;
+            } else if !data.is_empty() {
+                use pretty_hex::*;
+                writeln!(&mut account_string, "{:?}", data.hex_dump())?;
+            }
+        }
+        OutputFormat::DisplayQuiet => (),
+    }
+
+    Ok(account_string)
+}
+
+pub async fn process_show_subaccount(
+    rpc_client: &RpcClient,
+    config: &CliConfig<'_>,
+    subaccount_pubkey: &Pubkey,
+    output_file: &Option<String>,
+    use_lamports_unit: bool,
+) -> ProcessResult {
+    let account = rpc_client.get_subaccount(subaccount_pubkey).await?;
+    let data = &account.data;
+    let cli_account = CliAccount::new(subaccount_pubkey, &account, use_lamports_unit);
+
+    let mut account_string = config.output_format.formatted_string(&cli_account);
+
+    match config.output_format {
+        OutputFormat::Json | OutputFormat::JsonCompact => {
+            if let Some(output_file) = output_file {
+                let mut f = File::create(output_file)?;
+                f.write_all(account_string.as_bytes())?;
+                writeln!(&mut account_string)?;
+                writeln!(&mut account_string, "Wrote subaccount to {output_file}")?;
+            }
+        }
+        OutputFormat::Display | OutputFormat::DisplayVerbose => {
+            if let Some(output_file) = output_file {
+                let mut f = File::create(output_file)?;
+                f.write_all(data)?;
+                writeln!(&mut account_string)?;
+                writeln!(
+                    &mut account_string,
+                    "Wrote subaccount data to {output_file}"
+                )?;
             } else if !data.is_empty() {
                 use pretty_hex::*;
                 writeln!(&mut account_string, "{:?}", data.hex_dump())?;

@@ -589,6 +589,38 @@ impl JsonRpcRequestProcessor {
         Ok(new_response(&bank, accounts))
     }
 
+    /// F10: resolve a subaccount's owner-facing pubkey to its on-chain storage
+    /// entry. The runtime persists subaccount state in accounts-db under
+    /// `subaccount_storage_address(pubkey)` (sha256 of `[0x01, pubkey]`); this
+    /// RPC just runs the same translation and delegates to
+    /// [`Self::get_account_info`], so callers see the standard
+    /// `Option<UiAccount>` shape (missing storage → `None`).
+    pub async fn get_subaccount(
+        &self,
+        pubkey: Pubkey,
+        config: Option<RpcAccountInfoConfig>,
+    ) -> Result<RpcResponse<Option<UiAccount>>> {
+        let storage_address = solana_transaction_context::subaccount_storage_address(&pubkey);
+        self.get_account_info(storage_address, config).await
+    }
+
+    /// F10: batch variant of [`Self::get_subaccount`]. Translates each
+    /// owner-facing subaccount pubkey to its `subaccount_storage_address`
+    /// and delegates to [`Self::get_multiple_accounts`], preserving the
+    /// `Vec<Option<UiAccount>>` shape (one slot per input pubkey, `None`
+    /// for unprovisioned storage).
+    pub async fn get_multiple_subaccounts(
+        &self,
+        pubkeys: Vec<Pubkey>,
+        config: Option<RpcAccountInfoConfig>,
+    ) -> Result<RpcResponse<Vec<Option<UiAccount>>>> {
+        let storage_addresses = pubkeys
+            .iter()
+            .map(solana_transaction_context::subaccount_storage_address)
+            .collect();
+        self.get_multiple_accounts(storage_addresses, config).await
+    }
+
     pub fn get_minimum_balance_for_rent_exemption(
         &self,
         data_len: usize,
@@ -3244,6 +3276,22 @@ pub mod rpc_accounts {
             config: Option<RpcAccountInfoConfig>,
         ) -> BoxFuture<Result<RpcResponse<Vec<Option<UiAccount>>>>>;
 
+        #[rpc(meta, name = "getSubaccount")]
+        fn get_subaccount(
+            &self,
+            meta: Self::Metadata,
+            pubkey_str: String,
+            config: Option<RpcAccountInfoConfig>,
+        ) -> BoxFuture<Result<RpcResponse<Option<UiAccount>>>>;
+
+        #[rpc(meta, name = "getMultipleSubaccounts")]
+        fn get_multiple_subaccounts(
+            &self,
+            meta: Self::Metadata,
+            pubkey_strs: Vec<String>,
+            config: Option<RpcAccountInfoConfig>,
+        ) -> BoxFuture<Result<RpcResponse<Vec<Option<UiAccount>>>>>;
+
         #[rpc(meta, name = "getBlockCommitment")]
         fn get_block_commitment(
             &self,
@@ -3315,6 +3363,49 @@ pub mod rpc_accounts {
                     .map(|pubkey_str| verify_pubkey(&pubkey_str))
                     .collect::<Result<Vec<_>>>()?;
                 meta.get_multiple_accounts(pubkeys, config).await
+            }
+            .boxed()
+        }
+
+        fn get_subaccount(
+            &self,
+            meta: Self::Metadata,
+            pubkey_str: String,
+            config: Option<RpcAccountInfoConfig>,
+        ) -> BoxFuture<Result<RpcResponse<Option<UiAccount>>>> {
+            debug!("get_subaccount rpc request received: {pubkey_str:?}");
+            async move {
+                let pubkey = verify_pubkey(&pubkey_str)?;
+                meta.get_subaccount(pubkey, config).await
+            }
+            .boxed()
+        }
+
+        fn get_multiple_subaccounts(
+            &self,
+            meta: Self::Metadata,
+            pubkey_strs: Vec<String>,
+            config: Option<RpcAccountInfoConfig>,
+        ) -> BoxFuture<Result<RpcResponse<Vec<Option<UiAccount>>>>> {
+            debug!(
+                "get_multiple_subaccounts rpc request received: {:?}",
+                pubkey_strs.len()
+            );
+            async move {
+                let max_multiple_accounts = meta
+                    .config
+                    .max_multiple_accounts
+                    .unwrap_or(MAX_MULTIPLE_ACCOUNTS);
+                if pubkey_strs.len() > max_multiple_accounts {
+                    return Err(Error::invalid_params(format!(
+                        "Too many inputs provided; max {max_multiple_accounts}"
+                    )));
+                }
+                let pubkeys = pubkey_strs
+                    .into_iter()
+                    .map(|pubkey_str| verify_pubkey(&pubkey_str))
+                    .collect::<Result<Vec<_>>>()?;
+                meta.get_multiple_subaccounts(pubkeys, config).await
             }
             .boxed()
         }
@@ -5667,6 +5758,129 @@ pub mod tests {
             result["value"]["data"], expected,
             "should use data slice if parsing fails"
         );
+    }
+
+    // F10/PRS-314: `getSubaccount` resolves an owner-facing subaccount pubkey
+    // (the PDA returned by `sol_create_subaccount` / `sol_load_subaccount`) to
+    // its on-chain storage entry at `subaccount_storage_address(pubkey)` and
+    // returns the same `Option<UiAccount>` shape as `getAccountInfo`.
+    #[test]
+    fn test_rpc_get_subaccount() {
+        let rpc = RpcHandler::start();
+        let bank = rpc.working_bank();
+
+        let owner_pubkey = Pubkey::new_unique();
+        let storage_addr = solana_transaction_context::subaccount_storage_address(&owner_pubkey);
+
+        // No data stored yet → both calls (direct getAccountInfo and the
+        // owner-facing getSubaccount) return null.
+        let req = create_test_request("getSubaccount", Some(json!([owner_pubkey.to_string()])));
+        let result: Value = parse_success_result(rpc.handle_request_sync(req));
+        assert_eq!(result["value"], Value::Null, "missing subaccount → null");
+
+        // Plant a subaccount storage entry directly in the bank (no SBF
+        // execution needed — getSubaccount only does the address translation
+        // and delegates to the standard account lookup).
+        let owner_program = Pubkey::new_unique();
+        let data = vec![0xab, 0xcd, 0xef, 0x42];
+        let account = AccountSharedData::create_from_existing_shared_data(
+            12_345,
+            Arc::new(data.clone()),
+            owner_program,
+            false,
+            0,
+        );
+        bank.store_account(&storage_addr, &account);
+
+        // getSubaccount(owner_pubkey) must return the planted account.
+        let req = create_test_request(
+            "getSubaccount",
+            Some(json!([owner_pubkey.to_string(), {"encoding": "base64"}])),
+        );
+        let result: Value = parse_success_result(rpc.handle_request_sync(req));
+        let expected_data = json!([BASE64_STANDARD.encode(&data), "base64"]);
+        assert_eq!(result["value"]["data"], expected_data);
+        assert_eq!(result["value"]["lamports"], 12_345);
+        assert_eq!(result["value"]["owner"], owner_program.to_string());
+        assert_eq!(result["value"]["space"], data.len());
+
+        // getAccountInfo on the OWNER-facing pubkey must NOT see the entry
+        // (it lives at the translated `storage_addr`, not at owner_pubkey).
+        // This proves the RPC actually applies the address translation.
+        let req = create_test_request("getAccountInfo", Some(json!([owner_pubkey.to_string()])));
+        let result: Value = parse_success_result(rpc.handle_request_sync(req));
+        assert_eq!(
+            result["value"],
+            Value::Null,
+            "owner-facing pubkey must not resolve via plain getAccountInfo",
+        );
+
+        // getAccountInfo on the storage address — same data as getSubaccount.
+        let req = create_test_request(
+            "getAccountInfo",
+            Some(json!([storage_addr.to_string(), {"encoding": "base64"}])),
+        );
+        let result: Value = parse_success_result(rpc.handle_request_sync(req));
+        assert_eq!(result["value"]["data"], expected_data);
+
+        // getMultipleSubaccounts: mix one existing + one missing pubkey. The
+        // response must preserve order and report `null` for the missing slot.
+        let missing_pubkey = Pubkey::new_unique();
+        let req = create_test_request(
+            "getMultipleSubaccounts",
+            Some(json!([
+                [owner_pubkey.to_string(), missing_pubkey.to_string()],
+                {"encoding": "base64"},
+            ])),
+        );
+        let result: Value = parse_success_result(rpc.handle_request_sync(req));
+        let arr = result["value"]
+            .as_array()
+            .expect("getMultipleSubaccounts must return an array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["data"], expected_data);
+        assert_eq!(arr[1], Value::Null);
+    }
+
+    // Client + server: build the request through the client-side
+    // `RpcRequest::GetMultipleSubaccounts` (the same encoding
+    // `RpcClient::get_multiple_subaccounts` uses) and feed it to the server.
+    // Requesting more than `max_multiple_accounts` pubkeys must be rejected with
+    // an `InvalidParams` error before any account lookup happens.
+    #[test]
+    fn test_rpc_get_multiple_subaccounts_too_many_inputs() {
+        use solana_rpc_client_api::request::RpcRequest;
+
+        let rpc = RpcHandler::start();
+
+        // One over the default limit.
+        let pubkeys: Vec<String> = (0..=MAX_MULTIPLE_ACCOUNTS)
+            .map(|_| Pubkey::new_unique().to_string())
+            .collect();
+        assert_eq!(pubkeys.len(), MAX_MULTIPLE_ACCOUNTS + 1);
+
+        let request = RpcRequest::GetMultipleSubaccounts.build_request_json(1, json!([pubkeys]));
+        assert_eq!(request["method"], "getMultipleSubaccounts");
+
+        let (code, message) = parse_failure_response(rpc.handle_request_sync(request));
+        assert_eq!(code, ErrorCode::InvalidParams.code());
+        assert_eq!(
+            message,
+            format!("Too many inputs provided; max {MAX_MULTIPLE_ACCOUNTS}")
+        );
+
+        // Exactly at the limit must NOT trip the rejection (every entry resolves
+        // to `null` since no subaccount storage was planted).
+        let pubkeys: Vec<String> = (0..MAX_MULTIPLE_ACCOUNTS)
+            .map(|_| Pubkey::new_unique().to_string())
+            .collect();
+        let request = RpcRequest::GetMultipleSubaccounts.build_request_json(1, json!([pubkeys]));
+        let result: Value = parse_success_result(rpc.handle_request_sync(request));
+        let arr = result["value"]
+            .as_array()
+            .expect("getMultipleSubaccounts must return an array");
+        assert_eq!(arr.len(), MAX_MULTIPLE_ACCOUNTS);
+        assert!(arr.iter().all(|entry| *entry == Value::Null));
     }
 
     #[test]
