@@ -3041,6 +3041,22 @@ impl Bank {
             return;
         }
 
+        // Parasol test-only: shift the Alpenglow footer timestamp by the
+        // configured clock offset so `parasol_setClockOffset` affects this path
+        // too — it feeds both the Clock sysvar (seconds) and the nanosecond
+        // clock account below. Unlike `update_clock`, the footer value is
+        // authoritative and recomputed from scratch each slot (no ancestor
+        // read, no monotonic floor), so we add the current offset directly — no
+        // strip/compound bookkeeping is needed. `set_last_applied` keeps the
+        // "offset baked into the stored Clock sysvar" invariant that
+        // `update_clock` relies on, should a slot ever straddle the two paths at
+        // the Alpenglow migration boundary. Offset defaults to 0, so production
+        // behaviour is unchanged (a saturating add of 0).
+        let cur_offset = crate::parasol_clock_offset::get();
+        crate::parasol_clock_offset::set_last_applied(cur_offset);
+        let unix_timestamp_nanos =
+            unix_timestamp_nanos.saturating_add(cur_offset.saturating_mul(1_000_000_000));
+
         // On epoch boundaries, update epoch_start_timestamp
         //
         // Note: the genesis block's bank is created via new_from_genesis, which calls update_clock

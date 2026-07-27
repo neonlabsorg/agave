@@ -7305,6 +7305,68 @@ fn test_update_clock_timestamp() {
     );
 }
 
+#[test]
+fn test_update_clock_from_footer_applies_parasol_offset() {
+    // `parasol_clock_offset` is process-global and is read by every
+    // `update_clock` (i.e. by every bank creation), so a non-zero offset here
+    // could leak into concurrently running tests. Serialize against any other
+    // offset-mutating test (only this one today) and reset the offset on scope
+    // exit — even on panic — via a Drop guard, keeping the non-zero window
+    // minimal.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    struct ResetOffset;
+    impl Drop for ResetOffset {
+        fn drop(&mut self) {
+            crate::parasol_clock_offset::set(0);
+            crate::parasol_clock_offset::set_last_applied(0);
+        }
+    }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _reset = ResetOffset;
+    crate::parasol_clock_offset::set(0);
+    crate::parasol_clock_offset::set_last_applied(0);
+
+    let leader_pubkey = solana_pubkey::new_rand();
+    let GenesisConfigInfo {
+        genesis_config, ..
+    } = create_genesis_config_with_leader(5, &leader_pubkey, 3);
+    let bank = Bank::new_for_tests(&genesis_config);
+    let mut bank = new_from_parent(Arc::new(bank));
+    // The Alpenglow footer clock path is gated on the feature being active.
+    bank.activate_feature(&feature_set::alpenglow::id());
+
+    const OFFSET_SECS: i64 = 1_000;
+    const BASE_NANOS: i64 = 1_700_000_000_000_000_000; // synthetic footer ts (ns)
+    const BASE_SECS: i64 = BASE_NANOS / 1_000_000_000;
+
+    // Offset 0 (production default): footer timestamp passes through unshifted,
+    // and the seconds Clock sysvar and the nanosecond clock account agree.
+    bank.update_clock_from_footer(BASE_NANOS);
+    assert_eq!(bank.clock().unix_timestamp, BASE_SECS);
+    assert_eq!(bank.get_nanosecond_clock(), Some(BASE_NANOS));
+
+    // Non-zero offset: both representations shift by exactly the offset.
+    crate::parasol_clock_offset::set(OFFSET_SECS);
+    bank.update_clock_from_footer(BASE_NANOS);
+    let shifted_secs = bank.clock().unix_timestamp;
+    let shifted_nanos = bank.get_nanosecond_clock();
+    assert_eq!(shifted_secs, BASE_SECS + OFFSET_SECS);
+    assert_eq!(shifted_nanos, Some(BASE_NANOS + OFFSET_SECS * 1_000_000_000));
+
+    // Re-applying the same offset does NOT compound: the footer value is
+    // authoritative each slot (no ancestor read / monotonic floor), unlike
+    // `update_clock`.
+    bank.update_clock_from_footer(BASE_NANOS);
+    assert_eq!(bank.clock().unix_timestamp, shifted_secs);
+    assert_eq!(bank.get_nanosecond_clock(), shifted_nanos);
+
+    // Clearing the offset returns the clock to the raw footer value.
+    crate::parasol_clock_offset::set(0);
+    bank.update_clock_from_footer(BASE_NANOS);
+    assert_eq!(bank.clock().unix_timestamp, BASE_SECS);
+    assert_eq!(bank.get_nanosecond_clock(), Some(BASE_NANOS));
+}
+
 fn poh_estimate_offset(bank: &Bank) -> Duration {
     let mut epoch_start_slot = bank.epoch_schedule.get_first_slot_in_epoch(bank.epoch());
     if epoch_start_slot == bank.slot() {
