@@ -254,16 +254,17 @@ fn bench_create_vm(bencher: &mut Bencher) {
     executable.verify::<RequisiteVerifier>().unwrap();
 
     // Serialize account data
-    let (_serialized, regions, account_lengths, _instruction_data_offset) = serialize_parameters(
-        &invoke_context
-            .transaction_context
-            .get_current_instruction_context()
-            .unwrap(),
-        virtual_address_space_adjustments,
-        account_data_direct_mapping,
-        direct_account_pointers_in_program_input,
-    )
-    .unwrap();
+    let (_serialized, regions, account_lengths, _subaccount_slots, _instruction_data_offset) =
+        serialize_parameters(
+            &invoke_context
+                .transaction_context
+                .get_current_instruction_context()
+                .unwrap(),
+            virtual_address_space_adjustments,
+            account_data_direct_mapping,
+            direct_account_pointers_in_program_input,
+        )
+        .unwrap();
 
     bencher.iter(|| {
         create_vm!(
@@ -295,16 +296,17 @@ fn bench_instruction_count_tuner(_bencher: &mut Bencher) {
         .direct_account_pointers_in_program_input;
 
     // Serialize account data
-    let (_serialized, regions, account_lengths, _instruction_data_offset) = serialize_parameters(
-        &invoke_context
-            .transaction_context
-            .get_current_instruction_context()
-            .unwrap(),
-        virtual_address_space_adjustments,
-        account_data_direct_mapping,
-        direct_account_pointers_in_program_input,
-    )
-    .unwrap();
+    let (_serialized, regions, account_lengths, _subaccount_slots, _instruction_data_offset) =
+        serialize_parameters(
+            &invoke_context
+                .transaction_context
+                .get_current_instruction_context()
+                .unwrap(),
+            virtual_address_space_adjustments,
+            account_data_direct_mapping,
+            direct_account_pointers_in_program_input,
+        )
+        .unwrap();
 
     let feature_set = invoke_context.get_feature_set();
     let program_runtime_environment = create_program_runtime_environment_v1(
