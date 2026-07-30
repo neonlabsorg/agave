@@ -63,7 +63,10 @@ pub const SAFE_TO_SKIP_THRESHOLD: f64 = 0.4;
 pub(crate) const DELTA: Duration = Duration::from_millis(250);
 
 /// Time the leader has for producing and sending the block.
-pub(crate) const DELTA_BLOCK: Duration = Duration::from_millis(400);
+/// Parasol dev tuning: 100 ms slot time (was 400 ms). Safe on a low-latency
+/// local cluster; on a real multi-node network keep DELTA_BLOCK >= DELTA so the
+/// leader's block can propagate within the network-delay bound.
+pub(crate) const DELTA_BLOCK: Duration = Duration::from_millis(100);
 
 /// Base timeout for when leader's first slice should arrive if they sent it immediately.
 pub(crate) const DELTA_TIMEOUT: Duration = DELTA.checked_mul(3).unwrap();
