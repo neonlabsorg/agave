@@ -55,10 +55,10 @@ impl FromClapArgMatches for JsonRpcConfig {
             rpc_scan_and_fix_roots: matches.is_present("rpc_scan_and_fix_roots"),
             max_request_body_size: Some(value_t!(matches, "rpc_max_request_body_size", usize)?),
             disable_health_check: false,
-            // Parasol test-only clock offset is opt-in via the
-            // `solana-test-validator --enable-test-clock-offset` flag only;
-            // the regular agave-validator binary never exposes this RPC.
-            enable_test_clock_offset: false,
+            // Parasol test-only clock offset. Opt-in on both binaries via
+            // `--enable-test-clock-offset`, so a validator that is not explicitly
+            // asked for it never exposes these RPC methods.
+            enable_test_clock_offset: matches.is_present("enable_test_clock_offset"),
         })
     }
 }
@@ -87,6 +87,14 @@ pub(crate) fn args<'a, 'b>() -> Vec<Arg<'a, 'b>> {
             .help(
                 "Include CPI inner instructions, logs, and return data in the historical \
                  transaction info stored",
+            ),
+        Arg::with_name("enable_test_clock_offset")
+            .long("enable-test-clock-offset")
+            .takes_value(false)
+            .help(
+                "Expose the Parasol test-only `parasol_setClockOffset` / \
+                 `parasol_getClockOffset` JSON-RPC methods on this validator. \
+                 Off by default — only enable on test stands.",
             ),
         Arg::with_name("rpc_faucet_addr")
             .long("rpc-faucet-address")
@@ -241,6 +249,25 @@ pub(super) mod tests {
                     "--enable-rpc-transaction-history", // required by enable_extended_tx_metadata_storage
                     "--enable-extended-tx-metadata-storage",
                 ],
+                expected_args,
+            );
+        }
+    }
+
+    #[test]
+    fn verify_args_struct_by_command_run_with_enable_test_clock_offset() {
+        {
+            let default_run_args = crate::commands::run::args::RunArgs::default();
+            let expected_args = RunArgs {
+                json_rpc_config: JsonRpcConfig {
+                    enable_test_clock_offset: true,
+                    ..default_run_args.json_rpc_config.clone()
+                },
+                ..default_run_args.clone()
+            };
+            verify_args_struct_by_command_run_with_identity_setup(
+                default_run_args,
+                vec!["--enable-test-clock-offset"],
                 expected_args,
             );
         }
