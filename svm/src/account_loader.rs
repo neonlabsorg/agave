@@ -379,9 +379,36 @@ impl<CB: TransactionProcessingCallback> TransactionProcessingCallback for Accoun
 // NOTE this is a required subtrait of TransactionProcessingCallback.
 // It may make sense to break out a second subtrait just for the above two functions,
 // but this would be a nontrivial breaking change and require careful consideration.
+//
+// Every method must forward to the wrapped callback: the loader is what
+// `execute_loaded_transaction` hands to the InvokeContext, so anything left to
+// the trait default silently answers for the bank. Taking the default
+// `is_precompile` (false) routes precompile instructions down the ordinary
+// program path, where they fail with `UnsupportedProgramId`.
 impl<CB: TransactionProcessingCallback> solana_svm_callback::InvokeContextCallback
     for AccountLoader<'_, CB>
 {
+    fn get_epoch_stake(&self) -> u64 {
+        self.callbacks.get_epoch_stake()
+    }
+
+    fn get_epoch_stake_for_vote_account(&self, vote_address: &Pubkey) -> u64 {
+        self.callbacks.get_epoch_stake_for_vote_account(vote_address)
+    }
+
+    fn is_precompile(&self, program_id: &Pubkey) -> bool {
+        self.callbacks.is_precompile(program_id)
+    }
+
+    fn process_precompile(
+        &self,
+        program_id: &Pubkey,
+        data: &[u8],
+        instruction_datas: Vec<&[u8]>,
+    ) -> std::result::Result<(), solana_precompile_error::PrecompileError> {
+        self.callbacks
+            .process_precompile(program_id, data, instruction_datas)
+    }
 }
 
 /// Set the rent epoch to u64::MAX if the account is rent exempt.
