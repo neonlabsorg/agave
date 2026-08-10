@@ -14,7 +14,7 @@
     "config": "parasol.config",
     "market_prefix": "__MARKET_PREFIX__"
   },
-  market_config_account_size: 327,
+  market_config_account_size: 362,
   "ring_capacity": 65536,
   "parse_ceiling_us": 200
 }
