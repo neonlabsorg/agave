@@ -15,6 +15,21 @@
     "market_prefix": "__MARKET_PREFIX__"
   },
   market_config_account_size: 327,
+  // UserBase forwarding, which is what makes session-key grants visible to MDG:
+  // without the discriminator the plugin forwards no UserBase at all and every
+  // /v1/sessionKeys listing stays empty (MDG reads that path from its ingest
+  // stream only, never RPC). A discriminator rather than a size filter because
+  // the delegate slab is realloc'd on each grant/revoke.
+  // Regenerate with: cargo test -p mdg-state print_plugin_account_filters -- --nocapture
+  "user_base_discriminator": "6c32f6e5c5680e00",
+  // add_session_key / add_session_key_revoking_oldest / revoke_session_key.
+  // Without this gate every order and cancel also publishes a UserBase snapshot,
+  // because nearly every DEX instruction declares user_base writable.
+  "session_key_instruction_discriminators": [
+    "3047a56125161500",
+    "966a0790814e0e00",
+    "51c0206e68741000"
+  ],
   "ring_capacity": 65536,
   "parse_ceiling_us": 200
 }
