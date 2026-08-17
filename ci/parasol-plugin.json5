@@ -14,7 +14,7 @@
     "config": "parasol.config",
     "market_prefix": "__MARKET_PREFIX__"
   },
-  market_config_account_size: 327,
+  market_config_account_size: 370,
   // UserBase forwarding, which is what makes session-key grants visible to MDG:
   // without the discriminator the plugin forwards no UserBase at all and every
   // /v1/sessionKeys listing stays empty (MDG reads that path from its ingest
