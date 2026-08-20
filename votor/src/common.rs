@@ -66,7 +66,10 @@ pub(crate) const DELTA: Duration = Duration::from_millis(250);
 /// Parasol dev tuning: 100 ms slot time (was 400 ms). Safe on a low-latency
 /// local cluster; on a real multi-node network keep DELTA_BLOCK >= DELTA so the
 /// leader's block can propagate within the network-delay bound.
-pub(crate) const DELTA_BLOCK: Duration = Duration::from_millis(100);
+///
+/// `pub` rather than `pub(crate)` so that consumers outside votor can size
+/// per-slot budgets off the slot time; see `core::tvu::BLS_MAX_STREAMS_PER_SECOND`.
+pub const DELTA_BLOCK: Duration = Duration::from_millis(100);
 
 /// Base timeout for when leader's first slice should arrive if they sent it immediately.
 pub(crate) const DELTA_TIMEOUT: Duration = DELTA.checked_mul(3).unwrap();

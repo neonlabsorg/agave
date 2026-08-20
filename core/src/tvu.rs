@@ -25,6 +25,7 @@ use {
         window_service::{WindowService, WindowServiceChannels},
     },
     agave_votor::{
+        common::DELTA_BLOCK,
         consensus_metrics::MAX_IN_FLIGHT_CONSENSUS_EVENTS,
         event::{LeaderWindowInfo, VotorEventReceiver, VotorEventSender},
         vote_history::VoteHistory,
@@ -92,6 +93,27 @@ const MAX_ALPENGLOW_PACKET_NUM: usize = 10_000;
 /// This is overprovisioned to account for standstill scenarios, where a large amount
 /// of votes / certificate need to be refreshed.
 const MAX_BLS_MESSAGES_TO_SEND: usize = 1000;
+
+/// QUIC stream budget for the BLS consensus port, expressed *per slot*.
+///
+/// Upstream hardcodes `max_streams_per_second: 30`, a figure sized for 400 ms slots -
+/// i.e. about twelve streams per slot. `SimpleQosConfig` enforces the budget by sleeping
+/// until tokens replenish (`streamer::nonblocking::simple_qos`), so an undersized budget
+/// does not drop consensus traffic, it delays it. Parasol runs a much shorter
+/// `DELTA_BLOCK`, and on a two-node cluster the fixed 30/s budget pushed the follower's
+/// view of finalization 350-1300 ms behind the leader's while block delivery itself
+/// stayed at 6-12 ms.
+///
+/// Deriving the budget from the slot time instead of hardcoding it means a future
+/// `DELTA_BLOCK` change cannot silently strangle the consensus channel again. Thirty
+/// streams per slot leaves a 10x headroom over measured demand and is still three orders
+/// of magnitude below the TPU default (`DEFAULT_MAX_STREAMS_PER_MS * 1000` = 500_000/s).
+const BLS_MAX_STREAMS_PER_SLOT: u64 = 30;
+
+/// `BLS_MAX_STREAMS_PER_SLOT` converted to the per-second unit `SimpleQosConfig` wants.
+/// At the current `DELTA_BLOCK` of 100 ms this is 300 streams/s.
+const BLS_MAX_STREAMS_PER_SECOND: u64 =
+    BLS_MAX_STREAMS_PER_SLOT * 1_000 / DELTA_BLOCK.as_millis() as u64;
 
 pub struct Tvu {
     fetch_stage: ShredFetchStage,
@@ -274,7 +296,7 @@ impl Tvu {
                     ..Default::default()
                 };
                 let qos_config = SimpleQosConfig {
-                    max_streams_per_second: 30,
+                    max_streams_per_second: BLS_MAX_STREAMS_PER_SECOND,
                     // Cap by # of active validators (some overhead for epoch boundaries)
                     max_staked_connections: MAX_ALPENGLOW_VOTE_ACCOUNTS * 2,
                     // Two staked connection per validator to account for hotspares
