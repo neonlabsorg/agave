@@ -3,7 +3,10 @@ use {
         admin_rpc_service::{self, StakedNodesOverrides, load_staked_nodes_overrides},
         bootstrap,
         cli::{self},
-        commands::{FromClapArgMatches, run::args::RunArgs},
+        commands::{
+            FromClapArgMatches,
+            run::args::{RunArgs, parse_fixed_leader},
+        },
         ledger_lockfile, lock_ledger,
     },
     agave_snapshots::{
@@ -801,6 +804,10 @@ pub fn execute(
             .value_of("expected_genesis_hash")
             .map(|s| Hash::from_str(s).unwrap()),
         fixed_leader_schedule: None,
+        fixed_leader: matches
+            .value_of("fixed_leader_schedule")
+            .map(parse_fixed_leader)
+            .transpose()?,
         expected_bank_hash: matches
             .value_of("expected_bank_hash")
             .map(|s| Hash::from_str(s).unwrap()),

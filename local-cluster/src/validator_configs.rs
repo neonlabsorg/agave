@@ -24,6 +24,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         broadcast_stage_type: config.broadcast_stage_type.clone(),
         turbine_disabled: config.turbine_disabled.clone(),
         fixed_leader_schedule: config.fixed_leader_schedule.clone(),
+        fixed_leader: config.fixed_leader,
         wait_for_supermajority: config.wait_for_supermajority,
         new_hard_forks: config.new_hard_forks.clone(),
         known_validators: config.known_validators.clone(),

@@ -183,6 +183,14 @@ impl LeaderScheduleCache {
     }
 
     pub fn get_epoch_leader_schedule(&self, epoch: Epoch) -> Option<Arc<LeaderSchedule>> {
+        // Same short circuit as `slot_leader_at_no_compute` and
+        // `get_leader_schedule_else_compute`. Without it the read-only consumers of this
+        // method (`getLeaderSchedule` and `getSlotLeaders`, and `getBlockProduction`
+        // through the latter) keep reporting the stake weighted schedule while the node
+        // itself routes off the fixed one.
+        if let Some(ref fixed_schedule) = self.fixed_schedule {
+            return Some(fixed_schedule.leader_schedule.clone());
+        }
         self.cached_schedules.read().unwrap().0.get(&epoch).cloned()
     }
 

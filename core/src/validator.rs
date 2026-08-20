@@ -78,7 +78,7 @@ use {
     solana_hard_forks::HardForks,
     solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_leader_schedule::FixedSchedule,
+    solana_leader_schedule::{FixedSchedule, LeaderSchedule, SlotLeader},
     solana_ledger::{
         bank_forks_utils,
         blockstore::{
@@ -347,6 +347,12 @@ pub struct ValidatorConfig {
     pub broadcast_stage_type: BroadcastStageType,
     pub turbine_disabled: Arc<AtomicBool>,
     pub fixed_leader_schedule: Option<FixedSchedule>,
+    /// Parasol: pin every slot of the leader schedule to this one validator, so that
+    /// leadership can never migrate to a node that is only meant to serve RPC. Expanded
+    /// into a `FixedSchedule` once the root bank is known; ignored if
+    /// `fixed_leader_schedule` is already set. Must be identical on every node in the
+    /// cluster, otherwise they disagree on who the leader is.
+    pub fixed_leader: Option<SlotLeader>,
     pub wait_for_supermajority: Option<Slot>,
     pub new_hard_forks: Option<Vec<Slot>>,
     pub known_validators: Option<HashSet<Pubkey>>, // None = trust all
@@ -426,6 +432,7 @@ impl ValidatorConfig {
             broadcast_stage_type: BroadcastStageType::Standard,
             turbine_disabled: Arc::<AtomicBool>::default(),
             fixed_leader_schedule: None,
+            fixed_leader: None,
             wait_for_supermajority: None,
             new_hard_forks: None,
             known_validators: None,
@@ -2295,9 +2302,29 @@ fn load_blockstore(
         })
         .map_err(|err| err.to_string())?;
 
-    let mut leader_schedule_cache =
-        LeaderScheduleCache::new_from_bank(&bank_forks.read().unwrap().root_bank());
-    leader_schedule_cache.set_fixed_leader_schedule(config.fixed_leader_schedule.clone());
+    let root_bank = bank_forks.read().unwrap().root_bank();
+    let mut leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+    let fixed_leader_schedule = config.fixed_leader_schedule.clone().or_else(|| {
+        config.fixed_leader.map(|leader| {
+            // One entry per slot in an epoch, so the pinned schedule is shaped exactly like
+            // a computed one and every consumer - including the `getLeaderSchedule` /
+            // `getBlockProduction` RPCs - sees the same thing the node itself uses.
+            let slots_per_epoch = root_bank.epoch_schedule().slots_per_epoch;
+            warn!(
+                "Leader schedule is pinned to identity {} (vote account {}) for every slot. \
+                 Every node in the cluster must be started with the same \
+                 --fixed-leader-schedule value or they will disagree on who the leader is.",
+                leader.id, leader.vote_address,
+            );
+            FixedSchedule {
+                leader_schedule: Arc::new(LeaderSchedule::new_from_schedule(vec![
+                    leader;
+                    slots_per_epoch as usize
+                ])),
+            }
+        })
+    });
+    leader_schedule_cache.set_fixed_leader_schedule(fixed_leader_schedule);
 
     // Before replay starts, set the callbacks in each of the banks in BankForks so that
     // all dropped banks come through the `pruned_banks_receiver` channel. This way all bank

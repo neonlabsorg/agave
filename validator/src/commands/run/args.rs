@@ -23,6 +23,7 @@ use {
         validator::{BlockProductionMethod, BlockVerificationMethod},
     },
     solana_keypair::Keypair,
+    solana_leader_schedule::SlotLeader,
     solana_ledger::{blockstore_options::BlockstoreOptions, use_snapshot_archives_at_startup},
     solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
@@ -32,6 +33,21 @@ use {
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::{collections::HashSet, net::SocketAddr, path::PathBuf, str::FromStr},
 };
+
+/// Parse the `--fixed-leader-schedule <IDENTITY_PUBKEY:VOTE_PUBKEY>` value.
+///
+/// The v4 leader schedule is vote keyed (`runtime::leader_schedule_utils::leader_schedule`
+/// builds it from `bank.epoch_vote_accounts`), so pinning a leader needs the vote account
+/// address as well as the identity.
+pub(crate) fn parse_fixed_leader(value: &str) -> std::result::Result<SlotLeader, String> {
+    let (id, vote_address) = value.split_once(':').ok_or_else(|| {
+        format!("expected IDENTITY_PUBKEY:VOTE_PUBKEY, got '{value}' with no ':' separator")
+    })?;
+    let id = Pubkey::from_str(id).map_err(|err| format!("invalid identity pubkey '{id}': {err}"))?;
+    let vote_address = Pubkey::from_str(vote_address)
+        .map_err(|err| format!("invalid vote account pubkey '{vote_address}': {err}"))?;
+    Ok(SlotLeader { id, vote_address })
+}
 
 const EXCLUDE_KEY: &str = "account-index-exclude-key";
 const INCLUDE_KEY: &str = "account-index-include-key";
@@ -601,6 +617,21 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "If the validator starts up with no ledger, it will wait to start block \
                  production until it sees a vote land in a rooted slot. This prevents double \
                  signing. Turn off to risk double signing a block.",
+            ),
+    )
+    .arg(
+        Arg::with_name("fixed_leader_schedule")
+            .long("fixed-leader-schedule")
+            .value_name("IDENTITY_PUBKEY:VOTE_PUBKEY")
+            .takes_value(true)
+            .validator(|value| parse_fixed_leader(&value).map(|_| ()))
+            .help(
+                "Pin every slot of the leader schedule to this validator instead of computing \
+                 a stake weighted schedule, so leadership can never migrate to a node that is \
+                 only meant to serve RPC. The schedule in Alpenglow is vote keyed, so both the \
+                 identity and the vote account address are required. Every node in the cluster \
+                 must be started with the same value or they will disagree on who the leader \
+                 is. Intended for single-leader test stands.",
             ),
     )
     .arg(
@@ -1824,5 +1855,26 @@ mod tests {
             vec!["--allow-private-addr"],
             expected_args,
         );
+    }
+
+    #[test]
+    fn parse_fixed_leader_accepts_identity_and_vote_pubkeys() {
+        let id = Pubkey::new_unique();
+        let vote_address = Pubkey::new_unique();
+        assert_eq!(
+            parse_fixed_leader(&format!("{id}:{vote_address}")),
+            Ok(SlotLeader { id, vote_address })
+        );
+    }
+
+    #[test]
+    fn parse_fixed_leader_rejects_malformed_values() {
+        let id = Pubkey::new_unique();
+        // No separator: the vote account address is not optional, the v4 schedule is vote keyed.
+        assert!(parse_fixed_leader(&id.to_string()).is_err());
+        // Either half being unparseable is an error.
+        assert!(parse_fixed_leader(&format!("{id}:not-a-pubkey")).is_err());
+        assert!(parse_fixed_leader(&format!("not-a-pubkey:{id}")).is_err());
+        assert!(parse_fixed_leader(":").is_err());
     }
 }
