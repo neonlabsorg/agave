@@ -64,16 +64,27 @@ jobs:
         run: |
           set -euo pipefail
           # Same-named parasol-plugin branch if it exists, else dev.
-          if curl -fsS \
+          api="https://api.github.com/repos/neonlabsorg/parasol-plugin/branches"
+          if body=$(curl -fsS \
                -H "Authorization: Bearer ${GHTOKEN}" \
                -H "Accept: application/vnd.github+json" \
-               "https://api.github.com/repos/neonlabsorg/parasol-plugin/branches/${HEAD_REF}" >/dev/null 2>&1; then
+               "${api}/${HEAD_REF}" 2>/dev/null); then
             ref="${HEAD_REF}"
           else
             ref="dev"
+            body=$(curl -fsS \
+              -H "Authorization: Bearer ${GHTOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "${api}/dev")
           fi
-          echo "resolved parasol-plugin ref: ${ref}"
+          # Resolve the ref to a commit and pass it to the build. Without the sha
+          # in a build arg, buildkit reuses the cached clone layer (its RUN text
+          # never changes) and the image ships a plugin built from an older tree
+          # than the branch it names — with nothing in the log saying so.
+          sha=$(printf '%s' "${body}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["commit"]["sha"])')
+          echo "resolved parasol-plugin ref: ${ref} sha: ${sha}"
           echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image (with parasol-plugin)
         uses: docker/build-push-action@v7
@@ -86,6 +97,7 @@ jobs:
           build-args: |
             PARASOL_PLUGIN_REPO=github.com/neonlabsorg/parasol-plugin.git
             PARASOL_PLUGIN_REF=${{ steps.plugin_ref.outputs.ref }}
+            PARASOL_PLUGIN_SHA=${{ steps.plugin_ref.outputs.sha }}
           tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}-plugin,${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}-plugin
           push: true
     outputs:

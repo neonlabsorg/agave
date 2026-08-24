@@ -33,12 +33,27 @@ RUN cargo build --release
 # agent exists inside the builder.
 ARG PARASOL_PLUGIN_REPO=
 ARG PARASOL_PLUGIN_REF=dev
+# The commit the caller resolved for PARASOL_PLUGIN_REF, and the reason this
+# build arg exists at all: buildkit keys a RUN layer on the instruction text, so
+# a `git clone --branch <name>` whose command never changes is cached across new
+# commits on that branch. The image then ships a plugin binary built from an
+# older tree than the branch it claims, silently — the same stale-artifact
+# failure this pipeline has already paid for several times over. Naming the sha
+# in the layer makes a new plugin commit invalidate the cache, and checking it
+# out pins the build to exactly what the caller resolved rather than to whatever
+# the branch tip happens to be a few minutes later.
+ARG PARASOL_PLUGIN_SHA=
 RUN mkdir -p /opt/plugin-out
 RUN --mount=type=secret,id=gh_token if [ -n "${PARASOL_PLUGIN_REPO}" ]; then \
       set -eu; \
       GH_TOKEN=$(cat /run/secrets/gh_token); \
-      git clone --depth 1 --branch "${PARASOL_PLUGIN_REF}" \
+      echo "parasol-plugin ref=${PARASOL_PLUGIN_REF} sha=${PARASOL_PLUGIN_SHA}"; \
+      git clone --branch "${PARASOL_PLUGIN_REF}" \
         "https://x-access-token:${GH_TOKEN}@${PARASOL_PLUGIN_REPO}" /build/plugin-src; \
+      if [ -n "${PARASOL_PLUGIN_SHA}" ]; then \
+        git -C /build/plugin-src checkout --quiet "${PARASOL_PLUGIN_SHA}"; \
+      fi; \
+      git -C /build/plugin-src log --oneline -1; \
       set -x; \
       mkdir -p /opt/agave/parasol-plugin; \
       cp -r /build/plugin-src/crates /opt/agave/parasol-plugin/crates; \
