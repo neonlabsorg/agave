@@ -8,19 +8,42 @@
     "queue_buffering_max_kbytes": 1048576,
     "idempotence": true
   },
+  // Cluster routing: Market events go to `mkt-<name>` / `mkt-default-<h>` and
+  // user events to `<user_all_prefix>-<channel>`, both derived from the
+  // manager's route map — NOT to `events` with a `market_prefix` split, which
+  // is the monolith scheme and is ignored by this plugin. `control` carries
+  // slot-status + block-meta to every node.
   "topics": {
     "events": "parasol.events",
     "receipts": "parasol.receipts",
     "config": "parasol.config",
-    "market_prefix": "__MARKET_PREFIX__"
+    "control": "parasol.control"
   },
-  market_config_account_size: 370,
+  // The manager is the config authority (Q-DYN-CFG): the plugin fetches the
+  // dedicated-market set, default-topic count, user pool and named groups from
+  // it at load and refreshes them on an interval. Substituted by
+  // compose/cluster.yml; an empty value means "no manager, use the bootstrap
+  // below" — which on a cluster stack routes every event onto topics no node
+  // subscribes to, so the substitution is verified before the validator starts.
+  "manager_url": "__MANAGER_URL__",
+  // Cold-start routing, used only for the window between plugin load and the
+  // first successful manager fetch. Kept in step with the manager's own
+  // MDG_MANAGER_ALL_POOL_* env so a user lands on the same channel either way;
+  // the manager's map supersedes both once it answers.
+  "user_all_prefix": "usr-all",
+  "user_all_pool_size": 30,
+  // MarketConfig forwarding. Matched by the 8-byte account discriminator, not
+  // by account size: the size drifts with every on-chain layout change and is
+  // shared by other accounts of the same length. Without this the plugin
+  // forwards no MarketConfig at all and the manager's config-topic market
+  // discovery never fires (it then depends solely on its gPA sweep).
+  // Regenerate with: cargo test -p mdg-state print_plugin_account_filters -- --nocapture
+  "market_config_discriminator": "c94ebbe1f0c60900",
   // UserBase forwarding, which is what makes session-key grants visible to MDG:
   // without the discriminator the plugin forwards no UserBase at all and every
   // /v1/sessionKeys listing stays empty (MDG reads that path from its ingest
   // stream only, never RPC). A discriminator rather than a size filter because
   // the delegate slab is realloc'd on each grant/revoke.
-  // Regenerate with: cargo test -p mdg-state print_plugin_account_filters -- --nocapture
   "user_base_discriminator": "6c32f6e5c5680e00",
   // add_session_key / add_session_key_revoking_oldest / revoke_session_key.
   // Without this gate every order and cancel also publishes a UserBase snapshot,
