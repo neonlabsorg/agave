@@ -23,7 +23,7 @@ use {
     lru::LruCache,
     rand::prelude::IndexedRandom as _,
     solana_client::connection_cache::Protocol,
-    solana_clock::{DEFAULT_TICKS_PER_SECOND, MS_PER_TICK, Slot},
+    solana_clock::{DEFAULT_TICKS_PER_SECOND, DEFAULT_TICKS_PER_SLOT, MS_PER_TICK, Slot},
     solana_epoch_schedule::EpochSchedule,
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
@@ -56,12 +56,30 @@ use {
 #[cfg(test)]
 use {
     crate::repair::duplicate_repair_status::DuplicateSlotRepairStatus,
-    solana_clock::DEFAULT_MS_PER_SLOT, solana_keypair::Keypair,
+    solana_clock::{DEFAULT_MS_PER_SLOT, MS_PER_TICK},
+    solana_keypair::Keypair,
 };
 
-// Time to defer repair requests to allow for turbine propagation
-const DEFER_REPAIR_THRESHOLD: Duration = Duration::from_millis(250);
-const DEFER_REPAIR_THRESHOLD_TICKS: u64 = DEFER_REPAIR_THRESHOLD.as_millis() as u64 / MS_PER_TICK;
+// Time to defer repair requests to allow for turbine propagation.
+//
+// PARASOL: upstream writes this as a wall-clock 250ms, which is 5/8 of the
+// 400ms slot (DEFAULT_TICKS_PER_SLOT = 64) it was tuned against. This fork
+// runs 16 ticks per slot and its clusters run 32, where a fixed 250ms is 41
+// ticks — longer than a whole slot. A single missed shred then costs at least
+// one full block before the first repair request is even sent, which is the
+// arithmetic behind the observed one-block latency on a multi-node cluster.
+// Deriving the threshold from the slot length keeps upstream's ratio and makes
+// it track any later change to the slot time instead of silently going stale
+// again. It also drops MS_PER_TICK out of this expression, whose integer
+// division (1000 / 160 = 6) understates the true 6.25ms tick by 4%.
+const DEFER_REPAIR_THRESHOLD_TICKS: u64 = DEFAULT_TICKS_PER_SLOT * 5 / 8;
+#[cfg(test)]
+const DEFER_REPAIR_THRESHOLD: Duration =
+    Duration::from_millis(DEFER_REPAIR_THRESHOLD_TICKS * MS_PER_TICK);
+// The invariant that was violated: deferring repair for longer than a slot
+// makes every turbine miss cost a whole block. Checked at compile time because
+// this crate's test target does not build on this fork.
+static_assertions::const_assert!(DEFER_REPAIR_THRESHOLD_TICKS < DEFAULT_TICKS_PER_SLOT);
 
 // This is the amount of time we will wait for a repair request to be fulfilled
 // before making another request. Value is based on reasonable upper bound of
