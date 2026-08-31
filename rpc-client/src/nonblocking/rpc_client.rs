@@ -3828,6 +3828,144 @@ impl RpcClient {
         Ok(self.get_account(pubkey).await?.data)
     }
 
+    /// Returns all information associated with the subaccount of the provided
+    /// owner-facing pubkey.
+    ///
+    /// If the subaccount has no on-chain storage, this method returns an error.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method is built on the [`getSubaccount`] RPC method, which resolves
+    /// the owner-facing subaccount pubkey to its `subaccount_storage_address`
+    /// and returns the stored account (or `None` when no storage exists).
+    ///
+    /// [`getSubaccount`]: getSubaccount
+    pub async fn get_subaccount(&self, pubkey: &Pubkey) -> ClientResult<Account> {
+        self.get_subaccount_with_commitment(pubkey, self.commitment())
+            .await?
+            .value
+            .ok_or_else(|| RpcError::ForUser(format!("SubaccountNotFound: pubkey={pubkey}")).into())
+    }
+
+    /// Returns all information associated with the subaccount of the provided
+    /// owner-facing pubkey.
+    ///
+    /// If the subaccount has no on-chain storage, this method returns
+    /// `Ok(None)`.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method is built on the [`getSubaccount`] RPC method.
+    ///
+    /// [`getSubaccount`]: getSubaccount
+    pub async fn get_subaccount_with_commitment(
+        &self,
+        pubkey: &Pubkey,
+        commitment_config: CommitmentConfig,
+    ) -> RpcResult<Option<Account>> {
+        let config = RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64Zstd),
+            commitment: Some(commitment_config),
+            data_slice: None,
+            min_context_slot: None,
+        };
+
+        let response = self
+            .send(
+                RpcRequest::GetSubaccount,
+                json!([pubkey.to_string(), config]),
+            )
+            .await;
+
+        response
+            .map(|result_json: Value| {
+                if result_json.is_null() {
+                    return Err(
+                        RpcError::ForUser(format!("SubaccountNotFound: pubkey={pubkey}")).into(),
+                    );
+                }
+                let Response {
+                    context,
+                    value: ui_account,
+                } = serde_json::from_value::<Response<Option<UiAccount>>>(result_json)?;
+                trace!("Response subaccount {pubkey:?} {ui_account:?}");
+                Ok(Response {
+                    context,
+                    value: ui_account.and_then(|ui_account| ui_account.to_account()),
+                })
+            })
+            .map_err(|err| {
+                Into::<ClientError>::into(RpcError::ForUser(format!(
+                    "SubaccountNotFound: pubkey={pubkey}: {err}"
+                )))
+            })?
+    }
+
+    /// Returns the subaccount information for a list of owner-facing pubkeys.
+    ///
+    /// The returned vector preserves the order of `pubkeys`. An entry is `None`
+    /// when the corresponding subaccount has no on-chain storage.
+    ///
+    /// This method uses the configured [commitment level][cl].
+    ///
+    /// [cl]: https://solana.com/docs/rpc#configuring-state-commitment
+    ///
+    /// # RPC Reference
+    ///
+    /// This method is built on the [`getMultipleSubaccounts`] RPC method, which
+    /// resolves each owner-facing subaccount pubkey to its
+    /// `subaccount_storage_address` and returns the stored accounts.
+    ///
+    /// [`getMultipleSubaccounts`]: getMultipleSubaccounts
+    pub async fn get_multiple_subaccounts(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> ClientResult<Vec<Option<Account>>> {
+        Ok(self
+            .get_multiple_subaccounts_with_commitment(pubkeys, self.commitment())
+            .await?
+            .value)
+    }
+
+    /// Returns the subaccount information for a list of owner-facing pubkeys.
+    ///
+    /// The returned vector preserves the order of `pubkeys`. An entry is `None`
+    /// when the corresponding subaccount has no on-chain storage.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method is built on the [`getMultipleSubaccounts`] RPC method.
+    ///
+    /// [`getMultipleSubaccounts`]: getMultipleSubaccounts
+    pub async fn get_multiple_subaccounts_with_commitment(
+        &self,
+        pubkeys: &[Pubkey],
+        commitment_config: CommitmentConfig,
+    ) -> RpcResult<Vec<Option<Account>>> {
+        let config = RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64Zstd),
+            commitment: Some(commitment_config),
+            data_slice: None,
+            min_context_slot: None,
+        };
+        let pubkeys: Vec<_> = pubkeys.iter().map(|pubkey| pubkey.to_string()).collect();
+        let response = self
+            .send(RpcRequest::GetMultipleSubaccounts, json!([pubkeys, config]))
+            .await?;
+        let Response {
+            context,
+            value: accounts,
+        } = serde_json::from_value::<Response<Vec<Option<UiAccount>>>>(response)?;
+        let accounts: Vec<Option<Account>> = accounts
+            .into_iter()
+            .map(|rpc_account| rpc_account.and_then(|a| a.to_account()))
+            .collect();
+        Ok(Response {
+            context,
+            value: accounts,
+        })
+    }
+
     /// Returns minimum balance required to make an account with specified data length rent exempt.
     ///
     /// # RPC Reference

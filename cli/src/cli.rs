@@ -435,6 +435,11 @@ pub enum CliCommand {
         output_file: Option<String>,
         use_lamports_unit: bool,
     },
+    ShowSubaccount {
+        pubkey: Pubkey,
+        output_file: Option<String>,
+        use_lamports_unit: bool,
+    },
     Transfer {
         amount: SpendAmount,
         to: Pubkey,
@@ -800,6 +805,7 @@ pub fn parse_command(
         }
         // Wallet Commands
         ("account", Some(matches)) => parse_account(matches, wallet_manager),
+        ("subaccount", Some(matches)) => parse_subaccount(matches, wallet_manager),
         ("address", Some(matches)) => Ok(CliCommandInfo {
             command: CliCommand::Address,
             signers: vec![default_signer.signer_from_path(matches, wallet_manager)?],
@@ -1802,6 +1808,14 @@ pub async fn process_command(config: &CliConfig<'_>) -> ProcessResult {
             use_lamports_unit,
         } => {
             process_show_account(&rpc_client, config, pubkey, output_file, *use_lamports_unit).await
+        }
+        CliCommand::ShowSubaccount {
+            pubkey,
+            output_file,
+            use_lamports_unit,
+        } => {
+            process_show_subaccount(&rpc_client, config, pubkey, output_file, *use_lamports_unit)
+                .await
         }
         CliCommand::Transfer {
             amount,
