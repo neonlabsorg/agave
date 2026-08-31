@@ -60,6 +60,8 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         poh_hashes_per_batch: config.poh_hashes_per_batch,
         process_ledger_before_services: config.process_ledger_before_services,
         no_wait_for_vote_to_start_leader: config.no_wait_for_vote_to_start_leader,
+        turbine_roster_from_vote_accounts: config.turbine_roster_from_vote_accounts,
+        turbine_broadcast_to_all: config.turbine_broadcast_to_all,
         accounts_db_config: config.accounts_db_config.clone(),
         wait_to_vote_slot: config.wait_to_vote_slot,
         runtime_config: config.runtime_config.clone(),
