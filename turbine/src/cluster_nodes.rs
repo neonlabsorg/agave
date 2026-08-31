@@ -871,8 +871,14 @@ mod tests {
     use {
         super::*,
         itertools::Itertools,
+        solana_account::Account,
         solana_hash::Hash as SolanaHash,
         solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
+        solana_runtime::genesis_utils::{
+            create_genesis_config_with_vote_accounts, GenesisConfigInfo, ValidatorVoteKeypairs,
+        },
+        solana_signer::Signer,
+        solana_vote_program::vote_state,
         std::{collections::VecDeque, fmt::Debug, hash::Hash},
         test_case::test_case,
     };
@@ -1315,6 +1321,76 @@ mod tests {
         assert_eq!(stakes.len(), 3);
         // The map the bank owns is untouched.
         assert_eq!(epoch_staked_nodes.len(), 1);
+    }
+
+    // The premise the whole roster rests on, asserted against a real Bank: a
+    // genesis vote account that owns no stake account is visible in
+    // epoch_vote_accounts (which is not stake-filtered) and absent from
+    // epoch_staked_nodes (which is). That split is what lets a follower join
+    // the turbine tree without ever entering a leader schedule. It lives in
+    // runtime, so nothing in this crate would notice if it stopped holding.
+    #[test]
+    fn test_zero_stake_vote_account_is_rostered_but_never_staked() {
+        let leader = ValidatorVoteKeypairs::new_rand();
+        let leader_identity = leader.node_keypair.pubkey();
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config_with_vote_accounts(
+            1_000_000_000, // mint
+            &[&leader],
+            vec![1_000_000], // leader stake
+        );
+
+        // Exactly what parasol-genesis-builder emits for `stake_lamports: "0"`:
+        // an identity and a vote account, and no stake account at all.
+        let follower_identity = Pubkey::new_unique();
+        let follower_vote = Pubkey::new_unique();
+        genesis_config.accounts.insert(
+            follower_identity,
+            Account::new(1_000_000, 0, &solana_sdk_ids::system_program::id()),
+        );
+        genesis_config.accounts.insert(
+            follower_vote,
+            Account::from(vote_state::create_v3_account_with_authorized(
+                &follower_identity,
+                &follower_identity,
+                &follower_identity,
+                0,         // commission
+                1_000_000, // lamports — not stake
+            )),
+        );
+
+        let bank = Bank::new_for_tests(&genesis_config);
+        let epoch = bank.epoch();
+        let vote_accounts = bank.epoch_vote_accounts(epoch).unwrap();
+        let staked_nodes = bank.epoch_staked_nodes(epoch).unwrap();
+
+        assert!(
+            vote_accounts
+                .values()
+                .any(|(_stake, vote_account)| *vote_account.node_pubkey() == follower_identity),
+            "a zero-stake vote account must still be in epoch_vote_accounts"
+        );
+        assert!(
+            !staked_nodes.contains_key(&follower_identity),
+            "a zero-stake node must stay out of epoch_staked_nodes — that is what keeps it out of \
+             every leader schedule"
+        );
+        assert!(staked_nodes.contains_key(&leader_identity));
+
+        // ... and the merge the cache performs admits it to the tree.
+        let stakes = merged_roster_stakes(
+            &staked_nodes,
+            vote_accounts
+                .values()
+                .map(|(_stake, vote_account)| *vote_account.node_pubkey()),
+        );
+        assert_eq!(
+            stakes.get(&follower_identity),
+            Some(&TURBINE_ROSTER_WEIGHT),
+            "the roster must admit the unstaked follower"
+        );
+        assert_eq!(stakes.get(&leader_identity), Some(&1_000_000u64));
     }
 
     #[test]
