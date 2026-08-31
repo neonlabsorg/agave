@@ -697,6 +697,38 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("turbine_roster_from_vote_accounts")
+            .long("turbine-roster-from-vote-accounts")
+            .takes_value(false)
+            .help(
+                "Admit every node that owns a vote account in the epoch into the Turbine \
+                 retransmit tree, including nodes with zero stake. Turbine normally derives tree \
+                 membership from stake, so an unstaked node's position depends on each peer's \
+                 gossip view and the cluster does not agree on the tree; with this flag the \
+                 membership comes from the bank instead and is identical on every node. The \
+                 synthetic weight is used only to build the Turbine tree: it never enters the \
+                 bank, the leader schedule, the vote path, or consensus. THE SAME VALUE MUST BE \
+                 SET ON EVERY NODE OF THE CLUSTER, INCLUDING THE LEADER — a node that disagrees \
+                 computes a different tree and silently falls back to repair. Intended for small \
+                 private clusters with one permanent leader; do not enable on a public cluster, \
+                 where abandoned zero-stake vote accounts would pad the tree.",
+            ),
+    )
+    .arg(
+        Arg::with_name("turbine_broadcast_to_all")
+            .long("turbine-broadcast-to-all")
+            .takes_value(false)
+            .help(
+                "While this node is leader, send every shred to all known TVU peers instead of \
+                 only to the elected Turbine root. Costs one hop instead of two and does not \
+                 depend on the peers agreeing on the tree, at the price of multiplying leader \
+                 egress by the peer count. Retransmit still runs, so each node also receives the \
+                 forwarded copy and the duplicate is deduplicated; that second path is the point. \
+                 Intended for small private clusters — leader bandwidth grows linearly with \
+                 cluster size.",
+            ),
+    )
+    .arg(
         Arg::with_name("hard_forks")
             .long("hard-fork")
             .value_name("SLOT")

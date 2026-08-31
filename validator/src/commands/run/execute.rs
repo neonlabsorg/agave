@@ -603,6 +603,11 @@ pub fn execute(
         snapshot_config,
         no_wait_for_vote_to_start_leader: matches.is_present("no_wait_for_vote_to_start_leader"),
         single_validator: crate::single_validator_enabled(matches),
+        // PARASOL: turbine tree membership + leader fan-out knobs. Both must carry
+        // the same value on every node of the cluster; the resolved values are
+        // logged below so a mismatch is visible in each node's log head.
+        turbine_roster_from_vote_accounts: matches.is_present("turbine_roster_from_vote_accounts"),
+        turbine_broadcast_to_all: matches.is_present("turbine_broadcast_to_all"),
         wait_to_vote_slot: None,
         runtime_config: RuntimeConfig {
             log_messages_bytes_limit: value_of(matches, "log_messages_bytes_limit"),

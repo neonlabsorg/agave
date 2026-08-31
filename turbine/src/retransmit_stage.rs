@@ -658,10 +658,13 @@ impl RetransmitStage {
         slot_status_notifier: Option<SlotStatusNotifier>,
         xdp_sender: Option<XdpSender>,
         votor_event_sender: Option<Sender<VotorEvent>>,
+        // PARASOL: --turbine-roster-from-vote-accounts
+        turbine_roster_from_vote_accounts: bool,
     ) -> Self {
         let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
+            turbine_roster_from_vote_accounts,
         );
         let mut rng = rand::thread_rng();
         let mut stats = RetransmitStats::new(Instant::now());

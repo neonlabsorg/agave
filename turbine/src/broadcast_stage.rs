@@ -128,6 +128,9 @@ impl BroadcastStageType {
         shred_version: u16,
         quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
         xdp_sender: Option<XdpSender>,
+        // PARASOL: --turbine-roster-from-vote-accounts / --turbine-broadcast-to-all
+        turbine_roster_from_vote_accounts: bool,
+        turbine_broadcast_to_all: bool,
     ) -> BroadcastStage {
         match self {
             BroadcastStageType::Standard => BroadcastStage::new(
@@ -139,7 +142,11 @@ impl BroadcastStageType {
                 blockstore,
                 bank_forks,
                 quic_endpoint_sender,
-                StandardBroadcastRun::new(shred_version),
+                StandardBroadcastRun::new(
+                    shred_version,
+                    turbine_roster_from_vote_accounts,
+                    turbine_broadcast_to_all,
+                ),
                 xdp_sender,
             ),
 
@@ -485,7 +492,14 @@ pub enum BroadcastSocket<'a> {
 }
 
 /// Broadcasts shreds from the leader (i.e. this node) to the root of the
-/// turbine retransmit tree for each shred.
+/// turbine retransmit tree for each shred, or to every known peer when
+/// `broadcast_to_all` is set.
+// PARASOL: the broadcast_to_all flag takes this from 9 to 10 parameters. The
+// surrounding call sites (BroadcastStageType::new_broadcast_stage,
+// RetransmitStage::new) carry the same allow for the same reason: this is a
+// wiring function whose arguments are already all distinct, unrelated handles,
+// so grouping them into a struct would move the noise rather than remove it.
+#[allow(clippy::too_many_arguments)]
 pub fn broadcast_shreds(
     socket: BroadcastSocket,
     shreds: &[Shred],
@@ -496,6 +510,9 @@ pub fn broadcast_shreds(
     bank_forks: &RwLock<BankForks>,
     socket_addr_space: &SocketAddrSpace,
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
+    // PARASOL: --turbine-broadcast-to-all. Address every known peer directly
+    // instead of only the elected turbine root.
+    broadcast_to_all: bool,
 ) -> Result<()> {
     let mut result = Ok(());
     // Compute destinations & transmission protocols for each of the shreds to be sent
@@ -504,30 +521,61 @@ pub fn broadcast_shreds(
         let bank_forks = bank_forks.read().unwrap();
         (bank_forks.root_bank(), bank_forks.working_bank())
     };
-    let (packets, quic_packets): (Vec<_>, Vec<_>) = shreds
-        .iter()
-        .group_by(|shred| shred.slot())
-        .into_iter()
-        .flat_map(|(slot, shreds)| {
+    let (packets, quic_packets): (Vec<_>, Vec<_>) = if broadcast_to_all {
+        // PARASOL: one datagram per shred per peer. The turbine tree still
+        // operates on the receiving side, so a follower that is also the
+        // elected root retransmits as usual and every node ends up with two
+        // independent paths; the duplicate is dropped by the retransmit-stage
+        // deduper and by the blockstore insert.
+        let mut packets = Vec::new();
+        let mut quic_packets = Vec::new();
+        let groups = shreds.iter().group_by(|shred| shred.slot());
+        for (slot, shreds) in &groups {
             let cluster_nodes =
                 cluster_nodes_cache.get(slot, &root_bank, &working_bank, cluster_info);
             update_peer_stats(&cluster_nodes, last_datapoint_submit);
-            shreds.filter_map(move |shred| {
+            let peers: Vec<_> = cluster_nodes.get_broadcast_peers_all().collect();
+            for shred in shreds {
                 let key = shred.id();
                 let protocol = cluster_nodes::get_broadcast_protocol(&key);
-                cluster_nodes
-                    .get_broadcast_peer(&key)?
-                    .tvu(protocol)
-                    .filter(|addr| !addr.is_ipv6() && socket_addr_space.check(addr))
-                    .map(|addr| {
-                        (match protocol {
-                            Protocol::QUIC => Either::Right,
-                            Protocol::UDP => Either::Left,
-                        })((shred.payload(), addr))
-                    })
+                for addr in peers.iter().filter_map(|peer| peer.tvu(protocol)) {
+                    if addr.is_ipv6() || !socket_addr_space.check(&addr) {
+                        continue;
+                    }
+                    match protocol {
+                        Protocol::QUIC => quic_packets.push((shred.payload(), addr)),
+                        Protocol::UDP => packets.push((shred.payload(), addr)),
+                    }
+                }
+            }
+        }
+        (packets, quic_packets)
+    } else {
+        shreds
+            .iter()
+            .group_by(|shred| shred.slot())
+            .into_iter()
+            .flat_map(|(slot, shreds)| {
+                let cluster_nodes =
+                    cluster_nodes_cache.get(slot, &root_bank, &working_bank, cluster_info);
+                update_peer_stats(&cluster_nodes, last_datapoint_submit);
+                shreds.filter_map(move |shred| {
+                    let key = shred.id();
+                    let protocol = cluster_nodes::get_broadcast_protocol(&key);
+                    cluster_nodes
+                        .get_broadcast_peer(&key)?
+                        .tvu(protocol)
+                        .filter(|addr| !addr.is_ipv6() && socket_addr_space.check(addr))
+                        .map(|addr| {
+                            (match protocol {
+                                Protocol::QUIC => Either::Right,
+                                Protocol::UDP => Either::Left,
+                            })((shred.payload(), addr))
+                        })
+                })
             })
-        })
-        .partition_map(std::convert::identity);
+            .partition_map(std::convert::identity)
+    };
     shred_select.stop();
     transmit_stats.shred_select += shred_select.as_us();
     let num_udp_packets = packets.len();
@@ -770,7 +818,7 @@ pub mod test {
             blockstore.clone(),
             bank_forks,
             quic_endpoint_sender,
-            StandardBroadcastRun::new(0),
+            StandardBroadcastRun::new(0, false, false),
             None,
         );
 

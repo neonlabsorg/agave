@@ -138,6 +138,9 @@ impl Tpu {
         blockstore: Arc<Blockstore>,
         broadcast_type: &BroadcastStageType,
         xdp_sender: Option<XdpSender>,
+        // PARASOL: --turbine-roster-from-vote-accounts / --turbine-broadcast-to-all
+        turbine_roster_from_vote_accounts: bool,
+        turbine_broadcast_to_all: bool,
         exit: Arc<AtomicBool>,
         shred_version: u16,
         vote_tracker: Arc<VoteTracker>,
@@ -416,6 +419,8 @@ impl Tpu {
             shred_version,
             turbine_quic_endpoint_sender,
             xdp_sender,
+            turbine_roster_from_vote_accounts,
+            turbine_broadcast_to_all,
         );
 
         let mut key_notifiers = key_notifiers.write().unwrap();

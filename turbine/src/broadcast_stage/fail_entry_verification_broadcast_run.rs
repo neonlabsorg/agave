@@ -29,6 +29,7 @@ impl FailEntryVerificationBroadcastRun {
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
+            false,
         ));
         Self {
             shred_version,
@@ -194,6 +195,7 @@ impl BroadcastRun for FailEntryVerificationBroadcastRun {
             bank_forks,
             cluster_info.socket_addr_space(),
             quic_endpoint_sender,
+            false,
         )
     }
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()> {

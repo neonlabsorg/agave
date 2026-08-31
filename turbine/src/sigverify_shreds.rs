@@ -82,6 +82,10 @@ pub fn spawn_shred_sigverify(
     retransmit_sender: EvictingSender<Vec<shred::Payload>>,
     verified_sender: Sender<Vec<(shred::Payload, /*is_repaired:*/ bool)>>,
     num_sigverify_threads: NonZeroUsize,
+    // PARASOL: --turbine-roster-from-vote-accounts. Must match the value used by
+    // the retransmit stage, or the turbine parent computed here for the
+    // retransmitter-signature check would not be the node that actually forwarded.
+    turbine_roster_from_vote_accounts: bool,
 ) -> JoinHandle<()> {
     let recycler_cache = RecyclerCache::warmed();
     let mut stats = ShredSigVerifyStats::new(Instant::now());
@@ -89,6 +93,7 @@ pub fn spawn_shred_sigverify(
     let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
         CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
         CLUSTER_NODES_CACHE_TTL,
+        turbine_roster_from_vote_accounts,
     );
     let thread_pool = ThreadPoolBuilder::new()
         .num_threads(num_sigverify_threads.get())
@@ -688,6 +693,7 @@ mod tests {
         let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
+            false,
         );
         let stats = ShredSigVerifyStats::new(Instant::now());
 

@@ -56,6 +56,7 @@ impl BroadcastDuplicatesRun {
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
+            false,
         ));
         Self {
             config,

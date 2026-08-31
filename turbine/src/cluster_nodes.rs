@@ -47,6 +47,14 @@ thread_local! {
 const DATA_PLANE_FANOUT: usize = 200;
 pub(crate) const MAX_NUM_TURBINE_HOPS: usize = 4;
 
+// PARASOL: synthetic turbine-only weight given to a node that owns a vote
+// account in the epoch but has no stake, when the turbine roster is enabled.
+// It exists so the node holds a deterministic position in the retransmit tree
+// the same way a staked identity does. It is merged into a local copy of the
+// stakes map inside ClusterNodesCache::get and never reaches the bank, the
+// leader schedule, the vote path, or consensus.
+const TURBINE_ROSTER_WEIGHT: u64 = 1;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Loopback from slot leader: {leader}, shred: {shred:?}")]
@@ -97,6 +105,9 @@ type LruCacheOnce<K, V> = RwLock<LruCache<K, Arc<OnceLock<V>>>>;
 pub struct ClusterNodesCache<T> {
     cache: LruCacheOnce<Epoch, (/*as of:*/ Instant, Arc<ClusterNodes<T>>)>,
     ttl: Duration, // Time to live.
+    // PARASOL: when true, nodes owning a vote account in the epoch join the
+    // turbine node set even with zero stake (--turbine-roster-from-vote-accounts).
+    roster_from_vote_accounts: bool,
 }
 
 impl Node {
@@ -264,6 +275,19 @@ impl ClusterNodes<BroadcastStage> {
         let mut rng = TurbineRng::new_seeded(&self.pubkey, shred, self.use_cha_cha_8);
         let index = self.weighted_shuffle.first(&mut rng)?;
         self.nodes[index].contact_info()
+    }
+
+    // PARASOL: every peer known to this node, for --turbine-broadcast-to-all.
+    // The leader normally sends each shred to a single elected root and relies
+    // on that root's retransmit to reach the rest; on a small cluster it can
+    // address everyone directly instead, which costs one hop instead of two and
+    // does not depend on the peers agreeing on the tree.
+    pub(crate) fn get_broadcast_peers_all(&self) -> impl Iterator<Item = &ContactInfo> {
+        let self_pubkey = self.pubkey;
+        self.nodes
+            .iter()
+            .filter(move |node| node.pubkey() != &self_pubkey)
+            .filter_map(Node::contact_info)
     }
 }
 
@@ -558,10 +582,13 @@ impl<T> ClusterNodesCache<T> {
         // A time-to-live eviction policy is enforced to refresh entries in
         // case gossip contact-infos are updated.
         ttl: Duration,
+        // PARASOL: admit zero-stake vote-account owners into the turbine node set.
+        roster_from_vote_accounts: bool,
     ) -> Self {
         Self {
             cache: RwLock::new(LruCache::new(cap)),
             ttl,
+            roster_from_vote_accounts,
         }
     }
 }
@@ -621,16 +648,75 @@ impl<T: 'static> ClusterNodesCache<T> {
                     inc_new_counter_error!("cluster_nodes-unknown_epoch_staked_nodes", 1);
                     Arc::<HashMap<Pubkey, /*stake:*/ u64>>::default()
                 });
+            // PARASOL: with the turbine roster enabled, every node that owns a
+            // vote account in this epoch joins the node set, whether or not it
+            // has stake. Bank::epoch_vote_accounts is not filtered by stake,
+            // while epoch_staked_nodes is, so a zero-stake vote account gives a
+            // node a deterministic turbine position without putting it in any
+            // leader schedule or letting it vote. The merged map is a local
+            // temporary; the bank is untouched.
+            let stakes =
+                self.merge_turbine_roster(epoch, root_bank, working_bank, epoch_staked_nodes);
             let nodes = new_cluster_nodes::<T>(
                 cluster_info,
                 root_bank.cluster_type(),
-                &epoch_staked_nodes,
+                stakes.as_ref(),
                 use_cha_cha_8,
             );
             (Instant::now(), Arc::new(nodes))
         });
         nodes.clone()
     }
+
+    // PARASOL: returns the stakes map turbine should build its node set from.
+    // With the roster disabled this is the bank's epoch_staked_nodes unchanged
+    // and no allocation is made. With it enabled, every node owning a vote
+    // account in the epoch is added at TURBINE_ROSTER_WEIGHT if it is not
+    // already staked; `or_insert` guarantees a real stake is never lowered.
+    // This runs inside OnceLock::get_or_init, i.e. once per (epoch, cache TTL)
+    // per stage, not per shred.
+    fn merge_turbine_roster(
+        &self,
+        epoch: Epoch,
+        root_bank: &Bank,
+        working_bank: &Bank,
+        epoch_staked_nodes: Arc<HashMap<Pubkey, /*stake:*/ u64>>,
+    ) -> Arc<HashMap<Pubkey, /*stake:*/ u64>> {
+        if !self.roster_from_vote_accounts {
+            return epoch_staked_nodes;
+        }
+        let Some(vote_accounts) = [root_bank, working_bank]
+            .into_iter()
+            .find_map(|bank| bank.epoch_vote_accounts(epoch))
+        else {
+            error!(
+                "ClusterNodesCache::get: unknown Bank::epoch_vote_accounts for epoch: {epoch}; \
+                 turbine roster not applied"
+            );
+            return epoch_staked_nodes;
+        };
+        Arc::new(merged_roster_stakes(
+            &epoch_staked_nodes,
+            vote_accounts
+                .values()
+                .map(|(_stake, vote_account)| *vote_account.node_pubkey()),
+        ))
+    }
+}
+
+// PARASOL: adds each roster member to the stakes map at TURBINE_ROSTER_WEIGHT
+// unless it already carries stake. `or_insert` is load-bearing: a genuinely
+// staked node must keep its own weight so the leader stays dominant in the
+// weighted shuffle.
+fn merged_roster_stakes(
+    epoch_staked_nodes: &HashMap<Pubkey, /*stake:*/ u64>,
+    roster: impl Iterator<Item = Pubkey>,
+) -> HashMap<Pubkey, /*stake:*/ u64> {
+    let mut stakes = epoch_staked_nodes.clone();
+    for pubkey in roster {
+        stakes.entry(pubkey).or_insert(TURBINE_ROSTER_WEIGHT);
+    }
+    stakes
 }
 
 impl From<ContactInfo> for NodeId {
@@ -1206,5 +1292,96 @@ mod tests {
             assert!(unique_pubkeys.remove(node.pubkey()))
         }
         assert!(unique_pubkeys.is_empty());
+    }
+
+    // PARASOL tests for the turbine roster (--turbine-roster-from-vote-accounts)
+    // and the leader fan-out (--turbine-broadcast-to-all).
+
+    #[test]
+    fn test_merged_roster_stakes_admits_unstaked_and_preserves_stake() {
+        let leader = Pubkey::new_unique();
+        let follower_a = Pubkey::new_unique();
+        let follower_b = Pubkey::new_unique();
+        let epoch_staked_nodes = HashMap::from([(leader, 1_000_000u64)]);
+        let stakes = merged_roster_stakes(
+            &epoch_staked_nodes,
+            [leader, follower_a, follower_b].into_iter(),
+        );
+        // Roster members with no stake join at the synthetic weight ...
+        assert_eq!(stakes.get(&follower_a), Some(&TURBINE_ROSTER_WEIGHT));
+        assert_eq!(stakes.get(&follower_b), Some(&TURBINE_ROSTER_WEIGHT));
+        // ... and a real stake is never lowered by it.
+        assert_eq!(stakes.get(&leader), Some(&1_000_000u64));
+        assert_eq!(stakes.len(), 3);
+        // The map the bank owns is untouched.
+        assert_eq!(epoch_staked_nodes.len(), 1);
+    }
+
+    #[test]
+    fn test_merged_roster_stakes_is_noop_without_roster() {
+        let leader = Pubkey::new_unique();
+        let epoch_staked_nodes = HashMap::from([(leader, 42u64)]);
+        let stakes = merged_roster_stakes(&epoch_staked_nodes, std::iter::empty());
+        assert_eq!(stakes, epoch_staked_nodes);
+    }
+
+    // The property the roster exists for: once a node is in the stakes map it
+    // holds the same position on every peer, even when the peers' gossip tables
+    // disagree about who they have seen. Without the roster an unstaked node is
+    // only in the vector of the peers that happen to know it, so the leader's
+    // elected root can compute a different index for itself, believe it is a
+    // leaf, forward nothing, and send everyone else to repair.
+    #[test]
+    fn test_turbine_roster_makes_node_set_gossip_independent() {
+        let mut rng = rand::thread_rng();
+        // Two nodes with DIFFERENT gossip tables (4 peers vs 9 peers known).
+        let (nodes_a, _stakes_a, cluster_info_a) = make_test_cluster(&mut rng, 5, Some((1, 1)));
+        let (_nodes_b, _stakes_b, cluster_info_b) = make_test_cluster(&mut rng, 10, Some((1, 1)));
+        // Every node of the first cluster is on the roster, none of them staked.
+        let roster: HashMap<Pubkey, u64> = nodes_a
+            .iter()
+            .map(|node| (*node.pubkey(), TURBINE_ROSTER_WEIGHT))
+            .collect();
+        let seen_by = |cluster_info: &ClusterInfo| -> Vec<Pubkey> {
+            new_cluster_nodes::<RetransmitStage>(
+                cluster_info,
+                ClusterType::Development,
+                &roster,
+                /*use_cha_cha_8:*/ true,
+            )
+            .nodes
+            .iter()
+            .map(Node::pubkey)
+            .copied()
+            .filter(|pubkey| roster.contains_key(pubkey))
+            .collect()
+        };
+        // Both nodes place the roster members in the same order regardless of
+        // what their gossip tables hold.
+        assert_eq!(seen_by(&cluster_info_a), seen_by(&cluster_info_b));
+        assert_eq!(seen_by(&cluster_info_a).len(), roster.len());
+    }
+
+    #[test]
+    fn test_get_broadcast_peers_all_returns_every_peer_but_self() {
+        let mut rng = rand::thread_rng();
+        let (nodes, stakes, cluster_info) = make_test_cluster(&mut rng, 7, Some((1, 1)));
+        let cluster_nodes = new_cluster_nodes::<BroadcastStage>(
+            &cluster_info,
+            ClusterType::Development,
+            &stakes,
+            /*use_cha_cha_8:*/ true,
+        );
+        let peers: HashSet<Pubkey> = cluster_nodes
+            .get_broadcast_peers_all()
+            .map(|node| *node.pubkey())
+            .collect();
+        let expected: HashSet<Pubkey> = nodes
+            .iter()
+            .map(|node| *node.pubkey())
+            .filter(|pubkey| pubkey != &cluster_info.id())
+            .collect();
+        assert_eq!(peers, expected);
+        assert!(!peers.contains(&cluster_info.id()));
     }
 }
