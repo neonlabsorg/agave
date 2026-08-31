@@ -154,6 +154,8 @@ pub struct TvuConfig {
     pub replay_transactions_threads: NonZeroUsize,
     pub shred_sigverify_threads: NonZeroUsize,
     pub xdp_sender: Option<XdpSender>,
+    // PARASOL: --turbine-roster-from-vote-accounts
+    pub turbine_roster_from_vote_accounts: bool,
 }
 
 impl Default for TvuConfig {
@@ -168,6 +170,7 @@ impl Default for TvuConfig {
             replay_transactions_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             xdp_sender: None,
+            turbine_roster_from_vote_accounts: false,
         }
     }
 }
@@ -366,6 +369,7 @@ impl Tvu {
             retransmit_sender.clone(),
             verified_sender,
             tvu_config.shred_sigverify_threads,
+            tvu_config.turbine_roster_from_vote_accounts,
         );
 
         let retransmit_stage = RetransmitStage::new(
@@ -379,6 +383,7 @@ impl Tvu {
             slot_status_notifier.clone(),
             tvu_config.xdp_sender,
             votor_event_sender.clone(),
+            tvu_config.turbine_roster_from_vote_accounts,
         );
 
         let (ancestor_duplicate_slots_sender, ancestor_duplicate_slots_receiver) = unbounded();

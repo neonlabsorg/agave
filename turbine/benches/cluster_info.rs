@@ -75,6 +75,7 @@ fn broadcast_shreds_bench(b: &mut Bencher) {
     let cluster_nodes_cache = ClusterNodesCache::<BroadcastStage>::new(
         8,                      // cap
         Duration::from_secs(5), // ttl
+        false,                  // roster_from_vote_accounts
     );
     let shreds = Arc::new(shreds);
     let last_datapoint = Arc::new(AtomicInterval::default());
@@ -89,6 +90,7 @@ fn broadcast_shreds_bench(b: &mut Bencher) {
             &cluster_info,
             &bank_forks,
             &SocketAddrSpace::Unspecified,
+            false,
         )
         .unwrap();
     });

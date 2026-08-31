@@ -123,6 +123,9 @@ impl BroadcastStageType {
         shred_version: u16,
         xdp_sender: Option<XdpSender>,
         votor_event_sender: VotorEventSender,
+        // PARASOL: --turbine-roster-from-vote-accounts / --turbine-broadcast-to-all
+        turbine_roster_from_vote_accounts: bool,
+        turbine_broadcast_to_all: bool,
     ) -> BroadcastStage {
         let migration_status = bank_forks.read().unwrap().migration_status();
         match self {
@@ -134,7 +137,13 @@ impl BroadcastStageType {
                 exit_sender,
                 blockstore,
                 bank_forks,
-                StandardBroadcastRun::new(shred_version, migration_status, votor_event_sender),
+                StandardBroadcastRun::new(
+                    shred_version,
+                    migration_status,
+                    votor_event_sender,
+                    turbine_roster_from_vote_accounts,
+                    turbine_broadcast_to_all,
+                ),
                 xdp_sender,
             ),
 
@@ -484,7 +493,14 @@ pub enum BroadcastSocket<'a> {
 }
 
 /// Broadcasts shreds from the leader (i.e. this node) to the root of the
-/// turbine retransmit tree for each shred.
+/// turbine retransmit tree for each shred, or to every known peer when
+/// `broadcast_to_all` is set.
+// PARASOL: the broadcast_to_all flag takes this from 9 to 10 parameters. The
+// surrounding call sites (BroadcastStageType::new_broadcast_stage,
+// RetransmitStage::new) carry the same allow for the same reason: this is a
+// wiring function whose arguments are already all distinct, unrelated handles,
+// so grouping them into a struct would move the noise rather than remove it.
+#[allow(clippy::too_many_arguments)]
 pub fn broadcast_shreds(
     socket: BroadcastSocket,
     shreds: &[Shred],
@@ -494,6 +510,9 @@ pub fn broadcast_shreds(
     cluster_info: &ClusterInfo,
     bank_forks: &RwLock<BankForks>,
     socket_addr_space: &SocketAddrSpace,
+    // PARASOL: --turbine-broadcast-to-all. Address every known peer directly
+    // instead of only the elected turbine root.
+    broadcast_to_all: bool,
 ) -> Result<()> {
     let mut result = Ok(());
     // Compute destinations for each of the shreds to be sent
@@ -502,27 +521,51 @@ pub fn broadcast_shreds(
         let bank_forks = bank_forks.read().unwrap();
         (bank_forks.root_bank(), bank_forks.working_bank())
     };
-    let packets: Vec<_> = shreds
-        .iter()
-        .chunk_by(|shred| shred.slot())
-        .into_iter()
-        .flat_map(|(slot, shreds)| {
+    let packets: Vec<_> = if broadcast_to_all {
+        // PARASOL: one datagram per shred per peer. The turbine tree still
+        // operates on the receiving side, so a follower that is also the
+        // elected root retransmits as usual and every node ends up with two
+        // independent paths; the duplicate is dropped by the retransmit-stage
+        // deduper and by the blockstore insert.
+        let mut packets = Vec::new();
+        let groups = shreds.iter().chunk_by(|shred| shred.slot());
+        for (slot, shreds) in &groups {
             let cluster_nodes =
                 cluster_nodes_cache.get(slot, &root_bank, &working_bank, cluster_info);
             update_peer_stats(&cluster_nodes, last_datapoint_submit);
+            let peers: Vec<_> = cluster_nodes.get_broadcast_peers_all().collect();
+            for shred in shreds {
+                for addr in peers.iter().filter_map(|peer| peer.tvu(Protocol::UDP)) {
+                    if addr.is_ipv6() || !socket_addr_space.check(&addr) {
+                        continue;
+                    }
+                    packets.push((shred.payload(), addr));
+                }
+            }
+        }
+        packets
+    } else {
+        shreds
+            .iter()
+            .chunk_by(|shred| shred.slot())
+            .into_iter()
+            .flat_map(|(slot, shreds)| {
+                let cluster_nodes =
+                    cluster_nodes_cache.get(slot, &root_bank, &working_bank, cluster_info);
+                update_peer_stats(&cluster_nodes, last_datapoint_submit);
 
-            shreds.filter_map(move |shred| {
-                let key = shred.id();
-                let addr = cluster_nodes
-                    .get_broadcast_peer(&key)?
-                    .tvu(Protocol::UDP)
-                    .filter(|addr| !addr.is_ipv6() && socket_addr_space.check(addr))?;
+                shreds.filter_map(move |shred| {
+                    let key = shred.id();
+                    let addr = cluster_nodes
+                        .get_broadcast_peer(&key)?
+                        .tvu(Protocol::UDP)
+                        .filter(|addr| !addr.is_ipv6() && socket_addr_space.check(addr))?;
 
-                Some((shred.payload(), addr))
+                    Some((shred.payload(), addr))
+                })
             })
-        })
-        .collect();
-
+            .collect()
+    };
     shred_select.stop();
     transmit_stats.shred_select += shred_select.as_us();
     let num_udp_packets = packets.len();
@@ -751,7 +794,13 @@ pub mod test {
             exit_sender,
             blockstore.clone(),
             bank_forks,
-            StandardBroadcastRun::new(0, Arc::new(MigrationStatus::default()), votor_event_sender),
+            StandardBroadcastRun::new(
+                0,
+                Arc::new(MigrationStatus::default()),
+                votor_event_sender,
+                false,
+                false,
+            ),
             None,
         );
 

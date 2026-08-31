@@ -41,6 +41,8 @@ pub struct StandardBroadcastRun {
     reed_solomon_cache: Arc<ReedSolomonCache>,
     migration_status: Arc<MigrationStatus>,
     votor_event_sender: VotorEventSender,
+    // PARASOL: --turbine-broadcast-to-all
+    broadcast_to_all: bool,
 }
 
 #[derive(Debug)]
@@ -53,10 +55,14 @@ impl StandardBroadcastRun {
         shred_version: u16,
         migration_status: Arc<MigrationStatus>,
         votor_event_sender: VotorEventSender,
+        // PARASOL: --turbine-roster-from-vote-accounts / --turbine-broadcast-to-all
+        roster_from_vote_accounts: bool,
+        broadcast_to_all: bool,
     ) -> Self {
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
+            roster_from_vote_accounts,
         ));
         Self {
             slot: Slot::MAX,
@@ -77,6 +83,7 @@ impl StandardBroadcastRun {
             reed_solomon_cache: Arc::<ReedSolomonCache>::default(),
             migration_status,
             votor_event_sender,
+            broadcast_to_all,
         }
     }
 
@@ -409,6 +416,7 @@ impl StandardBroadcastRun {
             cluster_info,
             bank_forks,
             cluster_info.socket_addr_space(),
+            self.broadcast_to_all,
         )?;
         transmit_time.stop();
 
@@ -556,8 +564,13 @@ mod test {
     fn test_interrupted_slot_last_shred() {
         let keypair = Arc::new(Keypair::new());
         let (votor_event_sender, _votor_event_receiver) = unbounded();
-        let mut run =
-            StandardBroadcastRun::new(0, Arc::new(MigrationStatus::default()), votor_event_sender);
+        let mut run = StandardBroadcastRun::new(
+            0,
+            Arc::new(MigrationStatus::default()),
+            votor_event_sender,
+            false,
+            false,
+        );
         assert!(run.completed);
 
         // Set up the slot to be interrupted
@@ -605,8 +618,13 @@ mod test {
 
         // Step 1: Make an incomplete transmission for slot 0
         let (votor_event_sender, _votor_event_receiver) = unbounded();
-        let mut standard_broadcast_run =
-            StandardBroadcastRun::new(0, Arc::new(MigrationStatus::default()), votor_event_sender);
+        let mut standard_broadcast_run = StandardBroadcastRun::new(
+            0,
+            Arc::new(MigrationStatus::default()),
+            votor_event_sender,
+            false,
+            false,
+        );
         standard_broadcast_run
             .test_process_receive_results(
                 &leader_keypair,
@@ -733,8 +751,13 @@ mod test {
         let (ssend, _srecv) = unbounded();
         let (votor_event_sender, _votor_event_receiver) = unbounded();
         let mut last_tick_height = 0;
-        let mut standard_broadcast_run =
-            StandardBroadcastRun::new(0, Arc::new(MigrationStatus::default()), votor_event_sender);
+        let mut standard_broadcast_run = StandardBroadcastRun::new(
+            0,
+            Arc::new(MigrationStatus::default()),
+            votor_event_sender,
+            false,
+            false,
+        );
         let mut process_ticks = |num_ticks| {
             let ticks = create_ticks(num_ticks, 0, genesis_config.hash());
             last_tick_height += (ticks.len() - 1) as u64;
@@ -794,8 +817,13 @@ mod test {
         };
 
         let (votor_event_sender, _votor_event_receiver) = unbounded();
-        let mut standard_broadcast_run =
-            StandardBroadcastRun::new(0, Arc::new(MigrationStatus::default()), votor_event_sender);
+        let mut standard_broadcast_run = StandardBroadcastRun::new(
+            0,
+            Arc::new(MigrationStatus::default()),
+            votor_event_sender,
+            false,
+            false,
+        );
         standard_broadcast_run
             .test_process_receive_results(
                 &leader_keypair,
@@ -814,8 +842,13 @@ mod test {
         agave_logger::setup();
         let keypair = Keypair::new();
         let (votor_event_sender, _votor_event_receiver) = unbounded();
-        let mut bs =
-            StandardBroadcastRun::new(0, Arc::new(MigrationStatus::default()), votor_event_sender);
+        let mut bs = StandardBroadcastRun::new(
+            0,
+            Arc::new(MigrationStatus::default()),
+            votor_event_sender,
+            false,
+            false,
+        );
         bs.slot = 1;
         bs.parent = 0;
         let entries = create_ticks(10_000, 1, solana_hash::Hash::default());
