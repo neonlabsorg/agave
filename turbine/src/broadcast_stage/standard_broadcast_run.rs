@@ -38,6 +38,8 @@ pub struct StandardBroadcastRun {
     num_batches: usize,
     cluster_nodes_cache: Arc<ClusterNodesCache<BroadcastStage>>,
     reed_solomon_cache: Arc<ReedSolomonCache>,
+    // PARASOL: --turbine-broadcast-to-all
+    broadcast_to_all: bool,
 }
 
 #[derive(Debug)]
@@ -46,10 +48,16 @@ enum BroadcastError {
 }
 
 impl StandardBroadcastRun {
-    pub(super) fn new(shred_version: u16) -> Self {
+    pub(super) fn new(
+        shred_version: u16,
+        // PARASOL: --turbine-roster-from-vote-accounts / --turbine-broadcast-to-all
+        roster_from_vote_accounts: bool,
+        broadcast_to_all: bool,
+    ) -> Self {
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
+            roster_from_vote_accounts,
         ));
         Self {
             slot: Slot::MAX,
@@ -68,6 +76,7 @@ impl StandardBroadcastRun {
             num_batches: 0,
             cluster_nodes_cache,
             reed_solomon_cache: Arc::<ReedSolomonCache>::default(),
+            broadcast_to_all,
         }
     }
 
@@ -399,6 +408,7 @@ impl StandardBroadcastRun {
             bank_forks,
             cluster_info.socket_addr_space(),
             quic_endpoint_sender,
+            self.broadcast_to_all,
         )?;
         transmit_time.stop();
 
@@ -553,7 +563,7 @@ mod test {
     #[test]
     fn test_interrupted_slot_last_shred() {
         let keypair = Arc::new(Keypair::new());
-        let mut run = StandardBroadcastRun::new(0);
+        let mut run = StandardBroadcastRun::new(0, false, false);
         assert!(run.completed);
 
         // Set up the slot to be interrupted
@@ -602,7 +612,7 @@ mod test {
         };
 
         // Step 1: Make an incomplete transmission for slot 0
-        let mut standard_broadcast_run = StandardBroadcastRun::new(0);
+        let mut standard_broadcast_run = StandardBroadcastRun::new(0, false, false);
         standard_broadcast_run
             .test_process_receive_results(
                 &leader_keypair,
@@ -727,7 +737,7 @@ mod test {
         let (bsend, brecv) = unbounded();
         let (ssend, _srecv) = unbounded();
         let mut last_tick_height = 0;
-        let mut standard_broadcast_run = StandardBroadcastRun::new(0);
+        let mut standard_broadcast_run = StandardBroadcastRun::new(0, false, false);
         let mut process_ticks = |num_ticks| {
             let ticks = create_ticks(num_ticks, 0, genesis_config.hash());
             last_tick_height += (ticks.len() - 1) as u64;
@@ -788,7 +798,7 @@ mod test {
             last_tick_height: ticks.len() as u64,
         };
 
-        let mut standard_broadcast_run = StandardBroadcastRun::new(0);
+        let mut standard_broadcast_run = StandardBroadcastRun::new(0, false, false);
         standard_broadcast_run
             .test_process_receive_results(
                 &leader_keypair,
@@ -807,7 +817,7 @@ mod test {
     fn entries_to_shreds_max() {
         agave_logger::setup();
         let keypair = Keypair::new();
-        let mut bs = StandardBroadcastRun::new(0);
+        let mut bs = StandardBroadcastRun::new(0, false, false);
         bs.slot = 1;
         bs.parent = 0;
         let entries = create_ticks(10_000, 1, solana_hash::Hash::default());
