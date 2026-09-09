@@ -821,13 +821,15 @@ pub fn check_feature_activation(feature: &Pubkey, shred_slot: Slot, root_bank: &
 mod tests {
     use {
         super::*,
+        agave_feature_set::FeatureSet,
         itertools::Itertools,
         rand::prelude::IndexedRandom as _,
         solana_account::Account,
         solana_hash::Hash as SolanaHash,
         solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
         solana_runtime::genesis_utils::{
-            create_genesis_config_with_vote_accounts, GenesisConfigInfo, ValidatorVoteKeypairs,
+            GenesisConfigInfo, ValidatorVoteKeypairs,
+            create_genesis_config_with_vote_accounts_and_cluster_type,
         },
         solana_signer::Signer,
         solana_vote_program::vote_state,
@@ -1276,22 +1278,27 @@ mod tests {
         assert_eq!(epoch_staked_nodes.len(), 1);
     }
 
-    // The premise the whole roster rests on, asserted against a real Bank: a
-    // genesis vote account that owns no stake account is visible in
-    // epoch_vote_accounts (which is not stake-filtered) and absent from
-    // epoch_staked_nodes (which is). That split is what lets a follower join
-    // the turbine tree without ever entering a leader schedule. It lives in
-    // runtime, so nothing in this crate would notice if it stopped holding.
-    #[test]
-    fn test_zero_stake_vote_account_is_rostered_but_never_staked() {
+    // Builds a bank whose genesis carries one staked leader plus one vote
+    // account with no stake account at all — exactly what
+    // parasol-genesis-builder emits for `stake_lamports: "0"` — and returns
+    // the follower's identity alongside it.
+    //
+    // The feature set is a parameter because on Agave 4 the property under
+    // test is CONDITIONAL on it (see the two tests below), whereas
+    // `create_genesis_config_with_vote_accounts` hardcodes
+    // `FeatureSet::all_enabled()` and would decide the answer silently.
+    fn bank_with_unstaked_vote_account(feature_set: &FeatureSet) -> (Bank, Pubkey, Pubkey) {
         let leader = ValidatorVoteKeypairs::new_rand();
         let leader_identity = leader.node_keypair.pubkey();
         let GenesisConfigInfo {
             mut genesis_config, ..
-        } = create_genesis_config_with_vote_accounts(
+        } = create_genesis_config_with_vote_accounts_and_cluster_type(
             1_000_000_000, // mint
             &[&leader],
             vec![1_000_000], // leader stake
+            ClusterType::Development,
+            feature_set,
+            false, // is_alpenglow
         );
 
         // Exactly what parasol-genesis-builder emits for `stake_lamports: "0"`:
@@ -1313,7 +1320,30 @@ mod tests {
             )),
         );
 
-        let bank = Bank::new_for_tests(&genesis_config);
+        (
+            Bank::new_for_tests(&genesis_config),
+            leader_identity,
+            follower_identity,
+        )
+    }
+
+    // The premise the whole roster rests on, asserted against a real Bank: a
+    // genesis vote account that owns no stake account is visible in
+    // epoch_vote_accounts and absent from epoch_staked_nodes (which IS
+    // stake-filtered). That split is what lets a follower join the turbine tree
+    // without ever entering a leader schedule. It lives in runtime, so nothing
+    // in this crate would notice if it stopped holding.
+    //
+    // PARASOL/v4: on 3.1.13 this held unconditionally. On Agave 4 it holds only
+    // while `validator_admission_ticket` is INACTIVE — see the companion test
+    // for the other half, and read the two together as one statement.
+    #[test]
+    fn test_zero_stake_vote_account_is_rostered_but_never_staked() {
+        let mut feature_set = FeatureSet::all_enabled();
+        feature_set.deactivate(&agave_feature_set::validator_admission_ticket::id());
+        let (bank, leader_identity, follower_identity) =
+            bank_with_unstaked_vote_account(&feature_set);
+
         let epoch = bank.epoch();
         let vote_accounts = bank.epoch_vote_accounts(epoch).unwrap();
         let staked_nodes = bank.epoch_staked_nodes(epoch).unwrap();
@@ -1346,6 +1376,52 @@ mod tests {
         assert_eq!(stakes.get(&leader_identity), Some(&1_000_000u64));
     }
 
+    // The precondition, pinned so it cannot regress silently. With
+    // `validator_admission_ticket` ACTIVE, Bank::get_top_epoch_stakes routes the
+    // stakes cache through VoteAccounts::clone_and_filter_for_vat, which drops
+    // every vote account that has no stake, no BLS pubkey, or too small a
+    // balance. The epoch snapshot then loses the unstaked follower even though
+    // the live stakes cache still holds it, and
+    // `--turbine-roster-from-vote-accounts` would silently admit NOBODY.
+    //
+    // This is not hypothetical for this fork: parasol-genesis.yaml sets
+    // `features.enable_all: true` with an empty `deactivated` list, so the
+    // feature stays off only because the pubkey snapshot in
+    // parasol-genesis-builder/assets/all_feature_pubkeys.txt predates Agave 4.
+    // Regenerating that snapshot turns the flag into a no-op — and, because the
+    // same filter also requires a BLS pubkey that V3 vote accounts do not have,
+    // it would drop the STAKED validators too.
+    #[test]
+    fn test_validator_admission_ticket_filters_the_roster_out_of_epoch_stakes() {
+        let (bank, leader_identity, follower_identity) =
+            bank_with_unstaked_vote_account(&FeatureSet::all_enabled());
+
+        let epoch = bank.epoch();
+        let vote_accounts = bank.epoch_vote_accounts(epoch).unwrap();
+
+        assert!(
+            !vote_accounts
+                .values()
+                .any(|(_stake, vote_account)| *vote_account.node_pubkey() == follower_identity),
+            "with validator_admission_ticket active the unstaked vote account is expected to be \
+             filtered out of the epoch snapshot; if this now passes, re-read \
+             Bank::get_top_epoch_stakes and simplify the roster back to one unconditional case"
+        );
+        // The live stakes cache is the unfiltered view, and still has it — that
+        // is the asymmetry, and the fallback if the feature ever activates here.
+        assert!(
+            bank.vote_accounts()
+                .values()
+                .any(|(_stake, vote_account)| *vote_account.node_pubkey() == follower_identity),
+            "the live stakes cache is not stake-filtered"
+        );
+        assert!(
+            bank.epoch_staked_nodes(epoch)
+                .unwrap()
+                .contains_key(&leader_identity)
+        );
+    }
+
     #[test]
     fn test_merged_roster_stakes_is_noop_without_roster() {
         let leader = Pubkey::new_unique();
@@ -1362,7 +1438,7 @@ mod tests {
     // leaf, forward nothing, and send everyone else to repair.
     #[test]
     fn test_turbine_roster_makes_node_set_gossip_independent() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // Two nodes with DIFFERENT gossip tables (4 peers vs 9 peers known).
         let (nodes_a, _stakes_a, cluster_info_a) = make_test_cluster(&mut rng, 5, Some((1, 1)));
         let (_nodes_b, _stakes_b, cluster_info_b) = make_test_cluster(&mut rng, 10, Some((1, 1)));
@@ -1393,7 +1469,7 @@ mod tests {
 
     #[test]
     fn test_get_broadcast_peers_all_returns_every_peer_but_self() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let (nodes, stakes, cluster_info) = make_test_cluster(&mut rng, 7, Some((1, 1)));
         let cluster_nodes = new_cluster_nodes::<BroadcastStage>(
             &cluster_info,

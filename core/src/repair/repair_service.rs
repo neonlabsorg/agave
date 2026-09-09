@@ -23,7 +23,7 @@ use {
     lru::LruCache,
     rand::prelude::IndexedRandom as _,
     solana_client::connection_cache::Protocol,
-    solana_clock::{DEFAULT_TICKS_PER_SECOND, DEFAULT_TICKS_PER_SLOT, MS_PER_TICK, Slot},
+    solana_clock::{DEFAULT_TICKS_PER_SECOND, DEFAULT_TICKS_PER_SLOT, Slot},
     solana_epoch_schedule::EpochSchedule,
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
