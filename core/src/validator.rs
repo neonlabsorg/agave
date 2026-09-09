@@ -387,6 +387,13 @@ pub struct ValidatorConfig {
     pub validator_exit: Arc<RwLock<Exit>>,
     pub validator_exit_backpressure: HashMap<String, Arc<AtomicBool>>,
     pub no_wait_for_vote_to_start_leader: bool,
+    // PARASOL: admit zero-stake vote-account owners into the turbine node set so
+    // an unstaked follower holds a deterministic position in the retransmit tree
+    // (--turbine-roster-from-vote-accounts). Does not touch the leader schedule.
+    pub turbine_roster_from_vote_accounts: bool,
+    // PARASOL: the leader addresses every known peer directly instead of only the
+    // elected turbine root (--turbine-broadcast-to-all).
+    pub turbine_broadcast_to_all: bool,
     pub wait_to_vote_slot: Option<Slot>,
     pub runtime_config: RuntimeConfig,
     pub banking_trace_dir_byte_limit: banking_trace::DirByteLimit,
@@ -465,6 +472,8 @@ impl ValidatorConfig {
             validator_exit: Arc::new(RwLock::new(Exit::default())),
             validator_exit_backpressure: HashMap::default(),
             no_wait_for_vote_to_start_leader: true,
+            turbine_roster_from_vote_accounts: false,
+            turbine_broadcast_to_all: false,
             accounts_db_config: ACCOUNTS_DB_CONFIG_FOR_TESTING,
             wait_to_vote_slot: None,
             runtime_config: RuntimeConfig::default(),
@@ -774,6 +783,12 @@ impl Validator {
 
         info!("identity pubkey: {id}");
         info!("vote account pubkey: {vote_account}");
+        // PARASOL: both knobs must carry the same value on every node of the
+        // cluster; logging them here makes a mismatch visible in each log head.
+        info!(
+            "turbine: roster-from-vote-accounts={}, broadcast-to-all={}",
+            config.turbine_roster_from_vote_accounts, config.turbine_broadcast_to_all
+        );
 
         if !config.no_os_network_stats_reporting {
             verify_net_stats_access().map_err(|e| {
@@ -1669,6 +1684,7 @@ impl Validator {
                 replay_transactions_threads: config.replay_transactions_threads,
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,
                 xdp_sender: xdp_sender.clone(),
+                turbine_roster_from_vote_accounts: config.turbine_roster_from_vote_accounts,
             },
             &max_slots,
             block_metadata_notifier,
@@ -1734,6 +1750,8 @@ impl Validator {
             blockstore.clone(),
             &config.broadcast_stage_type,
             xdp_sender,
+            config.turbine_roster_from_vote_accounts,
+            config.turbine_broadcast_to_all,
             exit.clone(),
             node.info.shred_version(),
             vote_tracker,

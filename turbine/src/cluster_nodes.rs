@@ -47,6 +47,14 @@ thread_local! {
 pub(crate) const DATA_PLANE_FANOUT: usize = 200;
 pub(crate) const MAX_NUM_TURBINE_HOPS: usize = 4;
 
+// PARASOL: synthetic turbine-only weight given to a node that owns a vote
+// account in the epoch but has no stake, when the turbine roster is enabled.
+// It exists so the node holds a deterministic position in the retransmit tree
+// the same way a staked identity does. It is merged into a local copy of the
+// stakes map inside ClusterNodesCache::get and never reaches the bank, the
+// leader schedule, the vote path, or consensus.
+const TURBINE_ROSTER_WEIGHT: u64 = 1;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Loopback from slot leader: {leader}, shred: {shred:?}")]
@@ -97,6 +105,9 @@ type LruCacheOnce<K, V> = RwLock<LruCache<K, Arc<OnceLock<V>>>>;
 pub struct ClusterNodesCache<T> {
     cache: LruCacheOnce<Epoch, (/*as of:*/ Instant, Arc<ClusterNodes<T>>)>,
     ttl: Duration, // Time to live.
+    // PARASOL: when true, nodes owning a vote account in the epoch join the
+    // turbine node set even with zero stake (--turbine-roster-from-vote-accounts).
+    roster_from_vote_accounts: bool,
 }
 
 impl Node {
@@ -255,6 +266,19 @@ impl ClusterNodes<BroadcastStage> {
         let mut rng = TurbineRng::new_seeded(&self.pubkey, shred, self.use_cha_cha_8);
         let index = self.weighted_shuffle.first(&mut rng)?;
         self.nodes[index].contact_info()
+    }
+
+    // PARASOL: every peer known to this node, for --turbine-broadcast-to-all.
+    // The leader normally sends each shred to a single elected root and relies
+    // on that root's retransmit to reach the rest; on a small cluster it can
+    // address everyone directly instead, which costs one hop instead of two and
+    // does not depend on the peers agreeing on the tree.
+    pub(crate) fn get_broadcast_peers_all(&self) -> impl Iterator<Item = &ContactInfo> {
+        let self_pubkey = self.pubkey;
+        self.nodes
+            .iter()
+            .filter(move |node| node.pubkey() != &self_pubkey)
+            .filter_map(Node::contact_info)
     }
 }
 
@@ -549,10 +573,13 @@ impl<T> ClusterNodesCache<T> {
         // A time-to-live eviction policy is enforced to refresh entries in
         // case gossip contact-infos are updated.
         ttl: Duration,
+        // PARASOL: admit zero-stake vote-account owners into the turbine node set.
+        roster_from_vote_accounts: bool,
     ) -> Self {
         Self {
             cache: RwLock::new(LruCache::new(cap)),
             ttl,
+            roster_from_vote_accounts,
         }
     }
 }
@@ -612,16 +639,105 @@ impl<T: 'static> ClusterNodesCache<T> {
                     inc_new_counter_error!("cluster_nodes-unknown_epoch_staked_nodes", 1);
                     Arc::<HashMap<Pubkey, /*stake:*/ u64>>::default()
                 });
+            // PARASOL: with the turbine roster enabled, every node that owns a
+            // vote account in this epoch joins the node set, whether or not it
+            // has stake. Bank::epoch_vote_accounts is not filtered by stake,
+            // while epoch_staked_nodes is, so a zero-stake vote account gives a
+            // node a deterministic turbine position without putting it in any
+            // leader schedule or letting it vote. The merged map is a local
+            // temporary; the bank is untouched.
+            let stakes =
+                self.merge_turbine_roster(epoch, root_bank, working_bank, epoch_staked_nodes);
             let nodes = new_cluster_nodes::<T>(
                 cluster_info,
                 root_bank.cluster_type(),
-                &epoch_staked_nodes,
+                stakes.as_ref(),
                 use_cha_cha_8,
             );
             (Instant::now(), Arc::new(nodes))
         });
         nodes.clone()
     }
+
+    // PARASOL: returns the stakes map turbine should build its node set from.
+    // With the roster disabled this is the bank's epoch_staked_nodes unchanged
+    // and no allocation is made. With it enabled, every node owning a vote
+    // account is added at TURBINE_ROSTER_WEIGHT if it is not already staked;
+    // `or_insert` guarantees a real stake is never lowered. Which set of vote
+    // accounts counts as "owning one" depends on a feature gate — see below.
+    // This runs inside OnceLock::get_or_init, i.e. once per (epoch, cache TTL)
+    // per stage, not per shred.
+    fn merge_turbine_roster(
+        &self,
+        epoch: Epoch,
+        root_bank: &Bank,
+        working_bank: &Bank,
+        epoch_staked_nodes: Arc<HashMap<Pubkey, /*stake:*/ u64>>,
+    ) -> Arc<HashMap<Pubkey, /*stake:*/ u64>> {
+        if !self.roster_from_vote_accounts {
+            return epoch_staked_nodes;
+        }
+        // PARASOL/v4: the epoch snapshot is only usable while
+        // `validator_admission_ticket` is inactive. Once it activates,
+        // Bank::get_top_epoch_stakes routes the stakes cache through
+        // VoteAccounts::clone_and_filter_for_vat, which drops every vote account
+        // with no stake — precisely the accounts this roster exists to admit —
+        // and the flag would silently place NOBODY in the tree. The live stakes
+        // cache is not filtered, so it is the source in that case.
+        //
+        // The cost is epoch-stability. `epoch_vote_accounts` is a snapshot every
+        // node agrees on for the whole epoch; `vote_accounts` is the bank's
+        // current set, so two nodes rooted at different slots can differ for as
+        // long as it takes a vote-account creation or closure to be rooted
+        // everywhere, plus this cache's TTL. That is why it is taken from the
+        // ROOT bank and not the working bank: rooted state is agreed, the tip is
+        // not. Membership still changes only when an operator adds or removes a
+        // vote account, and a disagreement costs a repair, never consensus —
+        // this map never reaches the bank, the leader schedule or the vote path.
+        if root_bank
+            .feature_set
+            .is_active(&agave_feature_set::validator_admission_ticket::id())
+        {
+            let vote_accounts = root_bank.vote_accounts();
+            return Arc::new(merged_roster_stakes(
+                &epoch_staked_nodes,
+                vote_accounts
+                    .values()
+                    .map(|(_stake, vote_account)| *vote_account.node_pubkey()),
+            ));
+        }
+        let Some(vote_accounts) = [root_bank, working_bank]
+            .into_iter()
+            .find_map(|bank| bank.epoch_vote_accounts(epoch))
+        else {
+            error!(
+                "ClusterNodesCache::get: unknown Bank::epoch_vote_accounts for epoch: {epoch}; \
+                 turbine roster not applied"
+            );
+            return epoch_staked_nodes;
+        };
+        Arc::new(merged_roster_stakes(
+            &epoch_staked_nodes,
+            vote_accounts
+                .values()
+                .map(|(_stake, vote_account)| *vote_account.node_pubkey()),
+        ))
+    }
+}
+
+// PARASOL: adds each roster member to the stakes map at TURBINE_ROSTER_WEIGHT
+// unless it already carries stake. `or_insert` is load-bearing: a genuinely
+// staked node must keep its own weight so the leader stays dominant in the
+// weighted shuffle.
+fn merged_roster_stakes(
+    epoch_staked_nodes: &HashMap<Pubkey, /*stake:*/ u64>,
+    roster: impl Iterator<Item = Pubkey>,
+) -> HashMap<Pubkey, /*stake:*/ u64> {
+    let mut stakes = epoch_staked_nodes.clone();
+    for pubkey in roster {
+        stakes.entry(pubkey).or_insert(TURBINE_ROSTER_WEIGHT);
+    }
+    stakes
 }
 
 impl From<ContactInfo> for NodeId {
@@ -735,10 +851,18 @@ pub fn check_feature_activation(feature: &Pubkey, shred_slot: Slot, root_bank: &
 mod tests {
     use {
         super::*,
+        agave_feature_set::FeatureSet,
         itertools::Itertools,
         rand::prelude::IndexedRandom as _,
+        solana_account::Account,
         solana_hash::Hash as SolanaHash,
         solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
+        solana_runtime::genesis_utils::{
+            GenesisConfigInfo, ValidatorVoteKeypairs,
+            create_genesis_config_with_vote_accounts_and_cluster_type,
+        },
+        solana_signer::Signer,
+        solana_vote_program::vote_state,
         std::{collections::VecDeque, fmt::Debug, hash::Hash},
         test_case::test_case,
     };
@@ -1159,5 +1283,254 @@ mod tests {
             assert!(unique_pubkeys.remove(node.pubkey()))
         }
         assert!(unique_pubkeys.is_empty());
+    }
+
+    // PARASOL tests for the turbine roster (--turbine-roster-from-vote-accounts)
+    // and the leader fan-out (--turbine-broadcast-to-all).
+
+    #[test]
+    fn test_merged_roster_stakes_admits_unstaked_and_preserves_stake() {
+        let leader = Pubkey::new_unique();
+        let follower_a = Pubkey::new_unique();
+        let follower_b = Pubkey::new_unique();
+        let epoch_staked_nodes = HashMap::from([(leader, 1_000_000u64)]);
+        let stakes = merged_roster_stakes(
+            &epoch_staked_nodes,
+            [leader, follower_a, follower_b].into_iter(),
+        );
+        // Roster members with no stake join at the synthetic weight ...
+        assert_eq!(stakes.get(&follower_a), Some(&TURBINE_ROSTER_WEIGHT));
+        assert_eq!(stakes.get(&follower_b), Some(&TURBINE_ROSTER_WEIGHT));
+        // ... and a real stake is never lowered by it.
+        assert_eq!(stakes.get(&leader), Some(&1_000_000u64));
+        assert_eq!(stakes.len(), 3);
+        // The map the bank owns is untouched.
+        assert_eq!(epoch_staked_nodes.len(), 1);
+    }
+
+    // Builds a bank whose genesis carries one staked leader plus one vote
+    // account with no stake account at all — exactly what
+    // parasol-genesis-builder emits for `stake_lamports: "0"` — and returns
+    // the follower's identity alongside it.
+    //
+    // The feature set is a parameter because on Agave 4 the property under
+    // test is CONDITIONAL on it (see the two tests below), whereas
+    // `create_genesis_config_with_vote_accounts` hardcodes
+    // `FeatureSet::all_enabled()` and would decide the answer silently.
+    fn bank_with_unstaked_vote_account(feature_set: &FeatureSet) -> (Bank, Pubkey, Pubkey) {
+        let leader = ValidatorVoteKeypairs::new_rand();
+        let leader_identity = leader.node_keypair.pubkey();
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config_with_vote_accounts_and_cluster_type(
+            1_000_000_000, // mint
+            &[&leader],
+            vec![1_000_000], // leader stake
+            ClusterType::Development,
+            feature_set,
+            false, // is_alpenglow
+        );
+
+        // Exactly what parasol-genesis-builder emits for `stake_lamports: "0"`:
+        // an identity and a vote account, and no stake account at all.
+        let follower_identity = Pubkey::new_unique();
+        let follower_vote = Pubkey::new_unique();
+        genesis_config.accounts.insert(
+            follower_identity,
+            Account::new(1_000_000, 0, &solana_sdk_ids::system_program::id()),
+        );
+        genesis_config.accounts.insert(
+            follower_vote,
+            Account::from(vote_state::create_v3_account_with_authorized(
+                &follower_identity,
+                &follower_identity,
+                &follower_identity,
+                0,         // commission
+                1_000_000, // lamports — not stake
+            )),
+        );
+
+        (
+            Bank::new_for_tests(&genesis_config),
+            leader_identity,
+            follower_identity,
+        )
+    }
+
+    // The premise the whole roster rests on, asserted against a real Bank: a
+    // genesis vote account that owns no stake account is visible in
+    // epoch_vote_accounts and absent from epoch_staked_nodes (which IS
+    // stake-filtered). That split is what lets a follower join the turbine tree
+    // without ever entering a leader schedule. It lives in runtime, so nothing
+    // in this crate would notice if it stopped holding.
+    //
+    // PARASOL/v4: on 3.1.13 this held unconditionally. On Agave 4 it holds only
+    // while `validator_admission_ticket` is INACTIVE; the companion test covers
+    // the active case, where the roster reads the live stakes cache instead.
+    #[test]
+    fn test_zero_stake_vote_account_is_rostered_but_never_staked() {
+        let mut feature_set = FeatureSet::all_enabled();
+        feature_set.deactivate(&agave_feature_set::validator_admission_ticket::id());
+        let (bank, leader_identity, follower_identity) =
+            bank_with_unstaked_vote_account(&feature_set);
+
+        let epoch = bank.epoch();
+        let vote_accounts = bank.epoch_vote_accounts(epoch).unwrap();
+        let staked_nodes = bank.epoch_staked_nodes(epoch).unwrap();
+
+        assert!(
+            vote_accounts
+                .values()
+                .any(|(_stake, vote_account)| *vote_account.node_pubkey() == follower_identity),
+            "a zero-stake vote account must still be in epoch_vote_accounts"
+        );
+        assert!(
+            !staked_nodes.contains_key(&follower_identity),
+            "a zero-stake node must stay out of epoch_staked_nodes — that is what keeps it out of \
+             every leader schedule"
+        );
+        assert!(staked_nodes.contains_key(&leader_identity));
+
+        // ... and the merge the cache performs admits it to the tree.
+        let stakes = merged_roster_stakes(
+            &staked_nodes,
+            vote_accounts
+                .values()
+                .map(|(_stake, vote_account)| *vote_account.node_pubkey()),
+        );
+        assert_eq!(
+            stakes.get(&follower_identity),
+            Some(&TURBINE_ROSTER_WEIGHT),
+            "the roster must admit the unstaked follower"
+        );
+        assert_eq!(stakes.get(&leader_identity), Some(&1_000_000u64));
+    }
+
+    // With `validator_admission_ticket` ACTIVE the epoch snapshot can no longer
+    // carry the roster: Bank::get_top_epoch_stakes routes the stakes cache
+    // through VoteAccounts::clone_and_filter_for_vat, which drops every vote
+    // account with no stake, no BLS pubkey, or too small a balance. This pins
+    // both halves of that — the snapshot loses the unstaked follower, and
+    // merge_turbine_roster admits it anyway by reading the unfiltered live
+    // stakes cache instead.
+    //
+    // The fork will meet this: parasol-genesis.yaml sets `features.enable_all:
+    // true` with an empty `deactivated` list, so the feature stays off only
+    // because the pubkey snapshot in
+    // parasol-genesis-builder/assets/all_feature_pubkeys.txt predates Agave 4.
+    // Note what this fallback does NOT fix: the same filter requires a BLS
+    // pubkey that V3 vote accounts do not have, so with the feature active the
+    // STAKED validators leave the epoch snapshot too, and that breaks leader
+    // schedules — which no amount of turbine-side work can paper over.
+    #[test]
+    fn test_roster_falls_back_to_the_live_cache_under_validator_admission_ticket() {
+        let (bank, leader_identity, follower_identity) =
+            bank_with_unstaked_vote_account(&FeatureSet::all_enabled());
+        let epoch = bank.epoch();
+
+        assert!(
+            !bank
+                .epoch_vote_accounts(epoch)
+                .unwrap()
+                .values()
+                .any(|(_stake, vote_account)| *vote_account.node_pubkey() == follower_identity),
+            "with validator_admission_ticket active the unstaked vote account is expected to be \
+             filtered out of the epoch snapshot; if this now passes, re-read \
+             Bank::get_top_epoch_stakes and collapse the roster back to one unconditional case"
+        );
+        assert!(
+            bank.vote_accounts()
+                .values()
+                .any(|(_stake, vote_account)| *vote_account.node_pubkey() == follower_identity),
+            "the live stakes cache is not stake-filtered — it is what the fallback reads"
+        );
+
+        // End to end: the cache's own merge admits the unstaked follower despite
+        // the filtered snapshot, and still never lowers the leader's real stake.
+        let cache = ClusterNodesCache::<BroadcastStage>::new(
+            1,
+            Duration::from_secs(5),
+            true, // roster_from_vote_accounts
+        );
+        let stakes = cache.merge_turbine_roster(
+            epoch,
+            &bank,
+            &bank,
+            bank.epoch_staked_nodes(epoch).unwrap(),
+        );
+        assert_eq!(
+            stakes.get(&follower_identity),
+            Some(&TURBINE_ROSTER_WEIGHT),
+            "the roster must still admit the unstaked follower when the snapshot is filtered"
+        );
+        assert_eq!(stakes.get(&leader_identity), Some(&1_000_000u64));
+    }
+
+    #[test]
+    fn test_merged_roster_stakes_is_noop_without_roster() {
+        let leader = Pubkey::new_unique();
+        let epoch_staked_nodes = HashMap::from([(leader, 42u64)]);
+        let stakes = merged_roster_stakes(&epoch_staked_nodes, std::iter::empty());
+        assert_eq!(stakes, epoch_staked_nodes);
+    }
+
+    // The property the roster exists for: once a node is in the stakes map it
+    // holds the same position on every peer, even when the peers' gossip tables
+    // disagree about who they have seen. Without the roster an unstaked node is
+    // only in the vector of the peers that happen to know it, so the leader's
+    // elected root can compute a different index for itself, believe it is a
+    // leaf, forward nothing, and send everyone else to repair.
+    #[test]
+    fn test_turbine_roster_makes_node_set_gossip_independent() {
+        let mut rng = rand::rng();
+        // Two nodes with DIFFERENT gossip tables (4 peers vs 9 peers known).
+        let (nodes_a, _stakes_a, cluster_info_a) = make_test_cluster(&mut rng, 5, Some((1, 1)));
+        let (_nodes_b, _stakes_b, cluster_info_b) = make_test_cluster(&mut rng, 10, Some((1, 1)));
+        // Every node of the first cluster is on the roster, none of them staked.
+        let roster: HashMap<Pubkey, u64> = nodes_a
+            .iter()
+            .map(|node| (*node.pubkey(), TURBINE_ROSTER_WEIGHT))
+            .collect();
+        let seen_by = |cluster_info: &ClusterInfo| -> Vec<Pubkey> {
+            new_cluster_nodes::<RetransmitStage>(
+                cluster_info,
+                ClusterType::Development,
+                &roster,
+                /*use_cha_cha_8:*/ true,
+            )
+            .nodes
+            .iter()
+            .map(Node::pubkey)
+            .copied()
+            .filter(|pubkey| roster.contains_key(pubkey))
+            .collect()
+        };
+        // Both nodes place the roster members in the same order regardless of
+        // what their gossip tables hold.
+        assert_eq!(seen_by(&cluster_info_a), seen_by(&cluster_info_b));
+        assert_eq!(seen_by(&cluster_info_a).len(), roster.len());
+    }
+
+    #[test]
+    fn test_get_broadcast_peers_all_returns_every_peer_but_self() {
+        let mut rng = rand::rng();
+        let (nodes, stakes, cluster_info) = make_test_cluster(&mut rng, 7, Some((1, 1)));
+        let cluster_nodes = new_cluster_nodes::<BroadcastStage>(
+            &cluster_info,
+            ClusterType::Development,
+            &stakes,
+            /*use_cha_cha_8:*/ true,
+        );
+        let peers: HashSet<Pubkey> = cluster_nodes
+            .get_broadcast_peers_all()
+            .map(|node| *node.pubkey())
+            .collect();
+        let expected: HashSet<Pubkey> = nodes
+            .iter()
+            .map(|node| *node.pubkey())
+            .filter(|pubkey| pubkey != &cluster_info.id())
+            .collect();
+        assert_eq!(peers, expected);
+        assert!(!peers.contains(&cluster_info.id()));
     }
 }
