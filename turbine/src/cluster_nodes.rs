@@ -662,8 +662,9 @@ impl<T: 'static> ClusterNodesCache<T> {
     // PARASOL: returns the stakes map turbine should build its node set from.
     // With the roster disabled this is the bank's epoch_staked_nodes unchanged
     // and no allocation is made. With it enabled, every node owning a vote
-    // account in the epoch is added at TURBINE_ROSTER_WEIGHT if it is not
-    // already staked; `or_insert` guarantees a real stake is never lowered.
+    // account is added at TURBINE_ROSTER_WEIGHT if it is not already staked;
+    // `or_insert` guarantees a real stake is never lowered. Which set of vote
+    // accounts counts as "owning one" depends on a feature gate — see below.
     // This runs inside OnceLock::get_or_init, i.e. once per (epoch, cache TTL)
     // per stage, not per shred.
     fn merge_turbine_roster(
@@ -675,6 +676,35 @@ impl<T: 'static> ClusterNodesCache<T> {
     ) -> Arc<HashMap<Pubkey, /*stake:*/ u64>> {
         if !self.roster_from_vote_accounts {
             return epoch_staked_nodes;
+        }
+        // PARASOL/v4: the epoch snapshot is only usable while
+        // `validator_admission_ticket` is inactive. Once it activates,
+        // Bank::get_top_epoch_stakes routes the stakes cache through
+        // VoteAccounts::clone_and_filter_for_vat, which drops every vote account
+        // with no stake — precisely the accounts this roster exists to admit —
+        // and the flag would silently place NOBODY in the tree. The live stakes
+        // cache is not filtered, so it is the source in that case.
+        //
+        // The cost is epoch-stability. `epoch_vote_accounts` is a snapshot every
+        // node agrees on for the whole epoch; `vote_accounts` is the bank's
+        // current set, so two nodes rooted at different slots can differ for as
+        // long as it takes a vote-account creation or closure to be rooted
+        // everywhere, plus this cache's TTL. That is why it is taken from the
+        // ROOT bank and not the working bank: rooted state is agreed, the tip is
+        // not. Membership still changes only when an operator adds or removes a
+        // vote account, and a disagreement costs a repair, never consensus —
+        // this map never reaches the bank, the leader schedule or the vote path.
+        if root_bank
+            .feature_set
+            .is_active(&agave_feature_set::validator_admission_ticket::id())
+        {
+            let vote_accounts = root_bank.vote_accounts();
+            return Arc::new(merged_roster_stakes(
+                &epoch_staked_nodes,
+                vote_accounts
+                    .values()
+                    .map(|(_stake, vote_account)| *vote_account.node_pubkey()),
+            ));
         }
         let Some(vote_accounts) = [root_bank, working_bank]
             .into_iter()
@@ -1335,8 +1365,8 @@ mod tests {
     // in this crate would notice if it stopped holding.
     //
     // PARASOL/v4: on 3.1.13 this held unconditionally. On Agave 4 it holds only
-    // while `validator_admission_ticket` is INACTIVE — see the companion test
-    // for the other half, and read the two together as one statement.
+    // while `validator_admission_ticket` is INACTIVE; the companion test covers
+    // the active case, where the roster reads the live stakes cache instead.
     #[test]
     fn test_zero_stake_vote_account_is_rostered_but_never_staked() {
         let mut feature_set = FeatureSet::all_enabled();
@@ -1376,50 +1406,64 @@ mod tests {
         assert_eq!(stakes.get(&leader_identity), Some(&1_000_000u64));
     }
 
-    // The precondition, pinned so it cannot regress silently. With
-    // `validator_admission_ticket` ACTIVE, Bank::get_top_epoch_stakes routes the
-    // stakes cache through VoteAccounts::clone_and_filter_for_vat, which drops
-    // every vote account that has no stake, no BLS pubkey, or too small a
-    // balance. The epoch snapshot then loses the unstaked follower even though
-    // the live stakes cache still holds it, and
-    // `--turbine-roster-from-vote-accounts` would silently admit NOBODY.
+    // With `validator_admission_ticket` ACTIVE the epoch snapshot can no longer
+    // carry the roster: Bank::get_top_epoch_stakes routes the stakes cache
+    // through VoteAccounts::clone_and_filter_for_vat, which drops every vote
+    // account with no stake, no BLS pubkey, or too small a balance. This pins
+    // both halves of that — the snapshot loses the unstaked follower, and
+    // merge_turbine_roster admits it anyway by reading the unfiltered live
+    // stakes cache instead.
     //
-    // This is not hypothetical for this fork: parasol-genesis.yaml sets
-    // `features.enable_all: true` with an empty `deactivated` list, so the
-    // feature stays off only because the pubkey snapshot in
+    // The fork will meet this: parasol-genesis.yaml sets `features.enable_all:
+    // true` with an empty `deactivated` list, so the feature stays off only
+    // because the pubkey snapshot in
     // parasol-genesis-builder/assets/all_feature_pubkeys.txt predates Agave 4.
-    // Regenerating that snapshot turns the flag into a no-op — and, because the
-    // same filter also requires a BLS pubkey that V3 vote accounts do not have,
-    // it would drop the STAKED validators too.
+    // Note what this fallback does NOT fix: the same filter requires a BLS
+    // pubkey that V3 vote accounts do not have, so with the feature active the
+    // STAKED validators leave the epoch snapshot too, and that breaks leader
+    // schedules — which no amount of turbine-side work can paper over.
     #[test]
-    fn test_validator_admission_ticket_filters_the_roster_out_of_epoch_stakes() {
+    fn test_roster_falls_back_to_the_live_cache_under_validator_admission_ticket() {
         let (bank, leader_identity, follower_identity) =
             bank_with_unstaked_vote_account(&FeatureSet::all_enabled());
-
         let epoch = bank.epoch();
-        let vote_accounts = bank.epoch_vote_accounts(epoch).unwrap();
 
         assert!(
-            !vote_accounts
+            !bank
+                .epoch_vote_accounts(epoch)
+                .unwrap()
                 .values()
                 .any(|(_stake, vote_account)| *vote_account.node_pubkey() == follower_identity),
             "with validator_admission_ticket active the unstaked vote account is expected to be \
              filtered out of the epoch snapshot; if this now passes, re-read \
-             Bank::get_top_epoch_stakes and simplify the roster back to one unconditional case"
+             Bank::get_top_epoch_stakes and collapse the roster back to one unconditional case"
         );
-        // The live stakes cache is the unfiltered view, and still has it — that
-        // is the asymmetry, and the fallback if the feature ever activates here.
         assert!(
             bank.vote_accounts()
                 .values()
                 .any(|(_stake, vote_account)| *vote_account.node_pubkey() == follower_identity),
-            "the live stakes cache is not stake-filtered"
+            "the live stakes cache is not stake-filtered — it is what the fallback reads"
         );
-        assert!(
-            bank.epoch_staked_nodes(epoch)
-                .unwrap()
-                .contains_key(&leader_identity)
+
+        // End to end: the cache's own merge admits the unstaked follower despite
+        // the filtered snapshot, and still never lowers the leader's real stake.
+        let cache = ClusterNodesCache::<BroadcastStage>::new(
+            1,
+            Duration::from_secs(5),
+            true, // roster_from_vote_accounts
         );
+        let stakes = cache.merge_turbine_roster(
+            epoch,
+            &bank,
+            &bank,
+            bank.epoch_staked_nodes(epoch).unwrap(),
+        );
+        assert_eq!(
+            stakes.get(&follower_identity),
+            Some(&TURBINE_ROSTER_WEIGHT),
+            "the roster must still admit the unstaked follower when the snapshot is filtered"
+        );
+        assert_eq!(stakes.get(&leader_identity), Some(&1_000_000u64));
     }
 
     #[test]
